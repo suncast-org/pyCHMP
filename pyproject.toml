@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pychmp"
+version = "0.1.0a0"
+description = "Python Coronal Heating Modeling Pipeline for data-constrained fitting of GX models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+authors = [
+  { name = "Gelu Nita" },
+  { name = "Alexey Kuznetsov" },
+]
+keywords = ["solar-physics", "gx-simulator", "ebtel", "model-fitting", "radio", "euv"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+pychmp = "pychmp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/suncast-org/pyCHMP"
+Repository = "https://github.com/suncast-org/pyCHMP"
+"Algorithmic Provenance" = "https://github.com/kuznetsov-radio/gxmodelfitting"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pychmp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

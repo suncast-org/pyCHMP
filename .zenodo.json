@@ -1,0 +1,29 @@
+{
+  "title": "pyCHMP",
+  "description": "Python Coronal Heating Modeling Pipeline for data-constrained fitting of GX Simulator active-region models.",
+  "license": "BSD-3-Clause",
+  "creators": [
+    {
+      "name": "Nita, Gelu",
+      "affiliation": "SUNCAST-ORG"
+    },
+    {
+      "name": "Kuznetsov, Alexey"
+    }
+  ],
+  "keywords": [
+    "solar physics",
+    "GX Simulator",
+    "EBTEL",
+    "model fitting",
+    "microwave",
+    "EUV"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/kuznetsov-radio/gxmodelfitting",
+      "relation": "isDerivedFrom",
+      "scheme": "url"
+    }
+  ]
+}

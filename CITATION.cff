@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+title: "pyCHMP"
+message: "If you use this software, please cite it using the metadata below."
+type: software
+authors:
+  - family-names: "Nita"
+    given-names: "Gelu"
+  - family-names: "Kuznetsov"
+    given-names: "Alexey"
+repository-code: "https://github.com/suncast-org/pyCHMP"
+url: "https://github.com/suncast-org/pyCHMP"
+license: "BSD-3-Clause"
+keywords:
+  - solar physics
+  - GX Simulator
+  - EBTEL
+  - model fitting
+  - microwave
+  - EUV
+abstract: >-
+  pyCHMP is a Python coronal heating model fitting pipeline for data-constrained
+  exploration of EBTEL parameter space using pyAMPP models and pyGXrender
+  synthetic observables.
+references:
+  - type: software
+    title: "gxmodelfitting"
+    url: "https://github.com/kuznetsov-radio/gxmodelfitting"
