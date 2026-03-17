@@ -82,6 +82,14 @@ class GXRenderMWAdapter:
             verbose=self.verbose,
         )
         result = sdk.render_mw_maps(options)
+        
+        # Rename h5 output to add .h5 extension (gxrender saves without extension)
+        if self.output_dir and result.outputs.h5_path:
+            h5_path = Path(result.outputs.h5_path)
+            if h5_path.exists() and h5_path.suffix != '.h5':
+                h5_path_with_ext = h5_path.with_suffix('.h5')
+                h5_path.rename(h5_path_with_ext)
+        
         ti = np.asarray(result.ti, dtype=float)
         if ti.ndim != 3 or ti.shape[2] != 1:
             raise ValueError(f"expected single-frequency TI cube with shape (ny, nx, 1), got {ti.shape}")

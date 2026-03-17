@@ -32,14 +32,13 @@ def main() -> int:
     if args.output_h5:
         output_path = Path(args.output_h5)
         output_dir = str(output_path.parent)
-        # Remove .h5 extension if provided (gxrender adds it based on output_format)
+        # Remove .h5 extension if provided (gxrender will add it after save)
         if output_path.suffix == '.h5':
             output_name = output_path.stem
-            # gxrender saves without the .h5 extension when output_format="h5"
-            actual_output_file = Path(output_dir) / output_path.stem
+            actual_output_file = output_path
         else:
             output_name = output_path.name
-            actual_output_file = output_path
+            actual_output_file = output_path.with_suffix('.h5')
 
     adapter = GXRenderMWAdapter(
         model_path=args.model_path,
