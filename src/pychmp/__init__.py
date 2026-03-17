@@ -7,6 +7,7 @@ Algorithmic provenance:
 """
 
 from .fitting import Q0MapRenderer, fit_q0_to_observation
+from .gxrender_adapter import GXRenderMWAdapter
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
 from .optimize import Q0OptimizationResult, find_best_q0
 
@@ -17,6 +18,7 @@ __all__ = [
   "threshold_union_mask",
   "Q0MapRenderer",
   "fit_q0_to_observation",
+  "GXRenderMWAdapter",
   "Q0OptimizationResult",
   "find_best_q0",
 ]
