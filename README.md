@@ -37,6 +37,22 @@ pychmp --help
 pytest -q
 ```
 
+### Version Bumping
+
+This repository uses `bumpver` to keep package versions in sync between
+`pyproject.toml` and `src/pychmp/__init__.py`.
+
+```bash
+pip install -e .[dev]
+bumpver update --patch
+```
+
+Preview without writing files:
+
+```bash
+bumpver show
+```
+
 ## Citation
 
 Please use repository citation metadata in `CITATION.cff` and release metadata in `.zenodo.json`.

@@ -29,6 +29,7 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = [
+  "bumpver>=2024.1130",
   "pytest>=8.0",
 ]
 
@@ -46,3 +47,19 @@ packages = ["src/pychmp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.bumpver]
+current_version = "0.1.0a0"
+version_pattern = "MAJOR.MINOR.PATCH[PYTAGNUM]"
+commit_message = "chore: bump version {old_version} -> {new_version}"
+commit = false
+tag = false
+push = false
+
+[tool.bumpver.file_patterns]
+"pyproject.toml" = [
+  "version = \"{version}\"",
+]
+"src/pychmp/__init__.py" = [
+  "__version__ = \"{version}\"",
+]
