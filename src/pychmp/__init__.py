@@ -6,6 +6,7 @@ Algorithmic provenance:
   https://github.com/kuznetsov-radio/gxmodelfitting
 """
 
+from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
 from .optimize import Q0OptimizationResult, find_best_q0
 
@@ -14,6 +15,8 @@ __all__ = [
   "MetricValues",
   "compute_metrics",
   "threshold_union_mask",
+  "Q0MapRenderer",
+  "fit_q0_to_observation",
   "Q0OptimizationResult",
   "find_best_q0",
 ]
