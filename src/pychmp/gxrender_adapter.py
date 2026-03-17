@@ -40,12 +40,17 @@ class GXRenderMWAdapter:
     selective_heating: bool = False
     shtable: Any | None = None
     omp_threads: int = 8
+    pixel_scale_arcsec: float = 2.0
     geometry: Any | None = None
     observer: Any | None = None
     verbose: bool = False
 
     def render(self, q0: float) -> np.ndarray:
         sdk = _load_gxrender_sdk()
+
+        geometry = self.geometry
+        if geometry is None:
+            geometry = sdk.MapGeometry(pixel_scale_arcsec=float(self.pixel_scale_arcsec))
 
         plasma = sdk.CoronalPlasmaParameters(
             tbase=self.tbase,
@@ -64,7 +69,7 @@ class GXRenderMWAdapter:
             freqlist_ghz=[float(self.frequency_ghz)],
             plasma=plasma,
             omp_threads=self.omp_threads,
-            geometry=self.geometry,
+            geometry=geometry,
             observer=self.observer,
             save_outputs=False,
             write_preview=False,

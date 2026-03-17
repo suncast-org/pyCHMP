@@ -10,6 +10,10 @@ from pychmp.gxrender_adapter import GXRenderMWAdapter
 
 
 class FakeSDK:
+    class MapGeometry:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     class CoronalPlasmaParameters:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
