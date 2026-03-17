@@ -24,6 +24,21 @@
       "identifier": "https://github.com/kuznetsov-radio/gxmodelfitting",
       "relation": "isDerivedFrom",
       "scheme": "url"
+    },
+    {
+      "identifier": "10.5281/zenodo.19057091",
+      "relation": "isSupplementTo",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "10.5281/zenodo.15660387",
+      "relation": "isSupplementTo",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "10.3847/1538-4365/acd343",
+      "relation": "isDerivedFrom",
+      "scheme": "doi"
     }
   ]
 }

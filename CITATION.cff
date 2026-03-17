@@ -25,3 +25,39 @@ references:
   - type: software
     title: "gxmodelfitting"
     url: "https://github.com/kuznetsov-radio/gxmodelfitting"
+  - type: software
+    title: "gximagecomputing"
+    url: "https://github.com/kuznetsov-radio/gximagecomputing"
+  - type: software
+    title: "pyAMPP"
+    url: "https://github.com/suncast-org/pyAMPP"
+    doi: "10.5281/zenodo.19057091"
+  - type: software
+    title: "pyAMPP (all versions)"
+    doi: "10.5281/zenodo.15660387"
+  - type: article
+    title: "Data-constrained Solar Modeling with GX Simulator"
+    authors:
+      - family-names: "Nita"
+        given-names: "Gelu M."
+      - family-names: "Fleishman"
+        given-names: "Gregory D."
+      - family-names: "Kuznetsov"
+        given-names: "Alexey A."
+      - family-names: "Anfinogentov"
+        given-names: "Sergey A."
+      - family-names: "Stupishin"
+        given-names: "Alexey G."
+      - family-names: "Kontar"
+        given-names: "Eduard P."
+      - family-names: "Schonfeld"
+        given-names: "Samuel J."
+      - family-names: "Klimchuk"
+        given-names: "James A."
+      - family-names: "Gary"
+        given-names: "Dale E."
+    journal: "The Astrophysical Journal Supplement Series"
+    year: 2023
+    volume: 267
+    issue: 1
+    doi: "10.3847/1538-4365/acd343"
