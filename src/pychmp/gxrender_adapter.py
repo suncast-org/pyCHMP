@@ -43,6 +43,9 @@ class GXRenderMWAdapter:
     pixel_scale_arcsec: float = 2.0
     geometry: Any | None = None
     observer: Any | None = None
+    output_dir: str | Path | None = None
+    output_name: str | None = None
+    output_format: str = "h5"
     verbose: bool = False
 
     def render(self, q0: float) -> np.ndarray:
@@ -66,12 +69,15 @@ class GXRenderMWAdapter:
             model_path=Path(self.model_path),
             model_format=self.model_format,
             ebtel_path=self.ebtel_path,
+            output_dir=self.output_dir,
+            output_name=self.output_name,
+            output_format=self.output_format,
             freqlist_ghz=[float(self.frequency_ghz)],
             plasma=plasma,
             omp_threads=self.omp_threads,
             geometry=geometry,
             observer=self.observer,
-            save_outputs=False,
+            save_outputs=bool(self.output_dir),  # auto-save if output_dir is set
             write_preview=False,
             verbose=self.verbose,
         )
