@@ -18,15 +18,12 @@ EBTEL_PATH = Path(
 )
 
 Q0_TRUE = 0.0217
-Q0_ABS_TOL = 3e-3
-CHI2_MAX = 2.0
 PSF_BMAJ_ARCSEC = 5.77
 PSF_BMIN_ARCSEC = 5.77
 PSF_BPA_DEG = -17.5
 MAP_DX_ARCSEC = 2.5
 MAP_DY_ARCSEC = 2.5
 PSF_KERNEL_SIZE = 41
-NOISE_FRAC = 0.02
 NOISE_SEED = 12345
 
 
@@ -71,7 +68,18 @@ class _PSFConvolvedRenderer:
     os.environ.get("PYCHMP_RUN_GXRENDER_INTEGRATION") != "1",
     reason="Set PYCHMP_RUN_GXRENDER_INTEGRATION=1 to run gxrender integration test",
 )
-def test_q0_recovery_earth_observer_eovsa_psf() -> None:
+@pytest.mark.parametrize(
+    ("noise_frac", "q0_abs_tol", "chi2_max"),
+    [
+        (0.02, 3e-3, 2.0),
+        (0.05, 6e-3, 5.0),
+    ],
+)
+def test_q0_recovery_earth_observer_eovsa_psf(
+    noise_frac: float,
+    q0_abs_tol: float,
+    chi2_max: float,
+) -> None:
     if not MODEL_PATH.exists() or not EBTEL_PATH.exists():
         pytest.skip("Real fixture files are not available on this machine")
 
@@ -107,7 +115,7 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
     renderer = _PSFConvolvedRenderer(base_renderer, kernel)
 
     observed_clean = renderer.render(Q0_TRUE)
-    noise_std = NOISE_FRAC * float(np.max(observed_clean))
+    noise_std = noise_frac * float(np.max(observed_clean))
     rng = np.random.default_rng(NOISE_SEED)
     noise = rng.normal(loc=0.0, scale=noise_std, size=observed_clean.shape)
     observed = np.clip(observed_clean + noise, a_min=0.0, a_max=None)
@@ -144,25 +152,25 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
         print(f"  map_dy_arcsec:   {MAP_DY_ARCSEC:.2f}")
         print("  noise_applied:   yes")
         print(f"  noise_model:     gaussian")
-        print(f"  noise_frac:      {NOISE_FRAC:.4f}")
+        print(f"  noise_frac:      {noise_frac:.4f}")
         print(f"  noise_seed:      {NOISE_SEED}")
         print(f"  noise_std:       {noise_std:.6e}")
         print(f"  q0_truth:        {Q0_TRUE:.6f}")
         print(f"  q0_recovered:    {result.q0:.6f}")
         print(f"  q0_abs_error:    {q0_abs_err:.6e}")
-        print(f"  q0_abs_tol:      {Q0_ABS_TOL:.6e}")
+        print(f"  q0_abs_tol:      {q0_abs_tol:.6e}")
         print(f"  chi2:            {result.metrics.chi2:.6e}")
         print(f"  rho2:            {result.metrics.rho2:.6e}")
         print(f"  eta2:            {result.metrics.eta2:.6e}")
-        print(f"  chi2_max:        {CHI2_MAX:.6e}")
+        print(f"  chi2_max:        {chi2_max:.6e}")
         print(f"  optimizer_nit:   {result.nit}")
         print(f"  optimizer_nfev:  {result.nfev}")
         print(f"  optimizer_ok:    {result.success}")
 
     assert result.success, f"optimizer failed: {result.message}"
-    assert q0_abs_err <= Q0_ABS_TOL, (
-        f"q0 recovery error too large: |{result.q0:.6f} - {Q0_TRUE:.6f}| = {q0_abs_err:.6e} > {Q0_ABS_TOL:.6e}"
+    assert q0_abs_err <= q0_abs_tol, (
+        f"q0 recovery error too large: |{result.q0:.6f} - {Q0_TRUE:.6f}| = {q0_abs_err:.6e} > {q0_abs_tol:.6e}"
     )
-    assert result.metrics.chi2 <= CHI2_MAX, (
-        f"chi2 too large: {result.metrics.chi2:.6e} > {CHI2_MAX:.6e}"
+    assert result.metrics.chi2 <= chi2_max, (
+        f"chi2 too large: {result.metrics.chi2:.6e} > {chi2_max:.6e}"
     )

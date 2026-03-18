@@ -80,3 +80,4 @@ python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py
 ```
 
 Verbose diagnostics also report whether PSF and noise were applied, including beam parameters and noise settings.
+The integration test runs two noise regimes by default: `noise_frac=0.02` and `noise_frac=0.05`.
