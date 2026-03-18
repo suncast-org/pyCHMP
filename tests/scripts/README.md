@@ -68,3 +68,10 @@ Integration test (disabled by default because it requires local gxrender + test 
 PYCHMP_RUN_GXRENDER_INTEGRATION=1 \
 python -m pytest -q tests/test_integration_earth_eovsa_q0.py
 ```
+
+To print quantitative diagnostics (truth/recovered q0, error, metrics, tolerances):
+
+```bash
+PYCHMP_RUN_GXRENDER_INTEGRATION=1 PYCHMP_VERBOSE_INTEGRATION=1 \
+python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py
+```

@@ -17,6 +17,10 @@ EBTEL_PATH = Path(
     "/Users/gelu/Library/CloudStorage/Dropbox/@Projects/@SUNCAST-ORG/pyGXrender-test-data/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav"
 )
 
+Q0_TRUE = 0.0217
+Q0_ABS_TOL = 3e-3
+CHI2_MAX = 1e-2
+
 
 def _elliptical_gaussian_kernel(
     bmaj_arcsec: float,
@@ -93,8 +97,7 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
     )
     renderer = _PSFConvolvedRenderer(base_renderer, kernel)
 
-    q0_true = 0.0217
-    observed = renderer.render(q0_true)
+    observed = renderer.render(Q0_TRUE)
 
     # Use a floor to keep sigma positive and stable in low-intensity pixels.
     sigma = np.maximum(0.05 * np.max(observed), 1.0) * np.ones_like(observed)
@@ -111,5 +114,29 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
         maxiter=60,
     )
 
-    assert result.success
-    assert result.q0 == pytest.approx(q0_true, abs=3e-3)
+    q0_abs_err = abs(result.q0 - Q0_TRUE)
+
+    if os.environ.get("PYCHMP_VERBOSE_INTEGRATION") == "1":
+        print("integration diagnostics:")
+        print(f"  model_path:      {MODEL_PATH}")
+        print(f"  frequency_ghz:   17.0")
+        print(f"  map_shape:       {observed.shape}")
+        print(f"  q0_truth:        {Q0_TRUE:.6f}")
+        print(f"  q0_recovered:    {result.q0:.6f}")
+        print(f"  q0_abs_error:    {q0_abs_err:.6e}")
+        print(f"  q0_abs_tol:      {Q0_ABS_TOL:.6e}")
+        print(f"  chi2:            {result.metrics.chi2:.6e}")
+        print(f"  rho2:            {result.metrics.rho2:.6e}")
+        print(f"  eta2:            {result.metrics.eta2:.6e}")
+        print(f"  chi2_threshold:  {CHI2_MAX:.6e}")
+        print(f"  optimizer_nit:   {result.nit}")
+        print(f"  optimizer_nfev:  {result.nfev}")
+        print(f"  optimizer_ok:    {result.success}")
+
+    assert result.success, f"optimizer failed: {result.message}"
+    assert q0_abs_err <= Q0_ABS_TOL, (
+        f"q0 recovery error too large: |{result.q0:.6f} - {Q0_TRUE:.6f}| = {q0_abs_err:.6e} > {Q0_ABS_TOL:.6e}"
+    )
+    assert result.metrics.chi2 <= CHI2_MAX, (
+        f"chi2 too large: {result.metrics.chi2:.6e} > {CHI2_MAX:.6e}"
+    )
