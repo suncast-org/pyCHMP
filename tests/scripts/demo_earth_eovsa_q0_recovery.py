@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.signal import fftconvolve
@@ -45,6 +46,50 @@ class PSFConvolvedRenderer:
         return fftconvolve(raw, self._kernel, mode="same")
 
 
+def _save_artifacts(
+    out_dir: Path,
+    *,
+    observed_clean: np.ndarray,
+    observed_noisy: np.ndarray,
+    modeled_best: np.ndarray,
+    residual: np.ndarray,
+    diagnostics: dict[str, Any],
+    save_png: bool,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        out_dir / "earth_eovsa_q0_artifacts.npz",
+        observed_clean=observed_clean,
+        observed_noisy=observed_noisy,
+        modeled_best=modeled_best,
+        residual=residual,
+        diagnostics=diagnostics,
+    )
+
+    if not save_png:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    panels = [
+        ("Observed (Noisy)", observed_noisy),
+        ("Modeled (Best Q0)", modeled_best),
+        ("Residual (Model-Obs)", residual),
+    ]
+    for ax, (title, data) in zip(axes, panels):
+        im = ax.imshow(data, origin="lower", cmap="inferno")
+        ax.set_title(title)
+        ax.set_xlabel("X [pix]")
+        ax.set_ylabel("Y [pix]")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.savefig(out_dir / "earth_eovsa_q0_artifacts.png", dpi=140)
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Q0 recovery demo in Earth frame with EOVSA-like PSF")
     p.add_argument(
@@ -61,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noise-frac", type=float, default=0.02)
     p.add_argument("--noise-seed", type=int, default=12345)
     p.add_argument("--save-raw-h5", default=None)
+    p.add_argument("--artifacts-dir", default=None)
+    p.add_argument("--no-artifacts-png", action="store_true")
     return p.parse_args()
 
 
@@ -128,12 +175,42 @@ def main() -> int:
         xatol=1e-3,
         maxiter=60,
     )
+    modeled_best = renderer.render(result.q0)
+    residual = modeled_best - observed
 
     print(f"truth q0: {args.q0_true:.6f}")
     print(f"fit q0:   {result.q0:.6f}")
     print(f"chi2:     {result.metrics.chi2:.6e}")
     print(f"noise:    gaussian frac={args.noise_frac:.4f} seed={args.noise_seed} std={noise_std:.6e}")
     print(f"success:  {result.success}")
+
+    if args.artifacts_dir:
+        out_dir = Path(args.artifacts_dir)
+        _save_artifacts(
+            out_dir,
+            observed_clean=observed_clean,
+            observed_noisy=observed,
+            modeled_best=modeled_best,
+            residual=residual,
+            diagnostics={
+                "q0_truth": float(args.q0_true),
+                "q0_recovered": float(result.q0),
+                "q0_abs_error": float(abs(result.q0 - args.q0_true)),
+                "chi2": float(result.metrics.chi2),
+                "rho2": float(result.metrics.rho2),
+                "eta2": float(result.metrics.eta2),
+                "noise_frac": float(args.noise_frac),
+                "noise_seed": int(args.noise_seed),
+                "noise_std": float(noise_std),
+                "psf_bmaj_arcsec": 5.77,
+                "psf_bmin_arcsec": 5.77,
+                "psf_bpa_deg": -17.5,
+            },
+            save_png=not args.no_artifacts_png,
+        )
+        print(f"artifacts dir: {out_dir}")
+        print(f"data file:      {out_dir / 'earth_eovsa_q0_artifacts.npz'}")
+        print(f"png file:       {out_dir / 'earth_eovsa_q0_artifacts.png'}")
 
     if args.save_raw_h5:
         target = Path(args.save_raw_h5)

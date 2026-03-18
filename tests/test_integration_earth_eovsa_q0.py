@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -25,6 +26,51 @@ MAP_DX_ARCSEC = 2.5
 MAP_DY_ARCSEC = 2.5
 PSF_KERNEL_SIZE = 41
 NOISE_SEED = 12345
+
+
+def _save_artifacts(
+    out_dir: Path,
+    *,
+    observed_clean: np.ndarray,
+    observed_noisy: np.ndarray,
+    modeled_best: np.ndarray,
+    residual: np.ndarray,
+    diagnostics: dict[str, Any],
+    save_png: bool,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        out_dir / "earth_eovsa_q0_artifacts.npz",
+        observed_clean=observed_clean,
+        observed_noisy=observed_noisy,
+        modeled_best=modeled_best,
+        residual=residual,
+        diagnostics=diagnostics,
+    )
+
+    if not save_png:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ModuleNotFoundError:
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    panels = [
+        ("Observed (Noisy)", observed_noisy),
+        ("Modeled (Best Q0)", modeled_best),
+        ("Residual (Model-Obs)", residual),
+    ]
+    for ax, (title, data) in zip(axes, panels):
+        im = ax.imshow(data, origin="lower", cmap="inferno")
+        ax.set_title(title)
+        ax.set_xlabel("X [pix]")
+        ax.set_ylabel("Y [pix]")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.savefig(out_dir / "earth_eovsa_q0_artifacts.png", dpi=140)
+    plt.close(fig)
 
 
 def _elliptical_gaussian_kernel(
@@ -136,6 +182,9 @@ def test_q0_recovery_earth_observer_eovsa_psf(
         maxiter=60,
     )
 
+    modeled_best = renderer.render(result.q0)
+    residual = modeled_best - observed
+
     q0_abs_err = abs(result.q0 - Q0_TRUE)
 
     if os.environ.get("PYCHMP_VERBOSE_INTEGRATION") == "1":
@@ -166,6 +215,38 @@ def test_q0_recovery_earth_observer_eovsa_psf(
         print(f"  optimizer_nit:   {result.nit}")
         print(f"  optimizer_nfev:  {result.nfev}")
         print(f"  optimizer_ok:    {result.success}")
+
+    if os.environ.get("PYCHMP_SAVE_INTEGRATION_ARTIFACTS") == "1":
+        out_dir = Path(os.environ.get("PYCHMP_ARTIFACTS_DIR", "/tmp/pychmp_artifacts"))
+        save_png = os.environ.get("PYCHMP_SAVE_INTEGRATION_PNG", "1") == "1"
+        _save_artifacts(
+            out_dir,
+            observed_clean=observed_clean,
+            observed_noisy=observed,
+            modeled_best=modeled_best,
+            residual=residual,
+            diagnostics={
+                "q0_truth": Q0_TRUE,
+                "q0_recovered": float(result.q0),
+                "q0_abs_error": float(q0_abs_err),
+                "q0_abs_tol": float(q0_abs_tol),
+                "chi2": float(result.metrics.chi2),
+                "rho2": float(result.metrics.rho2),
+                "eta2": float(result.metrics.eta2),
+                "chi2_max": float(chi2_max),
+                "noise_frac": float(noise_frac),
+                "noise_seed": int(NOISE_SEED),
+                "noise_std": float(noise_std),
+                "psf_bmaj_arcsec": float(PSF_BMAJ_ARCSEC),
+                "psf_bmin_arcsec": float(PSF_BMIN_ARCSEC),
+                "psf_bpa_deg": float(PSF_BPA_DEG),
+                "psf_kernel_size": int(PSF_KERNEL_SIZE),
+            },
+            save_png=save_png,
+        )
+        if os.environ.get("PYCHMP_VERBOSE_INTEGRATION") == "1":
+            print(f"  artifacts_saved: yes")
+            print(f"  artifacts_dir:   {out_dir}")
 
     assert result.success, f"optimizer failed: {result.message}"
     assert q0_abs_err <= q0_abs_tol, (

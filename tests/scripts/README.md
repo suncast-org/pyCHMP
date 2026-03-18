@@ -60,6 +60,7 @@ python tests/scripts/demo_earth_eovsa_q0_recovery.py \
   --q0-max 0.05 \
   --noise-frac 0.02 \
   --noise-seed 12345 \
+  --artifacts-dir /tmp/pychmp_artifacts \
   --save-raw-h5 /tmp/earth_eovsa_raw.h5
 ```
 
@@ -78,6 +79,21 @@ To print quantitative diagnostics (truth/recovered q0, error, metrics, tolerance
 PYCHMP_RUN_GXRENDER_INTEGRATION=1 PYCHMP_VERBOSE_INTEGRATION=1 \
 python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py
 ```
+
+Optional artifact mode for integration test:
+
+```bash
+PYCHMP_RUN_GXRENDER_INTEGRATION=1 \
+PYCHMP_VERBOSE_INTEGRATION=1 \
+PYCHMP_SAVE_INTEGRATION_ARTIFACTS=1 \
+PYCHMP_ARTIFACTS_DIR=/tmp/pychmp_artifacts \
+PYCHMP_SAVE_INTEGRATION_PNG=1 \
+python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py --disable-warnings
+```
+
+This writes:
+- `earth_eovsa_q0_artifacts.npz` with observed_clean, observed_noisy, modeled_best, residual, diagnostics
+- `earth_eovsa_q0_artifacts.png` panel with colorbars (if matplotlib is available)
 
 Verbose diagnostics also report whether PSF and noise were applied, including beam parameters and noise settings.
 The integration test runs two noise regimes by default: `noise_frac=0.02` and `noise_frac=0.05`.
