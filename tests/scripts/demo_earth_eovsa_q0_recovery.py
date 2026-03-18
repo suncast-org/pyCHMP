@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
+import h5py
 import numpy as np
+from astropy.io import fits
 from scipy.signal import fftconvolve
 
 from pychmp import GXRenderMWAdapter, fit_q0_to_observation
@@ -46,6 +49,189 @@ class PSFConvolvedRenderer:
         return fftconvolve(raw, self._kernel, mode="same")
 
 
+def _build_common_wcs_header(
+    ny: int,
+    nx: int,
+    *,
+    xc_arcsec: float,
+    yc_arcsec: float,
+    dx_arcsec: float,
+    dy_arcsec: float,
+    date_obs: str,
+    bunit: str,
+) -> fits.Header:
+    return fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": int(nx),
+            "NAXIS2": int(ny),
+            "CTYPE1": "HPLN-TAN",
+            "CTYPE2": "HPLT-TAN",
+            "CUNIT1": "arcsec",
+            "CUNIT2": "arcsec",
+            "CDELT1": float(dx_arcsec),
+            "CDELT2": float(dy_arcsec),
+            "CRPIX1": (nx + 1.0) / 2.0,
+            "CRPIX2": (ny + 1.0) / 2.0,
+            "CRVAL1": float(xc_arcsec),
+            "CRVAL2": float(yc_arcsec),
+            "DATE-OBS": str(date_obs or "2025-01-01T00:00:00"),
+            "BUNIT": str(bunit),
+            "OBSERVER": "Earth",
+            "HGLN_OBS": 0.0,
+            "HGLT_OBS": 0.0,
+            "DSUN_OBS": 1.495978707e11,
+            "RSUN_REF": 6.957e8,
+        }
+    )
+
+
+def _decode_h5_scalar(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _load_blos_reference_map(model_path: Path) -> tuple[np.ndarray, fits.Header] | None:
+    if model_path.suffix.lower() not in {".h5", ".hdf5"}:
+        return None
+    if not model_path.exists():
+        return None
+
+    candidates = [
+        ("refmaps", "Bz_reference"),
+        ("reference_maps", "B_los"),
+        ("reference_maps", "Bz_reference"),
+    ]
+    try:
+        with h5py.File(model_path, "r") as f:
+            for root, key in candidates:
+                path = f"{root}/{key}"
+                if path not in f:
+                    continue
+                grp = f[path]
+                if "data" not in grp or "wcs_header" not in grp:
+                    continue
+                data = np.asarray(grp["data"], dtype=float)
+                wcs_text = _decode_h5_scalar(grp["wcs_header"][()])
+                header = fits.Header.fromstring(wcs_text, sep="\n")
+                return data, header
+    except Exception:
+        return None
+    return None
+
+
+def _save_viewer_h5(
+    out_h5: Path,
+    *,
+    observed_noisy: np.ndarray,
+    modeled_best: np.ndarray,
+    residual: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+) -> None:
+    out_h5.parent.mkdir(parents=True, exist_ok=True)
+
+    ti = np.stack([observed_noisy, modeled_best, residual], axis=-1).astype(np.float32)  # (ny, nx, 3)
+    tv = np.zeros_like(ti, dtype=np.float32)
+    cube = np.stack([np.transpose(ti, (1, 0, 2)), np.transpose(tv, (1, 0, 2))], axis=-1)  # (nx, ny, 3, 2)
+
+    header_text = wcs_header.tostring(sep="\n", endcard=True)
+    with h5py.File(out_h5, "w") as f:
+        maps = f.create_group("maps")
+        maps.create_dataset("data", data=cube, compression="gzip", compression_opts=4)
+        maps.create_dataset("freqlist_ghz", data=np.asarray([17.0, 17.1, 17.2], dtype=np.float64))
+        maps.create_dataset("stokes_ids", data=np.asarray(["TI", "TV"], dtype="S8"))
+        maps.create_dataset(
+            "map_ids",
+            data=np.asarray(["OBSERVED", "MODELED", "RESIDUAL", "OBSERVED", "MODELED", "RESIDUAL"], dtype="S32"),
+        )
+        maps.create_dataset("artifact_labels", data=np.asarray(["OBSERVED", "MODELED", "RESIDUAL"], dtype="S32"))
+
+        meta = f.create_group("metadata")
+        meta.create_dataset("wcs_header", data=np.bytes_(header_text))
+        meta.create_dataset("index_header", data=np.bytes_(header_text))
+        meta.create_dataset("date_obs", data=np.bytes_(str(wcs_header.get("DATE-OBS", ""))))
+        meta.create_dataset("observer_name", data=np.bytes_("Earth"))
+        meta.create_dataset("artifact_kind", data=np.bytes_("pychmp_q0_recovery"))
+        meta.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics, sort_keys=True)))
+
+
+def _save_png_panel(
+    out_png: Path,
+    *,
+    model_path: Path,
+    observed_noisy: np.ndarray,
+    modeled_best: np.ndarray,
+    residual: np.ndarray,
+    wcs_header: fits.Header,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+        import sunpy.map
+        from astropy import units as u
+        from astropy.coordinates import SkyCoord
+    except ModuleNotFoundError:
+        return
+
+    m_obs = sunpy.map.Map(observed_noisy, wcs_header)
+    m_mod = sunpy.map.Map(modeled_best, wcs_header)
+    m_res = sunpy.map.Map(residual, wcs_header)
+
+    blos = _load_blos_reference_map(model_path)
+
+    fig = plt.figure(figsize=(12.8, 9.2), constrained_layout=True)
+    gs = fig.add_gridspec(2, 2)
+
+    if blos is not None:
+        blos_data, blos_hdr = blos
+        m_blos = sunpy.map.Map(blos_data, blos_hdr)
+        ax0 = fig.add_subplot(gs[0, 0], projection=m_blos)
+        try:
+            xc = float(wcs_header.get("CRVAL1", 0.0))
+            yc = float(wcs_header.get("CRVAL2", 0.0))
+            nx = int(wcs_header.get("NAXIS1", observed_noisy.shape[1]))
+            ny = int(wcs_header.get("NAXIS2", observed_noisy.shape[0]))
+            dx = float(wcs_header.get("CDELT1", 1.0))
+            dy = float(wcs_header.get("CDELT2", 1.0))
+            half_x = 0.5 * nx * abs(dx)
+            half_y = 0.5 * ny * abs(dy)
+            bl = SkyCoord((xc - half_x) * u.arcsec, (yc - half_y) * u.arcsec, frame=m_blos.coordinate_frame)
+            tr = SkyCoord((xc + half_x) * u.arcsec, (yc + half_y) * u.arcsec, frame=m_blos.coordinate_frame)
+            m_blos = m_blos.submap(bl, top_right=tr)
+            ax0.remove()
+            ax0 = fig.add_subplot(gs[0, 0], projection=m_blos)
+        except Exception:
+            pass
+        im0 = m_blos.plot(axes=ax0, cmap="gray")
+        ax0.set_title("B_los Reference")
+        fig.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+    else:
+        ax0 = fig.add_subplot(gs[0, 0])
+        ax0.set_title("B_los Reference (Unavailable)")
+        ax0.axis("off")
+
+    ax1 = fig.add_subplot(gs[0, 1], projection=m_obs)
+    im1 = m_obs.plot(axes=ax1, cmap="inferno")
+    ax1.set_title("Observed (Noisy)")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    ax2 = fig.add_subplot(gs[1, 0], projection=m_mod)
+    im2 = m_mod.plot(axes=ax2, cmap="inferno")
+    ax2.set_title("Modeled (Best Q0)")
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+    ax3 = fig.add_subplot(gs[1, 1], projection=m_res)
+    im3 = m_res.plot(axes=ax3, cmap="coolwarm")
+    ax3.set_title("Residual (Model-Obs)")
+    fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+    fig.savefig(out_png, dpi=140, facecolor="white")
+    plt.close(fig)
+
+
 def _save_artifacts(
     out_dir: Path,
     *,
@@ -57,37 +243,37 @@ def _save_artifacts(
     save_png: bool,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_dir / "earth_eovsa_q0_artifacts.npz",
-        observed_clean=observed_clean,
+    ny, nx = observed_noisy.shape
+    wcs_header = _build_common_wcs_header(
+        ny,
+        nx,
+        xc_arcsec=-257.0,
+        yc_arcsec=-233.0,
+        dx_arcsec=2.5,
+        dy_arcsec=2.5,
+        date_obs="",
+        bunit="K",
+    )
+
+    out_h5 = out_dir / "earth_eovsa_q0_artifacts.h5"
+    _save_viewer_h5(
+        out_h5,
         observed_noisy=observed_noisy,
         modeled_best=modeled_best,
         residual=residual,
+        wcs_header=wcs_header,
         diagnostics=diagnostics,
     )
 
-    if not save_png:
-        return
-
-    try:
-        import matplotlib.pyplot as plt
-    except ModuleNotFoundError:
-        return
-
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
-    panels = [
-        ("Observed (Noisy)", observed_noisy),
-        ("Modeled (Best Q0)", modeled_best),
-        ("Residual (Model-Obs)", residual),
-    ]
-    for ax, (title, data) in zip(axes, panels):
-        im = ax.imshow(data, origin="lower", cmap="inferno")
-        ax.set_title(title)
-        ax.set_xlabel("X [pix]")
-        ax.set_ylabel("Y [pix]")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.savefig(out_dir / "earth_eovsa_q0_artifacts.png", dpi=140)
-    plt.close(fig)
+    if save_png:
+        _save_png_panel(
+            out_dir / "earth_eovsa_q0_artifacts.png",
+            model_path=Path(str(diagnostics.get("model_path", ""))),
+            observed_noisy=observed_noisy,
+            modeled_best=modeled_best,
+            residual=residual,
+            wcs_header=wcs_header,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -193,6 +379,7 @@ def main() -> int:
             modeled_best=modeled_best,
             residual=residual,
             diagnostics={
+                "model_path": str(args.model_path),
                 "q0_truth": float(args.q0_true),
                 "q0_recovered": float(result.q0),
                 "q0_abs_error": float(abs(result.q0 - args.q0_true)),
@@ -209,7 +396,8 @@ def main() -> int:
             save_png=not args.no_artifacts_png,
         )
         print(f"artifacts dir: {out_dir}")
-        print(f"data file:      {out_dir / 'earth_eovsa_q0_artifacts.npz'}")
+        print(f"data file:      {out_dir / 'earth_eovsa_q0_artifacts.h5'}")
+        print(f"view with:      gxrender-map-view {out_dir / 'earth_eovsa_q0_artifacts.h5'}")
         print(f"png file:       {out_dir / 'earth_eovsa_q0_artifacts.png'}")
 
     if args.save_raw_h5:

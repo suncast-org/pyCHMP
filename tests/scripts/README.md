@@ -92,8 +92,14 @@ python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py --disable-warnin
 ```
 
 This writes:
-- `earth_eovsa_q0_artifacts.npz` with observed_clean, observed_noisy, modeled_best, residual, diagnostics
-- `earth_eovsa_q0_artifacts.png` panel with colorbars (if matplotlib is available)
+- `earth_eovsa_q0_artifacts.h5` as a gxrender-map-view compatible container with common WCS and 3 artifact maps (observed, modeled, residual)
+- `earth_eovsa_q0_artifacts.png` as a WCS-aware 2x2 panel: B_los reference (if available), observed, modeled, residual
+
+Open the HDF5 artifact with:
+
+```bash
+gxrender-map-view /tmp/pychmp_artifacts/earth_eovsa_q0_artifacts.h5
+```
 
 Verbose diagnostics also report whether PSF and noise were applied, including beam parameters and noise settings.
 The integration test runs two noise regimes by default: `noise_frac=0.02` and `noise_frac=0.05`.
