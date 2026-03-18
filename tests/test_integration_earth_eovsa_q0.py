@@ -20,6 +20,12 @@ EBTEL_PATH = Path(
 Q0_TRUE = 0.0217
 Q0_ABS_TOL = 3e-3
 CHI2_MAX = 1e-2
+PSF_BMAJ_ARCSEC = 5.77
+PSF_BMIN_ARCSEC = 5.77
+PSF_BPA_DEG = -17.5
+MAP_DX_ARCSEC = 2.5
+MAP_DY_ARCSEC = 2.5
+PSF_KERNEL_SIZE = 41
 
 
 def _elliptical_gaussian_kernel(
@@ -72,8 +78,8 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
     geometry = sdk.MapGeometry(
         xc=-257.0,
         yc=-233.0,
-        dx=2.5,
-        dy=2.5,
+        dx=MAP_DX_ARCSEC,
+        dy=MAP_DY_ARCSEC,
         nx=64,
         ny=64,
     )
@@ -89,11 +95,12 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
     )
 
     kernel = _elliptical_gaussian_kernel(
-        bmaj_arcsec=5.77,
-        bmin_arcsec=5.77,
-        bpa_deg=-17.5,
-        dx_arcsec=2.5,
-        dy_arcsec=2.5,
+        bmaj_arcsec=PSF_BMAJ_ARCSEC,
+        bmin_arcsec=PSF_BMIN_ARCSEC,
+        bpa_deg=PSF_BPA_DEG,
+        dx_arcsec=MAP_DX_ARCSEC,
+        dy_arcsec=MAP_DY_ARCSEC,
+        size=PSF_KERNEL_SIZE,
     )
     renderer = _PSFConvolvedRenderer(base_renderer, kernel)
 
@@ -121,6 +128,13 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
         print(f"  model_path:      {MODEL_PATH}")
         print(f"  frequency_ghz:   17.0")
         print(f"  map_shape:       {observed.shape}")
+        print("  psf_applied:     yes")
+        print(f"  psf_bmaj_arcsec: {PSF_BMAJ_ARCSEC:.2f}")
+        print(f"  psf_bmin_arcsec: {PSF_BMIN_ARCSEC:.2f}")
+        print(f"  psf_bpa_deg:     {PSF_BPA_DEG:.1f}")
+        print(f"  psf_kernel_size: {PSF_KERNEL_SIZE}x{PSF_KERNEL_SIZE}")
+        print(f"  map_dx_arcsec:   {MAP_DX_ARCSEC:.2f}")
+        print(f"  map_dy_arcsec:   {MAP_DY_ARCSEC:.2f}")
         print(f"  q0_truth:        {Q0_TRUE:.6f}")
         print(f"  q0_recovered:    {result.q0:.6f}")
         print(f"  q0_abs_error:    {q0_abs_err:.6e}")
