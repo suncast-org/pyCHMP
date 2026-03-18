@@ -64,6 +64,8 @@ python tests/scripts/demo_earth_eovsa_q0_recovery.py \
   --save-raw-h5 /tmp/earth_eovsa_raw.h5
 ```
 
+For SAV model input, the demo automatically builds a temporary canonical HDF5 via gxrender's SAV-to-H5 converter and reads refmaps (including `Bz_reference`) from that converted file for the B_los panel.
+
 Note: for H5 inputs, `gxrender-mw --observer earth ...` is the native way to force Earth observer orientation.
 
 Integration test (disabled by default because it requires local gxrender + test fixtures):
@@ -92,14 +94,8 @@ python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py --disable-warnin
 ```
 
 This writes:
-- `earth_eovsa_q0_artifacts.h5` as a gxrender-map-view compatible container with common WCS and 3 artifact maps (observed, modeled, residual)
-- `earth_eovsa_q0_artifacts.png` as a WCS-aware 2x2 panel: B_los reference (if available), observed, modeled, residual
-
-Open the HDF5 artifact with:
-
-```bash
-gxrender-map-view /tmp/pychmp_artifacts/earth_eovsa_q0_artifacts.h5
-```
+- `earth_eovsa_q0_artifacts.h5` as a machine-readable container with common WCS and 3 artifact maps (observed, modeled, residual)
+- `earth_eovsa_q0_artifacts.png` as the primary WCS-aware 2x2 inspection panel: B_los reference (if available), observed, modeled, residual
 
 Verbose diagnostics also report whether PSF and noise were applied, including beam parameters and noise settings.
 The integration test runs two noise regimes by default: `noise_frac=0.02` and `noise_frac=0.05`.

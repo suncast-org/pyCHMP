@@ -37,6 +37,9 @@ pychmp --help
 pytest -q
 ```
 
+Demo scripts are available in `tests/scripts/` for quick hands-on validation
+outside the pytest suite.
+
 ### Version Bumping
 
 This repository uses `bumpver` to keep package versions in sync between

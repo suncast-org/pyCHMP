@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -94,10 +95,35 @@ def _decode_h5_scalar(value: Any) -> str:
     return str(value)
 
 
-def _load_blos_reference_map(model_path: Path) -> tuple[np.ndarray, fits.Header] | None:
-    if model_path.suffix.lower() not in {".h5", ".hdf5"}:
+def _ensure_refmap_h5_for_model(model_path: Path) -> Path | None:
+    suffix = model_path.suffix.lower()
+    if suffix in {".h5", ".hdf5"}:
+        return model_path if model_path.exists() else None
+    if suffix != ".sav" or not model_path.exists():
         return None
-    if not model_path.exists():
+
+    try:
+        from gxrender.io import build_h5_from_sav
+    except Exception:
+        return None
+
+    src = model_path.resolve()
+    stat = src.stat()
+    stamp = f"{int(stat.st_mtime)}_{int(stat.st_size)}"
+    out_h5 = Path(tempfile.gettempdir()) / f"pychmp_refmaps_{src.stem}_{stamp}.h5"
+    if out_h5.exists():
+        return out_h5
+
+    try:
+        build_h5_from_sav(src, out_h5, template_h5=None)
+        return out_h5
+    except Exception:
+        return None
+
+
+def _load_blos_reference_map(model_path: Path) -> tuple[np.ndarray, fits.Header] | None:
+    refmap_h5 = _ensure_refmap_h5_for_model(model_path)
+    if refmap_h5 is None:
         return None
 
     candidates = [
@@ -106,7 +132,7 @@ def _load_blos_reference_map(model_path: Path) -> tuple[np.ndarray, fits.Header]
         ("reference_maps", "Bz_reference"),
     ]
     try:
-        with h5py.File(model_path, "r") as f:
+        with h5py.File(refmap_h5, "r") as f:
             for root, key in candidates:
                 path = f"{root}/{key}"
                 if path not in f:
@@ -397,7 +423,6 @@ def main() -> int:
         )
         print(f"artifacts dir: {out_dir}")
         print(f"data file:      {out_dir / 'earth_eovsa_q0_artifacts.h5'}")
-        print(f"view with:      gxrender-map-view {out_dir / 'earth_eovsa_q0_artifacts.h5'}")
         print(f"png file:       {out_dir / 'earth_eovsa_q0_artifacts.png'}")
 
     if args.save_raw_h5:
