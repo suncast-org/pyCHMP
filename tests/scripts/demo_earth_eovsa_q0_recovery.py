@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--q0-true", type=float, default=0.0217)
     p.add_argument("--q0-min", type=float, default=0.005)
     p.add_argument("--q0-max", type=float, default=0.05)
+    p.add_argument("--noise-frac", type=float, default=0.02)
+    p.add_argument("--noise-seed", type=int, default=12345)
     p.add_argument("--save-raw-h5", default=None)
     return p.parse_args()
 
@@ -108,8 +110,12 @@ def main() -> int:
     )
     renderer = PSFConvolvedRenderer(base_renderer, kernel)
 
-    observed = renderer.render(args.q0_true)
-    sigma = np.maximum(0.05 * np.max(observed), 1.0) * np.ones_like(observed)
+    observed_clean = renderer.render(args.q0_true)
+    noise_std = max(0.0, float(args.noise_frac)) * float(np.max(observed_clean))
+    rng = np.random.default_rng(args.noise_seed)
+    noise = rng.normal(loc=0.0, scale=noise_std, size=observed_clean.shape)
+    observed = np.clip(observed_clean + noise, a_min=0.0, a_max=None)
+    sigma = max(noise_std, 1.0) * np.ones_like(observed)
 
     result = fit_q0_to_observation(
         renderer,
@@ -126,6 +132,7 @@ def main() -> int:
     print(f"truth q0: {args.q0_true:.6f}")
     print(f"fit q0:   {result.q0:.6f}")
     print(f"chi2:     {result.metrics.chi2:.6e}")
+    print(f"noise:    gaussian frac={args.noise_frac:.4f} seed={args.noise_seed} std={noise_std:.6e}")
     print(f"success:  {result.success}")
 
     if args.save_raw_h5:

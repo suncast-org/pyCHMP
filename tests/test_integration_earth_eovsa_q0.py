@@ -19,13 +19,15 @@ EBTEL_PATH = Path(
 
 Q0_TRUE = 0.0217
 Q0_ABS_TOL = 3e-3
-CHI2_MAX = 1e-2
+CHI2_MAX = 2.0
 PSF_BMAJ_ARCSEC = 5.77
 PSF_BMIN_ARCSEC = 5.77
 PSF_BPA_DEG = -17.5
 MAP_DX_ARCSEC = 2.5
 MAP_DY_ARCSEC = 2.5
 PSF_KERNEL_SIZE = 41
+NOISE_FRAC = 0.02
+NOISE_SEED = 12345
 
 
 def _elliptical_gaussian_kernel(
@@ -104,10 +106,15 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
     )
     renderer = _PSFConvolvedRenderer(base_renderer, kernel)
 
-    observed = renderer.render(Q0_TRUE)
+    observed_clean = renderer.render(Q0_TRUE)
+    noise_std = NOISE_FRAC * float(np.max(observed_clean))
+    rng = np.random.default_rng(NOISE_SEED)
+    noise = rng.normal(loc=0.0, scale=noise_std, size=observed_clean.shape)
+    observed = np.clip(observed_clean + noise, a_min=0.0, a_max=None)
 
-    # Use a floor to keep sigma positive and stable in low-intensity pixels.
-    sigma = np.maximum(0.05 * np.max(observed), 1.0) * np.ones_like(observed)
+    # Use known noise scale with a floor to keep sigma positive and stable.
+    sigma_level = max(noise_std, 1.0)
+    sigma = sigma_level * np.ones_like(observed)
 
     result = fit_q0_to_observation(
         renderer,
@@ -135,6 +142,11 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
         print(f"  psf_kernel_size: {PSF_KERNEL_SIZE}x{PSF_KERNEL_SIZE}")
         print(f"  map_dx_arcsec:   {MAP_DX_ARCSEC:.2f}")
         print(f"  map_dy_arcsec:   {MAP_DY_ARCSEC:.2f}")
+        print("  noise_applied:   yes")
+        print(f"  noise_model:     gaussian")
+        print(f"  noise_frac:      {NOISE_FRAC:.4f}")
+        print(f"  noise_seed:      {NOISE_SEED}")
+        print(f"  noise_std:       {noise_std:.6e}")
         print(f"  q0_truth:        {Q0_TRUE:.6f}")
         print(f"  q0_recovered:    {result.q0:.6f}")
         print(f"  q0_abs_error:    {q0_abs_err:.6e}")
@@ -142,7 +154,7 @@ def test_q0_recovery_earth_observer_eovsa_psf() -> None:
         print(f"  chi2:            {result.metrics.chi2:.6e}")
         print(f"  rho2:            {result.metrics.rho2:.6e}")
         print(f"  eta2:            {result.metrics.eta2:.6e}")
-        print(f"  chi2_threshold:  {CHI2_MAX:.6e}")
+        print(f"  chi2_max:        {CHI2_MAX:.6e}")
         print(f"  optimizer_nit:   {result.nit}")
         print(f"  optimizer_nfev:  {result.nfev}")
         print(f"  optimizer_ok:    {result.success}")

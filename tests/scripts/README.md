@@ -17,6 +17,7 @@ This folder contains demonstration scripts that exercise pyCHMP APIs outside of 
   - Runs an end-to-end Q0 recovery setup in an Earth-oriented SAV model frame.
   - Uses geometry center=(-257, -233) arcsec, dx=dy=2.5 arcsec, nx=ny=64.
   - Applies an EOVSA-like Gaussian beam (Bmaj=5.77", Bmin=5.77", BPA=-17.5 deg).
+  - Adds Gaussian noise to the pseudo-observed map by default (`noise-frac=0.02`, `noise-seed=12345`).
 
 ## Usage
 
@@ -57,6 +58,8 @@ python tests/scripts/demo_earth_eovsa_q0_recovery.py \
   --q0-true 0.0217 \
   --q0-min 0.005 \
   --q0-max 0.05 \
+  --noise-frac 0.02 \
+  --noise-seed 12345 \
   --save-raw-h5 /tmp/earth_eovsa_raw.h5
 ```
 
@@ -75,3 +78,5 @@ To print quantitative diagnostics (truth/recovered q0, error, metrics, tolerance
 PYCHMP_RUN_GXRENDER_INTEGRATION=1 PYCHMP_VERBOSE_INTEGRATION=1 \
 python -m pytest -s -q tests/test_integration_earth_eovsa_q0.py
 ```
+
+Verbose diagnostics also report whether PSF and noise were applied, including beam parameters and noise settings.
