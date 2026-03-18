@@ -128,9 +128,9 @@ def _save_viewer_h5(
         maps.create_dataset("stokes_ids", data=np.asarray(["TI", "TV"], dtype="S8"))
         maps.create_dataset(
             "map_ids",
-            data=np.asarray(["OBSERVED", "MODELED", "RESIDUAL", "OBSERVED", "MODELED", "RESIDUAL"], dtype="S32"),
+            data=np.asarray(["Observed", "Modeled", "Residual", "Observed", "Modeled", "Residual"], dtype="S32"),
         )
-        maps.create_dataset("artifact_labels", data=np.asarray(["OBSERVED", "MODELED", "RESIDUAL"], dtype="S32"))
+        maps.create_dataset("artifact_labels", data=np.asarray(["Observed", "Modeled", "Residual"], dtype="S32"))
 
         meta = f.create_group("metadata")
         meta.create_dataset("wcs_header", data=np.bytes_(header_text))
