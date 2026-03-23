@@ -10,6 +10,13 @@ This folder contains user-facing runnable workflows and validation applications.
   - Useful for understanding noise characteristics before fitting.
   - No additional dependencies beyond pyCHMP core.
 
+- `fit_q0_obs_map.py`
+  - Fit Q0 to real observational maps (EOVSA).
+  - Loads FITS maps, estimates noise, runs Q0 optimization.
+  - Supports gxrender-based rendering (optional).
+  - Demo mode for testing without gxrender models.
+  - Saves fitting results to H5 artifacts.
+
 - `validate_synthetic_q0_recovery.py`
   - Synthetic renderer sanity check.
   - No gxrender dependency required.
@@ -35,6 +42,20 @@ python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --method histo
 
 # Comparison of all methods
 python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --all-methods
+```
+
+```bash
+# Fit Q0 to real observational map (demo mode - no gxrender required)
+python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits --demo
+
+# Fit Q0 with gxrender models (requires valid model path)
+python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits \
+  --gxrender-path /path/to/gxrender_models
+
+# Fit Q0 with custom Q0 range and save artifacts
+python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits \
+  --q0-min 0.01 --q0-max 2.5 \
+  --artifacts-dir /tmp/q0_artifacts
 ```
 
 ```bash
