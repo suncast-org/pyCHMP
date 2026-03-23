@@ -2,6 +2,8 @@
 
 This module provides robust methods for estimating signal noise from full-disk
 solar maps, primarily using off-limb regions where the true signal is zero.
+
+Returns None if input map is unsuitable for reliable noise estimation.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ def estimate_map_noise(
     offlimb_annulus_deg: float = 15.0,
     histogram_clip_sigma: float = 3.0,
     histogram_clip_percentile: float = 50.0,
-) -> MapNoiseEstimate:
+) -> MapNoiseEstimate | None:
     """Estimate noise in a full-disk observed map.
 
     Parameters:
@@ -56,6 +58,7 @@ def estimate_map_noise(
 
     Returns:
         MapNoiseEstimate with sigma, sigma_map, and diagnostic metadata.
+        None if the input map is not suitable for reliable estimation.
 
     Raises:
         ValueError: If data is not 2D, or if requested method cannot be applied.
@@ -64,6 +67,17 @@ def estimate_map_noise(
 
     if data_arr.ndim != 2:
         raise ValueError(f"data must be 2D, got shape {data_arr.shape}")
+
+    # Validate data quality before proceeding
+    validation_result = _validate_map_data(data_arr)
+    if validation_result['is_valid'] is False:
+        import warnings
+        warnings.warn(
+            f"Map data quality check failed: {validation_result['message']}. "
+            "Noise estimation unreliable; returning None.",
+            UserWarning
+        )
+        return None
 
     # Try primary method; fall back if WCS unavailable
     if method == "offlimb_mad":
@@ -97,6 +111,61 @@ def estimate_map_noise(
         )
 
     raise ValueError(f"Unknown method: {method}")
+
+
+def _validate_map_data(data: np.ndarray) -> dict:
+    """Validate that map data is suitable for noise estimation.
+
+    Checks for:
+    - Excessive NaN pixels (threshold: 10%)
+    - Sufficient data coverage (minimum: 1000 valid pixels)
+    - Reasonable data value ranges (not constant or extremely corrupted)
+
+    Returns:
+        dict with keys: is_valid (bool), message (str)
+    """
+    # Check for NaN or masked pixels
+    nan_fraction = np.isnan(data).sum() / data.size
+    if nan_fraction > 0.1:  # More than 10% NaN
+        return {
+            'is_valid': False,
+            'message': f'Data contains {nan_fraction*100:.1f}% NaN pixels (threshold: 10%)',
+        }
+
+    # Remove NaN for further analysis
+    valid_data = data[~np.isnan(data)]
+
+    if len(valid_data) < 1000:  # At least 1000 valid pixels
+        return {
+            'is_valid': False,
+            'message': f'Only {len(valid_data)} valid pixels available (minimum: 1000)',
+        }
+
+    # Check for unreasonable data ranges (potential data corruption)
+    data_range = np.ptp(valid_data)  # peak-to-peak
+    data_std = np.std(valid_data)
+
+    if data_std == 0:
+        return {
+            'is_valid': False,
+            'message': 'Data has zero standard deviation (constant values)',
+        }
+
+    # Flag if range is extremely large relative to std (potential outliers/corruption)
+    if data_range > 100 * data_std:
+        return {
+            'is_valid': False,
+            'message': (
+                f'Data range ({data_range:.2e}) is {data_range/data_std:.1f}x std dev. '
+                'Potential data corruption or extreme outliers.'
+            ),
+        }
+
+    # All checks passed
+    return {
+        'is_valid': True,
+        'message': 'Data validation passed',
+    }
 
 
 def _estimate_offlimb_mad(

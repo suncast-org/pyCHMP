@@ -141,14 +141,14 @@ class TestOfflimbMadMethod:
 
     def test_invalid_method(self) -> None:
         """Test that invalid method raises ValueError."""
-        data = np.ones((10, 10))
+        data = np.random.normal(0, 1, size=(100, 100))
 
         with pytest.raises(ValueError, match="Unknown method"):
             estimate_map_noise(data, method="invalid_method")  # type: ignore
 
     def test_histogram_clip_invalid_percentile(self) -> None:
         """Test that invalid percentile raises ValueError."""
-        data = np.ones((10, 10))
+        data = np.random.normal(0, 1, size=(100, 100))
 
         with pytest.raises(ValueError, match="percentile must be in"):
             estimate_map_noise(
@@ -171,10 +171,11 @@ class TestResultProperties:
 
     def test_sigma_map_shape(self) -> None:
         """Test that sigma_map matches input shape."""
-        for shape in [(10, 10), (50, 75), (100, 100)]:
+        for shape in [(100, 100), (200, 200), (1024, 1024)]:
             data = np.random.normal(0, 1, size=shape)
             result = estimate_map_noise(data, method="histogram_clip")
 
+            assert result is not None, f"Result should not be None for shape {shape}"
             assert result.sigma_map.shape == shape
 
     def test_sigma_map_uniform(self) -> None:
@@ -222,17 +223,26 @@ class TestEdgeCases:
         data = np.full((100, 100), 5.0)
         result = estimate_map_noise(data, method="histogram_clip")
 
-        # Should produce valid result even if variance is zero
-        assert result.sigma >= 0
-        assert result.method_used == "histogram_clip"
+        # Should return None because zero variance is unreliable
+        assert result is None
 
     def test_small_array(self) -> None:
         """Test on small arrays."""
+        # Small array should fail validation (< 1000 pixels minimum)
         data = np.random.normal(0, 1, size=(5, 5))
         result = estimate_map_noise(data, method="histogram_clip")
+        assert result is None
 
+        # Larger but still small array should also fail
+        data = np.random.normal(0, 1, size=(20, 20))
+        result = estimate_map_noise(data, method="histogram_clip")
+        assert result is None
+
+        # Array with sufficient pixels should work
+        data = np.random.normal(0, 1, size=(50, 50))  # 2500 pixels > 1000 minimum
+        result = estimate_map_noise(data, method="histogram_clip")
+        assert result is not None
         assert result.sigma > 0
-        assert result.sigma_map.shape == (5, 5)
 
     def test_large_dynamic_range(self) -> None:
         """Test data with large dynamic range."""
