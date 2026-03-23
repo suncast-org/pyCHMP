@@ -7,7 +7,7 @@ from typing import Protocol
 import numpy as np
 
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
-from .optimize import MetricName, Q0OptimizationResult, find_best_q0
+from .optimize import MetricName, Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
 
 
 class Q0MapRenderer(Protocol):
@@ -28,6 +28,10 @@ def fit_q0_to_observation(
     target_metric: MetricName = "chi2",
     xatol: float = 1e-3,
     maxiter: int = 200,
+    adaptive_bracketing: bool = False,
+    q0_start: float | None = None,
+    q0_step: float = 1.61803398875,
+    max_bracket_steps: int = 12,
 ) -> Q0OptimizationResult:
     """Optimize Q0 by comparing rendered maps against observed maps."""
     observed_arr = np.asarray(observed, dtype=float)
@@ -36,13 +40,18 @@ def fit_q0_to_observation(
     if observed_arr.shape != sigma_arr.shape:
         raise ValueError("observed and sigma must have identical shapes")
 
-    def metric_function(q0: float) -> MetricValues:
+    def metric_function(q0: float) -> Q0MetricEvaluation:
         modeled_arr = np.asarray(renderer.render(float(q0)), dtype=float)
         if modeled_arr.shape != observed_arr.shape:
             raise ValueError("renderer output shape must match observed shape")
 
         mask = threshold_union_mask(observed_arr, modeled_arr, threshold)
-        return compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
+        metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
+        return Q0MetricEvaluation(
+            metrics=metrics,
+            total_observed_flux=float(np.sum(observed_arr[mask], dtype=float)),
+            total_modeled_flux=float(np.sum(modeled_arr[mask], dtype=float)),
+        )
 
     return find_best_q0(
         metric_function,
@@ -51,4 +60,8 @@ def fit_q0_to_observation(
         target_metric=target_metric,
         xatol=xatol,
         maxiter=maxiter,
+        adaptive_bracketing=adaptive_bracketing,
+        q0_start=q0_start,
+        q0_step=q0_step,
+        max_bracket_steps=max_bracket_steps,
     )

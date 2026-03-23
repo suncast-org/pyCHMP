@@ -24,21 +24,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    # Parse output path if provided
+    # Parse output path if provided.
     output_dir = None
     output_name = None
     actual_output_file = None
-    
+
     if args.output_h5:
         output_path = Path(args.output_h5)
         output_dir = str(output_path.parent)
-        # Remove .h5 extension if provided (gxrender will add it after save)
-        if output_path.suffix == '.h5':
+        # Remove .h5 extension if provided (gxrender will add it after save).
+        if output_path.suffix == ".h5":
             output_name = output_path.stem
             actual_output_file = output_path
         else:
             output_name = output_path.name
-            actual_output_file = output_path.with_suffix('.h5')
+            actual_output_file = output_path.with_suffix(".h5")
 
     adapter = GXRenderMWAdapter(
         model_path=args.model_path,
@@ -57,11 +57,11 @@ def main() -> int:
 
     print(f"Rendered map shape: {image.shape}")
     print(f"Rendered map min/max: {image.min():.4e}/{image.max():.4e}")
-    
+
     if args.output_h5 and actual_output_file:
         print(f"\nMap saved to: {actual_output_file}")
         print(f"View with: gxrender-map-view {actual_output_file}")
-    
+
     return 0
 
 

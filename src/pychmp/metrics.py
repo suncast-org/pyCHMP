@@ -65,11 +65,13 @@ def compute_metrics(
 
     if np.any(sig == 0):
         raise ValueError("sigma contains zero values in selected elements")
-    if np.any(obs == 0):
-        raise ValueError("observed contains zero values in selected elements")
+
+    nonzero = obs > 0
+    if not np.any(nonzero):
+        raise ValueError("observed contains no positive values in selected elements")
 
     chi2 = float(np.mean(((mod - obs) / sig) ** 2))
-    rho2 = float(np.mean((mod / obs - 1.0) ** 2))
-    eta2 = float(np.mean(((mod - obs) / float(np.mean(obs))) ** 2))
+    rho2 = float(np.mean((mod[nonzero] / obs[nonzero] - 1.0) ** 2))
+    eta2 = float(np.mean(((mod - obs) / float(np.mean(obs[nonzero]))) ** 2))
 
     return MetricValues(chi2=chi2, rho2=rho2, eta2=eta2)

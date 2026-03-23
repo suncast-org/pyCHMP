@@ -37,8 +37,7 @@ pychmp --help
 pytest -q
 ```
 
-Demo scripts are available in `tests/scripts/` for quick hands-on validation
-outside the pytest suite.
+User-facing runnable workflows are available in `examples/`.
 
 ### Version Bumping
 
