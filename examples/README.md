@@ -4,6 +4,12 @@ This folder contains user-facing runnable workflows and validation applications.
 
 ## Scripts
 
+- `estimate_map_noise_cli.py`
+  - Command-line tool to estimate noise from observational FITS maps.
+  - Supports multiple estimation methods: histogram_clip, offlimb_mad.
+  - Useful for understanding noise characteristics before fitting.
+  - No additional dependencies beyond pyCHMP core.
+
 - `validate_synthetic_q0_recovery.py`
   - Synthetic renderer sanity check.
   - No gxrender dependency required.
@@ -19,6 +25,17 @@ This folder contains user-facing runnable workflows and validation applications.
 ## Usage
 
 Run from repository root:
+
+```bash
+# Estimate noise from observational map (all methods)
+python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits
+
+# Using specific method
+python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --method histogram_clip
+
+# Comparison of all methods
+python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --all-methods
+```
 
 ```bash
 python examples/validate_synthetic_q0_recovery.py
