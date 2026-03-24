@@ -31,10 +31,39 @@ pip install -e .
 pychmp --help
 ```
 
+User-facing runnable workflows live under `examples/`, and tracked shell
+launchers for the heavier manual validation and observational fitting runs live
+under `scripts/`.
+
+If you use the tracked launcher scripts, install `pyGXrender-test-data` as a
+sibling checkout next to `pyCHMP` so they can resolve shared models, EOVSA
+maps, and EBTEL inputs without machine-specific absolute paths.
+
 ## Development
 
 ```bash
 pytest -q
+```
+
+User-facing runnable workflows are available in `examples/`.
+
+### Version Bumping
+
+This repository uses `bumpver` to keep package versions in sync between
+`pyproject.toml` and `src/pychmp/__init__.py`.
+
+```bash
+pip install -e .[dev]
+bumpver show
+```
+
+For normal stable-version increments you can use the usual `bumpver update`
+subcommands. For explicit pre-release bumps like `0.1.0a0 -> 0.1.0a1`, update
+the version fields directly or use an explicit `bumpver` target rather than
+assuming `--patch` is the right semantic move.
+
+```bash
+python -m bumpver show
 ```
 
 ## Citation
