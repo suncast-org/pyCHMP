@@ -7,7 +7,7 @@ from typing import Protocol
 import numpy as np
 
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
-from .optimize import MetricName, Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
+from .optimize import MetricName, ProgressCallback, Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
 
 
 class Q0MapRenderer(Protocol):
@@ -32,6 +32,7 @@ def fit_q0_to_observation(
     q0_start: float | None = None,
     q0_step: float = 1.61803398875,
     max_bracket_steps: int = 12,
+    progress_callback: ProgressCallback | None = None,
 ) -> Q0OptimizationResult:
     """Optimize Q0 by comparing rendered maps against observed maps.
 
@@ -81,4 +82,5 @@ def fit_q0_to_observation(
         q0_start=q0_start,
         q0_step=q0_step,
         max_bracket_steps=max_bracket_steps,
+        progress_callback=progress_callback,
     )

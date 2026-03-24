@@ -31,6 +31,14 @@ pip install -e .
 pychmp --help
 ```
 
+User-facing runnable workflows live under `examples/`, and tracked shell
+launchers for the heavier manual validation and observational fitting runs live
+under `scripts/`.
+
+If you use the tracked launcher scripts, install `pyGXrender-test-data` as a
+sibling checkout next to `pyCHMP` so they can resolve shared models, EOVSA
+maps, and EBTEL inputs without machine-specific absolute paths.
+
 ## Development
 
 ```bash

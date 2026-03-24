@@ -47,8 +47,10 @@ class GXRenderMWAdapter:
     output_name: str | None = None
     output_format: str = "h5"
     verbose: bool = False
+    render_call_count: int = 0
 
     def render(self, q0: float) -> np.ndarray:
+        self.render_call_count += 1
         sdk = _load_gxrender_sdk()
 
         geometry = self.geometry

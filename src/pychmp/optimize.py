@@ -30,6 +30,7 @@ class Q0MetricEvaluation:
 
 
 MetricFunctionResult: TypeAlias = MetricValues | Q0MetricEvaluation
+ProgressCallback: TypeAlias = Callable[[float, float, bool, str, float], None]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,8 @@ class _BracketSearchResult:
     bracket: tuple[float, float, float] | None
     steps_taken: int
     message: str
+    fallback_to_bounded_refinement: bool = True
+    boundary_q0: float | None = None
 
 
 def _metric_value(metrics: MetricValues, target_metric: MetricName) -> float:
@@ -94,13 +97,24 @@ def _evaluate_q0(
     target_metric: MetricName,
     cache: dict[float, _Q0EvaluationRecord],
     evaluation_order: list[float],
+    progress_callback: ProgressCallback | None = None,
 ) -> _Q0EvaluationRecord:
     q0 = float(q0)
     cached = cache.get(q0)
     if cached is not None:
         return cached
 
-    evaluation = _normalize_metric_result(metric_function(q0))
+    t0 = math.nan
+    try:
+        import time as _time
+
+        t0 = _time.perf_counter()
+        evaluation = _normalize_metric_result(metric_function(q0))
+        elapsed_s = _time.perf_counter() - t0
+    except Exception:
+        # Preserve original exception behavior while still allowing the normal
+        # control flow to surface the failure to callers.
+        raise
     objective_value = float(_metric_value(evaluation.metrics, target_metric))
     is_valid = bool(evaluation.is_valid) and math.isfinite(objective_value)
     record = _Q0EvaluationRecord(
@@ -114,6 +128,8 @@ def _evaluate_q0(
     )
     cache[q0] = record
     evaluation_order.append(q0)
+    if progress_callback is not None:
+        progress_callback(record.q0, record.objective_value, record.is_valid, record.message, float(elapsed_s))
     return record
 
 
@@ -134,6 +150,29 @@ def _find_bracket(records: dict[float, _Q0EvaluationRecord]) -> tuple[float, flo
     return (qa, qb, qc)
 
 
+def _boundary_best_q0(
+    records: dict[float, _Q0EvaluationRecord],
+    *,
+    side: Literal["lower", "upper"],
+) -> float | None:
+    ordered = sorted(records.values(), key=lambda item: item.q0)
+    if len(ordered) < 2:
+        return None
+
+    if side == "lower":
+        boundary = ordered[0]
+        neighbor = ordered[1]
+    else:
+        boundary = ordered[-1]
+        neighbor = ordered[-2]
+
+    if not (boundary.is_valid and neighbor.is_valid):
+        return None
+    if boundary.objective_value <= neighbor.objective_value:
+        return boundary.q0
+    return None
+
+
 def _step_q0(q0: float, *, direction: int, q0_step: float, q0_min: float, q0_max: float) -> float:
     if direction > 0:
         return min(q0 * q0_step, q0_max)
@@ -151,6 +190,7 @@ def _choose_initial_direction(
     target_metric: MetricName,
     cache: dict[float, _Q0EvaluationRecord],
     evaluation_order: list[float],
+    progress_callback: ProgressCallback | None = None,
 ) -> int:
     if (
         start_record.total_observed_flux is not None
@@ -176,6 +216,7 @@ def _choose_initial_direction(
             target_metric=target_metric,
             cache=cache,
             evaluation_order=evaluation_order,
+            progress_callback=progress_callback,
         )
     if right_q0 > q0_start:
         right_record = _evaluate_q0(
@@ -184,6 +225,7 @@ def _choose_initial_direction(
             target_metric=target_metric,
             cache=cache,
             evaluation_order=evaluation_order,
+            progress_callback=progress_callback,
         )
 
     if left_record and left_record.is_valid and right_record and right_record.is_valid:
@@ -206,6 +248,7 @@ def _adaptive_multiplicative_bracket(
     target_metric: MetricName,
     cache: dict[float, _Q0EvaluationRecord],
     evaluation_order: list[float],
+    progress_callback: ProgressCallback | None = None,
 ) -> _BracketSearchResult:
     start_record = _evaluate_q0(
         q0_start,
@@ -213,6 +256,7 @@ def _adaptive_multiplicative_bracket(
         target_metric=target_metric,
         cache=cache,
         evaluation_order=evaluation_order,
+        progress_callback=progress_callback,
     )
     if not start_record.is_valid:
         return _BracketSearchResult(bracket=None, steps_taken=0, message="adaptive bracketing start point is invalid")
@@ -231,6 +275,7 @@ def _adaptive_multiplicative_bracket(
         target_metric=target_metric,
         cache=cache,
         evaluation_order=evaluation_order,
+        progress_callback=progress_callback,
     )
 
     bracket = _find_bracket(cache)
@@ -239,10 +284,97 @@ def _adaptive_multiplicative_bracket(
 
     current_q0 = q0_start
     steps_taken = 0
+    direction_refined = False
+
+    first_q0 = _step_q0(current_q0, direction=direction, q0_step=q0_step, q0_min=q0_min, q0_max=q0_max)
+    if math.isclose(first_q0, current_q0, rel_tol=0.0, abs_tol=0.0):
+        side = "upper" if direction > 0 else "lower"
+        boundary_q0 = _boundary_best_q0(cache, side=side)
+        if boundary_q0 is not None:
+            return _BracketSearchResult(
+                bracket=None,
+                steps_taken=steps_taken,
+                message=f"adaptive bracketing hit the {side} safety bound while the objective was still improving; stopping at the boundary best instead of falling back",
+                fallback_to_bounded_refinement=False,
+                boundary_q0=boundary_q0,
+            )
+        return _BracketSearchResult(
+            bracket=None,
+            steps_taken=steps_taken,
+            message=f"adaptive bracketing hit the {side} safety bound without finding an interior minimum",
+        )
+
+    first_eval_count = len(evaluation_order)
+    first_record = _evaluate_q0(
+        first_q0,
+        metric_function=metric_function,
+        target_metric=target_metric,
+        cache=cache,
+        evaluation_order=evaluation_order,
+        progress_callback=progress_callback,
+    )
+    if len(evaluation_order) > first_eval_count:
+        steps_taken += 1
+
+    bracket = _find_bracket(cache)
+    if bracket is not None:
+        return _BracketSearchResult(
+            bracket=bracket,
+            steps_taken=steps_taken,
+            message="adaptive bracketing found a valid interior minimum",
+        )
+
+    # Single-frequency refinement: treat the flux-based initial direction as a
+    # hint only. If the very first step makes the target metric worse, probe
+    # the opposite side immediately and switch if that side is better.
+    if start_record.is_valid and first_record.is_valid and first_record.objective_value > start_record.objective_value:
+        opposite_direction = -direction
+        opposite_q0 = _step_q0(q0_start, direction=opposite_direction, q0_step=q0_step, q0_min=q0_min, q0_max=q0_max)
+        if not math.isclose(opposite_q0, q0_start, rel_tol=0.0, abs_tol=0.0):
+            opposite_eval_count = len(evaluation_order)
+            opposite_record = _evaluate_q0(
+                opposite_q0,
+                metric_function=metric_function,
+                target_metric=target_metric,
+                cache=cache,
+                evaluation_order=evaluation_order,
+                progress_callback=progress_callback,
+            )
+            if len(evaluation_order) > opposite_eval_count:
+                steps_taken += 1
+
+            bracket = _find_bracket(cache)
+            if bracket is not None:
+                return _BracketSearchResult(
+                    bracket=bracket,
+                    steps_taken=steps_taken,
+                    message="adaptive bracketing found a valid interior minimum after early direction correction",
+                )
+
+            if opposite_record.is_valid and opposite_record.objective_value <= start_record.objective_value:
+                direction = opposite_direction
+                current_q0 = opposite_q0
+                direction_refined = True
+            else:
+                current_q0 = first_q0
+        else:
+            current_q0 = first_q0
+    else:
+        current_q0 = first_q0
+
     while steps_taken < max_bracket_steps:
         next_q0 = _step_q0(current_q0, direction=direction, q0_step=q0_step, q0_min=q0_min, q0_max=q0_max)
         if math.isclose(next_q0, current_q0, rel_tol=0.0, abs_tol=0.0):
             side = "upper" if direction > 0 else "lower"
+            boundary_q0 = _boundary_best_q0(cache, side=side)
+            if boundary_q0 is not None:
+                return _BracketSearchResult(
+                    bracket=None,
+                    steps_taken=steps_taken,
+                    message=f"adaptive bracketing hit the {side} safety bound while the objective was still improving; stopping at the boundary best instead of falling back",
+                    fallback_to_bounded_refinement=False,
+                    boundary_q0=boundary_q0,
+                )
             return _BracketSearchResult(
                 bracket=None,
                 steps_taken=steps_taken,
@@ -257,14 +389,18 @@ def _adaptive_multiplicative_bracket(
             target_metric=target_metric,
             cache=cache,
             evaluation_order=evaluation_order,
+            progress_callback=progress_callback,
         )
 
         bracket = _find_bracket(cache)
         if bracket is not None:
+            message = "adaptive bracketing found a valid interior minimum"
+            if direction_refined:
+                message += " after early direction correction"
             return _BracketSearchResult(
                 bracket=bracket,
                 steps_taken=steps_taken,
-                message="adaptive bracketing found a valid interior minimum",
+                message=message,
             )
 
     return _BracketSearchResult(
@@ -286,6 +422,7 @@ def find_best_q0(
     q0_start: float | None = None,
     q0_step: float = 1.61803398875,
     max_bracket_steps: int = 12,
+    progress_callback: ProgressCallback | None = None,
 ) -> Q0OptimizationResult:
     """Find best Q0 with optional adaptive multiplicative bracketing.
 
@@ -318,6 +455,7 @@ def find_best_q0(
             target_metric=target_metric,
             cache=cache,
             evaluation_order=evaluation_order,
+            progress_callback=progress_callback,
         )
         return record.objective_value
 
@@ -326,6 +464,7 @@ def find_best_q0(
     bracket_found = False
     bracket_steps = 0
     message_prefix = ""
+    boundary_q0: float | None = None
 
     if adaptive_bracketing:
         bracket_result = _adaptive_multiplicative_bracket(
@@ -338,13 +477,34 @@ def find_best_q0(
             target_metric=target_metric,
             cache=cache,
             evaluation_order=evaluation_order,
+            progress_callback=progress_callback,
         )
         bracket = bracket_result.bracket
         bracket_found = bracket is not None
         bracket_steps = bracket_result.steps_taken
+        boundary_q0 = bracket_result.boundary_q0
         if bracket is not None:
             refinement_bounds = (bracket[0], bracket[2])
             message_prefix = bracket_result.message
+        elif not bracket_result.fallback_to_bounded_refinement and boundary_q0 is not None:
+            boundary_record = cache[float(boundary_q0)]
+            trial_q0 = tuple(evaluation_order)
+            trial_objective_values = tuple(cache[q0].objective_value for q0 in evaluation_order)
+            return Q0OptimizationResult(
+                q0=float(boundary_record.q0),
+                objective_value=boundary_record.objective_value,
+                metrics=boundary_record.metrics,
+                target_metric=target_metric,
+                success=False,
+                nfev=len(cache),
+                nit=int(bracket_steps),
+                message=bracket_result.message,
+                used_adaptive_bracketing=True,
+                bracket_found=False,
+                bracket=None,
+                trial_q0=trial_q0,
+                trial_objective_values=trial_objective_values,
+            )
         else:
             message_prefix = f"{bracket_result.message}; falling back to bounded refinement"
 
@@ -362,6 +522,7 @@ def find_best_q0(
         target_metric=target_metric,
         cache=cache,
         evaluation_order=evaluation_order,
+        progress_callback=progress_callback,
     )
 
     trial_q0 = tuple(evaluation_order)

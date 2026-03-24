@@ -12,10 +12,11 @@ This folder contains user-facing runnable workflows and validation applications.
 
 - `fit_q0_obs_map.py`
   - Fit Q0 to real observational maps (EOVSA).
-  - Loads FITS maps, estimates noise, runs Q0 optimization.
-  - Supports gxrender-based rendering (optional).
-  - Demo mode for testing without gxrender models.
-  - Saves fitting results to H5 artifacts.
+  - Requires explicit inputs: observational FITS map and model H5.
+  - Loads full-disk FITS maps, estimates background noise, crops/regrids the
+    observation onto the saved model-aligned FOV, then runs Q0 optimization.
+  - Does not perform implicit model path guessing.
+  - Saves fitting results to H5/PNG artifacts and reports fit diagnostics.
 
 - `validate_synthetic_q0_recovery.py`
   - Synthetic renderer sanity check.
@@ -45,15 +46,13 @@ python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --all-methods
 ```
 
 ```bash
-# Fit Q0 to real observational map (demo mode - no gxrender required)
-python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits --demo
 
-# Fit Q0 with gxrender models (requires valid model path)
-python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits \
-  --gxrender-path /path/to/gxrender_models
+# Fit Q0 to real observational map with explicit model and EBTEL input
+python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 --ebtel-path /path/to/ebtel.sav
 
 # Fit Q0 with custom Q0 range and save artifacts
-python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits \
+python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 \
+  --ebtel-path /path/to/ebtel.sav \
   --q0-min 0.01 --q0-max 2.5 \
   --artifacts-dir /tmp/q0_artifacts
 ```
@@ -82,6 +81,23 @@ python examples/validate_q0_recovery.py \
   --noise-seed 12345 \
   --artifacts-dir /tmp/pychmp_artifacts
 ```
+
+## Tracked Launcher Scripts
+
+For the heavier manual workflows, tracked shell launchers live in `scripts/`:
+
+- `scripts/fit_q0_obs_map_options_test.sh`
+  - Wraps `examples/fit_q0_obs_map.py` with a commented option block for easy
+    interactive toggling.
+  - Resolves test data from a sibling `pyGXrender-test-data` checkout by
+    default.
+  - Supports `--dry-run` to print the resolved command without starting a fit.
+
+- `scripts/validate_q0_recovery_options_test.sh`
+  - Wraps `examples/validate_q0_recovery.py` with the same style of
+    line-by-line option editing.
+  - Resolves the matching model and EBTEL input from sibling test data.
+  - Supports `--dry-run` to print the resolved command without starting a run.
 
 ## Relationship to tests
 
