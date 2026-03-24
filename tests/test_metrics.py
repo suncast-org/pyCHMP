@@ -38,13 +38,25 @@ def test_compute_metrics_requires_non_empty_mask() -> None:
         compute_metrics(observed, modeled, sigma, mask)
 
 
-def test_compute_metrics_rejects_zero_sigma_or_observed() -> None:
+def test_compute_metrics_allows_zero_observed_if_positive_values_exist() -> None:
     observed = np.array([1.0, 0.0])
     modeled = np.array([1.2, 0.3])
     sigma = np.array([1.0, 1.0])
     mask = np.array([True, True])
 
-    with pytest.raises(ValueError, match="observed contains zero"):
+    metrics = compute_metrics(observed, modeled, sigma, mask)
+    assert metrics.chi2 > 0.0
+    assert metrics.rho2 >= 0.0
+    assert metrics.eta2 >= 0.0
+
+
+def test_compute_metrics_rejects_zero_sigma_or_no_positive_observed() -> None:
+    observed = np.array([0.0, 0.0])
+    modeled = np.array([1.2, 0.3])
+    sigma = np.array([1.0, 1.0])
+    mask = np.array([True, True])
+
+    with pytest.raises(ValueError, match="observed contains no positive values"):
         compute_metrics(observed, modeled, sigma, mask)
 
     observed = np.array([1.0, 2.0])
