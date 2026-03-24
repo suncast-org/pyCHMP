@@ -54,13 +54,16 @@ This repository uses `bumpver` to keep package versions in sync between
 
 ```bash
 pip install -e .[dev]
-bumpver update --patch
+bumpver show
 ```
 
-Preview without writing files:
+For normal stable-version increments you can use the usual `bumpver update`
+subcommands. For explicit pre-release bumps like `0.1.0a0 -> 0.1.0a1`, update
+the version fields directly or use an explicit `bumpver` target rather than
+assuming `--patch` is the right semantic move.
 
 ```bash
-bumpver show
+python -m bumpver show
 ```
 
 ## Citation

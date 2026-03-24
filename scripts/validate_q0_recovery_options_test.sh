@@ -68,8 +68,8 @@ else
   CANDIDATES=(
     "$WORKSPACE_ROOT/pyCHMP/.conda/bin/python"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
-    "/Users/gelu/miniforge3/envs/suncast/bin/python"
-    "/Users/gelu/miniforge3/bin/python"
+    "$HOME/miniforge3/envs/suncast/bin/python"
+    "$HOME/miniforge3/bin/python"
     "python"
   )
 
