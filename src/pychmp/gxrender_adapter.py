@@ -49,6 +49,16 @@ def _load_common_workflow_helpers() -> Any:
         ) from exc
 
 
+def _load_render_mw_workflow() -> Any:
+    try:
+        return import_module("gxrender.workflows.render_mw")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "gxrender microwave workflow helpers are not importable. Install gximagecomputing/pyGXrender "
+            "into the active environment before using GXRenderMWAdapter."
+        ) from exc
+
+
 @dataclass(slots=True)
 class GXRenderMWContext:
     """Per-process reusable MW render context.
@@ -199,40 +209,54 @@ class GXRenderMWAdapter:
     def render(self, q0: float) -> np.ndarray:
         self.render_call_count += 1
         if self.output_dir:
-            sdk = _load_gxrender_sdk()
+            workflow = _load_render_mw_workflow()
             geometry = self.geometry
             if geometry is None:
+                sdk = _load_gxrender_sdk()
                 geometry = sdk.MapGeometry(pixel_scale_arcsec=float(self.pixel_scale_arcsec))
-
-            plasma = sdk.CoronalPlasmaParameters(
+            observer = self.observer
+            args = SimpleNamespace(
+                model_path=Path(self.model_path),
+                model_format=str(self.model_format),
+                ebtel_path=self.ebtel_path,
+                output_dir=Path(self.output_dir),
+                output_name=self.output_name,
+                output_format=str(self.output_format),
+                frequencies_ghz=[float(self.frequency_ghz)],
+                omp_threads=int(self.omp_threads),
+                save_outputs=True,
+                write_preview=False,
+                observer=self.observer,
+                dsun_cm=getattr(observer, "dsun_cm", None),
+                lonc_deg=getattr(observer, "lonc_deg", None),
+                b0sun_deg=getattr(observer, "b0sun_deg", None),
+                xc=getattr(geometry, "xc", None),
+                yc=getattr(geometry, "yc", None),
+                dx=getattr(geometry, "dx", None),
+                dy=getattr(geometry, "dy", None),
+                pixel_scale_arcsec=getattr(geometry, "pixel_scale_arcsec", float(self.pixel_scale_arcsec)),
+                nx=getattr(geometry, "nx", None),
+                ny=getattr(geometry, "ny", None),
+                xrange=getattr(geometry, "xrange", None),
+                yrange=getattr(geometry, "yrange", None),
+                auto_fov=False,
+                use_saved_fov=False,
                 tbase=self.tbase,
                 nbase=self.nbase,
                 q0=float(q0),
                 a=self.a,
                 b=self.b,
-                mode=self.mode,
-                selective_heating=self.selective_heating,
+                corona_mode=self.mode,
+                selective_heating=bool(self.selective_heating),
                 shtable=self.shtable,
+                shtable_path=None,
+                force_isothermal=False,
+                interpol_b=False,
+                analytical_nt=False,
             )
-            options = sdk.MWRenderOptions(
-                model_path=Path(self.model_path),
-                model_format=self.model_format,
-                ebtel_path=self.ebtel_path,
-                output_dir=self.output_dir,
-                output_name=self.output_name,
-                output_format=self.output_format,
-                freqlist_ghz=[float(self.frequency_ghz)],
-                plasma=plasma,
-                omp_threads=self.omp_threads,
-                geometry=geometry,
-                observer=self.observer,
-                save_outputs=True,
-                write_preview=False,
-                verbose=self.verbose,
-            )
-            result = sdk.render_mw_maps(options)
-            _rename_h5_output_if_needed(self.output_dir, getattr(result.outputs, "h5_path", None))
-            ti = np.asarray(result.ti, dtype=float)
+            run_result = workflow.run(args, verbose=bool(self.verbose))
+            _rename_h5_output_if_needed(self.output_dir, run_result["outputs"].get("h5_path"))
+            ti = np.asarray(run_result["result"]["TI"], dtype=float)
             if ti.ndim != 3 or ti.shape[2] != 1:
                 raise ValueError(f"expected single-frequency TI cube with shape (ny, nx, 1), got {ti.shape}")
             return ti[:, :, 0]

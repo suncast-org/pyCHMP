@@ -190,34 +190,28 @@ def test_gxrender_context_forwards_named_observer_to_workflow_args(monkeypatch) 
 
 
 def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -> None:
-    class FakeSDKWithRender(FakeSDK):
-        render_options = None
-
-        class CoronalPlasmaParameters:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-        class MWRenderOptions:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
+    class FakeRenderMWWorkflow:
+        last_args = None
 
         @staticmethod
-        def render_mw_maps(options):
-            FakeSDKWithRender.render_options = options
-            output_dir = Path(options.kwargs["output_dir"])
-            output_name = str(options.kwargs["output_name"] or "rendered_map")
+        def run(args, *, verbose=True):
+            del verbose
+            FakeRenderMWWorkflow.last_args = args
+            output_dir = Path(args.output_dir)
+            output_name = str(args.output_name or "rendered_map")
             raw_h5_path = output_dir / output_name
             output_dir.mkdir(parents=True, exist_ok=True)
             raw_h5_path.write_bytes(b"fake")
-            cube = np.full((2, 3, 1), options.kwargs["plasma"].kwargs["q0"], dtype=float)
-            return SimpleNamespace(
-                ti=cube,
-                outputs=SimpleNamespace(h5_path=raw_h5_path),
-            )
+            cube = np.full((2, 3, 1), float(args.q0), dtype=float)
+            return {
+                "result": {"TI": cube},
+                "outputs": {"h5_path": str(raw_h5_path)},
+            }
 
-    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithRender)
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: FakeGXRender)
     monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
+    monkeypatch.setattr(gxrender_adapter, "_load_render_mw_workflow", lambda: FakeRenderMWWorkflow)
 
     with TemporaryDirectory() as tmpdir:
         adapter = GXRenderMWAdapter(
@@ -237,6 +231,6 @@ def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -
 
         assert image.shape == (2, 3)
         assert np.allclose(image, 0.0217)
-        assert FakeSDKWithRender.render_options is not None
-        assert FakeSDKWithRender.render_options.kwargs["observer"] == "earth"
+        assert FakeRenderMWWorkflow.last_args is not None
+        assert FakeRenderMWWorkflow.last_args.observer == "earth"
         assert Path(tmpdir, "demo_map.h5").exists()
