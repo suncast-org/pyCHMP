@@ -7,7 +7,14 @@ from typing import Protocol
 import numpy as np
 
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
-from .optimize import MetricName, ProgressCallback, Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
+from .optimize import (
+    MetricName,
+    ProgressCallback,
+    ProgressStartCallback,
+    Q0MetricEvaluation,
+    Q0OptimizationResult,
+    find_best_q0,
+)
 
 
 class Q0MapRenderer(Protocol):
@@ -24,6 +31,8 @@ def fit_q0_to_observation(
     *,
     q0_min: float,
     q0_max: float,
+    hard_q0_min: float | None = None,
+    hard_q0_max: float | None = None,
     threshold: float = 0.1,
     target_metric: MetricName = "chi2",
     xatol: float = 1e-3,
@@ -32,6 +41,7 @@ def fit_q0_to_observation(
     q0_start: float | None = None,
     q0_step: float = 1.61803398875,
     max_bracket_steps: int = 12,
+    progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> Q0OptimizationResult:
     """Optimize Q0 by comparing rendered maps against observed maps.
@@ -75,6 +85,8 @@ def fit_q0_to_observation(
         metric_function,
         q0_min=q0_min,
         q0_max=q0_max,
+        hard_q0_min=hard_q0_min,
+        hard_q0_max=hard_q0_max,
         target_metric=actual_target_metric,
         xatol=xatol,
         maxiter=maxiter,
@@ -82,5 +94,6 @@ def fit_q0_to_observation(
         q0_start=q0_start,
         q0_step=q0_step,
         max_bracket_steps=max_bracket_steps,
+        progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
     )

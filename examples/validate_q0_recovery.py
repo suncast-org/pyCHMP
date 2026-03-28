@@ -921,11 +921,21 @@ def main() -> int:
     psf_bmaj_eff = float(args.psf_bmaj_arcsec) * psf_scale
     psf_bmin_eff = float(args.psf_bmin_arcsec) * psf_scale
     print(f"[setup] plasma/heating: a={a_param:.3f} b={b_param:.3f} tbase=1.000e+06 nbase=1.000e+08")
-    print(
-        "[setup] psf: "
-        f"bmaj={psf_bmaj_eff:.3f} bmin={psf_bmin_eff:.3f} bpa={float(args.psf_bpa_deg):.3f} "
-        f"ref_freq={float(args.psf_ref_frequency_ghz):.3f} scale_inverse_frequency={bool(args.psf_scale_inverse_frequency)}"
-    )
+    if bool(args.psf_scale_inverse_frequency):
+        print(
+            "[setup] psf: "
+            f"reference beam: bmaj={float(args.psf_bmaj_arcsec):.3f} "
+            f"bmin={float(args.psf_bmin_arcsec):.3f} "
+            f"bpa={float(args.psf_bpa_deg):.3f} @ {float(args.psf_ref_frequency_ghz):.3f} GHz"
+            f"\n    rescaled beam: bmaj={psf_bmaj_eff:.3f} bmin={psf_bmin_eff:.3f} "
+            f"bpa={float(args.psf_bpa_deg):.3f} @ {float(active_frequency_ghz):.3f} GHz"
+        )
+    else:
+        print(
+            "[setup] psf: "
+            f"beam: bmaj={psf_bmaj_eff:.3f} bmin={psf_bmin_eff:.3f} "
+            f"bpa={float(args.psf_bpa_deg):.3f} @ {float(active_frequency_ghz):.3f} GHz"
+        )
     print(
         "[setup] optimizer: "
         f"q0 in [{args.q0_min:.6f}, {args.q0_max:.6f}] "

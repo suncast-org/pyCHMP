@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import itertools
+import math
 import os
 from pathlib import Path
 import threading
@@ -29,7 +30,13 @@ from astropy.io import fits
 from scipy.ndimage import map_coordinates
 from scipy.signal import fftconvolve
 
-from pychmp import GXRenderMWAdapter, estimate_map_noise, fit_q0_to_observation
+from pychmp import (
+    GXRenderMWAdapter,
+    estimate_map_noise,
+    extract_frequency_ghz,
+    fit_q0_to_observation,
+    load_2d_fits_image,
+)
 
 try:
     from q0_artifact_plot import plot_q0_artifact_panel
@@ -84,31 +91,83 @@ def _extract_psf_from_header(header: fits.Header) -> tuple[dict[str, float] | No
     }, "fits_header"
 
 
+def _effective_psf_parameters(
+    *,
+    bmaj_arcsec: float | None,
+    bmin_arcsec: float | None,
+    bpa_deg: float | None,
+    active_frequency_ghz: float,
+    ref_frequency_ghz: float | None,
+    scale_inverse_frequency: bool,
+) -> dict[str, float | bool] | None:
+    if bmaj_arcsec is None or bmin_arcsec is None or bpa_deg is None:
+        return None
+    psf_scale = (
+        float(ref_frequency_ghz) / float(active_frequency_ghz)
+        if scale_inverse_frequency and ref_frequency_ghz is not None
+        else 1.0
+    )
+    return {
+        "reference_bmaj_arcsec": float(bmaj_arcsec),
+        "reference_bmin_arcsec": float(bmin_arcsec),
+        "reference_bpa_deg": float(bpa_deg),
+        "active_bmaj_arcsec": float(bmaj_arcsec) * float(psf_scale),
+        "active_bmin_arcsec": float(bmin_arcsec) * float(psf_scale),
+        "active_bpa_deg": float(bpa_deg),
+        "reference_frequency_ghz": float(ref_frequency_ghz) if ref_frequency_ghz is not None else float(active_frequency_ghz),
+        "active_frequency_ghz": float(active_frequency_ghz),
+        "scaled": bool(scale_inverse_frequency and ref_frequency_ghz is not None and not np.isclose(psf_scale, 1.0)),
+        "scale_factor": float(psf_scale),
+    }
+
+
+def _format_psf_report(
+    *,
+    source: str,
+    bmaj_arcsec: float | None,
+    bmin_arcsec: float | None,
+    bpa_deg: float | None,
+    active_frequency_ghz: float,
+    ref_frequency_ghz: float | None,
+    scale_inverse_frequency: bool,
+) -> str:
+    if source == "none" or bmaj_arcsec is None or bmin_arcsec is None or bpa_deg is None:
+        return "PSF source: none"
+    psf = _effective_psf_parameters(
+        bmaj_arcsec=bmaj_arcsec,
+        bmin_arcsec=bmin_arcsec,
+        bpa_deg=bpa_deg,
+        active_frequency_ghz=active_frequency_ghz,
+        ref_frequency_ghz=ref_frequency_ghz,
+        scale_inverse_frequency=scale_inverse_frequency,
+    )
+    assert psf is not None
+    if bool(psf["scaled"]):
+        return (
+            f"PSF source: {source} "
+            f"reference beam: bmaj={float(psf['reference_bmaj_arcsec']):.3f} "
+            f"bmin={float(psf['reference_bmin_arcsec']):.3f} "
+            f"bpa={float(psf['reference_bpa_deg']):.3f} @ {float(psf['reference_frequency_ghz']):.3f} GHz"
+            f"\n    rescaled beam: bmaj={float(psf['active_bmaj_arcsec']):.3f} "
+            f"bmin={float(psf['active_bmin_arcsec']):.3f} "
+            f"bpa={float(psf['active_bpa_deg']):.3f} @ {float(psf['active_frequency_ghz']):.3f} GHz"
+        )
+    return (
+        f"PSF source: {source} "
+        f"beam: bmaj={float(psf['active_bmaj_arcsec']):.3f} "
+        f"bmin={float(psf['active_bmin_arcsec']):.3f} "
+        f"bpa={float(psf['active_bpa_deg']):.3f} @ {float(psf['active_frequency_ghz']):.3f} GHz"
+    )
+
+
 def load_eovsa_map(fits_path: Path) -> tuple[np.ndarray, fits.Header, float]:
     """Load EOVSA FITS map and extract data, header, frequency.
     
     Returns:
         (data, header, frequency_ghz)
     """
-    with fits.open(fits_path) as hdul:
-        data = hdul[0].data
-        header = hdul[0].header
-
-    data_arr = np.asarray(data, dtype=float)
-    if data_arr.ndim > 2:
-        data_arr = np.squeeze(data_arr)
-    if data_arr.ndim != 2:
-        raise ValueError(f"Expected a 2D FITS image after squeeze, got shape {data_arr.shape}")
-
-    # Extract frequency from header
-    freq_ghz = None
-    if "CRVAL3" in header and "CUNIT3" in header:
-        if header["CUNIT3"].strip() == "Hz":
-            freq_ghz = header["CRVAL3"] / 1e9
-
-    if freq_ghz is None:
-        raise ValueError("Could not extract frequency from FITS header")
-
+    data_arr, header, _ = load_2d_fits_image(fits_path)
+    freq_ghz = extract_frequency_ghz(header)
     return data_arr, header, freq_ghz
 
 
@@ -426,6 +485,66 @@ def save_q0_artifact(
             f.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics, sort_keys=True)))
 
 
+def save_prepared_observation_bundle(
+    h5_path: Path,
+    *,
+    observed_cropped: np.ndarray,
+    sigma_cropped: np.ndarray,
+    target_header: fits.Header,
+    frequency_ghz: float,
+    geometry: Any,
+    observer_source: str,
+    observer_overrides: Any | None,
+    model_observer_meta: dict[str, Any],
+    header_psf: dict[str, float] | None,
+    header_psf_source: str,
+    noise_diagnostics: dict[str, Any] | None,
+) -> None:
+    geometry_dict = {
+        "xc": float(geometry.xc),
+        "yc": float(geometry.yc),
+        "dx": float(geometry.dx),
+        "dy": float(geometry.dy),
+        "nx": int(geometry.nx),
+        "ny": int(geometry.ny),
+    }
+    observer_override_dict = None
+    if observer_overrides is not None:
+        observer_override_dict = {
+            "dsun_cm": None if getattr(observer_overrides, "dsun_cm", None) is None else float(observer_overrides.dsun_cm),
+            "lonc_deg": None if getattr(observer_overrides, "lonc_deg", None) is None else float(observer_overrides.lonc_deg),
+            "b0sun_deg": None if getattr(observer_overrides, "b0sun_deg", None) is None else float(observer_overrides.b0sun_deg),
+        }
+    metadata = {
+        "frequency_ghz": float(frequency_ghz),
+        "geometry": geometry_dict,
+        "observer_source": str(observer_source),
+        "observer_overrides": observer_override_dict,
+        "model_observer_meta": dict(model_observer_meta or {}),
+        "header_psf": dict(header_psf or {}) if header_psf is not None else None,
+        "header_psf_source": str(header_psf_source),
+        "noise_diagnostics": dict(noise_diagnostics or {}) if noise_diagnostics is not None else None,
+    }
+    h5_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(h5_path, "w") as f:
+        f.create_dataset("observed", data=np.asarray(observed_cropped, dtype=np.float32), compression="gzip")
+        f.create_dataset("sigma_map", data=np.asarray(sigma_cropped, dtype=np.float32), compression="gzip")
+        f.create_dataset("wcs_header", data=np.bytes_(target_header.tostring(sep="\n", endcard=True)))
+        f.create_dataset("metadata_json", data=np.bytes_(json.dumps(metadata, sort_keys=True)))
+
+
+def load_prepared_observation_bundle(h5_path: Path) -> dict[str, Any]:
+    with h5py.File(h5_path, "r") as f:
+        metadata = json.loads(_decode_h5_scalar(f["metadata_json"][()]))
+        wcs_header = fits.Header.fromstring(_decode_h5_scalar(f["wcs_header"][()]), sep="\n")
+        return {
+            "observed": np.asarray(f["observed"], dtype=float),
+            "sigma_map": np.asarray(f["sigma_map"], dtype=float),
+            "wcs_header": wcs_header,
+            "metadata": metadata,
+        }
+
+
 def _clear_terminal_status_line(width: int = 120) -> None:
     print("\r" + (" " * width) + "\r", end="", flush=True)
 
@@ -473,11 +592,40 @@ def _run_stage(
 
 
 def _make_trial_progress_reporter(*, target_metric: str):
-    trial_index = 0
+    spinner_stop = threading.Event()
+    spinner_thread: threading.Thread | None = None
+    active_trial: int | None = None
+
+    def _stop_spinner() -> None:
+        nonlocal spinner_thread, active_trial
+        if spinner_thread is not None:
+            spinner_stop.set()
+            spinner_thread.join(timeout=1.0)
+            spinner_thread = None
+            spinner_stop.clear()
+            _clear_terminal_status_line()
+        active_trial = None
+
+    def _start(trial_index: int, q0: float) -> None:
+        del q0
+        nonlocal spinner_thread, active_trial
+        _stop_spinner()
+        active_trial = int(trial_index)
+
+        def _spin() -> None:
+            assert active_trial is not None
+            for ch in itertools.cycle("|/-\\"):
+                print(f"\r    trial {active_trial:02d}: rendering... {ch}", end="", flush=True)
+                if spinner_stop.wait(0.12):
+                    break
+
+        spinner_thread = threading.Thread(target=_spin, daemon=True)
+        spinner_thread.start()
 
     def _report(q0: float, objective_value: float, is_valid: bool, message: str, elapsed_s: float) -> None:
-        nonlocal trial_index
-        trial_index += 1
+        nonlocal active_trial
+        trial_index = 1 if active_trial is None else active_trial
+        _stop_spinner()
         validity = "ok" if is_valid else "invalid"
         extra = f" msg={message}" if message else ""
         print(
@@ -486,7 +634,7 @@ def _make_trial_progress_reporter(*, target_metric: str):
             flush=True,
         )
 
-    return _report
+    return _start, _report
 
 
 def _format_q0_value(value: float) -> str:
@@ -515,6 +663,20 @@ def _colorize(text: str, color: str) -> str:
     return f"{codes[color]}{text}{codes['reset']}"
 
 
+def _resolve_preflight_q0(
+    *,
+    q0_min: float,
+    q0_max: float,
+    q0_start: float | None,
+    preflight_q0: float | None,
+) -> float:
+    if preflight_q0 is not None:
+        return float(preflight_q0)
+    if q0_start is not None:
+        return float(q0_start)
+    return float(math.sqrt(float(q0_min) * float(q0_max)))
+
+
 
 def main():
     import sys
@@ -533,10 +695,22 @@ Examples:
     parser.add_argument("fits_file", type=Path, nargs="?", help="Path to FITS file (EOVSA map)")
     parser.add_argument("model_h5", type=Path, nargs="?", help="Path to model H5 file")
     parser.add_argument("--ebtel-path", type=Path, default=None, help="Path to EBTEL .sav file (required)")
+    parser.add_argument(
+        "--prepared-observation-h5",
+        type=Path,
+        default=None,
+        help="Optional prepared observation bundle H5; if provided, reuse precomputed cropped observation/sigma/WCS instead of reloading and regridding the FITS map.",
+    )
 
     # Q0 fitting controls
-    parser.add_argument("--q0-min", type=float, default=0.01, help="Minimum Q0 to search (default: 0.01)")
-    parser.add_argument("--q0-max", type=float, default=2.5, help="Maximum Q0 to search (default: 2.5)")
+    parser.add_argument("--q0-min", type=float, default=0.01, help="Lower edge of the initial Q0 search interval")
+    parser.add_argument("--q0-max", type=float, default=2.5, help="Upper edge of the initial Q0 search interval")
+    parser.add_argument("--hard-q0-min", type=float, default=None, help="Optional hard lower Q0 boundary")
+    parser.add_argument("--hard-q0-max", type=float, default=None, help="Optional hard upper Q0 boundary")
+    parser.add_argument("--adaptive-bracketing", action=argparse.BooleanOptionalAction, default=True, help="Enable adaptive Q0 bracketing")
+    parser.add_argument("--q0-start", type=float, default=None, help="Explicit starting Q0 for adaptive bracketing")
+    parser.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative Q0 step for adaptive bracketing")
+    parser.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive bracketing expansion steps")
     parser.add_argument("--target-metric", choices=["chi2", "rho2", "eta2"], default="chi2", help="Target metric for optimization (default: chi2)")
 
     # Plasma/geometry/observer overrides
@@ -572,6 +746,17 @@ Examples:
     parser.add_argument("--no-artifacts", action="store_true", help="Skip artifact saving")
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Print stage timing/progress diagnostics.")
     parser.add_argument("--spinner", action=argparse.BooleanOptionalAction, default=True, help="Show a spinner during long-running stages.")
+    parser.add_argument(
+        "--preflight-render-only",
+        action="store_true",
+        help="Render exactly one modeled map at the initial optimizer q0 and exit without fitting.",
+    )
+    parser.add_argument(
+        "--preflight-q0",
+        type=float,
+        default=None,
+        help="Override the q0 used by --preflight-render-only. Defaults to --q0-start or sqrt(q0_min*q0_max).",
+    )
 
     # Utility
     parser.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit")
@@ -583,8 +768,15 @@ Examples:
             "fits_file": "/path/to/eovsa_map.fits",
             "model_h5": "/path/to/model.h5",
             "ebtel_path": "/path/to/ebtel.sav",
+            "prepared_observation_h5": None,
             "q0_min": 0.01,
             "q0_max": 2.5,
+            "hard_q0_min": None,
+            "hard_q0_max": None,
+            "adaptive_bracketing": True,
+            "q0_start": None,
+            "q0_step": 1.61803398875,
+            "max_bracket_steps": 12,
             "target_metric": "chi2",
             "tbase": DEFAULT_TBASE,
             "nbase": DEFAULT_NBASE,
@@ -614,6 +806,8 @@ Examples:
             "no_artifacts": False,
             "progress": True,
             "spinner": True,
+            "preflight_render_only": False,
+            "preflight_q0": None,
         }
         print("Assumed defaults for fit_q0_obs_map.py:")
         for k, v in defaults.items():
@@ -635,32 +829,13 @@ Examples:
         print(f"ERROR: EBTEL .sav file not found: {args.ebtel_path}")
         exit(1)
 
+    total_start = time.perf_counter()
+
     print(f"\n{'=' * 70}")
     print("FITTING Q0 TO OBSERVATIONAL MAP")
     print(f"{'=' * 70}\n")
 
     # Load map
-    print(f"Loading FITS file: {args.fits_file.name}")
-    observed, header, freq_ghz = load_eovsa_map(args.fits_file)
-    print(f"  Shape: {observed.shape}")
-    print(f"  Frequency: {freq_ghz:.3f} GHz")
-    print(f"  Data range: [{observed.min():.2f}, {observed.max():.2f}]")
-
-    # Estimate noise from the full-disk map before any submap extraction.
-    print(f"\nEstimating noise from map...")
-    noise_result = estimate_map_noise(observed, method="histogram_clip")
-
-    if noise_result is None:
-        print("  ⚠️  Noise estimation failed (map quality issues)")
-        print(f"  Falling back to fixed sigma = {int(observed.std())}K")
-        sigma_map = np.full_like(observed, observed.std())
-        noise_diagnostics = None
-    else:
-        print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
-        print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
-        sigma_map = noise_result.sigma_map
-        noise_diagnostics = noise_result.diagnostics
-
     sdk = None
     try:
         from importlib import import_module
@@ -674,7 +849,168 @@ Examples:
     nbase = float(args.nbase) if args.nbase is not None else DEFAULT_NBASE
     a_param = float(args.a) if args.a is not None else DEFAULT_A
     b_param = float(args.b) if args.b is not None else DEFAULT_B
-    header_psf, header_psf_source = _extract_psf_from_header(header)
+    if args.prepared_observation_h5 is not None:
+        if not args.prepared_observation_h5.exists():
+            print(f"ERROR: Prepared observation bundle not found: {args.prepared_observation_h5}")
+            exit(1)
+        print(f"Loading prepared observation bundle: {args.prepared_observation_h5.name}")
+        prepared = load_prepared_observation_bundle(args.prepared_observation_h5)
+        prepared_meta = dict(prepared.get("metadata") or {})
+        observed_cropped = np.asarray(prepared["observed"], dtype=float)
+        sigma_cropped = np.asarray(prepared["sigma_map"], dtype=float)
+        target_header = prepared["wcs_header"].copy()
+        freq_ghz = float(prepared_meta.get("frequency_ghz", 0.0))
+        print(f"  Prepared submap grid: Ny={observed_cropped.shape[0]} Nx={observed_cropped.shape[1]}")
+        print(f"  Frequency: {freq_ghz:.3f} GHz")
+        geometry_data = dict(prepared_meta.get("geometry") or {})
+        geometry = sdk.MapGeometry(
+            xc=float(geometry_data["xc"]),
+            yc=float(geometry_data["yc"]),
+            dx=float(geometry_data["dx"]),
+            dy=float(geometry_data["dy"]),
+            nx=int(geometry_data["nx"]),
+            ny=int(geometry_data["ny"]),
+        )
+        observer_source = str(prepared_meta.get("observer_source", "prepared_bundle"))
+        override_data = prepared_meta.get("observer_overrides")
+        observer_overrides = None
+        if override_data:
+            observer_overrides = sdk.ObserverOverrides(
+                dsun_cm=override_data.get("dsun_cm"),
+                lonc_deg=override_data.get("lonc_deg"),
+                b0sun_deg=override_data.get("b0sun_deg"),
+            )
+        model_observer_meta = dict(prepared_meta.get("model_observer_meta") or {})
+        noise_diagnostics = prepared_meta.get("noise_diagnostics")
+        header_psf = prepared_meta.get("header_psf")
+        header_psf_source = str(prepared_meta.get("header_psf_source", "prepared_bundle"))
+        geometry_mode = "prepared_bundle"
+    else:
+        print(f"Loading FITS file: {args.fits_file.name}")
+        observed, header, freq_ghz = load_eovsa_map(args.fits_file)
+        print(f"  Shape: {observed.shape}")
+        print(f"  Frequency: {freq_ghz:.3f} GHz")
+        print(f"  Data range: [{observed.min():.2f}, {observed.max():.2f}]")
+
+        print(f"\nEstimating noise from map...")
+        noise_result = estimate_map_noise(observed, method="histogram_clip")
+        if noise_result is None:
+            print("  ⚠️  Noise estimation failed (map quality issues)")
+            print(f"  Falling back to fixed sigma = {int(observed.std())}K")
+            sigma_map = np.full_like(observed, observed.std())
+            noise_diagnostics = None
+        else:
+            print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
+            print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
+            sigma_map = noise_result.sigma_map
+            noise_diagnostics = noise_result.diagnostics
+
+        header_psf, header_psf_source = _extract_psf_from_header(header)
+        try:
+            observer_overrides, observer_source = _resolve_observer_overrides(
+                sdk,
+                model_path=args.model_h5,
+                observer_name=args.observer,
+                dsun_cm=args.dsun_cm,
+                lonc_deg=args.lonc_deg,
+                b0sun_deg=args.b0sun_deg,
+            )
+        except ValueError as exc:
+            print(f"  ✗ Failed to resolve observer settings: {exc}")
+            exit(1)
+        model_observer_meta = _load_model_observer_metadata(args.model_h5)
+
+        geometry_overrides_requested = any(v is not None for v in (args.xc, args.yc, args.dx, args.dy, args.nx, args.ny))
+        saved_fov = None
+        if geometry_overrides_requested:
+            geometry = sdk.MapGeometry(
+                xc=args.xc,
+                yc=args.yc,
+                dx=args.dx,
+                dy=args.dy,
+                nx=args.nx,
+                ny=args.ny,
+            )
+            geometry_mode = "explicit"
+        else:
+            saved_fov = _load_saved_fov_from_model(args.model_h5)
+            if saved_fov is None:
+                print("  ✗ Model does not expose a saved FOV. Provide --xc/--yc/--dx/--dy/--nx/--ny explicitly.")
+                exit(1)
+            dx_eff = float(args.pixel_scale_arcsec)
+            dy_eff = float(args.pixel_scale_arcsec)
+            nx_eff = max(16, int(round(float(saved_fov["xsize_arcsec"]) / abs(dx_eff))))
+            ny_eff = max(16, int(round(float(saved_fov["ysize_arcsec"]) / abs(dy_eff))))
+            geometry = sdk.MapGeometry(
+                xc=float(saved_fov["xc_arcsec"]),
+                yc=float(saved_fov["yc_arcsec"]),
+                dx=dx_eff,
+                dy=dy_eff,
+                nx=nx_eff,
+                ny=ny_eff,
+            )
+            geometry_mode = "saved_fov"
+
+        target_header = _build_target_header(
+            nx=int(geometry.nx),
+            ny=int(geometry.ny),
+            xc_arcsec=float(geometry.xc),
+            yc_arcsec=float(geometry.yc),
+            dx_arcsec=float(geometry.dx),
+            dy_arcsec=float(geometry.dy),
+            template_header=header,
+        )
+        target_header = _with_observer_wcs_keywords(
+            target_header,
+            observer_name=str(model_observer_meta.get("observer_name", args.observer or "earth")),
+            hgln_obs_deg=float(model_observer_meta.get("observer_lonc_deg", 0.0)),
+            hglt_obs_deg=float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
+            dsun_obs_m=float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)) / 100.0,
+        )
+        observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
+        sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
+        if np.isnan(observed_cropped).any():
+            nan_fraction = float(np.isnan(observed_cropped).sum()) / float(observed_cropped.size)
+            if nan_fraction > 0.05:
+                print(f"  ✗ Regridded observed submap contains too many NaNs ({nan_fraction:.1%}). Check FITS WCS or requested geometry.")
+                exit(1)
+            fill_value = float(np.nanmedian(observed_cropped))
+            observed_cropped = np.nan_to_num(observed_cropped, nan=fill_value)
+        if np.isnan(sigma_cropped).any():
+            fill_sigma = float(np.nanmedian(sigma_cropped))
+            if not np.isfinite(fill_sigma) or fill_sigma <= 0:
+                fill_sigma = float(np.nanmedian(sigma_map))
+            sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
+
+        print(f"\nPreparing model-aligned observational submap...")
+        print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
+        if geometry_mode == "explicit":
+            print(
+                f"  Geometry mode: explicit xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} "
+                f"dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} nx={int(geometry.nx)} ny={int(geometry.ny)}"
+            )
+        else:
+            raw_model_dx = saved_fov.get("dx_arcsec") if saved_fov is not None else None
+            raw_model_dy = saved_fov.get("dy_arcsec") if saved_fov is not None else None
+            raw_model_dx_str = f"{float(raw_model_dx):.6f}" if raw_model_dx is not None else "<not present>"
+            raw_model_dy_str = f"{float(raw_model_dy):.6f}" if raw_model_dy is not None else "<not present>"
+            print(
+                f"  Saved model FOV: xc={float(saved_fov['xc_arcsec']):.3f} yc={float(saved_fov['yc_arcsec']):.3f} "
+                f"xsize={float(saved_fov['xsize_arcsec']):.3f} ysize={float(saved_fov['ysize_arcsec']):.3f} "
+                f"model_dx={raw_model_dx_str} model_dy={raw_model_dy_str}"
+            )
+            print(
+                f"  Geometry mode: saved_fov xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} "
+                f"dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} nx={int(geometry.nx)} ny={int(geometry.ny)}"
+            )
+        print(f"  Observed submap grid: Ny={observed_cropped.shape[0]} Nx={observed_cropped.shape[1]}")
+        print(f"  Model render grid: Ny={int(geometry.ny)} Nx={int(geometry.nx)}")
+        print(f"  Pixel scale: dx={float(geometry.dx):.1f} dy={float(geometry.dy):.1f} arcsec/pixel")
+        print(
+            f"  FOV: {abs(float(geometry.dx)) * int(geometry.nx):.0f} x "
+            f"{abs(float(geometry.dy)) * int(geometry.ny):.0f} arcsec"
+        )
+
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
@@ -687,117 +1023,18 @@ Examples:
     elif psf_bmaj_arcsec is None and psf_bmin_arcsec is None and psf_bpa_deg is None:
         psf_source = "none"
 
-    try:
-        observer_overrides, observer_source = _resolve_observer_overrides(
-            sdk,
-            model_path=args.model_h5,
-            observer_name=args.observer,
-            dsun_cm=args.dsun_cm,
-            lonc_deg=args.lonc_deg,
-            b0sun_deg=args.b0sun_deg,
-        )
-    except ValueError as exc:
-        print(f"  ✗ Failed to resolve observer settings: {exc}")
-        exit(1)
-    model_observer_meta = _load_model_observer_metadata(args.model_h5)
-
-    geometry_overrides_requested = any(v is not None for v in (args.xc, args.yc, args.dx, args.dy, args.nx, args.ny))
-    saved_fov = None
-    if geometry_overrides_requested:
-        geometry = sdk.MapGeometry(
-            xc=args.xc,
-            yc=args.yc,
-            dx=args.dx,
-            dy=args.dy,
-            nx=args.nx,
-            ny=args.ny,
-        )
-        geometry_mode = "explicit"
-    else:
-        saved_fov = _load_saved_fov_from_model(args.model_h5)
-        if saved_fov is None:
-            print("  ✗ Model does not expose a saved FOV. Provide --xc/--yc/--dx/--dy/--nx/--ny explicitly.")
-            exit(1)
-        dx_eff = float(args.pixel_scale_arcsec)
-        dy_eff = float(args.pixel_scale_arcsec)
-        nx_eff = max(16, int(round(float(saved_fov["xsize_arcsec"]) / abs(dx_eff))))
-        ny_eff = max(16, int(round(float(saved_fov["ysize_arcsec"]) / abs(dy_eff))))
-        geometry = sdk.MapGeometry(
-            xc=float(saved_fov["xc_arcsec"]),
-            yc=float(saved_fov["yc_arcsec"]),
-            dx=dx_eff,
-            dy=dy_eff,
-            nx=nx_eff,
-            ny=ny_eff,
-        )
-        geometry_mode = "saved_fov"
-
-    target_header = _build_target_header(
-        nx=int(geometry.nx),
-        ny=int(geometry.ny),
-        xc_arcsec=float(geometry.xc),
-        yc_arcsec=float(geometry.yc),
-        dx_arcsec=float(geometry.dx),
-        dy_arcsec=float(geometry.dy),
-        template_header=header,
-    )
-    target_header = _with_observer_wcs_keywords(
-        target_header,
-        observer_name=str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        hgln_obs_deg=float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        hglt_obs_deg=float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        dsun_obs_m=float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)) / 100.0,
-    )
-    observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
-    sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
-    if np.isnan(observed_cropped).any():
-        nan_fraction = float(np.isnan(observed_cropped).sum()) / float(observed_cropped.size)
-        if nan_fraction > 0.05:
-            print(f"  ✗ Regridded observed submap contains too many NaNs ({nan_fraction:.1%}). Check FITS WCS or requested geometry.")
-            exit(1)
-        fill_value = float(np.nanmedian(observed_cropped))
-        observed_cropped = np.nan_to_num(observed_cropped, nan=fill_value)
-    if np.isnan(sigma_cropped).any():
-        fill_sigma = float(np.nanmedian(sigma_cropped))
-        if not np.isfinite(fill_sigma) or fill_sigma <= 0:
-            fill_sigma = float(np.nanmedian(sigma_map))
-        sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
-
-    print(f"\nPreparing model-aligned observational submap...")
-    print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
-    if geometry_mode == "explicit":
-        print(
-            f"  Geometry mode: explicit xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} "
-            f"dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} nx={int(geometry.nx)} ny={int(geometry.ny)}"
-        )
-    else:
-        raw_model_dx = saved_fov.get("dx_arcsec") if saved_fov is not None else None
-        raw_model_dy = saved_fov.get("dy_arcsec") if saved_fov is not None else None
-        raw_model_dx_str = f"{float(raw_model_dx):.6f}" if raw_model_dx is not None else "<not present>"
-        raw_model_dy_str = f"{float(raw_model_dy):.6f}" if raw_model_dy is not None else "<not present>"
-        print(
-            f"  Saved model FOV: xc={float(saved_fov['xc_arcsec']):.3f} yc={float(saved_fov['yc_arcsec']):.3f} "
-            f"xsize={float(saved_fov['xsize_arcsec']):.3f} ysize={float(saved_fov['ysize_arcsec']):.3f} "
-            f"model_dx={raw_model_dx_str} model_dy={raw_model_dy_str}"
-        )
-        print(
-            f"  Geometry mode: saved_fov xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} "
-            f"dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} nx={int(geometry.nx)} ny={int(geometry.ny)}"
-        )
-    print(f"  Observed submap grid: Ny={observed_cropped.shape[0]} Nx={observed_cropped.shape[1]}")
-    print(f"  Model render grid: Ny={int(geometry.ny)} Nx={int(geometry.nx)}")
-    print(f"  Pixel scale: dx={float(geometry.dx):.1f} dy={float(geometry.dy):.1f} arcsec/pixel")
     print(
-        f"  FOV: {abs(float(geometry.dx)) * int(geometry.nx):.0f} x "
-        f"{abs(float(geometry.dy)) * int(geometry.ny):.0f} arcsec"
-    )
-    if psf_source == "none":
-        print("  PSF source: none")
-    else:
-        print(
-            f"  PSF source: {psf_source} "
-            f"bmaj={float(psf_bmaj_arcsec):.3f} bmin={float(psf_bmin_arcsec):.3f} bpa={float(psf_bpa_deg):.3f}"
+        "  "
+        + _format_psf_report(
+            source=str(psf_source),
+            bmaj_arcsec=psf_bmaj_arcsec,
+            bmin_arcsec=psf_bmin_arcsec,
+            bpa_deg=psf_bpa_deg,
+            active_frequency_ghz=float(freq_ghz),
+            ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
+            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
         )
+    )
     print(f"  Plasma/heating: a={a_param:.3f} b={b_param:.3f} tbase={tbase:.3e} nbase={nbase:.3e}")
 
 
@@ -820,14 +1057,18 @@ Examples:
         base_adapter = GXRenderMWAdapter(**adapter_kwargs)
         renderer = base_adapter
         if psf_bmaj_arcsec is not None and psf_bmin_arcsec is not None and psf_bpa_deg is not None:
-            psf_scale = (
-                float(args.psf_ref_frequency_ghz) / float(freq_ghz)
-                if args.psf_scale_inverse_frequency and args.psf_ref_frequency_ghz is not None
-                else 1.0
+            psf_meta = _effective_psf_parameters(
+                bmaj_arcsec=psf_bmaj_arcsec,
+                bmin_arcsec=psf_bmin_arcsec,
+                bpa_deg=psf_bpa_deg,
+                active_frequency_ghz=float(freq_ghz),
+                ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
+                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
             )
+            assert psf_meta is not None
             kernel = _elliptical_gaussian_kernel(
-                bmaj_arcsec=float(psf_bmaj_arcsec) * psf_scale,
-                bmin_arcsec=float(psf_bmin_arcsec) * psf_scale,
+                bmaj_arcsec=float(psf_meta["active_bmaj_arcsec"]),
+                bmin_arcsec=float(psf_meta["active_bmin_arcsec"]),
                 bpa_deg=float(psf_bpa_deg),
                 dx_arcsec=float(geometry.dx),
                 dy_arcsec=float(geometry.dy),
@@ -838,16 +1079,68 @@ Examples:
         print(f"  ✗ Failed to initialize gxrender adapter: {e}")
         exit(1)
 
+    if bool(args.preflight_render_only):
+        preflight_q0 = _resolve_preflight_q0(
+            q0_min=float(args.q0_min),
+            q0_max=float(args.q0_max),
+            q0_start=None if args.q0_start is None else float(args.q0_start),
+            preflight_q0=None if args.preflight_q0 is None else float(args.preflight_q0),
+        )
+        print(f"\nRunning single-render preflight at q0={_format_q0_value(preflight_q0)}...")
+        try:
+            if isinstance(renderer, PSFConvolvedRenderer):
+                (raw_modeled_best, modeled_best), render_elapsed = _run_stage(
+                    "Preflight render",
+                    lambda: renderer.render_pair(preflight_q0),
+                    spinner=bool(args.spinner),
+                    stage_index=1,
+                    stage_total=1,
+                )
+            else:
+                modeled_best, render_elapsed = _run_stage(
+                    "Preflight render",
+                    lambda: base_adapter.render(preflight_q0),
+                    spinner=bool(args.spinner),
+                    stage_index=1,
+                    stage_total=1,
+                )
+                raw_modeled_best = modeled_best
+            print("  ✓ Preflight render completed")
+            print(f"  q0={_format_q0_value(preflight_q0)} dt={render_elapsed:.3f}s")
+            print(
+                f"  modeled map range: "
+                f"[{float(np.nanmin(modeled_best)):.6e}, {float(np.nanmax(modeled_best)):.6e}]"
+            )
+            print(
+                f"  raw modeled map range: "
+                f"[{float(np.nanmin(raw_modeled_best)):.6e}, {float(np.nanmax(raw_modeled_best)):.6e}]"
+            )
+            total_elapsed = time.perf_counter() - total_start
+            print(f"\n{'=' * 70}")
+            print(f"PREFLIGHT COMPLETE: success=True total={total_elapsed:.3f}s")
+            print(f"{'=' * 70}\n")
+            return
+        except Exception as e:
+            print(f"  ✗ Preflight render failed: {e}")
+            exit(1)
+
     # Fit Q0
     result = None
     render_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
     print(f"\nFitting Q0 using {args.target_metric} metric...")
-    print(f"  Q0 range: [{_format_q0_value(args.q0_min)}, {_format_q0_value(args.q0_max)}]")
+    print(f"  Q0 initial interval: [{_format_q0_value(args.q0_min)}, {_format_q0_value(args.q0_max)}]")
+    if args.hard_q0_min is not None or args.hard_q0_max is not None:
+        hard_left = _format_q0_value(args.hard_q0_min) if args.hard_q0_min is not None else "<unbounded>"
+        hard_right = _format_q0_value(args.hard_q0_max) if args.hard_q0_max is not None else "<unbounded>"
+        print(f"  Q0 hard bounds: [{hard_left}, {hard_right}]")
     stage_spinner = bool(args.spinner)
     stage_total = 2 if args.no_artifacts else 3
 
     try:
-        progress_callback = _make_trial_progress_reporter(target_metric=args.target_metric) if args.progress else None
+        progress_start_callback = None
+        progress_callback = None
+        if args.progress:
+            progress_start_callback, progress_callback = _make_trial_progress_reporter(target_metric=args.target_metric)
         if isinstance(renderer, PSFConvolvedRenderer):
             class _CachedObservedRenderer:
                 def render(self_inner, q0: float) -> np.ndarray:
@@ -872,8 +1165,14 @@ Examples:
                 sigma=sigma_cropped,
                 q0_min=args.q0_min,
                 q0_max=args.q0_max,
+                hard_q0_min=args.hard_q0_min,
+                hard_q0_max=args.hard_q0_max,
                 target_metric=args.target_metric,
-                adaptive_bracketing=True,
+                adaptive_bracketing=bool(args.adaptive_bracketing),
+                q0_start=args.q0_start,
+                q0_step=float(args.q0_step),
+                max_bracket_steps=int(args.max_bracket_steps),
+                progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
             ),
             spinner=stage_spinner and not bool(args.progress),
@@ -900,17 +1199,26 @@ Examples:
                 else "<none>"
             )
             print(f"  Adaptive bracketing: found={result.bracket_found} bracket={bracket_text}")
-        q0_span = max(abs(args.q0_max - args.q0_min), 1.0)
-        near_left = abs(result.q0 - args.q0_min) <= 0.01 * abs(args.q0_max - args.q0_min)
-        near_right = abs(result.q0 - args.q0_max) <= 0.01 * abs(args.q0_max - args.q0_min)
-        if result.bracket is not None:
+        hard_left = args.hard_q0_min
+        hard_right = args.hard_q0_max
+        near_left = False
+        near_right = False
+        if hard_left is not None and hard_right is not None:
+            span = max(abs(hard_right - hard_left), 1.0)
+            near_left = abs(result.q0 - hard_left) <= 0.01 * span
+            near_right = abs(result.q0 - hard_right) <= 0.01 * span
+        elif hard_left is not None:
+            near_left = abs(result.q0 - hard_left) <= 0.01 * max(abs(hard_left), 1.0)
+        elif hard_right is not None:
+            near_right = abs(result.q0 - hard_right) <= 0.01 * max(abs(hard_right), 1.0)
+        if (near_left or near_right) and result.bracket is not None:
             near_left = near_left and result.q0 <= result.bracket[1]
             near_right = near_right and result.q0 >= result.bracket[1]
         if near_left or near_right:
             side = "lower" if near_left else "upper"
             print(
                 _colorize(
-                    f"  WARNING: best q0 lies near the {side} search boundary; "
+                    f"  WARNING: best q0 lies near the {side} hard search boundary; "
                     "this run did not demonstrate a well-bracketed interior minimum.",
                     "red",
                 )
@@ -981,6 +1289,7 @@ Examples:
                 "rho2": float(result.metrics.rho2),
                 "eta2": float(result.metrics.eta2),
                 "q0_recovered": float(result.q0),
+                "fit_success": bool(result.success),
                 "optimizer_message": str(result.message),
                 "bracket_found": bool(result.bracket_found),
                 "bracket": [float(v) for v in result.bracket] if result.bracket is not None else None,
@@ -1044,8 +1353,10 @@ Examples:
         except Exception as e:
             print(f"  ✗ Failed to save artifacts: {e}")
 
+    total_elapsed = time.perf_counter() - total_start
+    fit_success = bool(result.success) if result is not None else False
     print(f"\n{'=' * 70}")
-    print("FITTING COMPLETE")
+    print(f"FITTING COMPLETE: success={fit_success} total={total_elapsed:.3f}s")
     print(f"{'=' * 70}\n")
 
 

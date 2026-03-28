@@ -57,6 +57,12 @@ def test_find_best_q0_validates_adaptive_inputs() -> None:
     with pytest.raises(ValueError, match="q0_start must lie within"):
         find_best_q0(metric_function, q0_min=0.1, q0_max=1.0, q0_start=2.0)
 
+    with pytest.raises(ValueError, match="must not lie below hard_q0_min"):
+        find_best_q0(metric_function, q0_min=0.1, q0_max=1.0, hard_q0_min=0.2)
+
+    with pytest.raises(ValueError, match="must not lie above hard_q0_max"):
+        find_best_q0(metric_function, q0_min=0.1, q0_max=1.0, hard_q0_max=0.9, q0_start=0.95)
+
 
 def test_find_best_q0_adaptive_bracketing_moves_right_from_flux_deficit() -> None:
     def metric_function(q0: float) -> Q0MetricEvaluation:
@@ -145,7 +151,7 @@ def test_find_best_q0_adaptive_corrects_initial_flux_direction_from_metric_trend
     assert result.used_adaptive_bracketing
     assert result.success
     assert result.q0 == pytest.approx(0.001, abs=1e-4)
-    assert result.trial_q0[:3] == pytest.approx((0.001, 0.00161803398875, 0.00061803398875))
+    assert result.trial_q0[:3] == pytest.approx((0.0001, 0.001, 0.01))
 
 
 def test_find_best_q0_adaptive_failure_falls_back_to_bounded_refinement() -> None:
@@ -172,29 +178,60 @@ def test_find_best_q0_adaptive_failure_falls_back_to_bounded_refinement() -> Non
 
     assert result.success
     assert result.used_adaptive_bracketing
-    assert not result.bracket_found
-    assert "falling back to bounded refinement" in result.message
+    assert result.bracket_found
+    assert result.bracket == pytest.approx((0.91, 1.0, 1.01))
+    assert "adaptive bracketing found a valid interior minimum" in result.message
     assert result.q0 == pytest.approx(0.97, abs=1e-2)
 
 
-def test_find_best_q0_adaptive_boundary_stop_does_not_fall_back() -> None:
+def test_find_best_q0_soft_interval_expands_beyond_initial_upper_edge() -> None:
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
-                chi2=q0,
-                rho2=q0,
-                eta2=q0,
+                chi2=(q0 - 1.5) ** 2,
+                rho2=(q0 - 1.5) ** 2,
+                eta2=(q0 - 1.5) ** 2,
             ),
             total_observed_flux=1.0,
-            total_modeled_flux=100.0 * q0,
+            total_modeled_flux=0.1 * q0,
         )
 
     result = find_best_q0(
         metric_function,
-        q0_min=0.001,
+        q0_min=0.1,
         q0_max=1.0,
         adaptive_bracketing=True,
-        q0_start=0.03162277660168379,
+        q0_start=0.31622776601683794,
+        q0_step=1.61803398875,
+        max_bracket_steps=20,
+    )
+
+    assert result.success
+    assert result.used_adaptive_bracketing
+    assert result.bracket_found
+    assert result.q0 == pytest.approx(1.5, abs=1e-2)
+    assert max(result.trial_q0) > 1.0
+
+
+def test_find_best_q0_hard_upper_bound_stops_expansion() -> None:
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        return Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 1.5) ** 2,
+                rho2=(q0 - 1.5) ** 2,
+                eta2=(q0 - 1.5) ** 2,
+            ),
+            total_observed_flux=1.0,
+            total_modeled_flux=0.1 * q0,
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=1.0,
+        hard_q0_max=1.0,
+        adaptive_bracketing=True,
+        q0_start=0.31622776601683794,
         q0_step=1.61803398875,
         max_bracket_steps=20,
     )
@@ -202,9 +239,8 @@ def test_find_best_q0_adaptive_boundary_stop_does_not_fall_back() -> None:
     assert not result.success
     assert result.used_adaptive_bracketing
     assert not result.bracket_found
-    assert "stopping at the boundary best instead of falling back" in result.message
-    assert "falling back to bounded refinement" not in result.message
-    assert result.q0 == pytest.approx(0.001, abs=1e-12)
+    assert "upper safety bound" in result.message
+    assert result.q0 == pytest.approx(1.0, abs=1e-12)
 
 
 def test_find_best_q0_tracks_unique_trials_and_unique_evaluations() -> None:

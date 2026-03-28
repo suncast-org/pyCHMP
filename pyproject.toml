@@ -39,6 +39,7 @@ dev = [
 
 [project.scripts]
 pychmp = "pychmp.cli:main"
+pychmp-view = "pychmp.viewer:main"
 
 [project.urls]
 Homepage = "https://github.com/suncast-org/pyCHMP"

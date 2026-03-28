@@ -70,10 +70,23 @@ done
 RUNTIME_CACHE_ROOT="${RUNTIME_CACHE_ROOT:-/tmp/pychmp_runtime_cache}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUNTIME_CACHE_ROOT/matplotlib}"
 export SUNPY_CONFIGDIR="${SUNPY_CONFIGDIR:-$RUNTIME_CACHE_ROOT/sunpy}"
-export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$RUNTIME_CACHE_ROOT/xdg}"
-export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
 export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
-mkdir -p "$MPLCONFIGDIR" "$SUNPY_CONFIGDIR" "$XDG_CACHE_HOME"
+DEFAULT_ASTROPY_CACHE="$HOME/.astropy/cache"
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+  export XDG_CACHE_HOME="$XDG_CACHE_HOME"
+elif [[ ! -d "$DEFAULT_ASTROPY_CACHE" ]]; then
+  export XDG_CACHE_HOME="$RUNTIME_CACHE_ROOT/xdg"
+else
+  unset XDG_CACHE_HOME 2>/dev/null || true
+fi
+if [[ -n "${OMP_PREFIX:-}" ]]; then
+  echo "Unsetting OMP_PREFIX=$OMP_PREFIX to avoid conflicting OpenMP runtimes"
+  unset OMP_PREFIX
+fi
+mkdir -p "$MPLCONFIGDIR" "$SUNPY_CONFIGDIR"
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+  mkdir -p "$XDG_CACHE_HOME"
+fi
 
 # Python selection:
 # - Use PYTHON_BIN if provided.
@@ -85,8 +98,8 @@ else
   CANDIDATES=(
     "$WORKSPACE_ROOT/pyCHMP/.conda/bin/python"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
-    "$HOME/miniforge3/envs/suncast/bin/python"
     "$HOME/miniforge3/bin/python"
+    "$HOME/miniforge3/envs/suncast/bin/python"
     "python"
   )
 
@@ -182,8 +195,12 @@ ARGS=(
   --ebtel-path "$EBTEL_PATH"
 
   # Q0 fitting controls:
-  --q0-min 0.00001
-  --q0-max 0.001
+  --q0-min 0.01
+  --q0-max 2.5
+  # --q0-min 0.001
+  # --q0-max 0.1
+  # --q0-min 0.00001
+  # --q0-max 0.001
   --target-metric chi2
 
   # Plasma/geometry/observer overrides (comment/uncomment as needed):
@@ -206,11 +223,13 @@ ARGS=(
   # --pixel-scale-arcsec 2.0
 
   # PSF/beam options:
-  # --psf-bmaj-arcsec 5.77
-  # --psf-bmin-arcsec 5.77
-  # --psf-bpa-deg -17.5
-  # --psf-ref-frequency-ghz 17.0
-  # --psf-scale-inverse-frequency
+  # Default EOVSA fallback for these tracked test maps: use the 17 GHz beam
+  # and scale it by inverse frequency when no FITS beam cards are present.
+  --psf-bmaj-arcsec 5.77
+  --psf-bmin-arcsec 5.77
+  --psf-bpa-deg -17.5
+  --psf-ref-frequency-ghz 17.0
+  --psf-scale-inverse-frequency
 
   # Artifacts/outputs:
   --artifacts-dir "$ARTIFACTS_DIR"
