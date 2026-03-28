@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from astropy.io import fits
 
-from pychmp import estimate_map_noise
+from pychmp import estimate_map_noise, load_2d_fits_image
 
 # EOVSA FITS file path
 fits_path = Path(
@@ -21,34 +21,30 @@ if not fits_path.exists():
     print("ERROR: File not found!")
     exit(1)
 
-# Open FITS file
 with fits.open(fits_path) as hdul:
     print(f"\nFITS file structure:")
     hdul.info()
 
-    # Get primary HDU
-    hdu = hdul[0]
-    data = hdu.data
-    header = hdu.header
+data, header, hdu_name = load_2d_fits_image(fits_path)
+print(f"\nSelected image HDU: {hdu_name}")
+print(f"Data shape: {data.shape}")
+print(f"Data dtype: {data.dtype}")
+print(f"Data range: [{np.min(data):.2f}, {np.max(data):.2f}]")
+print(f"Data mean: {np.mean(data):.2f}")
+print(f"Data std: {np.std(data):.2f}")
 
-    print(f"\nData shape: {data.shape}")
-    print(f"Data dtype: {data.dtype}")
-    print(f"Data range: [{np.min(data):.2f}, {np.max(data):.2f}]")
-    print(f"Data mean: {np.mean(data):.2f}")
-    print(f"Data std: {np.std(data):.2f}")
+# Extract frequency from header
+if "CRVAL3" in header:
+    freq_hz = header["CRVAL3"]
+    if "CUNIT3" in header and header["CUNIT3"].strip() == "Hz":
+        freq_ghz = freq_hz / 1e9
+        print(f"Frequency from FITS: {freq_ghz:.3f} GHz")
 
-    # Extract frequency from header
-    if "CRVAL3" in header:
-        freq_hz = header["CRVAL3"]
-        if "CUNIT3" in header and header["CUNIT3"].strip() == "Hz":
-            freq_ghz = freq_hz / 1e9
-            print(f"Frequency from FITS: {freq_ghz:.3f} GHz")
-    
-    # Print relevant header keys
-    print("\nRelevant FITS header keys:")
-    for key in ["CRVAL3", "CUNIT3", "CTYPE3", "CRPIX3", "CDELT3"]:
-        if key in header:
-            print(f"  {key}: {header[key]}")
+# Print relevant header keys
+print("\nRelevant FITS header keys:")
+for key in ["CRVAL3", "CUNIT3", "CTYPE3", "CRPIX3", "CDELT3"]:
+    if key in header:
+        print(f"  {key}: {header[key]}")
 
 # Test histogram_clip method (no WCS required)
 print("\n" + "=" * 70)

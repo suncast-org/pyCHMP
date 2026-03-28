@@ -15,6 +15,11 @@ option blocks and shared test-data path resolution.
   - Wraps `examples/validate_q0_recovery.py`.
   - Runs the synthetic recovery workflow against a matching model H5.
 
+- `scan_ab_obs_map_options_test.sh`
+  - Wraps `examples/scan_ab_obs_map.py`.
+  - Runs a real observational rectangular `(a, b)` scan against the matching
+    model H5 and writes a consolidated H5 scan file.
+
 ## Expected Layout
 
 By default these launchers expect sibling repositories:
@@ -44,16 +49,17 @@ Run from anywhere:
 ```bash
 pyCHMP/scripts/fit_q0_obs_map_options_test.sh
 pyCHMP/scripts/validate_q0_recovery_options_test.sh
+pyCHMP/scripts/scan_ab_obs_map_options_test.sh
 ```
 
-Both launchers support:
+All tracked launchers support:
 
 ```bash
 --dry-run
 ```
 
 This prints the resolved inputs and the exact Python command, then exits
-without starting a render or fit.
+without starting a render, fit, or scan.
 
 ## Editing Model / Map Choices
 
@@ -67,7 +73,7 @@ workflow is simple:
 For more targeted overrides, use environment variables such as:
 
 ```bash
-MODEL_PATH=/path/to/model.h5
+MODEL_H5_PATH=/path/to/model.h5
 OBS_FITS_PATH=/path/to/map.fits
 EBTEL_PATH=/path/to/ebtel.sav
 PYTHON_BIN=/path/to/python

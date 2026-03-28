@@ -11,25 +11,19 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-from astropy.io import fits
 from astropy.wcs import WCS
 
-from pychmp import estimate_map_noise
+from pychmp import estimate_map_noise, extract_frequency_ghz, load_2d_fits_image
 
 
 def load_fits_map(fits_path: Path) -> tuple:
     """Load FITS map and extract data, header, frequency."""
-    with fits.open(fits_path) as hdul:
-        hdul.info()
-        data = hdul[0].data
-        header = hdul[0].header
-
-    # Extract frequency from header if available
-    freq_ghz = None
-    if "CRVAL3" in header and "CUNIT3" in header:
-        if header["CUNIT3"].strip() == "Hz":
-            freq_ghz = header["CRVAL3"] / 1e9
-
+    data, header, hdu_name = load_2d_fits_image(fits_path)
+    print(f"Loaded image HDU: {hdu_name}")
+    try:
+        freq_ghz = extract_frequency_ghz(header)
+    except ValueError:
+        freq_ghz = None
     return data, header, freq_ghz
 
 

@@ -15,12 +15,28 @@ This folder contains user-facing runnable workflows and validation applications.
   - Requires explicit inputs: observational FITS map and model H5.
   - Loads full-disk FITS maps, estimates background noise, crops/regrids the
     observation onto the saved model-aligned FOV, then runs Q0 optimization.
-  - Does not perform implicit model path guessing.
   - Saves fitting results to H5/PNG artifacts and reports fit diagnostics.
 
 - `validate_synthetic_q0_recovery.py`
   - Synthetic renderer sanity check.
   - No gxrender dependency required.
+
+- `scan_synthetic_ab_grid.py`
+  - Synthetic rectangular `(a, b)` grid scan using the nested Q0 fitter.
+  - No gxrender dependency required.
+  - Useful for validating summary-grid behavior before running real model scans.
+
+- `scan_ab_obs_map.py`
+  - Real observational rectangular `(a, b)` grid scan against an EOVSA FITS map
+    plus matching model H5.
+  - Produces one consolidated H5 file containing the full scan summary and
+    per-point best-fit products.
+
+- `plot_ab_scan_artifacts.py`
+  - On-demand plotting utility for the consolidated `scan_ab_obs_map.py` H5
+    output.
+  - Can generate a selected-point solution panel and a grid-summary heatmap
+    figure.
 
 - `demo_gxrender_mw_adapter.py`
   - Demonstrates direct use of `GXRenderMWAdapter` with real model input.
@@ -35,30 +51,33 @@ This folder contains user-facing runnable workflows and validation applications.
 Run from repository root:
 
 ```bash
-# Estimate noise from observational map (all methods)
 python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits
-
-# Using specific method
 python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --method histogram_clip
-
-# Comparison of all methods
 python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --all-methods
 ```
 
 ```bash
-
-# Fit Q0 to real observational map with explicit model and EBTEL input
-python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 --ebtel-path /path/to/ebtel.sav
-
-# Fit Q0 with custom Q0 range and save artifacts
 python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 \
-  --ebtel-path /path/to/ebtel.sav \
-  --q0-min 0.01 --q0-max 2.5 \
-  --artifacts-dir /tmp/q0_artifacts
+  --ebtel-path /path/to/ebtel.sav
 ```
 
 ```bash
 python examples/validate_synthetic_q0_recovery.py
+```
+
+```bash
+python examples/scan_synthetic_ab_grid.py
+```
+
+```bash
+python examples/scan_ab_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 \
+  --ebtel-path /path/to/ebtel.sav \
+  --a-values 0.0,0.3,0.6 \
+  --b-values 2.1,2.4,2.7
+```
+
+```bash
+python examples/plot_ab_scan_artifacts.py /path/to/ab_scan.h5 --show-plot
 ```
 
 ```bash
@@ -94,10 +113,17 @@ For the heavier manual workflows, tracked shell launchers live in `scripts/`:
   - Supports `--dry-run` to print the resolved command without starting a fit.
 
 - `scripts/validate_q0_recovery_options_test.sh`
-  - Wraps `examples/validate_q0_recovery.py` with the same style of
-    line-by-line option editing.
+  - Wraps `examples/validate_q0_recovery.py` with the same style of line-by-line
+    option editing.
   - Resolves the matching model and EBTEL input from sibling test data.
   - Supports `--dry-run` to print the resolved command without starting a run.
+
+- `scripts/scan_ab_obs_map_options_test.sh`
+  - Wraps `examples/scan_ab_obs_map.py` with one option per line for easy grid
+    editing.
+  - Resolves the matching EOVSA map, model, and EBTEL input from sibling test
+    data.
+  - Supports `--dry-run` to print the resolved command without starting the scan.
 
 ## Relationship to tests
 

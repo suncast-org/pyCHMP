@@ -58,6 +58,27 @@ for arg in "$@"; do
   fi
 done
 
+RUNTIME_CACHE_ROOT="${RUNTIME_CACHE_ROOT:-/tmp/pychmp_runtime_cache}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUNTIME_CACHE_ROOT/matplotlib}"
+export SUNPY_CONFIGDIR="${SUNPY_CONFIGDIR:-$RUNTIME_CACHE_ROOT/sunpy}"
+export KMP_DUPLICATE_LIB_OK="${KMP_DUPLICATE_LIB_OK:-TRUE}"
+DEFAULT_ASTROPY_CACHE="$HOME/.astropy/cache"
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+  export XDG_CACHE_HOME="$XDG_CACHE_HOME"
+elif [[ ! -d "$DEFAULT_ASTROPY_CACHE" ]]; then
+  export XDG_CACHE_HOME="$RUNTIME_CACHE_ROOT/xdg"
+else
+  unset XDG_CACHE_HOME 2>/dev/null || true
+fi
+if [[ -n "${OMP_PREFIX:-}" ]]; then
+  echo "Unsetting OMP_PREFIX=$OMP_PREFIX to avoid conflicting OpenMP runtimes"
+  unset OMP_PREFIX
+fi
+mkdir -p "$MPLCONFIGDIR" "$SUNPY_CONFIGDIR"
+if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+  mkdir -p "$XDG_CACHE_HOME"
+fi
+
 # Python selection:
 # - Use PYTHON_BIN if provided.
 # - Otherwise probe common workspace envs and pick the first that imports gxrender.sdk.
@@ -68,8 +89,8 @@ else
   CANDIDATES=(
     "$WORKSPACE_ROOT/pyCHMP/.conda/bin/python"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
-    "$HOME/miniforge3/envs/suncast/bin/python"
     "$HOME/miniforge3/bin/python"
+    "$HOME/miniforge3/envs/suncast/bin/python"
     "python"
   )
 
