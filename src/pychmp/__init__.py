@@ -38,4 +38,4 @@ __all__ = [
   "find_best_q0",
 ]
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
