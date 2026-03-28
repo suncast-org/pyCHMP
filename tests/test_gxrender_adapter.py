@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import numpy as np
@@ -79,8 +81,11 @@ class WrongCubeGXRender(FakeGXRender):
 
 
 class FakeWorkflowHelpers:
+    prepared_args = None
+
     @staticmethod
     def prepare_common_inputs(args):
+        FakeWorkflowHelpers.prepared_args = args
         return SimpleNamespace(
             model="model",
             model_dt="model_dt",
@@ -162,3 +167,76 @@ def test_gxrender_mw_adapter_surfaces_missing_dependency(monkeypatch) -> None:
             a=0.3,
             b=2.7,
         )
+
+
+def test_gxrender_context_forwards_named_observer_to_workflow_args(monkeypatch) -> None:
+    FakeWorkflowHelpers.prepared_args = None
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: FakeGXRender)
+    monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
+
+    GXRenderMWAdapter(
+        model_path="model.h5",
+        frequency_ghz=5.8,
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+        observer="earth",
+    )
+
+    assert FakeWorkflowHelpers.prepared_args is not None
+    assert FakeWorkflowHelpers.prepared_args.observer == "earth"
+
+
+def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -> None:
+    class FakeSDKWithRender(FakeSDK):
+        render_options = None
+
+        class CoronalPlasmaParameters:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class MWRenderOptions:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        @staticmethod
+        def render_mw_maps(options):
+            FakeSDKWithRender.render_options = options
+            output_dir = Path(options.kwargs["output_dir"])
+            output_name = str(options.kwargs["output_name"] or "rendered_map")
+            raw_h5_path = output_dir / output_name
+            output_dir.mkdir(parents=True, exist_ok=True)
+            raw_h5_path.write_bytes(b"fake")
+            cube = np.full((2, 3, 1), options.kwargs["plasma"].kwargs["q0"], dtype=float)
+            return SimpleNamespace(
+                ti=cube,
+                outputs=SimpleNamespace(h5_path=raw_h5_path),
+            )
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithRender)
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: FakeGXRender)
+    monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
+
+    with TemporaryDirectory() as tmpdir:
+        adapter = GXRenderMWAdapter(
+            model_path="model.h5",
+            frequency_ghz=5.8,
+            tbase=1e6,
+            nbase=1e8,
+            a=0.3,
+            b=2.7,
+            observer="earth",
+            output_dir=tmpdir,
+            output_name="demo_map",
+            output_format="h5",
+        )
+
+        image = adapter.render(0.0217)
+
+        assert image.shape == (2, 3)
+        assert np.allclose(image, 0.0217)
+        assert FakeSDKWithRender.render_options is not None
+        assert FakeSDKWithRender.render_options.kwargs["observer"] == "earth"
+        assert Path(tmpdir, "demo_map.h5").exists()

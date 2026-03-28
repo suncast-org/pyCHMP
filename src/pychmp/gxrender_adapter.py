@@ -21,6 +21,14 @@ def _load_gxrender_sdk() -> Any:
         ) from exc
 
 
+def _rename_h5_output_if_needed(output_dir: str | Path | None, h5_path_raw: str | Path | None) -> None:
+    if not output_dir or not h5_path_raw:
+        return
+    h5_path = Path(h5_path_raw)
+    if h5_path.exists() and h5_path.suffix != ".h5":
+        h5_path.rename(h5_path.with_suffix(".h5"))
+
+
 def _load_gxrender_module() -> Any:
     try:
         return import_module("gxrender")
@@ -76,7 +84,7 @@ class GXRenderMWContext:
             model_path=Path(self.model_path),
             model_format=str(self.model_format),
             ebtel_path=self.ebtel_path,
-            observer=None,
+            observer=self.observer,
             dsun_cm=getattr(observer, "dsun_cm", None),
             lonc_deg=getattr(observer, "lonc_deg", None),
             b0sun_deg=getattr(observer, "b0sun_deg", None),
@@ -190,6 +198,44 @@ class GXRenderMWAdapter:
 
     def render(self, q0: float) -> np.ndarray:
         self.render_call_count += 1
+        if self.output_dir:
+            sdk = _load_gxrender_sdk()
+            geometry = self.geometry
+            if geometry is None:
+                geometry = sdk.MapGeometry(pixel_scale_arcsec=float(self.pixel_scale_arcsec))
+
+            plasma = sdk.CoronalPlasmaParameters(
+                tbase=self.tbase,
+                nbase=self.nbase,
+                q0=float(q0),
+                a=self.a,
+                b=self.b,
+                mode=self.mode,
+                selective_heating=self.selective_heating,
+                shtable=self.shtable,
+            )
+            options = sdk.MWRenderOptions(
+                model_path=Path(self.model_path),
+                model_format=self.model_format,
+                ebtel_path=self.ebtel_path,
+                output_dir=self.output_dir,
+                output_name=self.output_name,
+                output_format=self.output_format,
+                freqlist_ghz=[float(self.frequency_ghz)],
+                plasma=plasma,
+                omp_threads=self.omp_threads,
+                geometry=geometry,
+                observer=self.observer,
+                save_outputs=True,
+                write_preview=False,
+                verbose=self.verbose,
+            )
+            result = sdk.render_mw_maps(options)
+            _rename_h5_output_if_needed(self.output_dir, getattr(result.outputs, "h5_path", None))
+            ti = np.asarray(result.ti, dtype=float)
+            if ti.ndim != 3 or ti.shape[2] != 1:
+                raise ValueError(f"expected single-frequency TI cube with shape (ny, nx, 1), got {ti.shape}")
+            return ti[:, :, 0]
         return self._context.render(
             frequency_ghz=float(self.frequency_ghz),
             tbase=float(self.tbase),
