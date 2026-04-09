@@ -30,6 +30,8 @@ from pychmp.ab_scan_artifacts import (
     append_sparse_point_record,
     detect_scan_artifact_format,
     load_scan_file,
+    save_rectangular_scan_file,
+    slice_descriptor_from_diagnostics,
     write_sparse_scan_file,
 )
 from pychmp.ab_search import idl_q0_start_heuristic
@@ -102,6 +104,45 @@ class GridPointSpec:
     b: float
     q0_min: float | None = None
     q0_max: float | None = None
+
+
+class _TeeStream:
+    def __init__(self, *streams: Any) -> None:
+        self._streams = [stream for stream in streams if stream is not None]
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            try:
+                stream.write(data)
+            except UnicodeEncodeError:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                safe_text = str(data).encode(encoding, errors="replace").decode(encoding, errors="replace")
+                stream.write(safe_text)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        for stream in self._streams:
+            try:
+                if bool(stream.isatty()):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @property
+    def encoding(self) -> str:
+        for stream in self._streams:
+            enc = getattr(stream, "encoding", None)
+            if isinstance(enc, str) and enc:
+                return enc
+        return "utf-8"
 
 
 class _SharedContextPointRenderer:
@@ -372,6 +413,12 @@ def _load_fit_q0_artifact_payload(
             "fit_chi2_trials": tuple(float(v) for v in diagnostics.get("fit_chi2_trials", [])),
             "fit_rho2_trials": tuple(float(v) for v in diagnostics.get("fit_rho2_trials", [])),
             "fit_eta2_trials": tuple(float(v) for v in diagnostics.get("fit_eta2_trials", [])),
+            "nfev": int(diagnostics.get("nfev", -1)),
+            "nit": int(diagnostics.get("nit", -1)),
+            "message": str(diagnostics.get("optimizer_message", "")),
+            "used_adaptive_bracketing": bool(diagnostics.get("used_adaptive_bracketing", False)),
+            "bracket_found": bool(diagnostics.get("bracket_found", False)),
+            "bracket": tuple(float(v) for v in diagnostics.get("bracket", [])) if diagnostics.get("bracket") is not None else None,
             "target_metric": target_metric,
             "diagnostics": {
                 **diagnostics,
@@ -410,6 +457,12 @@ def _failed_sparse_point_payload(
         "fit_chi2_trials": tuple(),
         "fit_rho2_trials": tuple(),
         "fit_eta2_trials": tuple(),
+        "nfev": -1,
+        "nit": -1,
+        "message": str(message),
+        "used_adaptive_bracketing": False,
+        "bracket_found": False,
+        "bracket": None,
         "target_metric": str(target_metric),
         "diagnostics": {
             "a": float(a_value),
@@ -417,6 +470,11 @@ def _failed_sparse_point_payload(
             "target_metric": str(target_metric),
             "optimizer_message": str(message),
             "fit_success": False,
+            "nfev": -1,
+            "nit": -1,
+            "used_adaptive_bracketing": False,
+            "bracket_found": False,
+            "bracket": None,
             "point_status": str(status),
         },
     }
@@ -512,51 +570,23 @@ def _save_ab_scan_h5(
     success: np.ndarray,
     point_payloads: dict[tuple[int, int], dict[str, Any]],
 ) -> None:
-    out_h5.parent.mkdir(parents=True, exist_ok=True)
-    tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
-    with h5py.File(tmp_h5, "w") as f:
-        common = f.create_group("common")
-        common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
-        common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
-        common.create_dataset("wcs_header", data=np.bytes_(wcs_header.tostring(sep="\n", endcard=True)))
-        common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics, sort_keys=True)))
-
-        grid = f.create_group("grid")
-        grid.create_dataset("a_values", data=np.asarray(a_values, dtype=np.float64))
-        grid.create_dataset("b_values", data=np.asarray(b_values, dtype=np.float64))
-
-        summary = f.create_group("summary")
-        summary.create_dataset("best_q0", data=np.asarray(best_q0, dtype=np.float64))
-        summary.create_dataset("objective_values", data=np.asarray(objective_values, dtype=np.float64))
-        summary.create_dataset("chi2", data=np.asarray(chi2, dtype=np.float64))
-        summary.create_dataset("rho2", data=np.asarray(rho2, dtype=np.float64))
-        summary.create_dataset("eta2", data=np.asarray(eta2, dtype=np.float64))
-        summary.create_dataset("success", data=np.asarray(success, dtype=np.uint8))
-        summary.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
-
-        points = f.create_group("points")
-        for (_ai, _bi), payload in sorted(point_payloads.items()):
-            name = f"a{payload['a_index']:03d}_b{payload['b_index']:03d}"
-            grp = points.create_group(name)
-            grp.attrs["a"] = float(payload["a"])
-            grp.attrs["b"] = float(payload["b"])
-            grp.attrs["a_index"] = int(payload["a_index"])
-            grp.attrs["b_index"] = int(payload["b_index"])
-            grp.attrs["q0"] = float(payload["q0"])
-            grp.attrs["success"] = int(bool(payload["success"]))
-            grp.attrs["status"] = np.bytes_(str(payload.get("status", "computed")))
-            grp.attrs["target_metric"] = np.bytes_(str(payload["target_metric"]))
-            grp.create_dataset("modeled_best", data=np.asarray(payload["modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
-            grp.create_dataset("raw_modeled_best", data=np.asarray(payload["raw_modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
-            grp.create_dataset("residual", data=np.asarray(payload["residual"], dtype=np.float32), compression="gzip", compression_opts=4)
-            grp.create_dataset("fit_q0_trials", data=np.asarray(payload["fit_q0_trials"], dtype=np.float64))
-            fit_metric_ds = grp.create_dataset("fit_metric_trials", data=np.asarray(payload["fit_metric_trials"], dtype=np.float64))
-            fit_metric_ds.attrs["target_metric"] = np.bytes_(str(payload["target_metric"]))
-            grp.create_dataset("fit_chi2_trials", data=np.asarray(payload.get("fit_chi2_trials", ()), dtype=np.float64))
-            grp.create_dataset("fit_rho2_trials", data=np.asarray(payload.get("fit_rho2_trials", ()), dtype=np.float64))
-            grp.create_dataset("fit_eta2_trials", data=np.asarray(payload.get("fit_eta2_trials", ()), dtype=np.float64))
-            grp.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(payload["diagnostics"], sort_keys=True)))
-    os.replace(tmp_h5, out_h5)
+    save_rectangular_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=wcs_header,
+        diagnostics=diagnostics,
+        a_values=a_values,
+        b_values=b_values,
+        best_q0=best_q0,
+        objective_values=objective_values,
+        chi2=chi2,
+        rho2=rho2,
+        eta2=eta2,
+        success=success,
+        point_payloads=point_payloads,
+        slice_key=slice_descriptor_from_diagnostics(diagnostics)["key"],
+    )
 
 
 def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
@@ -629,7 +659,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
         "--recompute-existing",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="In sparse explicit-point mode, recompute matching existing (a,b) records instead of skipping them.",
+        help="Recompute matching existing records instead of skipping them. Failed points are always retried by default.",
     )
     p.add_argument("--point-timeout-s", type=float, default=900.0, help="Per-point worker timeout in seconds. Enforced for sparse explicit-point mode.")
     p.add_argument("--preflight-render", action=argparse.BooleanOptionalAction, default=True, help="Run an isolated single-render preflight before launching a full sparse explicit-point fit.")
@@ -641,7 +671,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--no-grid-png", action="store_true", help="Skip the grid-summary PNG.")
     p.add_argument("--no-point-png", action="store_true", help="Skip the selected-point PNG.")
     p.add_argument("--show-plot", action="store_true", help="Display generated plots interactively.")
-    p.add_argument("--no-viewer", action="store_true", help="Do not launch pychmp-view automatically when the scan completes.")
+    p.add_argument("--no-viewer", action="store_true", help="Do not launch pychmp-view automatically when the scan starts.")
     p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Print per-trial and per-point progress diagnostics.")
     p.add_argument("--spinner", action=argparse.BooleanOptionalAction, default=True, help="Show a spinner during long-running stages.")
     p.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit.")
@@ -652,6 +682,7 @@ def main() -> int:
     import sys
 
     parser, args = parse_args()
+    suppress_auto_viewer = os.environ.get("PYCHMP_NO_AUTO_VIEWER", "").strip().lower() in {"1", "true", "yes", "on"}
     scan_start = time.perf_counter()
     if args.defaults:
         defaults = {
@@ -863,7 +894,28 @@ def main() -> int:
     out_h5 = args.artifact_h5 if args.artifact_h5 is not None else artifacts_dir / f"{stem}.h5"
     out_h5 = Path(out_h5)
     artifacts_dir = out_h5.parent
-    existing_format = detect_scan_artifact_format(out_h5) if out_h5.exists() else None
+    out_log = Path(f"{out_h5}.log")
+    current_slice_key = str(
+        slice_descriptor_from_diagnostics(
+            {
+                "spectral_domain": "mw",
+                "spectral_label": f"{float(freq_ghz):.3f} GHz",
+                "frequency_ghz": float(freq_ghz),
+            }
+        )["key"]
+    )
+
+    live_log_handle = None
+    try:
+        out_log.parent.mkdir(parents=True, exist_ok=True)
+        live_log_handle = out_log.open("a", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStream(sys.stdout, live_log_handle)
+        sys.stderr = _TeeStream(sys.stderr, live_log_handle)
+        print(f"Live log file: {out_log}")
+    except Exception as exc:
+        print(_colorize(f"WARNING: failed to initialize live log sidecar: {exc}", "yellow"))
+
+    existing_format = detect_scan_artifact_format(out_h5, slice_key=current_slice_key) if out_h5.exists() else None
     use_sparse_mode = bool(explicit_points or existing_format == "sparse")
     target_points = explicit_points or [GridPointSpec(a=float(a), b=float(b)) for a in a_values for b in b_values]
     point_artifacts_dir = artifacts_dir / f"{stem}_point_runs" if (args.keep_point_artifacts or use_sparse_mode) else None
@@ -881,6 +933,40 @@ def main() -> int:
     viewer_script = Path(__file__).with_name("pychmp_view.py")
     viewer_cmd = [sys.executable, str(viewer_script), str(out_h5)]
     viewer_cmd_text = shlex.join(viewer_cmd)
+    viewer_process = None
+    viewer_refresh_signal = Path(f"{out_h5}.refresh")
+
+    def _notify_viewer_refresh(phase: str) -> None:
+        try:
+            viewer_refresh_signal.write_text(f"{time.time():.6f} {phase}\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _maybe_launch_viewer(phase: str) -> None:
+        nonlocal viewer_process
+        if bool(args.no_viewer) or suppress_auto_viewer:
+            return
+        if viewer_process is not None and viewer_process.poll() is None:
+            return
+        try:
+            proc = subprocess.Popen(
+                viewer_cmd,
+                start_new_session=True,
+            )
+            if proc.poll() is not None:
+                print(
+                    _colorize(
+                        f"WARNING: pychmp-view exited immediately after auto-launch ({phase}). "
+                        f"Try running manually: {viewer_cmd_text}",
+                        "yellow",
+                    )
+                )
+                return
+            viewer_process = proc
+            print(f"✓ Launched pychmp-view ({phase}) pid={proc.pid}")
+        except Exception as exc:
+            print(_colorize(f"WARNING: failed to launch pychmp-view automatically ({phase}): {exc}", "yellow"))
+
     print(f"  Live viewer command: {viewer_cmd_text}")
     print("  You may run this command while the scan is still in progress and use Refresh Artifact in the viewer.")
     if use_sparse_mode:
@@ -940,6 +1026,8 @@ def main() -> int:
 
     root_diag = {
         "artifact_kind": "pychmp_ab_scan",
+        "spectral_domain": "mw",
+        "spectral_label": f"{float(freq_ghz):.3f} GHz",
         "model_path": str(args.model_h5),
         "fits_file": str(args.fits_file),
         "ebtel_path": str(args.ebtel_path),
@@ -974,12 +1062,14 @@ def main() -> int:
                 diagnostics=root_diag,
                 point_records=[],
             )
+            _notify_viewer_refresh("sparse artifact initialized")
 
-        existing_payload = load_scan_file(out_h5) if out_h5.exists() else None
+        existing_payload = load_scan_file(out_h5, slice_key=current_slice_key) if out_h5.exists() else None
         existing_points = {
             (float(record["a"]), float(record["b"])): record
             for record in (existing_payload.get("point_records", []) if existing_payload is not None else [])
         }
+        _maybe_launch_viewer("scan start")
         prepared_observation_h5 = point_artifacts_dir / f"{stem}_prepared_observation.h5"
         save_prepared_observation_bundle(
             prepared_observation_h5,
@@ -1012,18 +1102,22 @@ def main() -> int:
                 )
 
             existing_point = existing_points.get((float(a_value), float(b_value)))
-            if existing_point is not None and str(existing_point.get("status", "computed")) not in {"pending", "missing"}:
-                if not bool(args.recompute_existing):
+            if existing_point is not None:
+                existing_status = str(existing_point.get("status", "computed"))
+                if existing_status == "failed":
+                    print("    recomputing failed point already present in sparse artifact")
+                elif existing_status not in {"pending", "missing"}:
+                    if not bool(args.recompute_existing):
+                        print(
+                            f"    skipping point already present in sparse artifact "
+                            f"(status={existing_status})"
+                        )
+                        run_success_count += int(bool(existing_point.get("success", False)))
+                        continue
                     print(
-                        f"    skipping point already present in sparse artifact "
-                        f"(status={existing_point.get('status', 'computed')})"
+                        f"    recomputing point already present in sparse artifact "
+                        f"(status={existing_status})"
                     )
-                    run_success_count += int(bool(existing_point.get("success", False)))
-                    continue
-                print(
-                    f"    recomputing point already present in sparse artifact "
-                    f"(status={existing_point.get('status', 'computed')})"
-                )
 
             q0_start = None
             if args.q0_start_scalar is not None:
@@ -1159,6 +1253,7 @@ def main() -> int:
                 diagnostics=root_diag,
                 point_payload=point_payload,
             )
+            _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
             existing_points[(float(a_value), float(b_value))] = point_payload
             point_elapsed = time.perf_counter() - point_start
             print(
@@ -1167,6 +1262,7 @@ def main() -> int:
                 f"{'=' * 70}\n"
             )
             print(f"Viewer command: {viewer_cmd_text}")
+            _maybe_launch_viewer(f"point {point_counter}/{stage_total} complete")
 
         payload = load_scan_file(out_h5)
         final_a_values = np.asarray(payload["a_values"], dtype=float)
@@ -1224,18 +1320,8 @@ def main() -> int:
                 )
             )
         print(f"Viewer command: {shlex.join(viewer_cmd)}")
-        if not bool(args.no_viewer):
-            try:
-                subprocess.Popen(
-                    viewer_cmd,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                )
-                print("✓ Launched pychmp-view")
-            except Exception as exc:
-                print(_colorize(f"WARNING: failed to launch pychmp-view automatically: {exc}", "yellow"))
+        _notify_viewer_refresh("scan complete")
+        _maybe_launch_viewer("scan complete")
         total_elapsed = time.perf_counter() - scan_start
         print(f"\n{'=' * 70}")
         print(f"SCAN COMPLETE: success={run_success_count}/{len(target_points)} total={total_elapsed:.3f}s")
@@ -1244,7 +1330,7 @@ def main() -> int:
 
     if out_h5.exists():
         try:
-            existing = load_scan_file(out_h5)
+            existing = load_scan_file(out_h5, slice_key=current_slice_key)
             existing_points = int(len(existing.get("points", {})))
             reused_points = 0
             for payload in existing.get("points", {}).values():
@@ -1305,6 +1391,8 @@ def main() -> int:
         success=success,
         point_payloads=point_payloads,
     )
+    _notify_viewer_refresh("rectangular artifact initialized")
+    _maybe_launch_viewer("scan start")
 
     stage_total = int(a_values.size * b_values.size)
     point_counter = 0
@@ -1314,12 +1402,20 @@ def main() -> int:
             point_start = time.perf_counter()
             print(f"\nPoint {point_counter}/{stage_total}: a={float(a_value):.3f} b={float(b_value):.3f}")
             existing_payload = point_payloads[(int(i), int(j))]
-            if str(existing_payload.get("status", "pending")) != "pending":
+            existing_status = str(existing_payload.get("status", "pending"))
+            if existing_status == "failed":
+                print("    recomputing failed point already present in artifact")
+            elif existing_status != "pending":
+                if not bool(args.recompute_existing):
+                    print(
+                        f"    skipping point already present in artifact "
+                        f"(status={existing_payload.get('status', 'computed')})"
+                    )
+                    continue
                 print(
-                    f"    skipping point already present in artifact "
+                    f"    recomputing point already present in artifact "
                     f"(status={existing_payload.get('status', 'computed')})"
                 )
-                continue
             q0_start = None
             if args.q0_start_scalar is not None:
                 q0_start = float(args.q0_start_scalar)
@@ -1608,12 +1704,14 @@ def main() -> int:
                     success=success,
                     point_payloads=point_payloads,
                 )
+                _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
                 print(
                     f"{'=' * 70}\n"
                     f"POINT COMPLETE: success=False total={point_elapsed:.3f}s\n"
                     f"{'=' * 70}\n"
                 )
                 print(f"Viewer command: {viewer_cmd_text}")
+                _maybe_launch_viewer(f"point {point_counter}/{stage_total} complete")
                 continue
 
             point_elapsed = time.perf_counter() - point_start
@@ -1633,12 +1731,14 @@ def main() -> int:
                 success=success,
                 point_payloads=point_payloads,
             )
+            _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
             print(
                 f"{'=' * 70}\n"
                 f"POINT COMPLETE: success={bool(result.success)} total={point_elapsed:.3f}s\n"
                 f"{'=' * 70}\n"
             )
             print(f"Viewer command: {viewer_cmd_text}")
+            _maybe_launch_viewer(f"point {point_counter}/{stage_total} complete")
 
     grid_png = None if args.no_grid_png else artifacts_dir / f"{stem}_grid.png"
     point_png = None if args.no_point_png else artifacts_dir / f"{stem}_point.png"
@@ -1677,18 +1777,8 @@ def main() -> int:
         )
         print(f"✓ Selected-point PNG: {point_png}")
     print(f"Viewer command: {shlex.join(viewer_cmd)}")
-    if not bool(args.no_viewer):
-        try:
-            subprocess.Popen(
-                viewer_cmd,
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-            )
-            print("✓ Launched pychmp-view")
-        except Exception as exc:
-            print(_colorize(f"WARNING: failed to launch pychmp-view automatically: {exc}", "yellow"))
+    _notify_viewer_refresh("scan complete")
+    _maybe_launch_viewer("scan complete")
     total_elapsed = time.perf_counter() - scan_start
     success_count = int(np.count_nonzero(success))
     total_points = int(success.size)

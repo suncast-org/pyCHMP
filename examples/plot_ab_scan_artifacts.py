@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -217,6 +217,8 @@ def _plot_selected_point(
 def plot_ab_scan_file(
     h5_path: Path,
     *,
+    payload: dict[str, Any] | None = None,
+    slice_key: str | None = None,
     a_index: int = 0,
     b_index: int = 0,
     show_grid: bool = False,
@@ -230,7 +232,7 @@ def plot_ab_scan_file(
     except ModuleNotFoundError:
         plt = None  # type: ignore[assignment]
 
-    payload = load_scan_file(h5_path)
+    payload = payload if payload is not None else load_scan_file(h5_path, slice_key=slice_key)
     wants_grid = bool(show_grid or out_grid_png is not None)
     wants_point = bool(show_point or out_point_png is not None)
     if wants_grid:
@@ -263,6 +265,7 @@ def plot_ab_scan_file(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot consolidated `(a,b)` scan artifacts.")
     parser.add_argument("artifact_h5", type=Path, help="Consolidated H5 produced by scan_ab_obs_map.py")
+    parser.add_argument("--slice-key", type=str, default=None, help="Optional spectral slice key to display from a multi-slice artifact.")
     parser.add_argument("--a-index", type=int, default=None, help="Selected a-grid index for the point panel. If omitted, defaults to the best point for the file target metric.")
     parser.add_argument("--b-index", type=int, default=None, help="Selected b-grid index for the point panel. If omitted, defaults to the best point for the file target metric.")
     parser.add_argument("--a-value", type=float, default=None, help="Alternative a selection by nearest value.")
@@ -283,29 +286,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-png", type=Path, default=None, help="Optional output path for the grid-summary PNG.")
     parser.add_argument("--point-png", type=Path, default=None, help="Optional output path for the selected-point PNG.")
     parser.add_argument("--no-plot", action="store_true", help="Do not display the generated plot(s); useful when only saving PNGs.")
-    parser.add_argument("--display-worker", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
-
-
-def _spawn_display_worker() -> int:
-    cmd = [sys.executable, str(Path(__file__).resolve())]
-    cmd.extend(arg for arg in sys.argv[1:] if arg != "--display-worker")
-    cmd.append("--display-worker")
-    subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-    )
-    return 0
 
 
 def main() -> int:
     args = parse_args()
-    if not args.no_plot and not args.display_worker:
-        return _spawn_display_worker()
-    payload = load_scan_file(args.artifact_h5)
+    payload = load_scan_file(args.artifact_h5, slice_key=args.slice_key)
     a_index = int(args.a_index) if args.a_index is not None else 0
     b_index = int(args.b_index) if args.b_index is not None else 0
     explicit_point_selection = any(
@@ -330,6 +316,8 @@ def main() -> int:
     show_plot = not bool(args.no_plot)
     plot_ab_scan_file(
         args.artifact_h5,
+        payload=payload,
+        slice_key=args.slice_key,
         a_index=a_index,
         b_index=b_index,
         show_grid=bool(args.grid),

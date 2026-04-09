@@ -13,6 +13,7 @@ from astropy.io import fits
 METRICS = ("chi2", "rho2", "eta2")
 RECTANGULAR_ARTIFACT_KIND = "pychmp_ab_scan"
 SPARSE_ARTIFACT_KIND = "pychmp_ab_scan_sparse_points"
+SLICE_CONTAINER_GROUP = "slices"
 
 
 def decode_scalar(value: Any) -> str:
@@ -26,7 +27,53 @@ def decode_scalar(value: Any) -> str:
     return str(value)
 
 
-def _artifact_kind_from_file(f: h5py.File) -> str:
+def _sanitize_slice_token(value: str) -> str:
+    text = str(value).strip().lower().replace(" ", "_")
+    sanitized = []
+    for char in text:
+        if char.isalnum() or char in {"_", "-"}:
+            sanitized.append(char)
+        elif char == ".":
+            sanitized.append("p")
+    token = "".join(sanitized).strip("_")
+    return token or "slice"
+
+
+def slice_descriptor_from_diagnostics(diagnostics: dict[str, Any], *, fallback_key: str = "default") -> dict[str, Any]:
+    domain = str(diagnostics.get("spectral_domain", "mw")).strip().lower()
+    frequency_ghz = diagnostics.get("frequency_ghz", diagnostics.get("active_frequency_ghz"))
+    channel_label = diagnostics.get("channel_label", diagnostics.get("euv_channel", diagnostics.get("channel_name")))
+    label = str(diagnostics.get("spectral_label", "")).strip()
+    sort_value: float | None = None
+
+    if domain == "mw" and frequency_ghz is not None:
+        frequency_ghz = float(frequency_ghz)
+        label = label or f"{frequency_ghz:.3f} GHz"
+        key = f"mw_{frequency_ghz:.6f}ghz".replace(".", "p")
+        sort_value = frequency_ghz
+    elif domain == "euv" and channel_label:
+        label = label or str(channel_label)
+        key = f"euv_{_sanitize_slice_token(str(channel_label))}"
+    else:
+        if channel_label and not label:
+            label = str(channel_label)
+        key = _sanitize_slice_token(str(diagnostics.get("slice_key", fallback_key)))
+        if not label:
+            label = str(diagnostics.get("slice_label", fallback_key))
+
+    display_label = f"{domain.upper()}: {label}" if domain in {"mw", "euv"} else label
+    return {
+        "key": key,
+        "domain": domain,
+        "label": label,
+        "display_label": display_label,
+        "frequency_ghz": float(frequency_ghz) if frequency_ghz is not None else None,
+        "channel_label": None if channel_label is None else str(channel_label),
+        "sort_value": sort_value,
+    }
+
+
+def _artifact_kind_from_group(f: h5py.Group | h5py.File) -> str:
     if "point_records" in f:
         return SPARSE_ARTIFACT_KIND
     common = f.get("common")
@@ -39,9 +86,68 @@ def _artifact_kind_from_file(f: h5py.File) -> str:
     return RECTANGULAR_ARTIFACT_KIND
 
 
-def detect_scan_artifact_format(h5_path: Path) -> str:
+def _sorted_slice_descriptors(descriptors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        descriptors,
+        key=lambda item: (
+            item.get("domain", ""),
+            item.get("sort_value") if item.get("sort_value") is not None else float("inf"),
+            str(item.get("label", "")),
+            str(item.get("key", "")),
+        ),
+    )
+
+
+def _resolve_slice_group(
+    f: h5py.File,
+    *,
+    slice_key: str | None = None,
+    allow_missing: bool = False,
+) -> tuple[h5py.Group | h5py.File | None, list[dict[str, Any]], str | None]:
+    if SLICE_CONTAINER_GROUP not in f:
+        diagnostics = {}
+        common = f.get("common")
+        if common is not None and "diagnostics_json" in common:
+            diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
+        descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key="default")
+        return f, [descriptor], descriptor["key"]
+
+    slices_group = f[SLICE_CONTAINER_GROUP]
+    descriptors: list[dict[str, Any]] = []
+    for name in sorted(slices_group.keys()):
+        grp = slices_group[name]
+        diagnostics = {}
+        common = grp.get("common")
+        if common is not None and "diagnostics_json" in common:
+            diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
+        descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key=name)
+        descriptor["key"] = str(name)
+        descriptors.append(descriptor)
+
+    descriptors = _sorted_slice_descriptors(descriptors)
+    key_lookup = {str(item["key"]): item for item in descriptors}
+    selected_key = slice_key if slice_key in key_lookup else None
+    if selected_key is None:
+        if allow_missing and slice_key is not None:
+            return None, descriptors, None
+        selected_key = str(descriptors[0]["key"]) if descriptors else None
+    if selected_key is None:
+        return None, descriptors, None
+    return slices_group[selected_key], descriptors, selected_key
+
+
+def list_scan_slices(h5_path: Path) -> list[dict[str, Any]]:
     with h5py.File(h5_path, "r") as f:
-        kind = _artifact_kind_from_file(f)
+        _group, descriptors, _selected_key = _resolve_slice_group(f)
+    return descriptors
+
+
+def detect_scan_artifact_format(h5_path: Path, *, slice_key: str | None = None) -> str | None:
+    with h5py.File(h5_path, "r") as f:
+        group, _descriptors, _selected_key = _resolve_slice_group(f, slice_key=slice_key, allow_missing=slice_key is not None)
+        if group is None:
+            return None
+        kind = _artifact_kind_from_group(group)
     return "sparse" if kind == SPARSE_ARTIFACT_KIND else "rectangular"
 
 
@@ -92,6 +198,11 @@ def _pending_point_payload(
         "target_metric": str(target_metric),
         "optimizer_message": str(message),
         "fit_success": False,
+        "nfev": -1,
+        "nit": -1,
+        "used_adaptive_bracketing": False,
+        "bracket_found": False,
+        "bracket": None,
         "point_status": str(status),
     }
     return {
@@ -110,6 +221,12 @@ def _pending_point_payload(
         "fit_chi2_trials": tuple(),
         "fit_rho2_trials": tuple(),
         "fit_eta2_trials": tuple(),
+        "nfev": -1,
+        "nit": -1,
+        "message": str(message),
+        "used_adaptive_bracketing": False,
+        "bracket_found": False,
+        "bracket": None,
         "target_metric": str(target_metric),
         "diagnostics": diagnostics,
     }
@@ -133,6 +250,12 @@ def _normalize_point_payload(payload: dict[str, Any], *, record_order: int) -> d
         "fit_chi2_trials": tuple(float(v) for v in payload.get("fit_chi2_trials", ())),
         "fit_rho2_trials": tuple(float(v) for v in payload.get("fit_rho2_trials", ())),
         "fit_eta2_trials": tuple(float(v) for v in payload.get("fit_eta2_trials", ())),
+        "nfev": int(payload.get("nfev", -1)),
+        "nit": int(payload.get("nit", -1)),
+        "message": str(payload.get("message", "")),
+        "used_adaptive_bracketing": bool(payload.get("used_adaptive_bracketing", False)),
+        "bracket_found": bool(payload.get("bracket_found", False)),
+        "bracket": payload.get("bracket", None),
         "target_metric": target_metric,
         "diagnostics": diagnostics,
     }
@@ -160,6 +283,14 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         if "fit_eta2_trials" in grp
         else (fit_metric_trials if target_metric == "eta2" else np.asarray([], dtype=float))
     )
+    bracket = None
+    if "bracket" in grp:
+        try:
+            bracket_arr = np.asarray(grp["bracket"], dtype=float)
+            if bracket_arr.size == 3:
+                bracket = tuple(float(v) for v in bracket_arr)
+        except Exception:
+            bracket = None
     return {
         "record_order": int(grp.attrs.get("record_order", 0)),
         "a": float(grp.attrs["a"]),
@@ -175,6 +306,12 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         "fit_chi2_trials": tuple(float(v) for v in fit_chi2_trials),
         "fit_rho2_trials": tuple(float(v) for v in fit_rho2_trials),
         "fit_eta2_trials": tuple(float(v) for v in fit_eta2_trials),
+        "nfev": int(grp.attrs.get("nfev", -1)),
+        "nit": int(grp.attrs.get("nit", -1)),
+        "message": decode_scalar(grp.attrs.get("message", b"")),
+        "used_adaptive_bracketing": bool(grp.attrs.get("used_adaptive_bracketing", False)),
+        "bracket_found": bool(grp.attrs.get("bracket_found", False)),
+        "bracket": bracket,
         "target_metric": target_metric,
         "diagnostics": json.loads(decode_scalar(grp["diagnostics_json"][()])),
     }
@@ -293,20 +430,27 @@ def _payload_from_point_records(
     }
 
 
-def load_scan_file(h5_path: Path) -> dict[str, Any]:
+def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, Any]:
     with h5py.File(h5_path, "r") as f:
-        common = f["common"]
+        group, descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            raise KeyError(f"slice not found: {slice_key}")
+        common = group["common"]
         wcs_header = fits.Header.fromstring(decode_scalar(common["wcs_header"][()]), sep="\n")
         diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
-        kind = _artifact_kind_from_file(f)
+        kind = _artifact_kind_from_group(group)
         if kind == SPARSE_ARTIFACT_KIND:
-            point_records = _load_sparse_point_records(f["point_records"])
+            point_records = _load_sparse_point_records(group["point_records"])
             target_metric = str(diagnostics.get("target_metric", "chi2"))
         else:
-            point_records = _load_rectangular_point_records(f["points"])
-            summary = f["summary"]
+            point_records = _load_rectangular_point_records(group["points"])
+            summary = group["summary"]
             target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
-        return _payload_from_point_records(
+        payload = _payload_from_point_records(
             observed=np.asarray(common["observed"], dtype=float),
             sigma_map=np.asarray(common["sigma_map"], dtype=float),
             wcs_header=wcs_header,
@@ -314,6 +458,120 @@ def load_scan_file(h5_path: Path) -> dict[str, Any]:
             point_records=point_records,
             target_metric=target_metric,
         )
+        selected_descriptor = next((item for item in descriptors if str(item["key"]) == str(selected_key)), None)
+        payload["available_slices"] = descriptors
+        payload["selected_slice_key"] = selected_key
+        payload["selected_slice"] = selected_descriptor
+        return payload
+
+
+def _write_common_group(
+    common: h5py.Group,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+) -> None:
+    common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
+    common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
+    common.create_dataset("wcs_header", data=np.bytes_(wcs_header.tostring(sep="\n", endcard=True)))
+    common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics, sort_keys=True)))
+
+
+def save_rectangular_scan_file(
+    out_h5: Path,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+    a_values: np.ndarray,
+    b_values: np.ndarray,
+    best_q0: np.ndarray,
+    objective_values: np.ndarray,
+    chi2: np.ndarray,
+    rho2: np.ndarray,
+    eta2: np.ndarray,
+    success: np.ndarray,
+    point_payloads: dict[tuple[int, int], dict[str, Any]],
+    slice_key: str | None = None,
+) -> None:
+    out_h5.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key=slice_key or "default")
+    resolved_slice_key = str(slice_key or descriptor["key"])
+    tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
+    with h5py.File(tmp_h5, "w") as dst:
+        slices_dst = dst.create_group(SLICE_CONTAINER_GROUP)
+        if out_h5.exists():
+            with h5py.File(out_h5, "r") as src:
+                if SLICE_CONTAINER_GROUP in src:
+                    for name in src[SLICE_CONTAINER_GROUP].keys():
+                        if str(name) == resolved_slice_key:
+                            continue
+                        src.copy(src[SLICE_CONTAINER_GROUP][name], slices_dst, name=name)
+                elif "common" in src:
+                    existing_diag = json.loads(decode_scalar(src["common"]["diagnostics_json"][()]))
+                    existing_descriptor = slice_descriptor_from_diagnostics(existing_diag, fallback_key="legacy")
+                    existing_key = str(existing_descriptor["key"])
+                    if existing_key != resolved_slice_key:
+                        legacy_dst = slices_dst.create_group(existing_key)
+                        for name in src.keys():
+                            src.copy(name, legacy_dst, name=name)
+
+        slice_group = slices_dst.create_group(resolved_slice_key)
+        slice_group.attrs["domain"] = np.bytes_(str(descriptor["domain"]))
+        slice_group.attrs["label"] = np.bytes_(str(descriptor["label"]))
+        if descriptor.get("frequency_ghz") is not None:
+            slice_group.attrs["frequency_ghz"] = float(descriptor["frequency_ghz"])
+        if descriptor.get("channel_label") is not None:
+            slice_group.attrs["channel_label"] = np.bytes_(str(descriptor["channel_label"]))
+
+        common = slice_group.create_group("common")
+        _write_common_group(
+            common,
+            observed=observed,
+            sigma_map=sigma_map,
+            wcs_header=wcs_header,
+            diagnostics=diagnostics,
+        )
+
+        grid = slice_group.create_group("grid")
+        grid.create_dataset("a_values", data=np.asarray(a_values, dtype=np.float64))
+        grid.create_dataset("b_values", data=np.asarray(b_values, dtype=np.float64))
+
+        summary = slice_group.create_group("summary")
+        summary.create_dataset("best_q0", data=np.asarray(best_q0, dtype=np.float64))
+        summary.create_dataset("objective_values", data=np.asarray(objective_values, dtype=np.float64))
+        summary.create_dataset("chi2", data=np.asarray(chi2, dtype=np.float64))
+        summary.create_dataset("rho2", data=np.asarray(rho2, dtype=np.float64))
+        summary.create_dataset("eta2", data=np.asarray(eta2, dtype=np.float64))
+        summary.create_dataset("success", data=np.asarray(success, dtype=np.uint8))
+        summary.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
+
+        points = slice_group.create_group("points")
+        for (_ai, _bi), payload in sorted(point_payloads.items()):
+            name = f"a{payload['a_index']:03d}_b{payload['b_index']:03d}"
+            grp = points.create_group(name)
+            grp.attrs["a"] = float(payload["a"])
+            grp.attrs["b"] = float(payload["b"])
+            grp.attrs["a_index"] = int(payload["a_index"])
+            grp.attrs["b_index"] = int(payload["b_index"])
+            grp.attrs["q0"] = float(payload["q0"])
+            grp.attrs["success"] = int(bool(payload["success"]))
+            grp.attrs["status"] = np.bytes_(str(payload.get("status", "computed")))
+            grp.attrs["target_metric"] = np.bytes_(str(payload["target_metric"]))
+            grp.create_dataset("modeled_best", data=np.asarray(payload["modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
+            grp.create_dataset("raw_modeled_best", data=np.asarray(payload["raw_modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
+            grp.create_dataset("residual", data=np.asarray(payload["residual"], dtype=np.float32), compression="gzip", compression_opts=4)
+            grp.create_dataset("fit_q0_trials", data=np.asarray(payload["fit_q0_trials"], dtype=np.float64))
+            fit_metric_ds = grp.create_dataset("fit_metric_trials", data=np.asarray(payload["fit_metric_trials"], dtype=np.float64))
+            fit_metric_ds.attrs["target_metric"] = np.bytes_(str(payload["target_metric"]))
+            grp.create_dataset("fit_chi2_trials", data=np.asarray(payload.get("fit_chi2_trials", ()), dtype=np.float64))
+            grp.create_dataset("fit_rho2_trials", data=np.asarray(payload.get("fit_rho2_trials", ()), dtype=np.float64))
+            grp.create_dataset("fit_eta2_trials", data=np.asarray(payload.get("fit_eta2_trials", ()), dtype=np.float64))
+            grp.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(payload["diagnostics"], sort_keys=True)))
+    os.replace(tmp_h5, out_h5)
 
 
 def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order: int) -> None:
@@ -325,6 +583,13 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
     grp.attrs["success"] = int(bool(normalized["success"]))
     grp.attrs["status"] = np.bytes_(str(normalized["status"]))
     grp.attrs["target_metric"] = np.bytes_(str(normalized["target_metric"]))
+    grp.attrs["nfev"] = int(normalized["nfev"])
+    grp.attrs["nit"] = int(normalized["nit"])
+    grp.attrs["message"] = np.bytes_(str(normalized["message"]))
+    grp.attrs["used_adaptive_bracketing"] = int(bool(normalized["used_adaptive_bracketing"]))
+    grp.attrs["bracket_found"] = int(bool(normalized["bracket_found"]))
+    if normalized["bracket"] is not None:
+        grp.create_dataset("bracket", data=np.asarray(normalized["bracket"], dtype=np.float64))
     grp.create_dataset("modeled_best", data=np.asarray(normalized["modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
     grp.create_dataset("raw_modeled_best", data=np.asarray(normalized["raw_modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
     grp.create_dataset("residual", data=np.asarray(normalized["residual"], dtype=np.float32), compression="gzip", compression_opts=4)
