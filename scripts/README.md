@@ -4,21 +4,34 @@ This directory contains tracked shell launchers for the heavier manual pyCHMP
 workflows. They wrap the Python entry points in `../examples/` with editable
 option blocks and shared test-data path resolution.
 
+## Layout
+
+- `unix/`
+  - Canonical Unix shell launchers (`.sh`).
+- `windows/`
+  - Windows Command Prompt launchers (`.cmd`).
+
 ## Scripts
 
-- `fit_q0_obs_map_options_test.sh`
+- `unix/fit_q0_obs_map_options_test.sh`
   - Wraps `examples/fit_q0_obs_map.py`.
   - Runs Q0 fitting against a real observational EOVSA FITS map plus a matching
     model H5.
 
-- `validate_q0_recovery_options_test.sh`
+- `unix/validate_q0_recovery_options_test.sh`
   - Wraps `examples/validate_q0_recovery.py`.
   - Runs the synthetic recovery workflow against a matching model H5.
 
-- `scan_ab_obs_map_options_test.sh`
+- `unix/scan_ab_obs_map_options_test.sh`
   - Wraps `examples/scan_ab_obs_map.py`.
   - Runs a real observational rectangular `(a, b)` scan against the matching
     model H5 and writes a consolidated H5 scan file.
+
+- `windows/fit_q0_obs_map_options_test.cmd`
+- `windows/validate_q0_recovery_options_test.cmd`
+- `windows/scan_ab_obs_map_options_test.cmd`
+  - Windows counterparts of the Unix launchers, intended for `cmd.exe` and the
+    viewer Run tab on Windows.
 
 ## Expected Layout
 
@@ -47,9 +60,17 @@ PYCHMP_TESTDATA_REPO=/path/to/pyGXrender-test-data
 Run from anywhere:
 
 ```bash
-pyCHMP/scripts/fit_q0_obs_map_options_test.sh
-pyCHMP/scripts/validate_q0_recovery_options_test.sh
-pyCHMP/scripts/scan_ab_obs_map_options_test.sh
+pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh
+pyCHMP/scripts/unix/validate_q0_recovery_options_test.sh
+pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh
+```
+
+On Windows `cmd.exe`:
+
+```bat
+pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd
+pyCHMP\scripts\windows\validate_q0_recovery_options_test.cmd
+pyCHMP\scripts\windows\scan_ab_obs_map_options_test.cmd
 ```
 
 All tracked launchers support:
@@ -60,6 +81,11 @@ All tracked launchers support:
 
 This prints the resolved inputs and the exact Python command, then exits
 without starting a render, fit, or scan.
+
+The scan launchers reuse the same artifact by default so reruns resume and
+skip points already present in the artifact. For a fresh timestamped artifact,
+set `PYCHMP_TIMESTAMP_ARTIFACTS=1`. To force a specific artifact file, set
+`ARTIFACT_H5`.
 
 ## Editing Model / Map Choices
 
@@ -77,6 +103,9 @@ MODEL_H5_PATH=/path/to/model.h5
 OBS_FITS_PATH=/path/to/map.fits
 EBTEL_PATH=/path/to/ebtel.sav
 PYTHON_BIN=/path/to/python
+ARTIFACT_H5=/path/to/scan_output.h5
+ARTIFACTS_STEM=custom_scan_name
+PYCHMP_TIMESTAMP_ARTIFACTS=1
 ```
 
 ## Notes

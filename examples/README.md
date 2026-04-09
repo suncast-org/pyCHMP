@@ -103,27 +103,31 @@ python examples/validate_q0_recovery.py \
 
 ## Tracked Launcher Scripts
 
-For the heavier manual workflows, tracked shell launchers live in `scripts/`:
+For the heavier manual workflows, tracked launchers live in `scripts/unix/`
+and `scripts/windows/`:
 
-- `scripts/fit_q0_obs_map_options_test.sh`
+- `scripts/unix/fit_q0_obs_map_options_test.sh`
   - Wraps `examples/fit_q0_obs_map.py` with a commented option block for easy
     interactive toggling.
   - Resolves test data from a sibling `pyGXrender-test-data` checkout by
     default.
   - Supports `--dry-run` to print the resolved command without starting a fit.
 
-- `scripts/validate_q0_recovery_options_test.sh`
+- `scripts/unix/validate_q0_recovery_options_test.sh`
   - Wraps `examples/validate_q0_recovery.py` with the same style of line-by-line
     option editing.
   - Resolves the matching model and EBTEL input from sibling test data.
   - Supports `--dry-run` to print the resolved command without starting a run.
 
-- `scripts/scan_ab_obs_map_options_test.sh`
+- `scripts/unix/scan_ab_obs_map_options_test.sh`
   - Wraps `examples/scan_ab_obs_map.py` with one option per line for easy grid
     editing.
   - Resolves the matching EOVSA map, model, and EBTEL input from sibling test
     data.
   - Supports `--dry-run` to print the resolved command without starting the scan.
+
+- `scripts/windows/*.cmd`
+  - Windows counterparts intended for `cmd.exe` usage and the viewer Run tab.
 
 ## Relationship to tests
 
