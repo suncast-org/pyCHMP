@@ -67,6 +67,23 @@ def _save_last_directory(path: Path | None) -> None:
         pass
 
 
+def _format_scalar(value: Any, pattern: str) -> str:
+    try:
+        numeric = float(value)
+    except Exception:
+        return "n/a"
+    if not np.isfinite(numeric):
+        return "nan"
+    if pattern.endswith("f") and numeric != 0.0 and abs(numeric) < 1e-4:
+        precision_text = pattern[1:-1] if pattern.startswith(".") else ""
+        try:
+            precision = max(1, int(precision_text))
+        except Exception:
+            precision = 6
+        return format(numeric, f".{precision}e")
+    return format(numeric, pattern)
+
+
 class _ToolTip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -112,6 +129,8 @@ class _SelectedSolutionWindow:
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.load_blos = False
         self.current_context: dict[str, Any] | None = None
+        self.show_mask_contours_var = tk.BooleanVar(value=True)
+        self.mask_type_var = tk.StringVar(value="ROI mask: union")
 
         outer = ttk.Frame(self.window, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
@@ -121,12 +140,21 @@ class _SelectedSolutionWindow:
 
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        toolbar.columnconfigure(2, weight=1)
+        toolbar.columnconfigure(4, weight=1)
         self.blos_button = ttk.Button(toolbar, text="Load B_los", command=self._load_blos_now)
         self.blos_button.grid(row=0, column=0, sticky="w")
         _ToolTip(self.blos_button, "Load B_los: fetch and cache the external reference panel on demand for the current model.")
+        self.mask_contour_check = ttk.Checkbutton(
+            toolbar,
+            text="Show ROI Mask Contour",
+            variable=self.show_mask_contours_var,
+            command=self._toggle_mask_contours,
+        )
+        self.mask_contour_check.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        _ToolTip(self.mask_contour_check, "Toggle the displayed ROI mask contour overlay on the observed, modeled, and residual panels.")
+        ttk.Label(toolbar, textvariable=self.mask_type_var, anchor=tk.W).grid(row=0, column=2, sticky="w", padx=(10, 0))
         self.status_var = tk.StringVar(value="Selected solution window is ready.")
-        ttk.Label(toolbar, textvariable=self.status_var, anchor=tk.W).grid(row=0, column=1, columnspan=2, sticky="ew", padx=(8, 0))
+        ttk.Label(toolbar, textvariable=self.status_var, anchor=tk.W).grid(row=0, column=3, columnspan=2, sticky="ew", padx=(10, 0))
 
         from matplotlib.figure import Figure
 
@@ -170,21 +198,54 @@ class _SelectedSolutionWindow:
             wcs_header_transform=context["wcs_header_transform"],
             load_blos=self.load_blos,
         )
+        self.panel.set_mask_contours_visible(bool(self.show_mask_contours_var.get()))
+        self.panel._draw_mask_contours(
+            bool(self.show_mask_contours_var.get()),
+            np.asarray(context["observed_noisy"], dtype=float),
+            np.asarray(context["modeled_best"], dtype=float),
+            diagnostics,
+        )
         slice_label = str(context["slice_label"])
+        mask_type = str(diagnostics.get("mask_type", "union")).strip() or "union"
+        threshold_value = diagnostics.get("threshold")
+        try:
+            threshold_text = f"{float(threshold_value):.3f}"
+        except Exception:
+            threshold_text = "n/a"
+        self.mask_type_var.set(f"ROI mask: {mask_type} @ {threshold_text}")
         self.window.title(
             "pyCHMP Selected Solution"
             f" - {slice_label} - a={float(diagnostics.get('a', np.nan)):.3f}"
             f" b={float(diagnostics.get('b', np.nan)):.3f}"
         )
+        elapsed_seconds = diagnostics.get("elapsed_seconds")
+        try:
+            elapsed_value = float(elapsed_seconds)
+        except Exception:
+            elapsed_value = float("nan")
+        elapsed_text = f" | elapsed={elapsed_value:.3f} s" if np.isfinite(elapsed_value) else ""
         self.status_var.set(
-            f"Slice: {slice_label} | q0={float(diagnostics.get('q0_recovered', np.nan)):.6f}"
-            f" | B_los: {'loaded' if self.load_blos else 'lazy'}"
+            f"Slice: {slice_label} | q0={_format_scalar(diagnostics.get('q0_recovered', np.nan), '.6f')}"
+            f" | B_los: {'loaded' if self.load_blos else 'lazy'}{elapsed_text}"
         )
         self.canvas.draw_idle()
 
     def _load_blos_now(self) -> None:
         self.load_blos = True
         self.update_selection()
+
+    def _toggle_mask_contours(self) -> None:
+        self.panel.set_mask_contours_visible(bool(self.show_mask_contours_var.get()))
+        if self.current_context is None:
+            return
+        diagnostics = dict(self.current_context["diagnostics"])
+        self.panel._draw_mask_contours(
+            bool(self.show_mask_contours_var.get()),
+            np.asarray(self.current_context["observed_noisy"], dtype=float),
+            np.asarray(self.current_context["modeled_best"], dtype=float),
+            diagnostics,
+        )
+        self.canvas.draw_idle()
 
 
 class PychmpViewApp:
@@ -200,7 +261,7 @@ class PychmpViewApp:
     _DISPLAY_PAD = 8
     _ACTIVE_REFRESH_GRACE_S = 10.0
 
-    def __init__(self, root: tk.Tk, artifact_h5: Path | None, *, initial_metric: str = "chi2") -> None:
+    def __init__(self, root: tk.Tk, artifact_h5: Path | None, *, initial_metric: str | None = None) -> None:
         self.root = root
         self.artifact_h5 = artifact_h5
         self.payload = {}
@@ -208,7 +269,9 @@ class PychmpViewApp:
         self.b_values = np.asarray([], dtype=float)
         self.display_model: dict[str, Any] = {"records": []}
         self.run_target_metric = "chi2"
-        self.metric_var = tk.StringVar(value=initial_metric if initial_metric in METRICS else "chi2")
+        self._preferred_initial_metric = initial_metric if initial_metric in METRICS else None
+        self.metric_var = tk.StringVar(value=self._preferred_initial_metric or "chi2")
+        self._last_rendered_metric = self.metric_var.get() if self.metric_var.get() in METRICS else "chi2"
         self.slice_key_var = tk.StringVar(value="")
         self.slice_display_var = tk.StringVar(value="")
         self.trials_xmin_var = tk.StringVar(value="")
@@ -228,6 +291,10 @@ class PychmpViewApp:
         self.refresh_signal_path: Path | None = None
         self._refresh_signal_mtime_ns = -1
         self._refresh_signal_phase = ""
+        self._refresh_signal_pending_points: list[tuple[float, float]] = []
+        self._external_refresh_after_id: str | None = None
+        self._present_window_after_id: str | None = None
+        self._is_closing = False
         self.info_notebook: ttk.Notebook | None = None
         self.info_tab: ttk.Frame | None = None
         self.center_notebook: ttk.Notebook | None = None
@@ -260,12 +327,13 @@ class PychmpViewApp:
         self.selected_solution_window: _SelectedSolutionWindow | None = None
 
         self.root.title(f"pychmp-view: {artifact_h5.name}" if artifact_h5 is not None else "pychmp-view")
+        self.root.protocol("WM_DELETE_WINDOW", self._close_root_window)
         self._configure_initial_window_geometry()
 
         self._build_ui()
         self._refresh_all()
-        self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
-        self.root.after(50, self._present_window)
+        self._external_refresh_after_id = self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
+        self._present_window_after_id = self.root.after(50, self._present_window)
 
     def _configure_initial_window_geometry(self) -> None:
         screen_w = max(1, int(self.root.winfo_screenwidth()))
@@ -488,6 +556,9 @@ class PychmpViewApp:
         self._apply_fixed_body_geometry()
 
     def _present_window(self) -> None:
+        self._present_window_after_id = None
+        if self._is_closing:
+            return
         try:
             self.root.deiconify()
             self.root.lift()
@@ -495,6 +566,28 @@ class PychmpViewApp:
             # Briefly mark the window topmost so macOS brings it forward.
             self.root.attributes("-topmost", True)
             self.root.after(200, lambda: self.root.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def _close_root_window(self) -> None:
+        self._is_closing = True
+        for after_id in (self._external_refresh_after_id, self._present_window_after_id):
+            if after_id is None:
+                continue
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._external_refresh_after_id = None
+        self._present_window_after_id = None
+        if self.selected_solution_window is not None:
+            try:
+                self.selected_solution_window.window.destroy()
+            except Exception:
+                pass
+            self.selected_solution_window = None
+        try:
+            self.root.destroy()
         except Exception:
             pass
 
@@ -522,6 +615,20 @@ class PychmpViewApp:
         self.trials_canvas_widget.configure(width=canvas_side, height=canvas_side)
         self.heatmap_figure.set_size_inches(canvas_side / 100.0, canvas_side / 100.0, forward=True)
         self.trials_figure.set_size_inches(canvas_side / 100.0, canvas_side / 100.0, forward=True)
+
+    def _reset_heatmap_colorbar_axis(self) -> None:
+        if self._heatmap_colorbar is not None:
+            try:
+                self._heatmap_colorbar.remove()
+            except Exception:
+                pass
+            self._heatmap_colorbar = None
+        try:
+            self.ax_heatmap_cbar.remove()
+        except Exception:
+            pass
+        self.heatmap_divider = make_axes_locatable(self.ax_heatmap)
+        self.ax_heatmap_cbar = self.heatmap_divider.append_axes("right", size="5%", pad=0.08)
 
     def _refresh_info_text(self) -> None:
         if self.info_text is None:
@@ -581,10 +688,15 @@ class PychmpViewApp:
             return "NO ARTIFACT", "No artifact", "No artifact loaded", "#6c757d", "white"
 
         points = self.payload.get("points", {})
+        diagnostics = dict(self.payload.get("diagnostics") or {})
         total = int(len(points))
         slice_descriptor = dict(self.payload.get("selected_slice") or {})
         slice_label = self._slice_label(slice_descriptor) if slice_descriptor else "current slice"
         slice_count = max(1, int(len(self.available_slices) or 1))
+        adaptive_sparse = (
+            str(diagnostics.get("artifact_kind", "")).strip().lower() == "pychmp_ab_scan_sparse_points"
+            and str(diagnostics.get("search_mode", "")).strip().lower() == "adaptive_local_single_frequency"
+        )
         if total == 0:
             toolbar_detail = f"{slice_label} | 0/{total} computed"
             info_detail = f"Current slice: {slice_label}\nGrid points: {total}\nComputed: 0\nArtifact slices: {slice_count}"
@@ -612,9 +724,15 @@ class PychmpViewApp:
         if phase_complete:
             badge = "FINISHED"
             color = "#2b8a3e"
+        elif adaptive_sparse and refresh_active:
+            badge = "RUNNING"
+            color = "#0b7285"
         elif (refresh_active or phase_running) and noncomputed > 0:
             badge = "RUNNING"
             color = "#0b7285"
+        elif adaptive_sparse and phase_running:
+            badge = "INCOMPLETE"
+            color = "#b26a00"
         elif noncomputed > 0:
             badge = "INCOMPLETE"
             color = "#b26a00"
@@ -628,6 +746,22 @@ class PychmpViewApp:
             f"Grid points: {total}",
             f"Computed: {computed}",
         ]
+        run_history = list(self.payload.get("run_history", [])) if self.payload else []
+        info_lines.append(f"Run history entries: {len(run_history)}")
+        if run_history:
+            latest_history = dict(run_history[-1])
+            latest_timestamp = str(latest_history.get("timestamp_utc", "")).strip()
+            latest_action = str(latest_history.get("action", "")).strip()
+            latest_command = str(
+                latest_history.get("wrapper_command")
+                or latest_history.get("effective_python_command")
+                or ""
+            ).strip()
+            if latest_timestamp or latest_action:
+                label = " ".join(part for part in (latest_timestamp, f"({latest_action})" if latest_action else "") if part)
+                info_lines.append(f"Latest run: {label}".strip())
+            if latest_command:
+                info_lines.append(f"Latest command: {latest_command}")
         if pending > 0:
             info_lines.append(f"Pending: {pending}")
         if failed > 0:
@@ -638,19 +772,44 @@ class PychmpViewApp:
         phase_display = str(self._refresh_signal_phase or "").strip()
         if phase_display:
             info_lines.append(f"Last phase: {phase_display}")
+        if self._refresh_signal_pending_points:
+            active_points = ", ".join(
+                f"(a={a_value:.3f}, b={b_value:.3f})"
+                for a_value, b_value in self._refresh_signal_pending_points[:4]
+            )
+            if len(self._refresh_signal_pending_points) > 4:
+                active_points += f", ... (+{len(self._refresh_signal_pending_points) - 4} more)"
+            info_lines.append(f"Active point(s): {active_points}")
         return badge, toolbar_detail, "\n".join(info_lines), color, "white"
 
-    def _read_refresh_signal_phase(self) -> str:
+    def _read_refresh_signal_payload(self) -> dict[str, Any]:
         if self.refresh_signal_path is None or not self.refresh_signal_path.exists():
-            return ""
+            return {"phase": "", "pending_points": []}
         try:
             text = self.refresh_signal_path.read_text(encoding="utf-8").strip()
         except Exception:
-            return ""
+            return {"phase": "", "pending_points": []}
         if not text:
-            return ""
+            return {"phase": "", "pending_points": []}
+        if text.startswith("{"):
+            try:
+                payload = json.loads(text)
+                phase = str(payload.get("phase", "")).strip()
+                pending_points: list[tuple[float, float]] = []
+                for item in payload.get("pending_points", []) or []:
+                    try:
+                        a_value = float(item.get("a"))
+                        b_value = float(item.get("b"))
+                    except Exception:
+                        continue
+                    if np.isfinite(a_value) and np.isfinite(b_value):
+                        pending_points.append((a_value, b_value))
+                return {"phase": phase, "pending_points": pending_points}
+            except Exception:
+                return {"phase": "", "pending_points": []}
         parts = text.split(maxsplit=1)
-        return parts[1].strip() if len(parts) == 2 else parts[0].strip()
+        phase = parts[1].strip() if len(parts) == 2 else parts[0].strip()
+        return {"phase": phase, "pending_points": []}
 
     def _refresh_scan_state_display(self) -> None:
         badge, toolbar_detail, info_detail, bg, fg = self._scan_state_snapshot()
@@ -671,6 +830,7 @@ class PychmpViewApp:
         add_item("□", "#1f77b4", "best rho2")
         add_item("△", "#2ca02c", "best eta2")
         add_item("×", "#444444", "selected point")
+        add_item("*", "#f08c00", "active point")
 
     def _build_trials_controls(self) -> None:
         if self.trials_controls is None:
@@ -842,26 +1002,63 @@ class PychmpViewApp:
             pass
         return 0, 0
 
-    def _capture_current_slice_view_state(self) -> None:
+    def _capture_current_slice_view_state(self, metric_name: str | None = None) -> None:
         token = self._slice_state_token()
         if token is None:
             return
-        self.slice_display_state[token] = {
-            "metric": str(self.metric_var.get()),
-            "a_index": int(self.a_index_var.get()),
-            "b_index": int(self.b_index_var.get()),
-            "trials_xmin": str(self.trials_xmin_var.get()),
-            "trials_xmax": str(self.trials_xmax_var.get()),
-            "trials_ymin": str(self.trials_ymin_var.get()),
-            "trials_ymax": str(self.trials_ymax_var.get()),
-            "trials_xscale": str(self.trials_xscale_var.get() or "linear"),
-            "trials_yscale": str(self.trials_yscale_var.get() or "linear"),
-        }
+        existing = dict(self.slice_display_state.get(token, {}))
+        per_metric = dict(existing.get("trials_by_metric", {}))
+        current_metric = str(metric_name or self.metric_var.get())
+        if current_metric in METRICS:
+            per_metric[current_metric] = {
+                "trials_xmin": str(self.trials_xmin_var.get()),
+                "trials_xmax": str(self.trials_xmax_var.get()),
+                "trials_ymin": str(self.trials_ymin_var.get()),
+                "trials_ymax": str(self.trials_ymax_var.get()),
+                "trials_xscale": str(self.trials_xscale_var.get() or "linear"),
+                "trials_yscale": str(self.trials_yscale_var.get() or "linear"),
+            }
+        existing.update(
+            {
+                "metric": current_metric,
+                "a_index": int(self.a_index_var.get()),
+                "b_index": int(self.b_index_var.get()),
+                "trials_by_metric": per_metric,
+            }
+        )
+        self.slice_display_state[token] = existing
+
+    def _reset_trials_controls_only(self) -> None:
+        self.trials_xscale_var.set("linear")
+        self.trials_yscale_var.set("linear")
+        self.trials_xmin_var.set("")
+        self.trials_xmax_var.set("")
+        self.trials_ymin_var.set("")
+        self.trials_ymax_var.set("")
+
+    def _restore_trials_controls_for_metric(self, metric_name: str) -> None:
+        token = self._slice_state_token()
+        state = self.slice_display_state.get(token or "", {})
+        per_metric = dict(state.get("trials_by_metric", {}))
+        metric_state = dict(per_metric.get(str(metric_name), {}))
+        if not metric_state:
+            self._reset_trials_controls_only()
+            return
+        self.trials_xscale_var.set(str(metric_state.get("trials_xscale", "linear") or "linear"))
+        self.trials_yscale_var.set(str(metric_state.get("trials_yscale", "linear") or "linear"))
+        self.trials_xmin_var.set(str(metric_state.get("trials_xmin", "")))
+        self.trials_xmax_var.set(str(metric_state.get("trials_xmax", "")))
+        self.trials_ymin_var.set(str(metric_state.get("trials_ymin", "")))
+        self.trials_ymax_var.set(str(metric_state.get("trials_ymax", "")))
 
     def _restore_slice_view_state(self) -> None:
         selected_key = str(self.payload.get("selected_slice_key", "")).strip()
         token = self._slice_state_token(selected_key)
-        metric_name = str(self.metric_var.get()) if self.metric_var.get() in METRICS else self.run_target_metric
+        metric_name = (
+            self._preferred_initial_metric
+            or (str(self.metric_var.get()) if self.metric_var.get() in METRICS else self.run_target_metric)
+            or self.run_target_metric
+        )
         default_a, default_b = self._default_point_selection(metric_name)
         state = self.slice_display_state.get(token or "", None)
 
@@ -869,12 +1066,8 @@ class PychmpViewApp:
             self.metric_var.set(metric_name if metric_name in METRICS else "chi2")
             self.a_index_var.set(default_a)
             self.b_index_var.set(default_b)
-            self.trials_xscale_var.set("linear")
-            self.trials_yscale_var.set("linear")
-            self.trials_xmin_var.set("")
-            self.trials_xmax_var.set("")
-            self.trials_ymin_var.set("")
-            self.trials_ymax_var.set("")
+            self._reset_trials_controls_only()
+            self._preferred_initial_metric = None
             return
 
         saved_metric = str(state.get("metric", metric_name))
@@ -889,13 +1082,8 @@ class PychmpViewApp:
             restored_b = int(np.clip(int(state.get("b_index", restored_b)), 0, max(0, self.b_values.size - 1)))
         self.a_index_var.set(restored_a)
         self.b_index_var.set(restored_b)
-
-        self.trials_xscale_var.set(str(state.get("trials_xscale", "linear") or "linear"))
-        self.trials_yscale_var.set(str(state.get("trials_yscale", "linear") or "linear"))
-        self.trials_xmin_var.set(str(state.get("trials_xmin", "")))
-        self.trials_xmax_var.set(str(state.get("trials_xmax", "")))
-        self.trials_ymin_var.set(str(state.get("trials_ymin", "")))
-        self.trials_ymax_var.set(str(state.get("trials_ymax", "")))
+        self._preferred_initial_metric = None
+        self._restore_trials_controls_for_metric(saved_metric)
 
     def _refresh_slice_controls(self) -> None:
         descriptors = list(self.available_slices)
@@ -935,7 +1123,7 @@ class PychmpViewApp:
             self.b_menu.current(int(np.clip(self.b_index_var.get(), 0, max(0, len(b_labels) - 1))))
 
     def _reload_payload(self, artifact_path: Path | None = None) -> None:
-        self._capture_current_slice_view_state()
+        self._capture_current_slice_view_state(self._last_rendered_metric)
         if artifact_path is not None:
             self.artifact_h5 = artifact_path
         if self.artifact_h5 is None:
@@ -950,6 +1138,7 @@ class PychmpViewApp:
             self.refresh_signal_path = None
             self._refresh_signal_mtime_ns = -1
             self._refresh_signal_phase = ""
+            self._refresh_signal_pending_points = []
             self._refresh_action_states()
             self._refresh_all()
             return
@@ -958,10 +1147,13 @@ class PychmpViewApp:
         if self.refresh_signal_path.exists():
             try:
                 self._refresh_signal_mtime_ns = int(self.refresh_signal_path.stat().st_mtime_ns)
-                self._refresh_signal_phase = self._read_refresh_signal_phase()
+                refresh_payload = self._read_refresh_signal_payload()
+                self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
+                self._refresh_signal_pending_points = list(refresh_payload.get("pending_points", []))
             except Exception:
                 self._refresh_signal_mtime_ns = -1
                 self._refresh_signal_phase = ""
+                self._refresh_signal_pending_points = []
         _save_last_directory(self.last_artifact_dir)
         prev_a = int(self.a_index_var.get())
         prev_b = int(self.b_index_var.get())
@@ -1007,6 +1199,9 @@ class PychmpViewApp:
         raise RuntimeError("unknown artifact loading failure")
 
     def _poll_external_refresh_signal(self) -> None:
+        self._external_refresh_after_id = None
+        if self._is_closing:
+            return
         try:
             if self.refresh_signal_path is None:
                 return
@@ -1014,12 +1209,18 @@ class PychmpViewApp:
                 mtime_ns = int(self.refresh_signal_path.stat().st_mtime_ns)
                 if mtime_ns > int(self._refresh_signal_mtime_ns):
                     self._refresh_signal_mtime_ns = mtime_ns
-                    self._refresh_signal_phase = self._read_refresh_signal_phase()
+                    refresh_payload = self._read_refresh_signal_payload()
+                    self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
+                    self._refresh_signal_pending_points = list(refresh_payload.get("pending_points", []))
                     self._reload_payload()
         except Exception:
             pass
         finally:
-            self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
+            if not self._is_closing:
+                try:
+                    self._external_refresh_after_id = self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
+                except Exception:
+                    self._external_refresh_after_id = None
 
     def _selected_point(self) -> dict[str, Any]:
         return self.payload["points"][(int(self.a_index_var.get()), int(self.b_index_var.get()))]
@@ -1076,6 +1277,8 @@ class PychmpViewApp:
         self._refresh_all()
 
     def _on_metric_changed(self) -> None:
+        self._capture_current_slice_view_state(self._last_rendered_metric)
+        self._restore_trials_controls_for_metric(str(self.metric_var.get()))
         self._jump_to_best()
 
     def _on_a_changed(self) -> None:
@@ -1093,7 +1296,7 @@ class PychmpViewApp:
         selected_key = str(self.available_slices[current].get("key", "")).strip()
         if not selected_key or selected_key == self._selected_slice_key():
             return
-        self._capture_current_slice_view_state()
+        self._capture_current_slice_view_state(self._last_rendered_metric)
         self.slice_key_var.set(selected_key)
         self._reload_payload()
 
@@ -1124,9 +1327,7 @@ class PychmpViewApp:
             self._refresh_action_states()
             self._refresh_scan_state_display()
             self.ax_heatmap.clear()
-            if self._heatmap_colorbar is not None:
-                self._heatmap_colorbar = None
-            self.ax_heatmap_cbar.clear()
+            self._reset_heatmap_colorbar_axis()
             self.ax_trials.clear()
             self.ax_heatmap.set_axis_off()
             self.ax_heatmap_cbar.set_axis_off()
@@ -1140,9 +1341,7 @@ class PychmpViewApp:
         if not self._has_selected_point():
             self._refresh_scan_state_display()
             self.ax_heatmap.clear()
-            if self._heatmap_colorbar is not None:
-                self._heatmap_colorbar = None
-            self.ax_heatmap_cbar.clear()
+            self._reset_heatmap_colorbar_axis()
             self.ax_trials.clear()
             self.ax_heatmap_cbar.set_axis_off()
             self.ax_heatmap.text(
@@ -1196,9 +1395,7 @@ class PychmpViewApp:
         records = list(self.display_model.get("records", []))
         record_lookup = {(int(record["a_index"]), int(record["b_index"])): record for record in records}
         self.ax_heatmap.clear()
-        if self._heatmap_colorbar is not None:
-            self._heatmap_colorbar = None
-        self.ax_heatmap_cbar.clear()
+        self._reset_heatmap_colorbar_axis()
         self.ax_heatmap_cbar.set_axis_on()
         patches = [
             Rectangle(
@@ -1237,12 +1434,22 @@ class PychmpViewApp:
             self.ax_heatmap.scatter(
                 [b_value],
                 [a_value],
+                s=120,
+                marker=marker,
+                facecolor="none",
+                edgecolor="white",
+                linewidth=3.2,
+                zorder=5,
+            )
+            self.ax_heatmap.scatter(
+                [b_value],
+                [a_value],
                 s=80,
                 marker=marker,
                 facecolor="none",
                 edgecolor=color,
-                linewidth=2.0,
-                zorder=5,
+                linewidth=1.8,
+                zorder=6,
             )
 
         current_a = int(self.a_index_var.get())
@@ -1253,12 +1460,34 @@ class PychmpViewApp:
         self.ax_heatmap.scatter(
             [current_b_value],
             [current_a_value],
+            s=170,
+            marker="x",
+            color="black",
+            linewidth=3.6,
+            zorder=7,
+        )
+        self.ax_heatmap.scatter(
+            [current_b_value],
+            [current_a_value],
             s=120,
             marker="x",
             color="white",
             linewidth=2.2,
-            zorder=6,
+            zorder=8,
         )
+        if self._refresh_signal_pending_points:
+            pending_b = [float(b_value) for _a_value, b_value in self._refresh_signal_pending_points]
+            pending_a = [float(a_value) for a_value, _b_value in self._refresh_signal_pending_points]
+            self.ax_heatmap.scatter(
+                pending_b,
+                pending_a,
+                s=180,
+                marker="*",
+                facecolor="#f08c00",
+                edgecolor="black",
+                linewidth=0.8,
+                zorder=7,
+            )
 
     def _draw_trials(self) -> None:
         point = self._selected_point()
@@ -1296,7 +1525,8 @@ class PychmpViewApp:
             self.ax_trials.grid(alpha=0.25)
             self._apply_trials_axis_controls(q0_trials=q0_trials, metric_trials=metric_trials)
             self._sync_trials_axis_controls_from_axes()
-            self._capture_current_slice_view_state()
+            self._last_rendered_metric = selected_metric if selected_metric in METRICS else point_metric
+            self._capture_current_slice_view_state(self._last_rendered_metric)
         else:
             self.ax_trials.text(
                 0.02,
@@ -1309,7 +1539,8 @@ class PychmpViewApp:
             self.ax_trials.set_axis_off()
             self.trials_xscale_var.set("linear")
             self.trials_yscale_var.set("linear")
-            self._capture_current_slice_view_state()
+            self._last_rendered_metric = selected_metric if selected_metric in METRICS else point_metric
+            self._capture_current_slice_view_state(self._last_rendered_metric)
         self.ax_trials.set_box_aspect(1.0)
         self.trials_figure.subplots_adjust(left=0.14, right=0.98, bottom=0.14, top=0.92)
 
@@ -1324,7 +1555,7 @@ class PychmpViewApp:
             f"Run target metric: {self.run_target_metric}\n"
             f"Selected point: a={self.a_values[int(self.a_index_var.get())]:.3f}, "
             f"b={self.b_values[int(self.b_index_var.get())]:.3f}\n"
-            f"Best q0: {float(point['q0']):.6f}\n"
+            f"Best q0: {_format_scalar(point.get('q0', np.nan), '.6f')}\n"
             f"Point {point_metric}: {best_metric_value:.6e}\n"
             f"Status: {success_text}"
         )
@@ -1338,11 +1569,19 @@ class PychmpViewApp:
             f"a = {self.a_values[int(self.a_index_var.get())]:.3f}",
             f"b = {self.b_values[int(self.b_index_var.get())]:.3f}",
             f"status = {point.get('status', 'computed')}",
-            f"q0 = {float(point['q0']):.6f}",
+            f"q0 = {_format_scalar(point.get('q0', np.nan), '.6f')}",
             f"chi2 = {float(diagnostics.get('chi2', np.nan)):.6e}",
             f"rho2 = {float(diagnostics.get('rho2', np.nan)):.6e}",
             f"eta2 = {float(diagnostics.get('eta2', np.nan)):.6e}",
         ]
+        elapsed_seconds = diagnostics.get("elapsed_seconds")
+        try:
+            elapsed_value = float(elapsed_seconds)
+        except Exception:
+            elapsed_value = float("nan")
+        if np.isfinite(elapsed_value):
+            lines[3] = f"{lines[3]} in {elapsed_value:.3f} s"
+            lines.append(f"elapsed = {elapsed_value:.3f} s")
         message = diagnostics.get("optimizer_message")
         if message:
             lines.extend(["", "message:", str(message)])
@@ -1409,7 +1648,7 @@ class PychmpViewApp:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive viewer for consolidated `(a,b)` scan artifacts.")
     parser.add_argument("artifact_h5", type=Path, nargs="?", help="Optional consolidated H5 produced by scan_ab_obs_map.py")
-    parser.add_argument("--metric", choices=METRICS, default="chi2", help="Initial metric shown in the heatmap.")
+    parser.add_argument("--metric", choices=METRICS, default=None, help="Optional initial metric override shown in the heatmap.")
     return parser
 
 

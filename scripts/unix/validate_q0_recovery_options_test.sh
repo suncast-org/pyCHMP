@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -57,22 +57,32 @@ if [[ -n "${PYTHON_BIN:-}" ]]; then
 else
   CANDIDATES=(
     "$WORKSPACE_ROOT/pyCHMP/.conda/bin/python"
+    "$WORKSPACE_ROOT/pyCHMP/.conda/python.exe"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
+    "$WORKSPACE_ROOT/gximagecomputing/.conda/python.exe"
     "$HOME/miniforge3/bin/python"
     "$HOME/miniforge3/envs/suncast/bin/python"
-    "python"
   )
+  if [[ -d "$HOME/.conda/envs" ]]; then
+    while IFS= read -r env_python; do
+      CANDIDATES+=("$env_python")
+    done < <(find "$HOME/.conda/envs" -maxdepth 2 -type f \( -path "*/bin/python" -o -name "python.exe" \) | sort)
+  fi
   for CANDIDATE in "${CANDIDATES[@]}"; do
-    if [[ "$CANDIDATE" == "python" ]]; then
-      if command -v python >/dev/null 2>&1 && python -c "import gxrender.sdk" >/dev/null 2>&1; then
-        PYTHON_CMD="python"
-        break
-      fi
-    elif [[ -x "$CANDIDATE" ]] && "$CANDIDATE" -c "import gxrender.sdk" >/dev/null 2>&1; then
+    if [[ -x "$CANDIDATE" ]] && "$CANDIDATE" -c "import gxrender.sdk" >/dev/null 2>&1; then
       PYTHON_CMD="$CANDIDATE"
       break
     fi
   done
+  if [[ -z "$PYTHON_CMD" ]]; then
+    for command_name in python3 python; do
+      command_path="$(command -v "$command_name" 2>/dev/null || true)"
+      if [[ -n "$command_path" && "$command_path" != *"/WindowsApps/"* ]] && "$command_path" -c "import gxrender.sdk" >/dev/null 2>&1; then
+        PYTHON_CMD="$command_path"
+        break
+      fi
+    done
+  fi
 fi
 
 MODELS_ROOT="$TESTDATA_REPO/raw/models"

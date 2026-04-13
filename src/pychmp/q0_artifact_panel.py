@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Callable
+import warnings
 
 import h5py
 import numpy as np
 from astropy.io import fits
-from astropy.wcs import WCS
+from astropy.wcs import FITSFixedWarning, WCS
 from matplotlib.figure import Figure
 
 
@@ -15,6 +16,14 @@ METRIC_CHOICES = ("chi2", "rho2", "eta2")
 _REFMAP_CACHE: dict[str, Path | None] = {}
 _BLOS_CACHE: dict[str, tuple[np.ndarray, fits.Header] | None] = {}
 _BLOS_FOV_CACHE: dict[str, tuple[np.ndarray, fits.Header] | None] = {}
+
+
+def _safe_wcs(header: fits.Header) -> WCS:
+    """Build a WCS while suppressing benign DATE-OBS->MJD-OBS fix warnings."""
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FITSFixedWarning)
+        return WCS(header)
 
 
 def _decode_h5_scalar(value: Any) -> str:
@@ -132,6 +141,23 @@ def _color_limits(data: np.ndarray, *, symmetric: bool = False) -> tuple[float, 
     return vmin, vmax
 
 
+def _format_scalar(value: Any, pattern: str) -> str:
+    try:
+        numeric = float(value)
+    except Exception:
+        return "n/a"
+    if not np.isfinite(numeric):
+        return "nan"
+    if pattern.endswith("f") and numeric != 0.0 and abs(numeric) < 1e-4:
+        precision_text = pattern[1:-1] if pattern.startswith(".") else ""
+        try:
+            precision = max(1, int(precision_text))
+        except Exception:
+            precision = 6
+        return format(numeric, f".{precision}e")
+    return format(numeric, pattern)
+
+
 def _crop_blos_to_fov(
     model_path: Path,
     *,
@@ -196,7 +222,47 @@ class Q0ArtifactPanelFigure:
         self._blos_note: Any = None
         self._blos_cache_key: str | None = None
         self._blos_loaded = False
+        self._show_mask_contours = True
 
+    def set_mask_contours_visible(self, visible: bool) -> None:
+        self._show_mask_contours = bool(visible)
+
+    def mask_contours_visible(self) -> bool:
+        return bool(self._show_mask_contours)
+
+    def _get_mask(self, observed, modeled, diagnostics):
+        # Get mask type and threshold from diagnostics
+        mask_type = diagnostics.get("mask_type", "union")
+        threshold = float(diagnostics.get("threshold", 0.1))
+        # Compute mask
+        from pychmp.metrics import threshold_union_mask, threshold_data_mask, threshold_model_mask, threshold_and_mask
+        mask_fn = {
+            "union": threshold_union_mask,
+            "data": threshold_data_mask,
+            "model": threshold_model_mask,
+            "and": threshold_and_mask,
+        }.get(mask_type, threshold_union_mask)
+        return mask_fn(observed, modeled, threshold)
+
+    def _draw_mask_contours(self, show, observed, modeled, diagnostics):
+        # Overlay mask contours on observed, modeled, and residual panels
+        mask = self._get_mask(observed, modeled, diagnostics)
+        for name in ("observed", "modeled", "residual"):
+            ax = self._common_axes.get(name)
+            if ax is None:
+                continue
+            # Remove previous contours
+            previous = getattr(ax, "_mask_contours", ())
+            if hasattr(previous, "remove"):
+                previous.remove()
+            else:
+                for coll in previous:
+                    coll.remove()
+            if show:
+                cs = ax.contour(mask.astype(float), levels=[0.5], colors="lime", linewidths=1.5, alpha=0.8)
+                ax._mask_contours = cs
+            else:
+                ax._mask_contours = ()
     def _build_layout(self, header: fits.Header, shape: tuple[int, int]) -> None:
         self.figure.clear()
         gs = self.figure.add_gridspec(2, 3)
@@ -214,7 +280,7 @@ class Q0ArtifactPanelFigure:
         self._common_notes = {}
 
         for name, slot, cmap in common_specs:
-            axis = self.figure.add_subplot(slot, projection=WCS(header))
+            axis = self.figure.add_subplot(slot, projection=_safe_wcs(header))
             image = axis.imshow(np.zeros(shape, dtype=float), origin="lower", cmap=cmap)
             colorbar = self.figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
             note = axis.text(
@@ -230,6 +296,7 @@ class Q0ArtifactPanelFigure:
             self._common_axes[name] = axis
             self._common_images[name] = image
             self._common_colorbars[name] = colorbar
+            self._common_notes[name] = note
             self._common_notes[name] = note
 
         self._blos_ax = self.figure.add_subplot(gs[0, 0])
@@ -323,7 +390,7 @@ class Q0ArtifactPanelFigure:
                 self._blos_colorbar.remove()
                 self._blos_colorbar = None
             self._blos_ax.remove()
-            self._blos_ax = self.figure.add_subplot(self._gs[0, 0], projection=WCS(blos_header))
+            self._blos_ax = self.figure.add_subplot(self._gs[0, 0], projection=_safe_wcs(blos_header))
             self._blos_image = self._blos_ax.imshow(np.asarray(blos_data, dtype=float), origin="lower", cmap="gray")
             self._blos_colorbar = self.figure.colorbar(self._blos_image, ax=self._blos_ax, fraction=0.046, pad=0.04)
             self._blos_note = self._blos_ax.text(
@@ -489,10 +556,7 @@ class Q0ArtifactPanelFigure:
         self._ensure_layout(header, shape)
 
         def fmt(value: Any, pattern: str) -> str:
-            try:
-                return format(float(value), pattern)
-            except Exception:
-                return "n/a"
+            return _format_scalar(value, pattern)
 
         q0_true = diag.get("q0_truth")
         q0_best = diag.get("q0_recovered")
@@ -554,9 +618,10 @@ class Q0ArtifactPanelFigure:
             b_text=b_text,
             load_blos=load_blos,
         )
+
         self._update_trials(
-            q0_trials=diag.get("fit_q0_trials"),
-            metric_trials=diag.get("fit_metric_trials", diag.get("fit_chi2_trials")),
+            q0_trials=diag.get("fit_q0_trials", ()),
+            metric_trials=diag.get(f"fit_{target_metric}_trials", ()),
             target_metric=target_metric,
             target_metric_val=target_metric_val,
             q0_best=q0_best,
@@ -570,16 +635,19 @@ class Q0ArtifactPanelFigure:
             fmt=fmt,
             diagnostics=diag,
         )
-        self.figure.canvas.draw_idle() if self.figure.canvas is not None else None
+
+        observed_arr = np.asarray(observed_noisy, dtype=float)
+        modeled_arr = np.asarray(modeled_best, dtype=float)
+        self._draw_mask_contours(self._show_mask_contours, observed_arr, modeled_arr, diag)
+
         if out_png is not None:
-            out_png.parent.mkdir(parents=True, exist_ok=True)
-            self.figure.savefig(out_png, dpi=140, facecolor="white")
+            self.figure.savefig(str(out_png), dpi=180)
 
 
 def plot_q0_artifact_panel(
-    out_png: Path,
+    out_png: Path | str | None,
     *,
-    model_path: Path,
+    model_path: Path | str,
     observed_noisy: np.ndarray,
     raw_modeled_best: np.ndarray,
     modeled_best: np.ndarray,
@@ -593,32 +661,41 @@ def plot_q0_artifact_panel(
     show_plot: bool = False,
     defer_show: bool = False,
     wcs_header_transform: Callable[[fits.Header], fits.Header] | None = None,
-    load_blos: bool = True,
-) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ModuleNotFoundError:
-        return
+    load_blos: bool = False,
+) -> Figure:
+    """Render the legacy Q0 artifact panel and optionally save/show it.
 
-    fig = plt.figure(figsize=(14.8, 9.2), constrained_layout=True)
-    panel = Q0ArtifactPanelFigure(fig)
+    This compatibility wrapper preserves the public function used by the
+    example scripts while delegating the actual panel construction to
+    ``Q0ArtifactPanelFigure``.
+    """
+
+    panel = Q0ArtifactPanelFigure()
+    output_path = None if out_png is None else Path(out_png)
     panel.update(
-        model_path=model_path,
-        observed_noisy=observed_noisy,
-        raw_modeled_best=raw_modeled_best,
-        modeled_best=modeled_best,
-        residual=residual,
+        model_path=Path(model_path),
+        observed_noisy=np.asarray(observed_noisy, dtype=float),
+        raw_modeled_best=np.asarray(raw_modeled_best, dtype=float),
+        modeled_best=np.asarray(modeled_best, dtype=float),
+        residual=np.asarray(residual, dtype=float),
         wcs_header=wcs_header,
-        frequency_ghz=frequency_ghz,
+        frequency_ghz=float(frequency_ghz),
         diagnostics=diagnostics,
-        log_metrics=log_metrics,
-        log_q0=log_q0,
+        log_metrics=bool(log_metrics),
+        log_q0=bool(log_q0),
         zoom2best=zoom2best,
         wcs_header_transform=wcs_header_transform,
-        load_blos=load_blos,
-        out_png=out_png,
+        load_blos=bool(load_blos),
+        out_png=output_path,
     )
-    if show_plot and not defer_show:
-        plt.show()
-    if not defer_show:
-        plt.close(fig)
+
+    if show_plot:
+        import matplotlib.pyplot as plt
+
+        plt.figure(panel.figure.number)
+        if defer_show:
+            panel.figure.canvas.draw_idle()
+        else:
+            plt.show()
+
+    return panel.figure

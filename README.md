@@ -47,6 +47,24 @@ pytest -q
 
 User-facing runnable workflows are available in `examples/`.
 
+Consolidated scan artifacts now use one normalized point schema across
+fixed-grid and adaptive search workflows. Each stored point carries the final
+best-fit maps plus per-trial `q0`, `chi2`, `rho2`, and `eta2` histories when
+available, so `pychmp-view` can plot the selected metric history directly from
+the artifact.
+
+Real-data gxrender validation workflows live under `examples/python/` rather
+than in the default automated test suite.
+
+The `examples/` area is now structured to allow parallel workflow formats:
+standalone Python validation scripts live under `examples/python/`, while
+future developer and collaborator notebook examples can live under
+`examples/notebooks/`.
+
+The `scripts/` directory remains reserved for tracked shell launchers (`.sh`
+and `.cmd`) that wrap those Python workflows; it is not the home of the Python
+entry-point files themselves.
+
 ### Version Bumping
 
 This repository uses `bumpver` to keep package versions in sync between

@@ -715,12 +715,19 @@ def find_best_q0(
     if message_prefix:
         result_message = f"{message_prefix}; {result_message}"
 
+    # Post-processing: flag as not successful if best_q0 is at the boundary
+    tol = 1e-8
+    boundary_failure = False
+    if abs(best_q0 - refinement_bounds[0]) < tol or abs(best_q0 - refinement_bounds[1]) < tol:
+        boundary_failure = True
+        result_message += " WARNING: Minimum is at the boundary of the search region; true minimum may lie outside."
+
     return Q0OptimizationResult(
         q0=best_q0,
         objective_value=best_record.objective_value,
         metrics=best_record.metrics,
         target_metric=target_metric,
-        success=bool(result.success),
+        success=bool(result.success) and not boundary_failure,
         nfev=len(cache),
         nit=int(result.nit) + int(bracket_steps),
         message=result_message,

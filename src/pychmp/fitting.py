@@ -6,7 +6,7 @@ from typing import Protocol
 
 import numpy as np
 
-from .metrics import MetricValues, compute_metrics, threshold_union_mask
+from .metrics import MetricValues, compute_metrics, threshold_union_mask, threshold_data_mask, threshold_model_mask, threshold_and_mask
 from .optimize import (
     MetricName,
     ProgressCallback,
@@ -34,6 +34,7 @@ def fit_q0_to_observation(
     hard_q0_min: float | None = None,
     hard_q0_max: float | None = None,
     threshold: float = 0.1,
+    mask_type: str = "union",
     target_metric: MetricName = "chi2",
     xatol: float = 1e-3,
     maxiter: int = 200,
@@ -68,12 +69,20 @@ def fit_q0_to_observation(
         if observed_arr.shape != sigma_arr.shape:
             raise ValueError("observed and sigma must have identical shapes")
 
+
+    mask_fn = {
+        "union": threshold_union_mask,
+        "data": threshold_data_mask,
+        "model": threshold_model_mask,
+        "and": threshold_and_mask,
+    }.get(mask_type, threshold_union_mask)
+
     def metric_function(q0: float) -> Q0MetricEvaluation:
         modeled_arr = np.asarray(renderer.render(float(q0)), dtype=float)
         if modeled_arr.shape != observed_arr.shape:
             raise ValueError("renderer output shape must match observed shape")
 
-        mask = threshold_union_mask(observed_arr, modeled_arr, threshold)
+        mask = mask_fn(observed_arr, modeled_arr, threshold)
         metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
         return Q0MetricEvaluation(
             metrics=metrics,

@@ -39,6 +39,27 @@ def threshold_union_mask(
     return np.logical_or(obs_mask, mod_mask)
 
 
+def threshold_data_mask(observed: np.ndarray, modeled: np.ndarray, threshold: float) -> np.ndarray:
+    """Return mask where observed is above thresholded maximum."""
+    obs_max = float(np.max(observed))
+    return observed > (obs_max * threshold)
+
+
+def threshold_model_mask(observed: np.ndarray, modeled: np.ndarray, threshold: float) -> np.ndarray:
+    """Return mask where modeled is above thresholded maximum."""
+    mod_max = float(np.max(modeled))
+    return modeled > (mod_max * threshold)
+
+
+def threshold_and_mask(observed: np.ndarray, modeled: np.ndarray, threshold: float) -> np.ndarray:
+    """Return mask where both observed and modeled are above thresholded maxima."""
+    obs_max = float(np.max(observed))
+    mod_max = float(np.max(modeled))
+    obs_mask = observed > (obs_max * threshold)
+    mod_mask = modeled > (mod_max * threshold)
+    return np.logical_and(obs_mask, mod_mask)
+
+
 def compute_metrics(
     observed: np.ndarray,
     modeled: np.ndarray,

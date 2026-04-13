@@ -113,6 +113,7 @@ class FakeWorkflowHelpers:
 
 
 def test_gxrender_mw_adapter_renders_single_frequency_map(monkeypatch) -> None:
+    """Render a single-frequency microwave map through the adapter."""
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: FakeGXRender)
     monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
@@ -133,6 +134,7 @@ def test_gxrender_mw_adapter_renders_single_frequency_map(monkeypatch) -> None:
 
 
 def test_gxrender_mw_adapter_requires_single_frequency_cube(monkeypatch) -> None:
+    """Reject gxrender outputs that are not single-frequency cubes."""
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: WrongCubeGXRender)
     monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
@@ -151,6 +153,7 @@ def test_gxrender_mw_adapter_requires_single_frequency_cube(monkeypatch) -> None
 
 
 def test_gxrender_mw_adapter_surfaces_missing_dependency(monkeypatch) -> None:
+    """Surface missing gxrender dependencies during adapter setup."""
     def raise_missing():
         raise ModuleNotFoundError("gxrender")
 
@@ -170,6 +173,7 @@ def test_gxrender_mw_adapter_surfaces_missing_dependency(monkeypatch) -> None:
 
 
 def test_gxrender_context_forwards_named_observer_to_workflow_args(monkeypatch) -> None:
+    """Forward the named observer into shared gxrender workflow args."""
     FakeWorkflowHelpers.prepared_args = None
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: FakeGXRender)
@@ -190,6 +194,7 @@ def test_gxrender_context_forwards_named_observer_to_workflow_args(monkeypatch) 
 
 
 def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -> None:
+    """Use the SDK workflow path when persistent output is requested."""
     class FakeRenderMWWorkflow:
         last_args = None
 

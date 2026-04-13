@@ -20,6 +20,7 @@ class WrongShapeRenderer:
 
 
 def test_fit_q0_to_observation_recovers_true_q0() -> None:
+    """Recover the true q0 from a synthetic observation."""
     observed = np.array([[10.0, 12.0], [14.0, 16.0]])
     sigma = np.ones_like(observed)
     renderer = SyntheticRenderer(observed, true_q0=3.7)
@@ -39,6 +40,7 @@ def test_fit_q0_to_observation_recovers_true_q0() -> None:
 
 
 def test_fit_q0_to_observation_validates_shape_mismatch() -> None:
+    """Reject renderer outputs whose shape differs from the observation."""
     observed = np.ones((3, 3))
     sigma = np.ones((3, 3))
 
@@ -53,6 +55,7 @@ def test_fit_q0_to_observation_validates_shape_mismatch() -> None:
 
 
 def test_fit_q0_to_observation_validates_observed_sigma_shapes() -> None:
+    """Reject observed and sigma arrays with incompatible shapes."""
     observed = np.ones((3, 3))
     sigma = np.ones((2, 2))
 

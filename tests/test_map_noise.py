@@ -221,7 +221,8 @@ class TestEdgeCases:
     def test_zero_variance_data(self) -> None:
         """Test handling of constant data."""
         data = np.full((100, 100), 5.0)
-        result = estimate_map_noise(data, method="histogram_clip")
+        with pytest.warns(UserWarning, match="zero standard deviation"):
+            result = estimate_map_noise(data, method="histogram_clip")
 
         # Should return None because zero variance is unreliable
         assert result is None
@@ -230,12 +231,14 @@ class TestEdgeCases:
         """Test on small arrays."""
         # Small array should fail validation (< 1000 pixels minimum)
         data = np.random.normal(0, 1, size=(5, 5))
-        result = estimate_map_noise(data, method="histogram_clip")
+        with pytest.warns(UserWarning, match="Only 25 valid pixels available"):
+            result = estimate_map_noise(data, method="histogram_clip")
         assert result is None
 
         # Larger but still small array should also fail
         data = np.random.normal(0, 1, size=(20, 20))
-        result = estimate_map_noise(data, method="histogram_clip")
+        with pytest.warns(UserWarning, match="Only 400 valid pixels available"):
+            result = estimate_map_noise(data, method="histogram_clip")
         assert result is None
 
         # Array with sufficient pixels should work

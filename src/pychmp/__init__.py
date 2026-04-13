@@ -6,7 +6,7 @@ Algorithmic provenance:
   https://github.com/kuznetsov-radio/gxmodelfitting
 """
 
-from .ab_search import ABPointResult, ABScanResult, ABRendererFactory, evaluate_ab_point, idl_q0_start_heuristic, multi_scan_ab
+from .ab_search import ABLocalSearchResult, ABPointResult, ABScanResult, ABRendererFactory, evaluate_ab_point, idl_q0_start_heuristic, multi_scan_ab, search_local_minimum_ab
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .gxrender_adapter import GXRenderMWAdapter, GXRenderMWContext
@@ -26,9 +26,11 @@ __all__ = [
   "ABRendererFactory",
   "ABPointResult",
   "ABScanResult",
+  "ABLocalSearchResult",
   "evaluate_ab_point",
   "idl_q0_start_heuristic",
   "multi_scan_ab",
+  "search_local_minimum_ab",
   "GXRenderMWAdapter",
   "GXRenderMWContext",
   "MapNoiseEstimate",
