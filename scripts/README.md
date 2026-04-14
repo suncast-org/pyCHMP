@@ -148,6 +148,27 @@ skip points already present in the artifact. For a fresh timestamped artifact,
 set `PYCHMP_TIMESTAMP_ARTIFACTS=1`. To force a specific artifact file, set
 `ARTIFACT_H5`.
 
+Adaptive-search example from Git Bash:
+
+```bash
+bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_frequency.h5" \
+  --a-min -4.5 \
+  --a-max 3.0 \
+  --b-min -3.0 \
+  --b-max 4.8 \
+  --b-start 0.0 \
+  --q0-start 0.0001 \
+  --max-bracket-steps 30 \
+  --threshold-metric 1.3
+```
+
+Equivalent Windows launcher:
+
+```bat
+scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
+```
+
 ## Editing Model / Map Choices
 
 Each script is intentionally written with one option per line so the common
