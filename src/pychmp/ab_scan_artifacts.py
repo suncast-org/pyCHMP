@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any
 
@@ -19,20 +21,23 @@ RUN_HISTORY_DATASET = "run_history_json"
 REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "artifact_kind",
     "target_metric",
-    "model_path",
-    "fits_file",
-    "ebtel_path",
+    "model_sha256",
+    "fits_sha256",
+    "ebtel_sha256",
     "frequency_ghz",
     "map_xc_arcsec",
     "map_yc_arcsec",
     "map_dx_arcsec",
     "map_dy_arcsec",
+    "map_nx",
+    "map_ny",
     "observer_name",
     "observer_lonc_deg",
     "observer_b0sun_deg",
     "observer_dsun_cm",
     "observer_obs_time",
 )
+COMPATIBILITY_SIGNATURE_KEY = "compatibility_signature"
 
 
 class ScanArtifactCompatibilityError(ValueError):
@@ -61,6 +66,45 @@ def _normalize_path_like(value: Any) -> str:
     return os.path.normcase(os.path.normpath(text))
 
 
+def _compute_file_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _path_candidates_from_text(value: Any) -> list[Path]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    candidates: list[Path] = [Path(text).expanduser()]
+    msys_match = re.match(r"^/([a-zA-Z])/(.*)$", text)
+    if msys_match:
+        drive = msys_match.group(1).upper()
+        suffix = msys_match.group(2).replace("/", "\\")
+        candidates.append(Path(f"{drive}:\\{suffix}"))
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _resolve_existing_file_from_diagnostics(value: Any) -> Path | None:
+    for candidate in _path_candidates_from_text(value):
+        try:
+            if candidate.is_file():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
 def _canonical_header_text(header: fits.Header) -> str:
     return header.tostring(sep="\n", endcard=True)
 
@@ -81,9 +125,6 @@ def _arrays_match_for_reuse(lhs: np.ndarray, rhs: np.ndarray) -> bool:
 
 
 def _diagnostic_values_match(key: str, existing: Any, current: Any) -> bool:
-    if key.endswith("_path") or key == "fits_file":
-        return _normalize_path_like(existing) == _normalize_path_like(current)
-
     if isinstance(existing, (int, float, np.integer, np.floating)) or isinstance(current, (int, float, np.integer, np.floating)):
         try:
             existing_value = float(existing)
@@ -130,6 +171,7 @@ def scan_artifact_compatibility_issues(
         issues.append("WCS header differs from the stored artifact")
 
     existing_diagnostics = dict(payload.get("diagnostics", {}))
+    artifact_kind = str(existing_diagnostics.get("artifact_kind", ""))
     for key in REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS:
         if key not in existing_diagnostics:
             issues.append(f"stored diagnostics are missing required key '{key}'")
@@ -141,6 +183,19 @@ def scan_artifact_compatibility_issues(
             issues.append(
                 f"diagnostic mismatch for '{key}' "
                 f"(stored={existing_diagnostics[key]!r}, current={diagnostics[key]!r})"
+            )
+
+    # Rectangular artifacts represent a single coherent run, so require an exact
+    # command-signature match when present. Sparse artifacts may intentionally
+    # accumulate multiple runs and therefore filter incompatible point records
+    # during hydration instead of rejecting the whole file.
+    if artifact_kind != SPARSE_ARTIFACT_KIND:
+        existing_signature = str(existing_diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
+        current_signature = str(diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
+        if existing_signature and current_signature and existing_signature != current_signature:
+            issues.append(
+                f"diagnostic mismatch for '{COMPATIBILITY_SIGNATURE_KEY}' "
+                f"(stored={existing_signature!r}, current={current_signature!r})"
             )
 
     return issues
@@ -218,8 +273,6 @@ def slice_descriptor_from_diagnostics(diagnostics: dict[str, Any], *, fallback_k
 
 
 def _artifact_kind_from_group(f: h5py.Group | h5py.File) -> str:
-    if "point_records" in f:
-        return SPARSE_ARTIFACT_KIND
     common = f.get("common")
     if common is not None and "diagnostics_json" in common:
         try:
@@ -227,6 +280,8 @@ def _artifact_kind_from_group(f: h5py.Group | h5py.File) -> str:
             return str(diagnostics.get("artifact_kind", RECTANGULAR_ARTIFACT_KIND))
         except Exception:
             pass
+    if "point_records" in f and "summary" not in f:
+        return SPARSE_ARTIFACT_KIND
     return RECTANGULAR_ARTIFACT_KIND
 
 
@@ -582,6 +637,14 @@ def _load_rectangular_point_records(points_group: h5py.Group) -> list[dict[str, 
     return sorted(records, key=lambda item: (float(item["a"]), float(item["b"])))
 
 
+def _load_canonical_point_records(group: h5py.Group) -> list[dict[str, Any]]:
+    if "point_records" in group:
+        return _load_sparse_point_records(group["point_records"])
+    if "points" in group:
+        return _load_rectangular_point_records(group["points"])
+    return []
+
+
 def _payload_from_point_records(
     *,
     observed: np.ndarray,
@@ -696,7 +759,7 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, 
             point_records = _load_sparse_point_records(group["point_records"])
             target_metric = str(diagnostics.get("target_metric", "chi2"))
         else:
-            point_records = _load_rectangular_point_records(group["points"])
+            point_records = _load_canonical_point_records(group)
             summary = group["summary"]
             target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
         payload = _payload_from_point_records(
@@ -726,6 +789,118 @@ def load_run_history(h5_path: Path, *, slice_key: str | None = None) -> list[dic
             raise KeyError(f"slice not found: {slice_key or selected_key}")
         common = group["common"]
         return _decode_run_history(common)
+
+
+def backfill_artifact_diagnostics(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    artifact_path = Path(h5_path)
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f"artifact not found: {artifact_path}")
+
+    report: dict[str, Any] = {
+        "artifact_path": str(artifact_path),
+        "dry_run": bool(dry_run),
+        "slice_count": 0,
+        "updated_slice_count": 0,
+        "updated_fields": {},
+        "skipped_fields": {},
+        "slices": [],
+    }
+    mode = "r" if dry_run else "r+"
+    with h5py.File(artifact_path, mode) as f:
+        selected_groups: list[tuple[str, h5py.Group]] = []
+        if SLICE_CONTAINER_GROUP in f:
+            slices = f[SLICE_CONTAINER_GROUP]
+            if slice_key is not None:
+                if str(slice_key) not in slices:
+                    raise KeyError(f"slice not found: {slice_key}")
+                selected_groups.append((str(slice_key), slices[str(slice_key)]))
+            else:
+                for name in sorted(slices.keys()):
+                    selected_groups.append((str(name), slices[name]))
+        else:
+            selected_groups.append((str(slice_key or "legacy"), f))
+
+        report["slice_count"] = len(selected_groups)
+        for selected_key, group in selected_groups:
+            common = group.get("common")
+            if common is None or "diagnostics_json" not in common:
+                report["slices"].append(
+                    {
+                        "slice_key": selected_key,
+                        "updated": False,
+                        "updated_fields": {},
+                        "skipped_fields": {"diagnostics_json": "missing common diagnostics"},
+                    }
+                )
+                continue
+
+            diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
+            updated_fields: dict[str, Any] = {}
+            skipped_fields: dict[str, str] = {}
+
+            observed_shape = tuple(int(v) for v in np.asarray(common["observed"]).shape)
+            if len(observed_shape) >= 2:
+                map_ny = int(observed_shape[-2])
+                map_nx = int(observed_shape[-1])
+                if "map_nx" not in diagnostics or diagnostics.get("map_nx") in {None, ""}:
+                    diagnostics["map_nx"] = map_nx
+                    updated_fields["map_nx"] = map_nx
+                if "map_ny" not in diagnostics or diagnostics.get("map_ny") in {None, ""}:
+                    diagnostics["map_ny"] = map_ny
+                    updated_fields["map_ny"] = map_ny
+
+            for path_key, hash_key in (
+                ("fits_file", "fits_sha256"),
+                ("model_path", "model_sha256"),
+                ("ebtel_path", "ebtel_sha256"),
+            ):
+                if str(diagnostics.get(hash_key, "")).strip():
+                    continue
+                resolved_path = _resolve_existing_file_from_diagnostics(diagnostics.get(path_key))
+                if resolved_path is None:
+                    skipped_fields[hash_key] = f"source file unavailable from {path_key}"
+                    continue
+                diagnostics[hash_key] = _compute_file_sha256(resolved_path)
+                updated_fields[hash_key] = diagnostics[hash_key]
+
+            if updated_fields and not dry_run:
+                common["diagnostics_json"][()] = np.bytes_(json.dumps(diagnostics, sort_keys=True))
+
+            if updated_fields:
+                report["updated_slice_count"] = int(report["updated_slice_count"]) + 1
+            for key in updated_fields:
+                report["updated_fields"][key] = int(report["updated_fields"].get(key, 0)) + 1
+            for key in skipped_fields:
+                report["skipped_fields"][key] = int(report["skipped_fields"].get(key, 0)) + 1
+            report["slices"].append(
+                {
+                    "slice_key": selected_key,
+                    "updated": bool(updated_fields),
+                    "updated_fields": updated_fields,
+                    "skipped_fields": skipped_fields,
+                }
+            )
+    return report
+
+
+def point_record_matches_compatibility_signature(
+    record: dict[str, Any],
+    *,
+    compatibility_signature: str | None,
+) -> bool:
+    expected = str(compatibility_signature or "").strip()
+    if not expected:
+        return True
+    diagnostics = dict(record.get("diagnostics", {}))
+    actual = str(diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
+    if not actual:
+        return False
+    return actual == expected
 
 
 def _write_common_group(
@@ -765,6 +940,7 @@ def save_rectangular_scan_file(
     success: np.ndarray,
     point_payloads: dict[tuple[int, int], dict[str, Any]],
     slice_key: str | None = None,
+    run_history: list[dict[str, Any]] | None = None,
 ) -> None:
     out_h5.parent.mkdir(parents=True, exist_ok=True)
     descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key=slice_key or "default")
@@ -803,6 +979,7 @@ def save_rectangular_scan_file(
             sigma_map=sigma_map,
             wcs_header=wcs_header,
             diagnostics=diagnostics,
+            run_history=run_history,
         )
 
         grid = slice_group.create_group("grid")
@@ -819,7 +996,8 @@ def save_rectangular_scan_file(
         summary.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
 
         points = slice_group.create_group("points")
-        for (_ai, _bi), payload in sorted(point_payloads.items()):
+        point_records = slice_group.create_group("point_records")
+        for record_order, ((_ai, _bi), payload) in enumerate(sorted(point_payloads.items())):
             name = f"a{payload['a_index']:03d}_b{payload['b_index']:03d}"
             grp = points.create_group(name)
             grp.attrs["a"] = float(payload["a"])
@@ -840,6 +1018,8 @@ def save_rectangular_scan_file(
             grp.create_dataset("fit_rho2_trials", data=np.asarray(payload.get("fit_rho2_trials", ()), dtype=np.float64))
             grp.create_dataset("fit_eta2_trials", data=np.asarray(payload.get("fit_eta2_trials", ()), dtype=np.float64))
             grp.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(payload["diagnostics"], sort_keys=True)))
+            canonical_grp = point_records.create_group(f"r{record_order:06d}")
+            _write_point_group(canonical_grp, payload, record_order=record_order)
     os.replace(tmp_h5, out_h5)
 
 
@@ -945,6 +1125,92 @@ def append_sparse_point_record(
         raise OSError(
             f"unable to append sparse point record after {_SPARSE_APPEND_RETRY_ATTEMPTS} attempts: {out_h5}"
         ) from last_exc
+
+
+def append_point_record(
+    out_h5: Path,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+    point_payload: dict[str, Any],
+) -> None:
+    artifact_kind = str(diagnostics.get("artifact_kind", "")).strip()
+    if not out_h5.exists():
+        raise FileNotFoundError(
+            f"artifact must be initialized before appending point records: {out_h5}"
+        )
+    if artifact_kind == SPARSE_ARTIFACT_KIND:
+        append_sparse_point_record(
+            out_h5,
+            observed=observed,
+            sigma_map=sigma_map,
+            wcs_header=wcs_header,
+            diagnostics=diagnostics,
+            point_payload=point_payload,
+        )
+        return
+
+    payload = load_scan_file(out_h5)
+    if str(payload.get("artifact_format", "")) == "sparse":
+        append_sparse_point_record(
+            out_h5,
+            observed=observed,
+            sigma_map=sigma_map,
+            wcs_header=wcs_header,
+            diagnostics=diagnostics,
+            point_payload=point_payload,
+        )
+        return
+
+    a_values = np.asarray(payload["a_values"], dtype=float)
+    b_values = np.asarray(payload["b_values"], dtype=float)
+    points = dict(payload["points"])
+    best_q0 = np.asarray(payload["best_q0"], dtype=float)
+    objective_values = np.asarray(payload["objective_values"], dtype=float)
+    chi2 = np.asarray(payload["chi2"], dtype=float)
+    rho2 = np.asarray(payload["rho2"], dtype=float)
+    eta2 = np.asarray(payload["eta2"], dtype=float)
+    success = np.asarray(payload["success"], dtype=bool)
+
+    if "a_index" in point_payload and "b_index" in point_payload:
+        a_index = int(point_payload["a_index"])
+        b_index = int(point_payload["b_index"])
+    else:
+        a_index = int(_match_existing_index(a_values, float(point_payload["a"])))
+        b_index = int(_match_existing_index(b_values, float(point_payload["b"])))
+
+    diagnostics_json = dict(point_payload.get("diagnostics", {}))
+    points[(a_index, b_index)] = {
+        **point_payload,
+        "a_index": int(a_index),
+        "b_index": int(b_index),
+    }
+    best_q0[a_index, b_index] = float(point_payload.get("q0", np.nan))
+    objective_values[a_index, b_index] = float(diagnostics_json.get("target_metric_value", np.nan))
+    chi2[a_index, b_index] = float(diagnostics_json.get("chi2", np.nan))
+    rho2[a_index, b_index] = float(diagnostics_json.get("rho2", np.nan))
+    eta2[a_index, b_index] = float(diagnostics_json.get("eta2", np.nan))
+    success[a_index, b_index] = bool(point_payload.get("success", False))
+
+    save_rectangular_scan_file(
+        out_h5,
+        observed=np.asarray(observed, dtype=float),
+        sigma_map=np.asarray(sigma_map, dtype=float),
+        wcs_header=wcs_header,
+        diagnostics=dict(diagnostics),
+        a_values=a_values,
+        b_values=b_values,
+        best_q0=best_q0,
+        objective_values=objective_values,
+        chi2=chi2,
+        rho2=rho2,
+        eta2=eta2,
+        success=success,
+        point_payloads=points,
+        run_history=list(payload.get("run_history", [])),
+    )
 
 
 def convert_rectangular_artifact_to_sparse(src_h5: Path, dst_h5: Path, *, overwrite: bool = False) -> None:

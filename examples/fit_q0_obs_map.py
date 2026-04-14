@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import itertools
 import math
@@ -290,6 +291,17 @@ def _decode_h5_scalar(value: Any) -> str:
     return str(value)
 
 
+def _compute_file_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_model_obs_time_iso(model_path: Path) -> str | None:
     try:
         with h5py.File(model_path, "r") as f:
@@ -301,6 +313,19 @@ def _load_model_obs_time_iso(model_path: Path) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _load_model_identity(model_path: Path) -> str:
+    try:
+        with h5py.File(model_path, "r") as f:
+            for key in ("metadata/id", "meta/id", "model/id"):
+                if key in f:
+                    txt = _decode_h5_scalar(np.asarray(f[key]).reshape(-1)[0]).strip()
+                    if txt:
+                        return txt
+    except Exception:
+        pass
+    return model_path.stem
 
 
 def _load_saved_fov_from_model(model_path: Path) -> dict[str, float] | None:

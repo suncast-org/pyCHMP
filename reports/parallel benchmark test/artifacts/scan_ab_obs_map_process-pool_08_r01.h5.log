@@ -1,6 +1,6 @@
-Live log file: C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5.log
+Live log file: C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5.log
 [33m  Note: --point-timeout-s is not enforced in the current in-process scan mode.[0m
-  Live viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+  Live viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
   You may run this command while the scan is still in progress and use Refresh Artifact in the viewer.
   Artifact storage mode: rectangular grid H5
 
@@ -14,10 +14,10 @@ Point 1/9: a=0.000 b=2.100
   Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
   Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
 ======================================================================
-POINT COMPLETE: success=True total=280.639s
+POINT COMPLETE: success=True total=251.223s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 Point 2/9: a=0.000 b=2.400
 [32m  ✓ Fitting converged[0m
@@ -29,10 +29,10 @@ Point 2/9: a=0.000 b=2.400
   Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
   Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
 ======================================================================
-POINT COMPLETE: success=True total=282.013s
+POINT COMPLETE: success=True total=252.858s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 Point 3/9: a=0.000 b=2.700
 [32m  ✓ Fitting converged[0m
@@ -44,10 +44,10 @@ Point 3/9: a=0.000 b=2.700
   Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
   Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
 ======================================================================
-POINT COMPLETE: success=True total=276.621s
+POINT COMPLETE: success=True total=249.499s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 Point 4/9: a=0.300 b=2.100
 [32m  ✓ Fitting converged[0m
@@ -59,10 +59,10 @@ Point 4/9: a=0.300 b=2.100
   Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
   Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
 ======================================================================
-POINT COMPLETE: success=True total=304.477s
+POINT COMPLETE: success=True total=273.961s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 Point 5/9: a=0.300 b=2.400
 [32m  ✓ Fitting converged[0m
@@ -74,27 +74,12 @@ Point 5/9: a=0.300 b=2.400
   Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
   Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
 ======================================================================
-POINT COMPLETE: success=True total=299.834s
+POINT COMPLETE: success=True total=276.268s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
-Point 6/9: a=0.300 b=2.700
-[32m  ✓ Fitting converged[0m
-  Fitted Q0: 0.000598
-  Objective value (chi2): 3.109500e+02
-  Metrics: chi2=3.109500e+02, rho2=5.529849e-01, eta2=6.243739e-01
-  Trials: nfev=12 nit=7 saved_trials=12
-  Optimizer message: adaptive bracketing found a valid interior minimum; Solution found.
-  Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
-  Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
-======================================================================
-POINT COMPLETE: success=True total=286.798s
-======================================================================
-
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
-
-Point 7/9: a=0.600 b=2.100
+Point 6/9: a=0.600 b=2.100
 [32m  ✓ Fitting converged[0m
   Fitted Q0: 0.000312
   Objective value (chi2): 2.963112e+02
@@ -104,10 +89,25 @@ Point 7/9: a=0.600 b=2.100
   Adaptive bracketing: found=True bracket=(1.000000e-05, 1.000000e-04, 0.001000)
   Render diagnostics: trial_renders=11 final_renders=0 total_gxrender_calls=11
 ======================================================================
-POINT COMPLETE: success=True total=273.581s
+POINT COMPLETE: success=True total=251.059s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
+
+Point 7/9: a=0.300 b=2.700
+[32m  ✓ Fitting converged[0m
+  Fitted Q0: 0.000598
+  Objective value (chi2): 3.109500e+02
+  Metrics: chi2=3.109500e+02, rho2=5.529849e-01, eta2=6.243739e-01
+  Trials: nfev=12 nit=7 saved_trials=12
+  Optimizer message: adaptive bracketing found a valid interior minimum; Solution found.
+  Adaptive bracketing: found=True bracket=(1.000000e-04, 0.001000, 0.001618)
+  Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
+======================================================================
+POINT COMPLETE: success=True total=263.540s
+======================================================================
+
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 Point 8/9: a=0.600 b=2.400
 [32m  ✓ Fitting converged[0m
@@ -119,10 +119,10 @@ Point 8/9: a=0.600 b=2.400
   Adaptive bracketing: found=True bracket=(1.000000e-05, 1.000000e-04, 0.001000)
   Render diagnostics: trial_renders=12 final_renders=0 total_gxrender_calls=12
 ======================================================================
-POINT COMPLETE: success=True total=261.625s
+POINT COMPLETE: success=True total=238.694s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 Point 9/9: a=0.600 b=2.700
 [32m  ✓ Fitting converged[0m
@@ -134,14 +134,14 @@ Point 9/9: a=0.600 b=2.700
   Adaptive bracketing: found=True bracket=(1.000000e-05, 1.000000e-04, 0.001000)
   Render diagnostics: trial_renders=11 final_renders=0 total_gxrender_calls=11
 ======================================================================
-POINT COMPLETE: success=True total=102.253s
+POINT COMPLETE: success=True total=89.813s
 ======================================================================
 
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
-✓ Saved consolidated scan file: C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5
-Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmarks\scan_ab_obs_map_process-pool_08_r01.h5'
+✓ Saved consolidated scan file: C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5
+Viewer command: 'C:\Users\gelu_\.conda\envs\pyampp-dev\python.exe' 'C:\Users\gelu_\code\SUNCAST-ORG\pyCHMP\examples\pychmp_view.py' 'C:\Users\gelu_\AppData\Local\Temp\pychmp_benchmark_regen_2026-04-13\artifacts\scan_ab_obs_map_process-pool_08_r01.h5'
 
 ======================================================================
-SCAN COMPLETE: success=9/9 total=389.605s
+SCAN COMPLETE: success=9/9 total=348.923s
 ======================================================================

@@ -6,7 +6,14 @@ from pathlib import Path
 from typing import Sequence
 
 from . import __version__
-from .ab_scan_artifacts import load_run_history
+from .ab_scan_artifacts import backfill_artifact_diagnostics, load_run_history
+
+
+def _iter_backfill_targets(target: Path, *, recursive: bool) -> list[Path]:
+    if target.is_dir():
+        iterator = target.rglob("*.h5") if recursive else target.glob("*.h5")
+        return sorted(path for path in iterator if path.is_file())
+    return [target]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     history_parser.add_argument("--slice-key", default=None, help="Optional artifact slice key")
     history_parser.add_argument("--latest", action="store_true", help="Print only the latest recorded entry")
     history_parser.add_argument("--json", action="store_true", help="Emit JSON instead of human-readable text")
+
+    backfill_parser = subparsers.add_parser(
+        "artifact-backfill",
+        help="Populate missing compatibility diagnostics in an existing artifact.",
+    )
+    backfill_parser.add_argument("artifact_h5", type=Path, help="Artifact H5 path")
+    backfill_parser.add_argument("--slice-key", default=None, help="Optional artifact slice key")
+    backfill_parser.add_argument("--dry-run", action="store_true", help="Report proposed updates without modifying the artifact")
+    backfill_parser.add_argument("--recursive", action="store_true", help="When the target is a directory, include subdirectories")
+    backfill_parser.add_argument("--json", action="store_true", help="Emit JSON instead of human-readable text")
     return parser
 
 
@@ -63,6 +80,33 @@ def _print_history_text(entries: list[dict], *, latest_only: bool) -> int:
     return 0
 
 
+def _print_backfill_text(report: dict) -> int:
+    print(f"Artifact: {report.get('artifact_path', '')}")
+    print(f"Dry run: {'yes' if report.get('dry_run') else 'no'}")
+    print(f"Slices inspected: {report.get('slice_count', 0)}")
+    print(f"Slices updated: {report.get('updated_slice_count', 0)}")
+    updated_fields = dict(report.get("updated_fields", {}))
+    skipped_fields = dict(report.get("skipped_fields", {}))
+    if updated_fields:
+        print("Updated fields:")
+        for key in sorted(updated_fields):
+            print(f"  {key}: {updated_fields[key]}")
+    else:
+        print("Updated fields: none")
+    if skipped_fields:
+        print("Skipped fields:")
+        for key in sorted(skipped_fields):
+            print(f"  {key}: {skipped_fields[key]}")
+    print("")
+    for item in list(report.get("slices", [])):
+        print(f"[{item.get('slice_key', '')}] updated={'yes' if item.get('updated') else 'no'}")
+        for key, value in sorted(dict(item.get("updated_fields", {})).items()):
+            print(f"    set {key} = {value}")
+        for key, value in sorted(dict(item.get("skipped_fields", {})).items()):
+            print(f"    skipped {key}: {value}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -76,6 +120,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(selected_entries, indent=2, sort_keys=True))
             return 0
         return _print_history_text(entries, latest_only=bool(args.latest))
+    if args.command == "artifact-backfill":
+        reports = [
+            backfill_artifact_diagnostics(
+                path,
+                slice_key=args.slice_key,
+                dry_run=bool(args.dry_run),
+            )
+            for path in _iter_backfill_targets(args.artifact_h5, recursive=bool(args.recursive))
+        ]
+        if args.json:
+            print(json.dumps(reports, indent=2, sort_keys=True))
+            return 0
+        for index, report in enumerate(reports, start=1):
+            if index > 1:
+                print("")
+            _print_backfill_text(report)
+        return 0
     parser.print_help()
     return 0
 

@@ -10,6 +10,7 @@ the viewer can inspect progress while the search is still running.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -35,6 +36,16 @@ def _format_console_scalar(value: float, *, fixed_precision: int = 6) -> str:
     return f"{numeric:.{fixed_precision}f}"
 
 
+def _build_command_compatibility_signature(argv: list[str]) -> str:
+    normalized = json.dumps([str(item) for item in argv], separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _build_physical_compatibility_signature(payload: dict[str, Any]) -> str:
+    normalized = json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _build_run_history_entry(
     *,
     artifact_h5: Path,
@@ -46,6 +57,7 @@ def _build_run_history_entry(
 ) -> dict[str, Any]:
     effective_python_argv = [str(sys.executable), *[str(item) for item in sys.argv]]
     wrapper_command = os.environ.get("PYCHMP_WRAPPER_COMMAND", "").strip()
+    compatibility_signature = _build_command_compatibility_signature(effective_python_argv)
     return {
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "action": str(action),
@@ -57,6 +69,7 @@ def _build_run_history_entry(
         "wrapper_command": wrapper_command or None,
         "effective_python_argv": effective_python_argv,
         "effective_python_command": shlex.join(effective_python_argv),
+        "compatibility_signature": compatibility_signature,
         "viewer_command": str(viewer_cmd_text),
         "log_path": str(log_path),
         "target_metric": str(target_metric),
@@ -73,13 +86,15 @@ for candidate in (REPO_ROOT, EXAMPLES_ROOT):
 
 from pychmp import ABPointResult, GXRenderMWAdapter, estimate_map_noise, search_local_minimum_ab
 from pychmp.ab_scan_artifacts import (
+    COMPATIBILITY_SIGNATURE_KEY,
     ScanArtifactCompatibilityError,
-    append_sparse_point_record,
+    append_point_record,
     append_run_history_entry,
     build_computed_point_payload,
     detect_scan_artifact_format,
     load_scan_file,
     load_run_history,
+    point_record_matches_compatibility_signature,
     validate_scan_artifact_compatibility,
     write_sparse_scan_file,
 )
@@ -92,10 +107,12 @@ try:
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
         _build_target_header,
+        _compute_file_sha256,
         _effective_psf_parameters,
         _elliptical_gaussian_kernel,
         _extract_psf_from_header,
         _format_psf_report,
+        _load_model_identity,
         _resolve_selected_psf,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
@@ -112,10 +129,12 @@ except ModuleNotFoundError:
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
         _build_target_header,
+        _compute_file_sha256,
         _effective_psf_parameters,
         _elliptical_gaussian_kernel,
         _extract_psf_from_header,
         _format_psf_report,
+        _load_model_identity,
         _resolve_selected_psf,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
@@ -369,6 +388,7 @@ def _point_payload_from_result(
     observed_template: np.ndarray,
     target_metric: str,
     psf_source: str,
+    compatibility_signature: str,
 ) -> dict[str, Any]:
     renderer = renderer_factory(float(point.a), float(point.b))
     if hasattr(renderer, "render_pair"):
@@ -405,6 +425,7 @@ def _point_payload_from_result(
         "fit_rho2_trials": [float(v) for v in fit_rho2_trials],
         "fit_eta2_trials": [float(v) for v in fit_eta2_trials],
         "psf_source": str(psf_source),
+        COMPATIBILITY_SIGNATURE_KEY: str(compatibility_signature),
         "point_status": "computed",
     }
     if np.isfinite(elapsed_seconds):
@@ -482,6 +503,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         renderer_factory: _AdaptiveRendererFactory,
         target_metric: str,
         psf_source: str,
+        compatibility_signature: str,
         viewer_heartbeat: _ViewerRefreshHeartbeat | None = None,
     ) -> None:
         self._artifact_h5 = Path(artifact_h5)
@@ -492,6 +514,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         self._renderer_factory = renderer_factory
         self._target_metric = str(target_metric)
         self._psf_source = str(psf_source)
+        self._compatibility_signature = str(compatibility_signature)
         self._viewer_heartbeat = viewer_heartbeat
         self._point_map: dict[tuple[float, float], ABPointResult] = {}
 
@@ -517,6 +540,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         )
         count = 0
         for record in payload.get("point_records", []):
+            if not point_record_matches_compatibility_signature(
+                record,
+                compatibility_signature=self._compatibility_signature,
+            ):
+                continue
             point = _point_from_record(record, target_metric=self._target_metric)
             self._point_map[(float(point.a), float(point.b))] = point
             count += 1
@@ -537,8 +565,9 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             observed_template=self._observed,
             target_metric=self._target_metric,
             psf_source=self._psf_source,
+            compatibility_signature=self._compatibility_signature,
         )
-        append_sparse_point_record(
+        append_point_record(
             self._artifact_h5,
             observed=self._observed,
             sigma_map=self._sigma_map,
@@ -834,37 +863,47 @@ def main() -> int:
     )
 
     psf_kernel = None
+    resolved_psf_meta = None
     if psf_bmaj_arcsec is not None and psf_bmin_arcsec is not None and psf_bpa_deg is not None:
-        psf_meta = _effective_psf_parameters(
+        resolved_psf_meta = _effective_psf_parameters(
             bmaj_arcsec=psf_bmaj_arcsec,
             bmin_arcsec=psf_bmin_arcsec,
             bpa_deg=psf_bpa_deg,
             active_frequency_ghz=float(freq_ghz),
             ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
+            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
         )
-        assert psf_meta is not None
+        assert resolved_psf_meta is not None
         psf_kernel = _elliptical_gaussian_kernel(
-            bmaj_arcsec=float(psf_meta["active_bmaj_arcsec"]),
-            bmin_arcsec=float(psf_meta["active_bmin_arcsec"]),
+            bmaj_arcsec=float(resolved_psf_meta["active_bmaj_arcsec"]),
+            bmin_arcsec=float(resolved_psf_meta["active_bmin_arcsec"]),
             bpa_deg=float(psf_bpa_deg),
             dx_arcsec=float(geometry.dx),
             dy_arcsec=float(geometry.dy),
         )
 
+    model_sha256 = _compute_file_sha256(model_h5)
+    fits_sha256 = _compute_file_sha256(fits_path)
+    ebtel_sha256 = _compute_file_sha256(ebtel_path)
     root_diag = {
         "artifact_kind": "pychmp_ab_scan_sparse_points",
         "spectral_domain": "mw",
         "spectral_label": f"{float(freq_ghz):.3f} GHz",
         "model_path": str(model_h5),
+        "model_id": str(_load_model_identity(model_h5)),
+        "model_sha256": str(model_sha256),
         "fits_file": str(fits_path),
+        "fits_sha256": str(fits_sha256),
         "ebtel_path": str(ebtel_path),
+        "ebtel_sha256": str(ebtel_sha256),
         "target_metric": str(args.target_metric),
         "frequency_ghz": float(freq_ghz),
         "map_xc_arcsec": float(geometry.xc),
         "map_yc_arcsec": float(geometry.yc),
         "map_dx_arcsec": float(geometry.dx),
         "map_dy_arcsec": float(geometry.dy),
+        "map_nx": int(geometry.nx),
+        "map_ny": int(geometry.ny),
         "noise_diagnostics": noise_diag,
         "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
         "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
@@ -878,11 +917,43 @@ def main() -> int:
         "db": float(args.db),
         "a_range": [float(args.a_min), float(args.a_max)],
         "b_range": [float(args.b_min), float(args.b_max)],
+        "threshold": float(args.threshold),
+        "mask_type": str(args.mask_type),
         "threshold_metric": float(args.threshold_metric),
         "no_area": bool(args.no_area),
         "execution_policy": str(args.execution_policy),
         "execution_max_workers": None if args.max_workers is None else int(args.max_workers),
+        "psf_source": str(psf_source),
+        "resolved_psf": resolved_psf_meta,
     }
+    compatibility_signature = _build_physical_compatibility_signature(
+        {
+            "artifact_kind": root_diag["artifact_kind"],
+            "target_metric": root_diag["target_metric"],
+            "model_sha256": root_diag["model_sha256"],
+            "fits_sha256": root_diag["fits_sha256"],
+            "ebtel_sha256": root_diag["ebtel_sha256"],
+            "frequency_ghz": root_diag["frequency_ghz"],
+            "map_xc_arcsec": root_diag["map_xc_arcsec"],
+            "map_yc_arcsec": root_diag["map_yc_arcsec"],
+            "map_dx_arcsec": root_diag["map_dx_arcsec"],
+            "map_dy_arcsec": root_diag["map_dy_arcsec"],
+            "map_nx": root_diag["map_nx"],
+            "map_ny": root_diag["map_ny"],
+            "observer_name": root_diag["observer_name"],
+            "observer_lonc_deg": root_diag["observer_lonc_deg"],
+            "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
+            "observer_dsun_cm": root_diag["observer_dsun_cm"],
+            "observer_obs_time": root_diag["observer_obs_time"],
+            "threshold": root_diag["threshold"],
+            "threshold_metric": root_diag["threshold_metric"],
+            "mask_type": root_diag["mask_type"],
+            "no_area": root_diag["no_area"],
+            "psf_source": root_diag["psf_source"],
+            "resolved_psf": root_diag["resolved_psf"],
+        }
+    )
+    root_diag[COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
 
     artifact_preexisting = artifact_h5.exists()
     existing_format = detect_scan_artifact_format(artifact_h5) if artifact_preexisting else None
@@ -941,6 +1012,7 @@ def main() -> int:
         renderer_factory=factory,
         target_metric=str(args.target_metric),
         psf_source=str(psf_source),
+        compatibility_signature=compatibility_signature,
         viewer_heartbeat=viewer_heartbeat,
     )
     try:
@@ -949,7 +1021,8 @@ def main() -> int:
         raise SystemExit(str(exc)) from exc
     append_run_history_entry(
         artifact_h5,
-        _build_run_history_entry(
+        {
+            **_build_run_history_entry(
             artifact_h5=artifact_h5,
             log_path=log_path,
             viewer_cmd_text=viewer_cmd_text,
@@ -960,7 +1033,9 @@ def main() -> int:
             ),
             target_metric=str(args.target_metric),
             recompute_existing=bool(args.recompute_existing),
-        ),
+            ),
+            "compatibility_signature": compatibility_signature,
+        },
     )
     print(f"Resume state: {reused_points} compatible point(s) loaded from the existing artifact")
     if auto_viewer_enabled:
