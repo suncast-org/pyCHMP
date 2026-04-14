@@ -55,6 +55,7 @@ packages = ["src/pychmp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = [".", "src"]
 
 [tool.bumpver]
 current_version = "0.1.0a2"

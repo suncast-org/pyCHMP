@@ -121,7 +121,8 @@ def _metric_summary_lines(diag: dict[str, Any], target_metric: str, fmt: Callabl
 
 
 def _header_token(header: fits.Header, shape: tuple[int, int]) -> str:
-    return f"{shape[0]}x{shape[1]}::{header.tostring(sep='\n', endcard=True)}"
+    header_text = header.tostring(sep="\n", endcard=True)
+    return f"{shape[0]}x{shape[1]}::{header_text}"
 
 
 def _color_limits(data: np.ndarray, *, symmetric: bool = False) -> tuple[float, float]:
