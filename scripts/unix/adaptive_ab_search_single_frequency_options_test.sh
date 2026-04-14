@@ -24,6 +24,9 @@ CLI_B_MIN=""
 CLI_B_MAX=""
 CLI_Q0_MIN=""
 CLI_Q0_MAX=""
+CLI_OBS_FITS_PATH=""
+CLI_MODEL_H5_PATH=""
+CLI_EBTEL_PATH=""
 
 latest_dated_dir() {
   local parent="$1"
@@ -57,6 +60,21 @@ while (($#)); do
     --artifact-h5)
       [[ $# -ge 2 ]] || { echo "ERROR: --artifact-h5 requires a path argument"; exit 1; }
       CLI_ARTIFACT_H5="$2"
+      shift 2
+      ;;
+    --obs-fits-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-fits-path requires a path argument"; exit 1; }
+      CLI_OBS_FITS_PATH="$2"
+      shift 2
+      ;;
+    --model-h5-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --model-h5-path requires a path argument"; exit 1; }
+      CLI_MODEL_H5_PATH="$2"
+      shift 2
+      ;;
+    --ebtel-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --ebtel-path requires a path argument"; exit 1; }
+      CLI_EBTEL_PATH="$2"
       shift 2
       ;;
     --artifacts-dir)
@@ -251,6 +269,15 @@ if [[ -n "$CLI_Q0_MIN" ]]; then
 fi
 if [[ -n "$CLI_Q0_MAX" ]]; then
   Q0_MAX="$CLI_Q0_MAX"
+fi
+if [[ -n "$CLI_OBS_FITS_PATH" ]]; then
+  OBS_FITS_PATH="$CLI_OBS_FITS_PATH"
+fi
+if [[ -n "$CLI_MODEL_H5_PATH" ]]; then
+  MODEL_H5_PATH="$CLI_MODEL_H5_PATH"
+fi
+if [[ -n "$CLI_EBTEL_PATH" ]]; then
+  EBTEL_PATH="$CLI_EBTEL_PATH"
 fi
 if [[ -n "$CLI_ARTIFACT_H5" ]]; then
   ARTIFACT_H5="$CLI_ARTIFACT_H5"

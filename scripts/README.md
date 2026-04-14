@@ -150,8 +150,92 @@ set `PYCHMP_TIMESTAMP_ARTIFACTS=1`. To force a specific artifact file, set
 
 Adaptive-search example from Git Bash:
 
+- Prefer the explicit launcher flags:
+  `--obs-fits-path`, `--model-h5-path`, and `--ebtel-path`.
+- `OBS_FITS_PATH`, `MODEL_H5_PATH`, and `EBTEL_PATH` remain supported as
+  fallback environment overrides.
+- Precedence is: explicit launcher flag, then environment variable, then the
+  launcher's built-in default.
+
+Git Bash example with your own files:
+
 ```bash
 bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --obs-fits-path "/path/to/your_map.fits" \
+  --model-h5-path "/path/to/your_model.h5" \
+  --ebtel-path "/path/to/your_ebtel.sav" \
+  --artifact-h5 "/path/to/output/adaptive_ab_search_single_frequency.h5" \
+  --a-min -4.5 \
+  --a-max 3.0 \
+  --b-min -3.0 \
+  --b-max 4.8 \
+  --b-start 0.0 \
+  --q0-start 0.0001 \
+  --max-bracket-steps 30 \
+  --threshold-metric 1.3
+```
+
+PowerShell example with your own files:
+
+```powershell
+bash .\scripts\unix\adaptive_ab_search_single_frequency_options_test.sh `
+  --obs-fits-path "C:\path\to\your_map.fits" `
+  --model-h5-path "C:\path\to\your_model.h5" `
+  --ebtel-path "C:\path\to\your_ebtel.sav" `
+  --artifact-h5 "C:\path\to\output\adaptive_ab_search_single_frequency.h5" `
+  --a-min -4.5 `
+  --a-max 3.0 `
+  --b-min -3.0 `
+  --b-max 4.8 `
+  --b-start 0.0 `
+  --q0-start 0.0001 `
+  --max-bracket-steps 30 `
+  --threshold-metric 1.3
+```
+
+`cmd.exe` example with your own files:
+
+```bat
+scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
+  --obs-fits-path C:\path\to\your_map.fits ^
+  --model-h5-path C:\path\to\your_model.h5 ^
+  --ebtel-path C:\path\to\your_ebtel.sav ^
+  --artifact-h5 C:\path\to\output\adaptive_ab_search_single_frequency.h5 ^
+  --a-min -4.5 ^
+  --a-max 3.0 ^
+  --b-min -3.0 ^
+  --b-max 4.8 ^
+  --b-start 0.0 ^
+  --q0-start 0.0001 ^
+  --max-bracket-steps 30 ^
+  --threshold-metric 1.3
+```
+
+Direct Python example with your own files:
+
+```bash
+python examples/python/adaptive_ab_search_single_frequency.py \
+  /path/to/your_map.fits \
+  /path/to/your_model.h5 \
+  --ebtel-path /path/to/your_ebtel.sav \
+  --artifact-h5 /path/to/output/adaptive_ab_search_single_frequency.h5 \
+  --a-min -4.5 \
+  --a-max 3.0 \
+  --b-min -3.0 \
+  --b-max 4.8 \
+  --b-start 0.0 \
+  --q0-start 0.0001 \
+  --max-bracket-steps 30 \
+  --threshold-metric 1.3
+```
+
+Tracked 2.874 GHz development-data example:
+
+```bash
+bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --obs-fits-path "/path/to/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20260323T195655/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" \
+  --model-h5-path "/path/to/pyGXrender-test-data/raw/models/models_20260323T195655/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" \
+  --ebtel-path "/path/to/pyGXrender-test-data/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav" \
   --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_frequency.h5" \
   --a-min -4.5 \
   --a-max 3.0 \
