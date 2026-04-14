@@ -46,6 +46,7 @@ class ScanArtifactCompatibilityError(ValueError):
 
 _SPARSE_APPEND_RETRY_ATTEMPTS = 12
 _SPARSE_APPEND_RETRY_DELAY_S = 0.20
+_H5PY_FILE = h5py.File
 
 
 def decode_scalar(value: Any) -> str:
@@ -289,6 +290,20 @@ def _run_history_dtype() -> Any:
     return h5py.string_dtype(encoding="utf-8")
 
 
+def _text_dataset_dtype() -> Any:
+    return h5py.string_dtype(encoding="utf-8")
+
+
+def _create_text_dataset(group: h5py.Group, name: str, text: str) -> h5py.Dataset:
+    return group.create_dataset(name, data=str(text), dtype=_text_dataset_dtype())
+
+
+def _replace_text_dataset(group: h5py.Group, name: str, text: str) -> h5py.Dataset:
+    if name in group:
+        del group[name]
+    return _create_text_dataset(group, name, text)
+
+
 def _ensure_run_history_dataset(common: h5py.Group) -> h5py.Dataset:
     if RUN_HISTORY_DATASET in common:
         return common[RUN_HISTORY_DATASET]
@@ -315,7 +330,7 @@ def _decode_run_history(common: h5py.Group) -> list[dict[str, Any]]:
 
 def append_run_history_entry(h5_path: Path, entry: dict[str, Any], *, slice_key: str | None = None) -> None:
     serialized = json.dumps(entry, sort_keys=True)
-    with h5py.File(h5_path, "a") as f:
+    with _H5PY_FILE(h5_path, "a") as f:
         group, _descriptors, selected_key = _resolve_slice_group(
             f,
             slice_key=slice_key,
@@ -381,13 +396,13 @@ def _resolve_slice_group(
 
 
 def list_scan_slices(h5_path: Path) -> list[dict[str, Any]]:
-    with h5py.File(h5_path, "r") as f:
+    with _H5PY_FILE(h5_path, "r") as f:
         _group, descriptors, _selected_key = _resolve_slice_group(f)
     return descriptors
 
 
 def detect_scan_artifact_format(h5_path: Path, *, slice_key: str | None = None) -> str | None:
-    with h5py.File(h5_path, "r") as f:
+    with _H5PY_FILE(h5_path, "r") as f:
         group, _descriptors, _selected_key = _resolve_slice_group(f, slice_key=slice_key, allow_missing=slice_key is not None)
         if group is None:
             return None
@@ -739,7 +754,7 @@ def _payload_from_point_records(
 
 
 def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, Any]:
-    with h5py.File(h5_path, "r") as f:
+    with _H5PY_FILE(h5_path, "r") as f:
         group, descriptors, selected_key = _resolve_slice_group(
             f,
             slice_key=slice_key,
@@ -779,7 +794,7 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, 
 
 
 def load_run_history(h5_path: Path, *, slice_key: str | None = None) -> list[dict[str, Any]]:
-    with h5py.File(h5_path, "r") as f:
+    with _H5PY_FILE(h5_path, "r") as f:
         group, _descriptors, selected_key = _resolve_slice_group(
             f,
             slice_key=slice_key,
@@ -811,7 +826,7 @@ def backfill_artifact_diagnostics(
         "slices": [],
     }
     mode = "r" if dry_run else "r+"
-    with h5py.File(artifact_path, mode) as f:
+    with _H5PY_FILE(artifact_path, mode) as f:
         selected_groups: list[tuple[str, h5py.Group]] = []
         if SLICE_CONTAINER_GROUP in f:
             slices = f[SLICE_CONTAINER_GROUP]
@@ -869,7 +884,7 @@ def backfill_artifact_diagnostics(
                 updated_fields[hash_key] = diagnostics[hash_key]
 
             if updated_fields and not dry_run:
-                common["diagnostics_json"][()] = np.bytes_(json.dumps(diagnostics, sort_keys=True))
+                _replace_text_dataset(common, "diagnostics_json", json.dumps(diagnostics, sort_keys=True))
 
             if updated_fields:
                 report["updated_slice_count"] = int(report["updated_slice_count"]) + 1
@@ -914,8 +929,8 @@ def _write_common_group(
 ) -> None:
     common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
     common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
-    common.create_dataset("wcs_header", data=np.bytes_(wcs_header.tostring(sep="\n", endcard=True)))
-    common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics, sort_keys=True)))
+    _create_text_dataset(common, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
+    _create_text_dataset(common, "diagnostics_json", json.dumps(diagnostics, sort_keys=True))
     dataset = _ensure_run_history_dataset(common)
     for entry in list(run_history or []):
         next_index = int(dataset.shape[0])
@@ -944,12 +959,12 @@ def save_rectangular_scan_file(
 ) -> None:
     out_h5.parent.mkdir(parents=True, exist_ok=True)
     descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key=slice_key or "default")
-    resolved_slice_key = str(slice_key or descriptor["key"])
+    resolved_slice_key = str(slice_key or "default")
     tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
-    with h5py.File(tmp_h5, "w") as dst:
+    with _H5PY_FILE(tmp_h5, "w") as dst:
         slices_dst = dst.create_group(SLICE_CONTAINER_GROUP)
         if out_h5.exists():
-            with h5py.File(out_h5, "r") as src:
+            with _H5PY_FILE(out_h5, "r") as src:
                 if SLICE_CONTAINER_GROUP in src:
                     for name in src[SLICE_CONTAINER_GROUP].keys():
                         if str(name) == resolved_slice_key:
@@ -1017,7 +1032,7 @@ def save_rectangular_scan_file(
             grp.create_dataset("fit_chi2_trials", data=np.asarray(payload.get("fit_chi2_trials", ()), dtype=np.float64))
             grp.create_dataset("fit_rho2_trials", data=np.asarray(payload.get("fit_rho2_trials", ()), dtype=np.float64))
             grp.create_dataset("fit_eta2_trials", data=np.asarray(payload.get("fit_eta2_trials", ()), dtype=np.float64))
-            grp.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(payload["diagnostics"], sort_keys=True)))
+            _create_text_dataset(grp, "diagnostics_json", json.dumps(payload["diagnostics"], sort_keys=True))
             canonical_grp = point_records.create_group(f"r{record_order:06d}")
             _write_point_group(canonical_grp, payload, record_order=record_order)
     os.replace(tmp_h5, out_h5)
@@ -1048,7 +1063,7 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
     grp.create_dataset("fit_chi2_trials", data=np.asarray(normalized["fit_chi2_trials"], dtype=np.float64))
     grp.create_dataset("fit_rho2_trials", data=np.asarray(normalized["fit_rho2_trials"], dtype=np.float64))
     grp.create_dataset("fit_eta2_trials", data=np.asarray(normalized["fit_eta2_trials"], dtype=np.float64))
-    grp.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(normalized["diagnostics"], sort_keys=True)))
+    _create_text_dataset(grp, "diagnostics_json", json.dumps(normalized["diagnostics"], sort_keys=True))
 
 
 def write_sparse_scan_file(
@@ -1068,12 +1083,12 @@ def write_sparse_scan_file(
     # Always record mask_type if present, else default to 'union'
     if "mask_type" not in diagnostics_out:
         diagnostics_out["mask_type"] = diagnostics.get("mask_type", "union")
-    with h5py.File(tmp_h5, "w") as f:
+    with _H5PY_FILE(tmp_h5, "w") as f:
         common = f.create_group("common")
         common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
         common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
-        common.create_dataset("wcs_header", data=np.bytes_(wcs_header.tostring(sep="\n", endcard=True)))
-        common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics_out, sort_keys=True)))
+        _create_text_dataset(common, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
+        _create_text_dataset(common, "diagnostics_json", json.dumps(diagnostics_out, sort_keys=True))
         dataset = _ensure_run_history_dataset(common)
         for entry in list(run_history or []):
             next_index = int(dataset.shape[0])

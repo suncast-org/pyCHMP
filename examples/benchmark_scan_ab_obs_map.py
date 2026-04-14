@@ -21,6 +21,15 @@ class BenchmarkRow:
     artifact_h5: str
 
 
+def _portable_artifact_path(artifact_h5: Path, *, bundle_root: Path | None) -> str:
+    if bundle_root is None:
+        return str(artifact_h5)
+    try:
+        return Path(os.path.relpath(artifact_h5, start=bundle_root)).as_posix()
+    except Exception:
+        return str(artifact_h5)
+
+
 def _parse_worker_counts(text: str) -> list[int]:
     values = [item.strip() for item in str(text).split(",") if item.strip()]
     if not values:
@@ -55,7 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--psf-bmin-arcsec", type=float, default=5.77)
     parser.add_argument("--psf-bpa-deg", type=float, default=-17.5)
     parser.add_argument("--psf-ref-frequency-ghz", type=float, default=17.0)
-    parser.add_argument("--psf-scale-inverse-frequency", action="store_true", default=True)
+    parser.add_argument(
+        "--psf-scale-inverse-frequency",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     return parser.parse_args()
 
 
@@ -89,7 +102,6 @@ def _build_scan_command(args: argparse.Namespace, *, execution_policy: str, max_
         str(float(args.psf_bpa_deg)),
         "--psf-ref-frequency-ghz",
         str(float(args.psf_ref_frequency_ghz)),
-        "--psf-scale-inverse-frequency",
         "--artifact-h5",
         str(artifact_h5),
         "--execution-policy",
@@ -104,6 +116,8 @@ def _build_scan_command(args: argparse.Namespace, *, execution_policy: str, max_
         "--no-progress",
         "--no-spinner",
     ]
+    if bool(args.psf_scale_inverse_frequency):
+        cmd.append("--psf-scale-inverse-frequency")
     for extra_arg in args.scan_arg:
         cmd.append(str(extra_arg))
     return cmd, artifact_h5
@@ -151,7 +165,7 @@ def main() -> int:
                     repeat=int(repeat_index),
                     elapsed_seconds=float(elapsed),
                     exit_code=int(exit_code),
-                    artifact_h5=str(artifact_h5),
+                    artifact_h5=_portable_artifact_path(artifact_h5, bundle_root=args.csv_out.parent if args.csv_out is not None else None),
                 )
             )
             print(

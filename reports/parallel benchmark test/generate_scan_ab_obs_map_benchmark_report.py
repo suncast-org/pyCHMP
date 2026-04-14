@@ -202,13 +202,17 @@ def build_markdown(
             f"| {item['mode']} | {int(item['workers'])} | {int(item['repeat'])} | {float(item['elapsed_seconds']):.3f} | {float(item['speedup_vs_serial']):.3f} | {int(item['exit_code'])} |"
         )
 
+    best_workers = int(best_parallel["workers"])
+    best_elapsed = float(best_parallel["elapsed_seconds"])
+    best_speedup = float(best_parallel["speedup_vs_serial"])
+
     return f"""# {title}
 
 ## Scope
 
 This document summarizes the measured runtime of the real-data 3x3 `scan_ab_obs_map.py`
 benchmark for pyCHMP using the tracked `pyGXrender-test-data` dataset and the benchmark
-bundle rooted at `{csv_path.parent.name}/`.
+bundle stored in `reports/parallel benchmark test/`.
 
 The immediate purpose of the run is operational rather than purely descriptive: it is meant
 to help decide whether a given machine should run the rectangular single-frequency `(a, b)`
@@ -326,9 +330,9 @@ Commands used to retrieve the host metadata shown below:
     but it is not the fastest option for the full 3x3 real-data scan.
 - A one-worker process pool is slightly slower than pure serial, so process-pool startup by
     itself does not justify enabling parallel mode.
-- The useful region on this machine is the mid-range worker counts. `workers=5` produced the
-    best observed result at `386.832 s`, improving on the serial baseline of
-    `{float(serial_item['elapsed_seconds']):.3f} s` by about `1.156x`.
+- The useful region on this machine is the mid-range worker counts. `workers={best_workers}` produced the
+    best observed result at `{best_elapsed:.3f} s`, improving on the serial baseline of
+    `{float(serial_item['elapsed_seconds']):.3f} s` by about `{best_speedup:.3f}x`.
 - Results for `workers=3`, `6`, and `9` were close enough that a provisioning policy should
     prefer a moderate cap rather than simply using every logical processor.
 - Practical implication: for this workflow and host, an `auto` policy should favor process-pool

@@ -4,7 +4,7 @@
 
 This document summarizes the measured runtime of the real-data 3x3 `scan_ab_obs_map.py`
 benchmark for pyCHMP using the tracked `pyGXrender-test-data` dataset and the benchmark
-bundle rooted at `report/`.
+bundle stored in `reports/parallel benchmark test/`.
 
 The immediate purpose of the run is operational rather than purely descriptive: it is meant
 to help decide whether a given machine should run the rectangular single-frequency `(a, b)`
@@ -133,9 +133,9 @@ Commands used to retrieve the host metadata shown below:
     but it is not the fastest option for the full 3x3 real-data scan.
 - A one-worker process pool is slightly slower than pure serial, so process-pool startup by
     itself does not justify enabling parallel mode.
-- The useful region on this machine is the mid-range worker counts. `workers=5` produced the
-    best observed result at `386.832 s`, improving on the serial baseline of
-    `413.884 s` by about `1.156x`.
+- The useful region on this machine is the mid-range worker counts. `workers=7` produced the
+    best observed result at `346.473 s`, improving on the serial baseline of
+    `413.884 s` by about `1.195x`.
 - Results for `workers=3`, `6`, and `9` were close enough that a provisioning policy should
     prefer a moderate cap rather than simply using every logical processor.
 - Practical implication: for this workflow and host, an `auto` policy should favor process-pool

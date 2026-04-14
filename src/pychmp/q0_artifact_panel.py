@@ -236,13 +236,8 @@ class Q0ArtifactPanelFigure:
         mask_type = diagnostics.get("mask_type", "union")
         threshold = float(diagnostics.get("threshold", 0.1))
         # Compute mask
-        from pychmp.metrics import threshold_union_mask, threshold_data_mask, threshold_model_mask, threshold_and_mask
-        mask_fn = {
-            "union": threshold_union_mask,
-            "data": threshold_data_mask,
-            "model": threshold_model_mask,
-            "and": threshold_and_mask,
-        }.get(mask_type, threshold_union_mask)
+        from pychmp.metrics import resolve_threshold_mask
+        mask_fn = resolve_threshold_mask(mask_type)
         return mask_fn(observed, modeled, threshold)
 
     def _draw_mask_contours(self, show, observed, modeled, diagnostics):

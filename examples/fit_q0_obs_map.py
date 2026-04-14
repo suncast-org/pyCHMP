@@ -1381,6 +1381,12 @@ Examples:
         try:
             diagnostics = {
                 "model_path": str(args.model_h5),
+                "model_id": str(_load_model_identity(args.model_h5)),
+                "model_sha256": str(_compute_file_sha256(args.model_h5)),
+                "fits_file": str(args.fits_file),
+                "fits_sha256": str(_compute_file_sha256(args.fits_file)),
+                "ebtel_path": str(args.ebtel_path),
+                "ebtel_sha256": str(_compute_file_sha256(args.ebtel_path)),
                 "observer_name_effective": str(args.observer or "saved_metadata"),
                 "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
                 "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),

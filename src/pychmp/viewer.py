@@ -772,13 +772,14 @@ class PychmpViewApp:
         phase_display = str(self._refresh_signal_phase or "").strip()
         if phase_display:
             info_lines.append(f"Last phase: {phase_display}")
-        if self._refresh_signal_pending_points:
+        pending_points = list(getattr(self, "_refresh_signal_pending_points", []) or [])
+        if pending_points:
             active_points = ", ".join(
                 f"(a={a_value:.3f}, b={b_value:.3f})"
-                for a_value, b_value in self._refresh_signal_pending_points[:4]
+                for a_value, b_value in pending_points[:4]
             )
-            if len(self._refresh_signal_pending_points) > 4:
-                active_points += f", ... (+{len(self._refresh_signal_pending_points) - 4} more)"
+            if len(pending_points) > 4:
+                active_points += f", ... (+{len(pending_points) - 4} more)"
             info_lines.append(f"Active point(s): {active_points}")
         return badge, toolbar_detail, "\n".join(info_lines), color, "white"
 

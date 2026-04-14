@@ -20,16 +20,27 @@ class MetricValues:
     eta2: float
 
 
+def _validate_mask_inputs(
+    observed: np.ndarray,
+    modeled: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    observed_arr = np.asarray(observed)
+    modeled_arr = np.asarray(modeled)
+    if observed_arr.shape != modeled_arr.shape:
+        raise ValueError("observed and modeled must have identical shapes")
+    if not (0.0 <= threshold <= 1.0):
+        raise ValueError("threshold must be between 0 and 1")
+    return observed_arr, modeled_arr
+
+
 def threshold_union_mask(
     observed: np.ndarray,
     modeled: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
     """Return mask where observed or modeled is above thresholded maxima."""
-    if observed.shape != modeled.shape:
-        raise ValueError("observed and modeled must have identical shapes")
-    if not (0.0 <= threshold <= 1.0):
-        raise ValueError("threshold must be between 0 and 1")
+    observed, modeled = _validate_mask_inputs(observed, modeled, threshold)
 
     obs_max = float(np.max(observed))
     mod_max = float(np.max(modeled))
@@ -39,25 +50,42 @@ def threshold_union_mask(
     return np.logical_or(obs_mask, mod_mask)
 
 
-def threshold_data_mask(observed: np.ndarray, modeled: np.ndarray, threshold: float) -> np.ndarray:
+def threshold_data_mask(observed: np.ndarray, _modeled: np.ndarray, threshold: float) -> np.ndarray:
     """Return mask where observed is above thresholded maximum."""
+    observed, _modeled = _validate_mask_inputs(observed, _modeled, threshold)
     obs_max = float(np.max(observed))
     return observed > (obs_max * threshold)
 
 
 def threshold_model_mask(observed: np.ndarray, modeled: np.ndarray, threshold: float) -> np.ndarray:
     """Return mask where modeled is above thresholded maximum."""
+    observed, modeled = _validate_mask_inputs(observed, modeled, threshold)
     mod_max = float(np.max(modeled))
     return modeled > (mod_max * threshold)
 
 
 def threshold_and_mask(observed: np.ndarray, modeled: np.ndarray, threshold: float) -> np.ndarray:
     """Return mask where both observed and modeled are above thresholded maxima."""
+    observed, modeled = _validate_mask_inputs(observed, modeled, threshold)
     obs_max = float(np.max(observed))
     mod_max = float(np.max(modeled))
     obs_mask = observed > (obs_max * threshold)
     mod_mask = modeled > (mod_max * threshold)
     return np.logical_and(obs_mask, mod_mask)
+
+
+def resolve_threshold_mask(mask_type: str):
+    normalized = str(mask_type).strip().lower()
+    mask_fn = {
+        "union": threshold_union_mask,
+        "data": threshold_data_mask,
+        "model": threshold_model_mask,
+        "and": threshold_and_mask,
+    }.get(normalized)
+    if mask_fn is None:
+        supported = ", ".join(("union", "data", "model", "and"))
+        raise ValueError(f"unsupported mask_type {mask_type!r}; expected one of: {supported}")
+    return mask_fn
 
 
 def compute_metrics(
