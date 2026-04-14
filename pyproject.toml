@@ -27,6 +27,8 @@ classifiers = [
 ]
 dependencies = [
   "astropy>=5",
+  "h5py>=3.8",
+  "matplotlib>=3.8",
   "numpy>=1.25",
   "scipy>=1.11",
 ]
@@ -53,6 +55,7 @@ packages = ["src/pychmp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = [".", "src"]
 
 [tool.bumpver]
 current_version = "0.1.0a2"

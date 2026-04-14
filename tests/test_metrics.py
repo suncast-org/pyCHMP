@@ -5,6 +5,7 @@ from pychmp.metrics import compute_metrics, threshold_union_mask
 
 
 def test_threshold_union_mask_selects_union() -> None:
+    """Select the union of above-threshold observed and modeled pixels."""
     observed = np.array([0.0, 1.0, 2.0, 3.0])
     modeled = np.array([4.0, 0.1, 0.2, 0.3])
 
@@ -14,6 +15,7 @@ def test_threshold_union_mask_selects_union() -> None:
 
 
 def test_compute_metrics_expected_values() -> None:
+    """Compute chi2, rho2, and eta2 with the expected formulas."""
     observed = np.array([10.0, 20.0, 30.0, 40.0])
     modeled = np.array([11.0, 18.0, 33.0, 37.0])
     sigma = np.array([1.0, 2.0, 3.0, 4.0])
@@ -29,6 +31,7 @@ def test_compute_metrics_expected_values() -> None:
 
 
 def test_compute_metrics_requires_non_empty_mask() -> None:
+    """Reject metric evaluation when the mask selects no samples."""
     observed = np.ones((2, 2))
     modeled = np.ones((2, 2))
     sigma = np.ones((2, 2))
@@ -39,6 +42,7 @@ def test_compute_metrics_requires_non_empty_mask() -> None:
 
 
 def test_compute_metrics_allows_zero_observed_if_positive_values_exist() -> None:
+    """Allow zero-valued observed pixels when positive samples remain."""
     observed = np.array([1.0, 0.0])
     modeled = np.array([1.2, 0.3])
     sigma = np.array([1.0, 1.0])
@@ -51,6 +55,7 @@ def test_compute_metrics_allows_zero_observed_if_positive_values_exist() -> None
 
 
 def test_compute_metrics_rejects_zero_sigma_or_no_positive_observed() -> None:
+    """Reject invalid sigma values and all-nonpositive observed data."""
     observed = np.array([0.0, 0.0])
     modeled = np.array([1.2, 0.3])
     sigma = np.array([1.0, 1.0])

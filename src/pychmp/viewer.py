@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import textwrap
+import time
 import tkinter as tk
 from pathlib import Path
+from tkinter import scrolledtext
 from tkinter import filedialog, ttk
 from typing import Any
 
 import numpy as np
 from matplotlib.collections import PatchCollection
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -24,7 +28,9 @@ from .ab_scan_artifacts import (
     build_patch_grid_model,
     find_record_for_point,
     load_scan_file,
+    with_observer_metadata,
 )
+from .q0_artifact_panel import Q0ArtifactPanelFigure
 
 
 def _viewer_state_path() -> Path:
@@ -61,8 +67,201 @@ def _save_last_directory(path: Path | None) -> None:
         pass
 
 
+def _format_scalar(value: Any, pattern: str) -> str:
+    try:
+        numeric = float(value)
+    except Exception:
+        return "n/a"
+    if not np.isfinite(numeric):
+        return "nan"
+    if pattern.endswith("f") and numeric != 0.0 and abs(numeric) < 1e-4:
+        precision_text = pattern[1:-1] if pattern.startswith(".") else ""
+        try:
+            precision = max(1, int(precision_text))
+        except Exception:
+            precision = 6
+        return format(numeric, f".{precision}e")
+    return format(numeric, pattern)
+
+
+class _ToolTip:
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tipwindow: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _show(self, _event: Any) -> None:
+        if self.tipwindow is not None or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self.tipwindow = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tw,
+            text=self.text,
+            justify=tk.LEFT,
+            background="#fff8dc",
+            relief=tk.SOLID,
+            borderwidth=1,
+            font=("TkDefaultFont", 9),
+            padx=6,
+            pady=3,
+        )
+        label.pack()
+
+    def _hide(self, _event: Any) -> None:
+        if self.tipwindow is not None:
+            self.tipwindow.destroy()
+            self.tipwindow = None
+
+
+class _SelectedSolutionWindow:
+    def __init__(self, app: PychmpViewApp) -> None:
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("pyCHMP Selected Solution")
+        self.window.geometry("1220x830")
+        self.window.minsize(980, 700)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.load_blos = False
+        self.current_context: dict[str, Any] | None = None
+        self.show_mask_contours_var = tk.BooleanVar(value=True)
+        self.mask_type_var = tk.StringVar(value="ROI mask: union")
+
+        outer = ttk.Frame(self.window, padding=8)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        outer.rowconfigure(2, weight=0)
+
+        toolbar = ttk.Frame(outer)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        toolbar.columnconfigure(4, weight=1)
+        self.blos_button = ttk.Button(toolbar, text="Load B_los", command=self._load_blos_now)
+        self.blos_button.grid(row=0, column=0, sticky="w")
+        _ToolTip(self.blos_button, "Load B_los: fetch and cache the external reference panel on demand for the current model.")
+        self.mask_contour_check = ttk.Checkbutton(
+            toolbar,
+            text="Show ROI Mask Contour",
+            variable=self.show_mask_contours_var,
+            command=self._toggle_mask_contours,
+        )
+        self.mask_contour_check.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        _ToolTip(self.mask_contour_check, "Toggle the displayed ROI mask contour overlay on the observed, modeled, and residual panels.")
+        ttk.Label(toolbar, textvariable=self.mask_type_var, anchor=tk.W).grid(row=0, column=2, sticky="w", padx=(10, 0))
+        self.status_var = tk.StringVar(value="Selected solution window is ready.")
+        ttk.Label(toolbar, textvariable=self.status_var, anchor=tk.W).grid(row=0, column=3, columnspan=2, sticky="ew", padx=(10, 0))
+
+        from matplotlib.figure import Figure
+
+        self.figure = Figure(figsize=(14.8, 9.2), dpi=100, constrained_layout=True)
+        self.panel = Q0ArtifactPanelFigure(self.figure)
+        self.canvas = FigureCanvasTkAgg(self.figure, master=outer)
+        self.canvas.get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        toolbar_frame = ttk.Frame(outer)
+        toolbar_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.grid(row=0, column=0, sticky="w")
+
+    def present(self) -> None:
+        self.window.deiconify()
+        self.window.lift()
+        self.window.focus_force()
+
+    def close(self) -> None:
+        try:
+            self.window.destroy()
+        finally:
+            self.app.selected_solution_window = None
+
+    def update_selection(self) -> None:
+        context = self.app._selected_solution_plot_context()
+        if context is None:
+            self.status_var.set("No completed point available yet.")
+            return
+        self.current_context = context
+        diagnostics = dict(context["diagnostics"])
+        self.panel.update(
+            model_path=context["model_path"],
+            observed_noisy=context["observed_noisy"],
+            raw_modeled_best=context["raw_modeled_best"],
+            modeled_best=context["modeled_best"],
+            residual=context["residual"],
+            wcs_header=context["wcs_header"],
+            frequency_ghz=context["frequency_ghz"],
+            diagnostics=diagnostics,
+            wcs_header_transform=context["wcs_header_transform"],
+            load_blos=self.load_blos,
+        )
+        self.panel.set_mask_contours_visible(bool(self.show_mask_contours_var.get()))
+        self.panel._draw_mask_contours(
+            bool(self.show_mask_contours_var.get()),
+            np.asarray(context["observed_noisy"], dtype=float),
+            np.asarray(context["modeled_best"], dtype=float),
+            diagnostics,
+        )
+        slice_label = str(context["slice_label"])
+        mask_type = str(diagnostics.get("mask_type", "union")).strip() or "union"
+        threshold_value = diagnostics.get("threshold")
+        try:
+            threshold_text = f"{float(threshold_value):.3f}"
+        except Exception:
+            threshold_text = "n/a"
+        self.mask_type_var.set(f"ROI mask: {mask_type} @ {threshold_text}")
+        self.window.title(
+            "pyCHMP Selected Solution"
+            f" - {slice_label} - a={float(diagnostics.get('a', np.nan)):.3f}"
+            f" b={float(diagnostics.get('b', np.nan)):.3f}"
+        )
+        elapsed_seconds = diagnostics.get("elapsed_seconds")
+        try:
+            elapsed_value = float(elapsed_seconds)
+        except Exception:
+            elapsed_value = float("nan")
+        elapsed_text = f" | elapsed={elapsed_value:.3f} s" if np.isfinite(elapsed_value) else ""
+        self.status_var.set(
+            f"Slice: {slice_label} | q0={_format_scalar(diagnostics.get('q0_recovered', np.nan), '.6f')}"
+            f" | B_los: {'loaded' if self.load_blos else 'lazy'}{elapsed_text}"
+        )
+        self.canvas.draw_idle()
+
+    def _load_blos_now(self) -> None:
+        self.load_blos = True
+        self.update_selection()
+
+    def _toggle_mask_contours(self) -> None:
+        self.panel.set_mask_contours_visible(bool(self.show_mask_contours_var.get()))
+        if self.current_context is None:
+            return
+        diagnostics = dict(self.current_context["diagnostics"])
+        self.panel._draw_mask_contours(
+            bool(self.show_mask_contours_var.get()),
+            np.asarray(self.current_context["observed_noisy"], dtype=float),
+            np.asarray(self.current_context["modeled_best"], dtype=float),
+            diagnostics,
+        )
+        self.canvas.draw_idle()
+
+
 class PychmpViewApp:
-    def __init__(self, root: tk.Tk, artifact_h5: Path | None, *, initial_metric: str = "chi2") -> None:
+    _LOAD_RETRY_ATTEMPTS = 8
+    _LOAD_RETRY_DELAY_S = 0.35
+    _EXTERNAL_REFRESH_POLL_MS = 1200
+    _MAX_LOG_LINES = 3000
+    _INITIAL_LOG_READ_BYTES = 262_144
+    _TAB_FOOTER_HEIGHT = 108
+    _TOOLBAR_HEIGHT = 40
+    _NOTEBOOK_TAB_HEIGHT = 28
+    _WINDOW_VERTICAL_CHROME = 28
+    _DISPLAY_PAD = 8
+    _ACTIVE_REFRESH_GRACE_S = 10.0
+
+    def __init__(self, root: tk.Tk, artifact_h5: Path | None, *, initial_metric: str | None = None) -> None:
         self.root = root
         self.artifact_h5 = artifact_h5
         self.payload = {}
@@ -70,130 +269,252 @@ class PychmpViewApp:
         self.b_values = np.asarray([], dtype=float)
         self.display_model: dict[str, Any] = {"records": []}
         self.run_target_metric = "chi2"
-        self.metric_var = tk.StringVar(value=initial_metric if initial_metric in METRICS else "chi2")
+        self._preferred_initial_metric = initial_metric if initial_metric in METRICS else None
+        self.metric_var = tk.StringVar(value=self._preferred_initial_metric or "chi2")
+        self._last_rendered_metric = self.metric_var.get() if self.metric_var.get() in METRICS else "chi2"
+        self.slice_key_var = tk.StringVar(value="")
+        self.slice_display_var = tk.StringVar(value="")
+        self.trials_xmin_var = tk.StringVar(value="")
+        self.trials_xmax_var = tk.StringVar(value="")
+        self.trials_ymin_var = tk.StringVar(value="")
+        self.trials_ymax_var = tk.StringVar(value="")
+        self.trials_xscale_var = tk.StringVar(value="linear")
+        self.trials_yscale_var = tk.StringVar(value="linear")
         self.a_index_var = tk.IntVar(value=0)
         self.b_index_var = tk.IntVar(value=0)
+        self.scan_state_var = tk.StringVar(value="NO ARTIFACT")
+        self.scan_state_detail_var = tk.StringVar(value="No artifact loaded")
+        self.scan_state_info_var = tk.StringVar(value="No artifact loaded")
         self.status_var = tk.StringVar(value="")
         self.summary_var = tk.StringVar(value="")
         self.last_artifact_dir = _load_last_directory()
+        self.refresh_signal_path: Path | None = None
+        self._refresh_signal_mtime_ns = -1
+        self._refresh_signal_phase = ""
+        self._refresh_signal_pending_points: list[tuple[float, float]] = []
+        self._external_refresh_after_id: str | None = None
+        self._present_window_after_id: str | None = None
+        self._is_closing = False
+        self.info_notebook: ttk.Notebook | None = None
+        self.info_tab: ttk.Frame | None = None
+        self.center_notebook: ttk.Notebook | None = None
+        self.q0_trials_tab: ttk.Frame | None = None
+        self.left_panel_width = 0
+        self.center_panel_width = 0
+        self.right_panel_width = 0
+        self.left_notebook: ttk.Notebook | None = None
+        self.right_notebook: ttk.Notebook | None = None
+        self.heatmap_tab: ttk.Frame | None = None
+        self.trials_tab: ttk.Frame | None = None
+        self.trials_controls: ttk.Frame | None = None
+        self.info_frame: ttk.Frame | None = None
+        self.info_canvas: tk.Canvas | None = None
+        self.info_canvas_window: int | None = None
+        self.info_scrollbar: ttk.Scrollbar | None = None
+        self.info_text: tk.Text | None = None
+        self.slice_menu: ttk.Combobox | None = None
+        self.slice_display_label: ttk.Label | None = None
+        self.available_slices: list[dict[str, Any]] = []
+        self.slice_display_state: dict[str, dict[str, Any]] = {}
+        self.open_artifact_button: ttk.Button | None = None
+        self.display_selected_button: ttk.Button | None = None
+        self.summary_button: ttk.Button | None = None
+        self.refresh_button: ttk.Button | None = None
+        self.scan_state_badge: tk.Label | None = None
+        self.scan_state_label: ttk.Label | None = None
+        self.scan_state_info_label: ttk.Label | None = None
+        self.square_display_side = 0
+        self.selected_solution_window: _SelectedSolutionWindow | None = None
 
         self.root.title(f"pychmp-view: {artifact_h5.name}" if artifact_h5 is not None else "pychmp-view")
+        self.root.protocol("WM_DELETE_WINDOW", self._close_root_window)
         self._configure_initial_window_geometry()
 
         self._build_ui()
         self._refresh_all()
-        self.root.after(50, self._present_window)
+        self._external_refresh_after_id = self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
+        self._present_window_after_id = self.root.after(50, self._present_window)
 
     def _configure_initial_window_geometry(self) -> None:
         screen_w = max(1, int(self.root.winfo_screenwidth()))
         screen_h = max(1, int(self.root.winfo_screenheight()))
 
-        # Preserve the proportions that work on the user's Mac by expressing the
-        # previous fixed geometry as screen-relative ratios instead of pixels.
-        width_ratio = 1380.0 / 1440.0
-        height_ratio = 760.0 / 900.0
-        min_width_ratio = 1240.0 / 1440.0
-        min_height_ratio = 700.0 / 900.0
+        width = max(900, int(round(screen_w * 0.75)))
+        panel_width = int(round(screen_w * 0.25))
+        square_side = max(220, panel_width - 24)
 
-        width = min(screen_w - 24, max(980, int(round(screen_w * width_ratio))))
-        height = min(screen_h - 60, max(620, int(round(screen_h * height_ratio))))
-        min_width = min(width, max(980, int(round(screen_w * min_width_ratio))))
-        min_height = min(height, max(620, int(round(screen_h * min_height_ratio))))
+        # Height is derived from required vertical stack: shared toolbar + tab header +
+        # square display region + fixed tab footer + outer chrome/padding.
+        required_height = (
+            16  # outer frame vertical padding (8 top + 8 bottom)
+            + self._TOOLBAR_HEIGHT
+            + 6  # gap below toolbar
+            + self._NOTEBOOK_TAB_HEIGHT
+            + square_side
+            + self._TAB_FOOTER_HEIGHT
+            + self._WINDOW_VERTICAL_CHROME
+        )
+        height = min(max(560, required_height), max(560, screen_h - 40))
 
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(min_width, min_height)
+        self.root.minsize(width, height)
+        self.root.maxsize(width, height)
+        self.root.resizable(False, False)
+
+        self.left_panel_width = panel_width
+        self.center_panel_width = panel_width
+        self.right_panel_width = panel_width
+        self.square_display_side = square_side
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(2, weight=1)
+        outer.rowconfigure(1, weight=1)
 
-        controls = ttk.Frame(outer)
-        controls.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        toolbar = ttk.Frame(outer)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        toolbar.columnconfigure(99, weight=1)
 
-        ttk.Label(controls, text="Metric").pack(side=tk.LEFT)
-        metric_menu = ttk.Combobox(controls, width=10, state="readonly", values=list(METRICS), textvariable=self.metric_var)
-        metric_menu.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(toolbar, text="Metric").grid(row=0, column=0, sticky="w")
+        metric_menu = ttk.Combobox(toolbar, width=8, state="readonly", values=list(METRICS), textvariable=self.metric_var)
+        metric_menu.grid(row=0, column=1, sticky="w", padx=(6, 8))
         metric_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_metric_changed())
 
-        ttk.Button(controls, text="Jump To Best", command=self._jump_to_best).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(toolbar, text="Best", command=self._jump_to_best).grid(row=0, column=2, sticky="w", padx=(0, 10))
 
-        ttk.Label(controls, text="a").pack(side=tk.LEFT)
-        self.a_menu = ttk.Combobox(controls, width=14, state="readonly")
-        self.a_menu.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(toolbar, text="Slice").grid(row=0, column=3, sticky="w")
+        self.slice_menu = ttk.Combobox(toolbar, width=18, state="readonly")
+        self.slice_menu.grid(row=0, column=4, sticky="w", padx=(6, 6))
+        self.slice_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_slice_changed())
+        self.slice_display_label = ttk.Label(toolbar, textvariable=self.slice_display_var, anchor=tk.W)
+        self.slice_display_label.grid(row=0, column=4, sticky="w", padx=(6, 6))
+
+        ttk.Label(toolbar, text="a").grid(row=0, column=5, sticky="w")
+        self.a_menu = ttk.Combobox(toolbar, width=10, state="readonly")
+        self.a_menu.configure(width=10)
+        self.a_menu.grid(row=0, column=6, sticky="w", padx=(6, 10))
         self.a_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_a_changed())
 
-        ttk.Label(controls, text="b").pack(side=tk.LEFT)
-        self.b_menu = ttk.Combobox(controls, width=14, state="readonly")
-        self.b_menu.pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(toolbar, text="b").grid(row=0, column=7, sticky="w")
+        self.b_menu = ttk.Combobox(toolbar, width=10, state="readonly")
+        self.b_menu.configure(width=10)
+        self.b_menu.grid(row=0, column=8, sticky="w", padx=(6, 12))
         self.b_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_b_changed())
 
-        actions = ttk.Frame(outer)
-        actions.grid(row=1, column=0, sticky="w", pady=(0, 6))
-        ttk.Button(actions, text="Open Artifact", command=self._open_artifact).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(actions, text="Open Selected Maps", command=self._open_selected_maps).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(actions, text="Open Grid Summary", command=self._open_grid_summary).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(actions, text="Refresh Artifact", command=self._reload_payload).pack(side=tk.LEFT)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=9, sticky="ns", padx=(0, 10))
+
+        open_artifact_button = ttk.Button(toolbar, text="📂", width=3, command=self._open_artifact)
+        open_artifact_button.grid(row=0, column=10, sticky="w", padx=(0, 6))
+        self.open_artifact_button = open_artifact_button
+        display_selected_button = ttk.Button(toolbar, text="🖼", width=3, command=self._open_selected_maps)
+        display_selected_button.grid(row=0, column=11, sticky="w", padx=(0, 6))
+        self.display_selected_button = display_selected_button
+        summary_button = ttk.Button(toolbar, text="▦", width=3, command=self._open_grid_summary)
+        summary_button.grid(row=0, column=12, sticky="w", padx=(0, 6))
+        self.summary_button = summary_button
+        refresh_button = ttk.Button(toolbar, text="↻", width=3, command=self._reload_payload)
+        refresh_button.grid(row=0, column=13, sticky="w")
+        self.refresh_button = refresh_button
+        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=14, sticky="ns", padx=(10, 10))
+        scan_state_badge = tk.Label(
+            toolbar,
+            textvariable=self.scan_state_var,
+            bg="#6c757d",
+            fg="white",
+            font=("TkDefaultFont", 9, "bold"),
+            padx=8,
+            pady=3,
+        )
+        scan_state_badge.grid(row=0, column=15, sticky="w")
+        self.scan_state_badge = scan_state_badge
+        scan_state_label = ttk.Label(toolbar, textvariable=self.scan_state_detail_var, anchor=tk.W)
+        scan_state_label.grid(row=0, column=16, sticky="w", padx=(8, 0))
+        self.scan_state_label = scan_state_label
+        _ToolTip(open_artifact_button, "Open Artifact: choose a consolidated pyCHMP scan H5 artifact file.")
+        _ToolTip(display_selected_button, "Display Selected Solution: open or refresh the persistent detailed solution window for the current (a, b) point.")
+        _ToolTip(summary_button, "Display Grid Summary: open the external grid-summary plot for the current artifact.")
+        _ToolTip(refresh_button, "Refresh Artifact: reload the current artifact and update the viewer if the scan has advanced.")
+        _ToolTip(scan_state_badge, "Scan status: indicates whether the current slice appears to be running, finished, incomplete, or empty. Full details are shown in the Info pane.")
 
         content = ttk.Frame(outer)
-        content.grid(row=2, column=0, sticky="nsew")
-        content.columnconfigure(0, weight=9)
-        content.columnconfigure(1, weight=2)
+        content.grid(row=1, column=0, sticky="nsew")
+        content.columnconfigure(0, minsize=self.left_panel_width + self.center_panel_width + 8, weight=0)
+        content.columnconfigure(1, minsize=self.right_panel_width, weight=0)
+        content.columnconfigure(2, weight=1)
         content.rowconfigure(0, weight=1)
 
         plot_area = ttk.Frame(content)
         plot_area.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        plot_area.columnconfigure(0, weight=1)
-        plot_area.columnconfigure(1, weight=1)
+        plot_area.columnconfigure(0, minsize=self.left_panel_width, weight=0)
+        plot_area.columnconfigure(1, minsize=self.center_panel_width, weight=0)
         plot_area.rowconfigure(0, weight=1)
 
         info_panel = ttk.Frame(content)
         info_panel.grid(row=0, column=1, sticky="nsew")
-        info_panel.columnconfigure(0, weight=1)
+        info_panel.columnconfigure(0, minsize=self.right_panel_width, weight=0)
         info_panel.rowconfigure(0, weight=1)
 
-        info_canvas = tk.Canvas(info_panel, highlightthickness=0)
-        info_canvas.grid(row=0, column=0, sticky="nsew")
-        info_scroll_y = ttk.Scrollbar(info_panel, orient=tk.VERTICAL, command=info_canvas.yview)
-        info_scroll_y.grid(row=0, column=1, sticky="ns")
-        info_scroll_x = ttk.Scrollbar(info_panel, orient=tk.HORIZONTAL, command=info_canvas.xview)
-        info_scroll_x.grid(row=1, column=0, sticky="ew")
-        info_canvas.configure(yscrollcommand=info_scroll_y.set, xscrollcommand=info_scroll_x.set)
+        info_notebook = ttk.Notebook(info_panel)
+        info_notebook.grid(row=0, column=0, sticky="nsew")
+        self.info_notebook = info_notebook
+        self.info_notebook.configure(width=self.right_panel_width)
 
-        self.info_inner = ttk.Frame(info_canvas)
-        self.info_canvas_window = info_canvas.create_window((0, 0), window=self.info_inner, anchor="nw")
-        self.info_inner.columnconfigure(0, weight=1)
-        self.info_canvas = info_canvas
+        info_tab = ttk.Frame(info_notebook)
+        info_tab.columnconfigure(0, weight=1)
+        info_tab.rowconfigure(0, weight=1)
+        self.info_tab = info_tab
+        info_notebook.add(info_tab, text="Info")
 
-        run_info_frame = ttk.LabelFrame(self.info_inner, text="Run Info", padding=10)
-        run_info_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.status_label = ttk.Label(
-            run_info_frame,
-            textvariable=self.status_var,
-            justify=tk.LEFT,
-            anchor=tk.NW,
-            font=("TkDefaultFont", 12),
+        info_text = scrolledtext.ScrolledText(
+            info_tab,
+            wrap=tk.WORD,
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=0,
+            font=("TkDefaultFont", 10),
+            width=1,
+            height=1,
+            padx=8,
+            pady=8,
+            cursor="arrow",
         )
-        self.status_label.pack(fill=tk.X)
+        info_text.grid(row=0, column=0, sticky="nsew")
+        self.info_text = info_text
+        self.info_scrollbar = None
+        try:
+            info_text.vbar.configure(width=14)
+        except Exception:
+            pass
+        info_text.configure(state=tk.DISABLED)
+        info_text.tag_configure("heading", font=("TkDefaultFont", 10, "bold"), spacing1=2, spacing3=4)
+        info_text.tag_configure("body", font=("TkDefaultFont", 10))
 
         left_notebook = ttk.Notebook(plot_area)
         left_notebook.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left_notebook.configure(width=self.left_panel_width)
+        self.left_notebook = left_notebook
         right_notebook = ttk.Notebook(plot_area)
         right_notebook.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        right_notebook.configure(width=self.center_panel_width)
+        self.center_notebook = right_notebook
 
         heatmap_tab = ttk.Frame(left_notebook)
         heatmap_tab.columnconfigure(0, weight=1)
         heatmap_tab.rowconfigure(0, weight=1)
-        heatmap_tab.rowconfigure(1, weight=0)
+        heatmap_tab.rowconfigure(1, minsize=self._TAB_FOOTER_HEIGHT, weight=0)
+        self.heatmap_tab = heatmap_tab
         left_notebook.add(heatmap_tab, text="Grid Metric")
 
         trials_tab = ttk.Frame(right_notebook)
         trials_tab.columnconfigure(0, weight=1)
         trials_tab.rowconfigure(0, weight=1)
-        right_notebook.add(trials_tab, text="Q0 Trials")
+        trials_tab.rowconfigure(1, minsize=self._TAB_FOOTER_HEIGHT, weight=0)
+        self.trials_tab = trials_tab
+        right_notebook.add(trials_tab, text="Trials")
+        self.q0_trials_tab = trials_tab
 
         self.heatmap_figure = Figure(figsize=(4.8, 4.2), dpi=100)
         self.ax_heatmap = self.heatmap_figure.add_subplot(111)
@@ -209,7 +530,7 @@ class PychmpViewApp:
         self._heatmap_colorbar = None
         self.heatmap_canvas = FigureCanvasTkAgg(self.heatmap_figure, master=heatmap_tab)
         self.heatmap_canvas_widget = self.heatmap_canvas.get_tk_widget()
-        self.heatmap_canvas_widget.grid(row=0, column=0, sticky="nsew")
+        self.heatmap_canvas_widget.grid(row=0, column=0, sticky="nsew", padx=self._DISPLAY_PAD, pady=self._DISPLAY_PAD)
         self.heatmap_canvas.mpl_connect("button_press_event", self._on_canvas_click)
         self.heatmap_legend_row = ttk.Frame(heatmap_tab)
         self.heatmap_legend_row.grid(row=1, column=0, sticky="ew", pady=(2, 0))
@@ -217,23 +538,13 @@ class PychmpViewApp:
 
         self.trials_canvas = FigureCanvasTkAgg(self.trials_figure, master=trials_tab)
         self.trials_canvas_widget = self.trials_canvas.get_tk_widget()
-        self.trials_canvas_widget.grid(row=0, column=0, sticky="nsew")
-
-        summary_frame = ttk.LabelFrame(self.info_inner, text="Selected Point", padding=10)
-        summary_frame.grid(row=1, column=0, sticky="nsew")
-        self.info_inner.rowconfigure(1, weight=1)
-        self.summary_label = ttk.Label(
-            summary_frame,
-            textvariable=self.summary_var,
-            justify=tk.LEFT,
-            anchor=tk.NW,
-            font=("TkFixedFont", 11),
-        )
-        self.summary_label.pack(fill=tk.BOTH, expand=True, anchor=tk.NW)
+        self.trials_canvas_widget.grid(row=0, column=0, sticky="nsew", padx=self._DISPLAY_PAD, pady=self._DISPLAY_PAD)
+        trials_controls = ttk.Frame(trials_tab)
+        trials_controls.grid(row=1, column=0, sticky="ew", padx=self._DISPLAY_PAD, pady=(0, 4))
+        self.trials_controls = trials_controls
+        self._build_trials_controls()
 
         self.root.bind("<Configure>", self._on_resize)
-        self.info_inner.bind("<Configure>", self._on_info_panel_configure)
-        self.info_canvas.bind("<Configure>", self._on_info_canvas_configure)
 
         if self.artifact_h5 is not None:
             self._reload_payload()
@@ -242,8 +553,12 @@ class PychmpViewApp:
             self.summary_var.set("No artifact loaded.")
             self._refresh_all()
         self._refresh_selector_values()
+        self._apply_fixed_body_geometry()
 
     def _present_window(self) -> None:
+        self._present_window_after_id = None
+        if self._is_closing:
+            return
         try:
             self.root.deiconify()
             self.root.lift()
@@ -254,17 +569,256 @@ class PychmpViewApp:
         except Exception:
             pass
 
+    def _close_root_window(self) -> None:
+        self._is_closing = True
+        for after_id in (self._external_refresh_after_id, self._present_window_after_id):
+            if after_id is None:
+                continue
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._external_refresh_after_id = None
+        self._present_window_after_id = None
+        if self.selected_solution_window is not None:
+            try:
+                self.selected_solution_window.window.destroy()
+            except Exception:
+                pass
+            self.selected_solution_window = None
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
     def _on_resize(self, _event: Any) -> None:
         total_width = max(400, int(self.root.winfo_width()) - 60)
         side_width = max(240, int(total_width * 0.22))
-        self.status_label.configure(wraplength=side_width)
-        self.summary_label.configure(wraplength=side_width)
+        self._apply_fixed_body_geometry()
 
-    def _on_info_panel_configure(self, _event: Any) -> None:
-        self.info_canvas.configure(scrollregion=self.info_canvas.bbox("all"))
+    def _apply_fixed_body_geometry(self) -> None:
+        square_side = int(self.square_display_side)
+        canvas_side = max(180, square_side - 2 * self._DISPLAY_PAD)
 
-    def _on_info_canvas_configure(self, event: Any) -> None:
-        self.info_canvas.itemconfigure(self.info_canvas_window, width=event.width)
+        if self.left_notebook is not None:
+            self.left_notebook.configure(width=self.left_panel_width)
+        if self.right_notebook is not None:
+            self.right_notebook.configure(width=self.center_panel_width)
+        if self.info_notebook is not None:
+            self.info_notebook.configure(width=self.right_panel_width)
+
+        if self.heatmap_tab is not None:
+            self.heatmap_tab.rowconfigure(0, minsize=square_side, weight=0)
+        if self.trials_tab is not None:
+            self.trials_tab.rowconfigure(0, minsize=square_side, weight=0)
+        self.heatmap_canvas_widget.configure(width=canvas_side, height=canvas_side)
+        self.trials_canvas_widget.configure(width=canvas_side, height=canvas_side)
+        self.heatmap_figure.set_size_inches(canvas_side / 100.0, canvas_side / 100.0, forward=True)
+        self.trials_figure.set_size_inches(canvas_side / 100.0, canvas_side / 100.0, forward=True)
+
+    def _reset_heatmap_colorbar_axis(self) -> None:
+        if self._heatmap_colorbar is not None:
+            try:
+                self._heatmap_colorbar.remove()
+            except Exception:
+                pass
+            self._heatmap_colorbar = None
+        try:
+            self.ax_heatmap_cbar.remove()
+        except Exception:
+            pass
+        self.heatmap_divider = make_axes_locatable(self.ax_heatmap)
+        self.ax_heatmap_cbar = self.heatmap_divider.append_axes("right", size="5%", pad=0.08)
+
+    def _refresh_info_text(self) -> None:
+        if self.info_text is None:
+            return
+        self.info_text.configure(state=tk.NORMAL)
+        self.info_text.delete("1.0", tk.END)
+        self.info_text.insert(tk.END, "Scan State\n", "heading")
+        self.info_text.insert(tk.END, f"{self._wrap_info_block(self.scan_state_info_var.get())}\n\n", "body")
+        self.info_text.insert(tk.END, "Artifact\n", "heading")
+        self.info_text.insert(tk.END, f"{self._wrap_info_block(self.status_var.get())}\n\n", "body")
+        self.info_text.insert(tk.END, "Selected Point\n", "heading")
+        self.info_text.insert(tk.END, f"{self._wrap_info_block(self.summary_var.get())}\n", "body")
+        self.info_text.configure(state=tk.DISABLED)
+
+    def _wrap_info_block(self, text: str) -> str:
+        wrapped_lines: list[str] = []
+        width = self._info_wrap_width_chars()
+        for raw_line in str(text).splitlines():
+            if not raw_line.strip():
+                wrapped_lines.append("")
+                continue
+            wrapped_lines.extend(
+                textwrap.wrap(
+                    raw_line,
+                    width=width,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+                or [raw_line]
+            )
+        return "\n".join(wrapped_lines)
+
+    def _info_wrap_width_chars(self) -> int:
+        if self.info_text is not None:
+            try:
+                widget_width = int(self.info_text.winfo_width())
+                if widget_width > 40:
+                    return max(28, int((widget_width - 24) / 7.2))
+            except Exception:
+                pass
+        return max(28, int((self.right_panel_width - 24) / 7.2))
+
+    def _refresh_action_states(self) -> None:
+        has_artifact = self.artifact_h5 is not None
+        has_selected_point = has_artifact and self._has_selected_point()
+        if self.open_artifact_button is not None:
+            self.open_artifact_button.state(["!disabled"])
+        if self.display_selected_button is not None:
+            self.display_selected_button.state(["!disabled"] if has_selected_point else ["disabled"])
+        if self.summary_button is not None:
+            self.summary_button.state(["!disabled"] if has_artifact else ["disabled"])
+        if self.refresh_button is not None:
+            self.refresh_button.state(["!disabled"] if has_artifact else ["disabled"])
+
+    def _scan_state_snapshot(self) -> tuple[str, str, str, str, str]:
+        if self.artifact_h5 is None or not self.payload:
+            return "NO ARTIFACT", "No artifact", "No artifact loaded", "#6c757d", "white"
+
+        points = self.payload.get("points", {})
+        diagnostics = dict(self.payload.get("diagnostics") or {})
+        total = int(len(points))
+        slice_descriptor = dict(self.payload.get("selected_slice") or {})
+        slice_label = self._slice_label(slice_descriptor) if slice_descriptor else "current slice"
+        slice_count = max(1, int(len(self.available_slices) or 1))
+        adaptive_sparse = (
+            str(diagnostics.get("artifact_kind", "")).strip().lower() == "pychmp_ab_scan_sparse_points"
+            and str(diagnostics.get("search_mode", "")).strip().lower() == "adaptive_local_single_frequency"
+        )
+        if total == 0:
+            toolbar_detail = f"{slice_label} | 0/{total} computed"
+            info_detail = f"Current slice: {slice_label}\nGrid points: {total}\nComputed: 0\nArtifact slices: {slice_count}"
+            return "EMPTY", toolbar_detail, info_detail, "#6c757d", "white"
+
+        statuses = [str(point.get("status", "computed")).strip().lower() for point in points.values()]
+        pending = int(sum(status == "pending" for status in statuses))
+        failed = int(sum(status == "failed" for status in statuses))
+        computed = int(sum(status == "computed" for status in statuses))
+        other = max(0, total - pending - failed - computed)
+        noncomputed = pending + failed + other
+
+        refresh_active = False
+        if self.refresh_signal_path is not None and self.refresh_signal_path.exists():
+            try:
+                refresh_age_s = max(0.0, time.time() - float(self.refresh_signal_path.stat().st_mtime))
+                refresh_active = refresh_age_s <= float(self._ACTIVE_REFRESH_GRACE_S)
+            except Exception:
+                refresh_active = False
+
+        phase = str(self._refresh_signal_phase or "").strip().lower()
+        phase_running = bool(phase) and phase not in {"scan complete", "complete"}
+        phase_complete = phase in {"scan complete", "complete"}
+
+        if phase_complete:
+            badge = "FINISHED"
+            color = "#2b8a3e"
+        elif adaptive_sparse and refresh_active:
+            badge = "RUNNING"
+            color = "#0b7285"
+        elif (refresh_active or phase_running) and noncomputed > 0:
+            badge = "RUNNING"
+            color = "#0b7285"
+        elif adaptive_sparse and phase_running:
+            badge = "INCOMPLETE"
+            color = "#b26a00"
+        elif noncomputed > 0:
+            badge = "INCOMPLETE"
+            color = "#b26a00"
+        else:
+            badge = "FINISHED"
+            color = "#2b8a3e"
+
+        toolbar_detail = f"{slice_label} | {computed}/{total} computed"
+        info_lines = [
+            f"Current slice: {slice_label}",
+            f"Grid points: {total}",
+            f"Computed: {computed}",
+        ]
+        run_history = list(self.payload.get("run_history", [])) if self.payload else []
+        info_lines.append(f"Run history entries: {len(run_history)}")
+        if run_history:
+            latest_history = dict(run_history[-1])
+            latest_timestamp = str(latest_history.get("timestamp_utc", "")).strip()
+            latest_action = str(latest_history.get("action", "")).strip()
+            latest_command = str(
+                latest_history.get("wrapper_command")
+                or latest_history.get("effective_python_command")
+                or ""
+            ).strip()
+            if latest_timestamp or latest_action:
+                label = " ".join(part for part in (latest_timestamp, f"({latest_action})" if latest_action else "") if part)
+                info_lines.append(f"Latest run: {label}".strip())
+            if latest_command:
+                info_lines.append(f"Latest command: {latest_command}")
+        if pending > 0:
+            info_lines.append(f"Pending: {pending}")
+        if failed > 0:
+            info_lines.append(f"Failed: {failed}")
+        if other > 0:
+            info_lines.append(f"Other: {other}")
+        info_lines.append(f"Artifact slices: {slice_count}")
+        phase_display = str(self._refresh_signal_phase or "").strip()
+        if phase_display:
+            info_lines.append(f"Last phase: {phase_display}")
+        pending_points = list(getattr(self, "_refresh_signal_pending_points", []) or [])
+        if pending_points:
+            active_points = ", ".join(
+                f"(a={a_value:.3f}, b={b_value:.3f})"
+                for a_value, b_value in pending_points[:4]
+            )
+            if len(pending_points) > 4:
+                active_points += f", ... (+{len(pending_points) - 4} more)"
+            info_lines.append(f"Active point(s): {active_points}")
+        return badge, toolbar_detail, "\n".join(info_lines), color, "white"
+
+    def _read_refresh_signal_payload(self) -> dict[str, Any]:
+        if self.refresh_signal_path is None or not self.refresh_signal_path.exists():
+            return {"phase": "", "pending_points": []}
+        try:
+            text = self.refresh_signal_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return {"phase": "", "pending_points": []}
+        if not text:
+            return {"phase": "", "pending_points": []}
+        if text.startswith("{"):
+            try:
+                payload = json.loads(text)
+                phase = str(payload.get("phase", "")).strip()
+                pending_points: list[tuple[float, float]] = []
+                for item in payload.get("pending_points", []) or []:
+                    try:
+                        a_value = float(item.get("a"))
+                        b_value = float(item.get("b"))
+                    except Exception:
+                        continue
+                    if np.isfinite(a_value) and np.isfinite(b_value):
+                        pending_points.append((a_value, b_value))
+                return {"phase": phase, "pending_points": pending_points}
+            except Exception:
+                return {"phase": "", "pending_points": []}
+        parts = text.split(maxsplit=1)
+        phase = parts[1].strip() if len(parts) == 2 else parts[0].strip()
+        return {"phase": phase, "pending_points": []}
+
+    def _refresh_scan_state_display(self) -> None:
+        badge, toolbar_detail, info_detail, bg, fg = self._scan_state_snapshot()
+        self.scan_state_var.set(badge)
+        self.scan_state_detail_var.set(toolbar_detail)
+        self.scan_state_info_var.set(info_detail)
+        if self.scan_state_badge is not None:
+            self.scan_state_badge.configure(bg=bg, fg=fg)
 
     def _build_heatmap_legend_row(self) -> None:
         def add_item(symbol: str, color: str, label: str) -> None:
@@ -277,8 +831,289 @@ class PychmpViewApp:
         add_item("□", "#1f77b4", "best rho2")
         add_item("△", "#2ca02c", "best eta2")
         add_item("×", "#444444", "selected point")
+        add_item("*", "#f08c00", "active point")
+
+    def _build_trials_controls(self) -> None:
+        if self.trials_controls is None:
+            return
+
+        controls = self.trials_controls
+        for column in range(10):
+            controls.columnconfigure(column, weight=0)
+        controls.columnconfigure(10, weight=1)
+
+        ttk.Label(controls, text="x range").grid(row=0, column=0, sticky="w")
+        xmin_entry = ttk.Entry(controls, width=11, textvariable=self.trials_xmin_var)
+        xmin_entry.grid(row=0, column=1, sticky="w", padx=(4, 4))
+        ttk.Label(controls, text="to").grid(row=0, column=2, sticky="w")
+        xmax_entry = ttk.Entry(controls, width=11, textvariable=self.trials_xmax_var)
+        xmax_entry.grid(row=0, column=3, sticky="w", padx=(4, 10))
+
+        ttk.Label(controls, text="x scale").grid(row=0, column=4, sticky="w")
+        xscale_menu = ttk.Combobox(controls, width=8, state="readonly", values=("linear", "log"), textvariable=self.trials_xscale_var)
+        xscale_menu.grid(row=0, column=5, sticky="w", padx=(4, 10))
+        xscale_menu.bind("<<ComboboxSelected>>", lambda _event: self._refresh_all())
+        reset_x_button = ttk.Button(controls, text="↺", width=2, command=self._reset_trials_x_axis)
+        reset_x_button.grid(row=0, column=6, sticky="w")
+
+        ttk.Label(controls, text="y range").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ymin_entry = ttk.Entry(controls, width=11, textvariable=self.trials_ymin_var)
+        ymin_entry.grid(row=1, column=1, sticky="w", padx=(4, 4), pady=(6, 0))
+        ymax_entry = ttk.Entry(controls, width=11, textvariable=self.trials_ymax_var)
+        ttk.Label(controls, text="to").grid(row=1, column=2, sticky="w", pady=(6, 0))
+        ymax_entry.grid(row=1, column=3, sticky="w", padx=(4, 10), pady=(6, 0))
+
+        ttk.Label(controls, text="y scale").grid(row=1, column=4, sticky="w", pady=(6, 0))
+        yscale_menu = ttk.Combobox(controls, width=8, state="readonly", values=("linear", "log"), textvariable=self.trials_yscale_var)
+        yscale_menu.grid(row=1, column=5, sticky="w", padx=(4, 10), pady=(6, 0))
+        yscale_menu.bind("<<ComboboxSelected>>", lambda _event: self._refresh_all())
+        reset_y_button = ttk.Button(controls, text="↺", width=2, command=self._reset_trials_y_axis)
+        reset_y_button.grid(row=1, column=6, sticky="w", pady=(6, 0))
+
+        _ToolTip(xmin_entry, "X range minimum: enter a lower q0 limit and press Enter to redraw the Trials plot.")
+        _ToolTip(xmax_entry, "X range maximum: enter an upper q0 limit and press Enter to redraw the Trials plot.")
+        _ToolTip(xscale_menu, "X scale: switch the Trials plot q0 axis between linear and logarithmic scaling.")
+        _ToolTip(reset_x_button, "Reset X axis: restore the Trials plot x-axis to its default linear autoscaled view for this slice.")
+        _ToolTip(ymin_entry, "Y range minimum: enter a lower metric limit and press Enter to redraw the Trials plot.")
+        _ToolTip(ymax_entry, "Y range maximum: enter an upper metric limit and press Enter to redraw the Trials plot.")
+        _ToolTip(yscale_menu, "Y scale: switch the Trials plot metric axis between linear and logarithmic scaling.")
+        _ToolTip(reset_y_button, "Reset Y axis: restore the Trials plot y-axis to its default linear autoscaled view for this slice.")
+
+        for entry in (xmin_entry, xmax_entry, ymin_entry, ymax_entry):
+            entry.bind("<Return>", lambda _event: self._refresh_all())
+
+    def _parse_axis_limit(self, text: str) -> float | None:
+        value = str(text).strip()
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    def _apply_trials_axis_controls(self, *, q0_trials: np.ndarray, metric_trials: np.ndarray) -> None:
+        xscale = str(self.trials_xscale_var.get() or "linear")
+        yscale = str(self.trials_yscale_var.get() or "linear")
+
+        if xscale == "log":
+            positive_q0 = q0_trials[np.isfinite(q0_trials) & (q0_trials > 0)]
+            if positive_q0.size:
+                self.ax_trials.set_xscale("log")
+        else:
+            self.ax_trials.set_xscale("linear")
+
+        if yscale == "log":
+            positive_metric = metric_trials[np.isfinite(metric_trials) & (metric_trials > 0)]
+            if positive_metric.size:
+                self.ax_trials.set_yscale("log")
+        else:
+            self.ax_trials.set_yscale("linear")
+
+        xmin = self._parse_axis_limit(self.trials_xmin_var.get())
+        xmax = self._parse_axis_limit(self.trials_xmax_var.get())
+        ymin = self._parse_axis_limit(self.trials_ymin_var.get())
+        ymax = self._parse_axis_limit(self.trials_ymax_var.get())
+
+        if self.ax_trials.get_xscale() == "log":
+            if xmin is not None and xmin <= 0:
+                xmin = None
+            if xmax is not None and xmax <= 0:
+                xmax = None
+        if self.ax_trials.get_yscale() == "log":
+            if ymin is not None and ymin <= 0:
+                ymin = None
+            if ymax is not None and ymax <= 0:
+                ymax = None
+
+        if xmin is not None and xmax is not None and xmin < xmax:
+            self.ax_trials.set_xlim(xmin, xmax)
+        elif xmin is not None:
+            self.ax_trials.set_xlim(left=xmin)
+        elif xmax is not None:
+            self.ax_trials.set_xlim(right=xmax)
+
+        if ymin is not None and ymax is not None and ymin < ymax:
+            self.ax_trials.set_ylim(ymin, ymax)
+        elif ymin is not None:
+            self.ax_trials.set_ylim(bottom=ymin)
+        elif ymax is not None:
+            self.ax_trials.set_ylim(top=ymax)
+
+    def _sync_trials_axis_controls_from_axes(self) -> None:
+        x0, x1 = self.ax_trials.get_xlim()
+        y0, y1 = self.ax_trials.get_ylim()
+        self.trials_xmin_var.set(f"{float(x0):.6g}")
+        self.trials_xmax_var.set(f"{float(x1):.6g}")
+        self.trials_ymin_var.set(f"{float(y0):.6g}")
+        self.trials_ymax_var.set(f"{float(y1):.6g}")
+        self.trials_xscale_var.set(str(self.ax_trials.get_xscale()))
+        self.trials_yscale_var.set(str(self.ax_trials.get_yscale()))
+
+    def _reset_trials_view(self) -> None:
+        self.trials_xscale_var.set("linear")
+        self.trials_yscale_var.set("linear")
+        self.trials_xmin_var.set("")
+        self.trials_xmax_var.set("")
+        self.trials_ymin_var.set("")
+        self.trials_ymax_var.set("")
+        self._refresh_all()
+
+    def _reset_trials_x_axis(self) -> None:
+        self.trials_xscale_var.set("linear")
+        self.trials_xmin_var.set("")
+        self.trials_xmax_var.set("")
+        self._refresh_all()
+
+    def _reset_trials_y_axis(self) -> None:
+        self.trials_yscale_var.set("linear")
+        self.trials_ymin_var.set("")
+        self.trials_ymax_var.set("")
+        self._refresh_all()
+
+    def _slice_label(self, descriptor: dict[str, Any]) -> str:
+        display_label = str(descriptor.get("display_label", "")).strip()
+        if display_label:
+            return display_label
+        label = str(descriptor.get("label", descriptor.get("key", ""))).strip()
+        return label or "default"
+
+    def _selected_slice_key(self) -> str | None:
+        value = str(self.slice_key_var.get()).strip()
+        return value or None
+
+    def _slice_state_token(self, slice_key: str | None = None) -> str | None:
+        if self.artifact_h5 is None:
+            return None
+        key = str(slice_key or self.payload.get("selected_slice_key") or self._selected_slice_key() or "").strip()
+        if not key:
+            return None
+        try:
+            artifact_text = str(self.artifact_h5.expanduser().resolve())
+        except Exception:
+            artifact_text = str(self.artifact_h5)
+        return f"{artifact_text}::{key}"
+
+    def _default_point_selection(self, metric_name: str) -> tuple[int, int]:
+        if not self.payload or self.a_values.size == 0 or self.b_values.size == 0:
+            return 0, 0
+        try:
+            if np.any(np.isfinite(np.asarray(self.payload[metric_name], dtype=float))):
+                return best_grid_index(self.payload, metric_name)
+        except Exception:
+            pass
+        return 0, 0
+
+    def _capture_current_slice_view_state(self, metric_name: str | None = None) -> None:
+        token = self._slice_state_token()
+        if token is None:
+            return
+        existing = dict(self.slice_display_state.get(token, {}))
+        per_metric = dict(existing.get("trials_by_metric", {}))
+        current_metric = str(metric_name or self.metric_var.get())
+        if current_metric in METRICS:
+            per_metric[current_metric] = {
+                "trials_xmin": str(self.trials_xmin_var.get()),
+                "trials_xmax": str(self.trials_xmax_var.get()),
+                "trials_ymin": str(self.trials_ymin_var.get()),
+                "trials_ymax": str(self.trials_ymax_var.get()),
+                "trials_xscale": str(self.trials_xscale_var.get() or "linear"),
+                "trials_yscale": str(self.trials_yscale_var.get() or "linear"),
+            }
+        existing.update(
+            {
+                "metric": current_metric,
+                "a_index": int(self.a_index_var.get()),
+                "b_index": int(self.b_index_var.get()),
+                "trials_by_metric": per_metric,
+            }
+        )
+        self.slice_display_state[token] = existing
+
+    def _reset_trials_controls_only(self) -> None:
+        self.trials_xscale_var.set("linear")
+        self.trials_yscale_var.set("linear")
+        self.trials_xmin_var.set("")
+        self.trials_xmax_var.set("")
+        self.trials_ymin_var.set("")
+        self.trials_ymax_var.set("")
+
+    def _restore_trials_controls_for_metric(self, metric_name: str) -> None:
+        token = self._slice_state_token()
+        state = self.slice_display_state.get(token or "", {})
+        per_metric = dict(state.get("trials_by_metric", {}))
+        metric_state = dict(per_metric.get(str(metric_name), {}))
+        if not metric_state:
+            self._reset_trials_controls_only()
+            return
+        self.trials_xscale_var.set(str(metric_state.get("trials_xscale", "linear") or "linear"))
+        self.trials_yscale_var.set(str(metric_state.get("trials_yscale", "linear") or "linear"))
+        self.trials_xmin_var.set(str(metric_state.get("trials_xmin", "")))
+        self.trials_xmax_var.set(str(metric_state.get("trials_xmax", "")))
+        self.trials_ymin_var.set(str(metric_state.get("trials_ymin", "")))
+        self.trials_ymax_var.set(str(metric_state.get("trials_ymax", "")))
+
+    def _restore_slice_view_state(self) -> None:
+        selected_key = str(self.payload.get("selected_slice_key", "")).strip()
+        token = self._slice_state_token(selected_key)
+        metric_name = (
+            self._preferred_initial_metric
+            or (str(self.metric_var.get()) if self.metric_var.get() in METRICS else self.run_target_metric)
+            or self.run_target_metric
+        )
+        default_a, default_b = self._default_point_selection(metric_name)
+        state = self.slice_display_state.get(token or "", None)
+
+        if state is None:
+            self.metric_var.set(metric_name if metric_name in METRICS else "chi2")
+            self.a_index_var.set(default_a)
+            self.b_index_var.set(default_b)
+            self._reset_trials_controls_only()
+            self._preferred_initial_metric = None
+            return
+
+        saved_metric = str(state.get("metric", metric_name))
+        if saved_metric not in METRICS:
+            saved_metric = metric_name if metric_name in METRICS else "chi2"
+        self.metric_var.set(saved_metric)
+
+        restored_a, restored_b = self._default_point_selection(saved_metric)
+        if self.a_values.size:
+            restored_a = int(np.clip(int(state.get("a_index", restored_a)), 0, max(0, self.a_values.size - 1)))
+        if self.b_values.size:
+            restored_b = int(np.clip(int(state.get("b_index", restored_b)), 0, max(0, self.b_values.size - 1)))
+        self.a_index_var.set(restored_a)
+        self.b_index_var.set(restored_b)
+        self._preferred_initial_metric = None
+        self._restore_trials_controls_for_metric(saved_metric)
+
+    def _refresh_slice_controls(self) -> None:
+        descriptors = list(self.available_slices)
+        labels = [self._slice_label(item) for item in descriptors]
+        keys = [str(item.get("key", "")) for item in descriptors]
+        selected_key = str(self.payload.get("selected_slice_key", self._selected_slice_key() or "")).strip()
+        if selected_key and selected_key in keys:
+            selected_index = keys.index(selected_key)
+        else:
+            selected_index = 0 if keys else -1
+            selected_key = keys[selected_index] if selected_index >= 0 else ""
+        self.slice_key_var.set(selected_key)
+        self.slice_display_var.set(labels[selected_index] if selected_index >= 0 else "")
+        if self.slice_menu is not None:
+            self.slice_menu.configure(values=labels)
+            if len(labels) > 1:
+                self.slice_menu.grid()
+                if self.slice_display_label is not None:
+                    self.slice_display_label.grid_remove()
+                self.slice_menu.current(selected_index)
+            else:
+                self.slice_menu.grid_remove()
+                if self.slice_display_label is not None:
+                    self.slice_display_label.grid()
+        elif self.slice_display_label is not None:
+            self.slice_display_label.grid()
 
     def _refresh_selector_values(self) -> None:
+        self._refresh_slice_controls()
         a_labels = [f"{i}: {value:.3f}" for i, value in enumerate(self.a_values)]
         b_labels = [f"{i}: {value:.3f}" for i, value in enumerate(self.b_values)]
         self.a_menu.configure(values=a_labels)
@@ -289,61 +1124,187 @@ class PychmpViewApp:
             self.b_menu.current(int(np.clip(self.b_index_var.get(), 0, max(0, len(b_labels) - 1))))
 
     def _reload_payload(self, artifact_path: Path | None = None) -> None:
+        self._capture_current_slice_view_state(self._last_rendered_metric)
         if artifact_path is not None:
             self.artifact_h5 = artifact_path
         if self.artifact_h5 is None:
             self.status_var.set("No artifact loaded. Use Open Artifact to choose a consolidated scan H5 file.")
             self.summary_var.set("No artifact loaded.")
             self.payload = {}
+            self.available_slices = []
+            self.slice_key_var.set("")
+            self.slice_display_var.set("")
             self.a_values = np.asarray([], dtype=float)
             self.b_values = np.asarray([], dtype=float)
+            self.refresh_signal_path = None
+            self._refresh_signal_mtime_ns = -1
+            self._refresh_signal_phase = ""
+            self._refresh_signal_pending_points = []
+            self._refresh_action_states()
             self._refresh_all()
             return
         self.last_artifact_dir = self.artifact_h5.expanduser().resolve().parent
+        self.refresh_signal_path = Path(f"{self.artifact_h5}.refresh")
+        if self.refresh_signal_path.exists():
+            try:
+                self._refresh_signal_mtime_ns = int(self.refresh_signal_path.stat().st_mtime_ns)
+                refresh_payload = self._read_refresh_signal_payload()
+                self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
+                self._refresh_signal_pending_points = list(refresh_payload.get("pending_points", []))
+            except Exception:
+                self._refresh_signal_mtime_ns = -1
+                self._refresh_signal_phase = ""
+                self._refresh_signal_pending_points = []
         _save_last_directory(self.last_artifact_dir)
         prev_a = int(self.a_index_var.get())
         prev_b = int(self.b_index_var.get())
-        self.payload = load_scan_file(self.artifact_h5)
+        requested_slice_key = self._selected_slice_key()
+        try:
+            self.payload = self._load_scan_file_with_retries(self.artifact_h5, slice_key=requested_slice_key)
+        except Exception as exc:
+            self.status_var.set(
+                "Artifact is currently being written or is temporarily locked. "
+                "Please retry in a moment.\n"
+                f"Details: {exc}"
+            )
+            self.summary_var.set("Could not refresh artifact right now. Existing view remains unchanged.")
+            return
         self.root.title(f"pychmp-view: {self.artifact_h5.name}")
+        self.available_slices = list(self.payload.get("available_slices", []))
+        self.slice_key_var.set(str(self.payload.get("selected_slice_key", "")))
         self.a_values = np.asarray(self.payload["a_values"], dtype=float)
         self.b_values = np.asarray(self.payload["b_values"], dtype=float)
         self.display_model = build_patch_grid_model(self.payload)
         self.run_target_metric = str(self.payload.get("target_metric", "chi2"))
-        if self.metric_var.get() not in METRICS:
-            self.metric_var.set(self.run_target_metric)
-        if np.any(np.isfinite(np.asarray(self.payload[self.metric_var.get()], dtype=float))):
-            default_a, default_b = best_grid_index(self.payload, self.metric_var.get())
-        else:
-            default_a, default_b = 0, 0
-        self.a_index_var.set(int(np.clip(prev_a, 0, max(0, self.a_values.size - 1))) if self.a_values.size else default_a)
-        self.b_index_var.set(int(np.clip(prev_b, 0, max(0, self.b_values.size - 1))) if self.b_values.size else default_b)
+        self._restore_slice_view_state()
         self._refresh_selector_values()
+        self._refresh_action_states()
         self._refresh_all()
+
+    def _load_scan_file_with_retries(self, artifact_h5: Path, *, slice_key: str | None = None) -> dict[str, Any]:
+        last_exc: Exception | None = None
+        for attempt in range(1, self._LOAD_RETRY_ATTEMPTS + 1):
+            try:
+                return load_scan_file(artifact_h5, slice_key=slice_key)
+            except (BlockingIOError, PermissionError, OSError) as exc:
+                last_exc = exc
+                if attempt >= self._LOAD_RETRY_ATTEMPTS:
+                    break
+                self.status_var.set(
+                    "Artifact is busy (possibly being written); "
+                    f"retrying {attempt}/{self._LOAD_RETRY_ATTEMPTS - 1}..."
+                )
+                time.sleep(self._LOAD_RETRY_DELAY_S)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("unknown artifact loading failure")
+
+    def _poll_external_refresh_signal(self) -> None:
+        self._external_refresh_after_id = None
+        if self._is_closing:
+            return
+        try:
+            if self.refresh_signal_path is None:
+                return
+            if self.refresh_signal_path.exists():
+                mtime_ns = int(self.refresh_signal_path.stat().st_mtime_ns)
+                if mtime_ns > int(self._refresh_signal_mtime_ns):
+                    self._refresh_signal_mtime_ns = mtime_ns
+                    refresh_payload = self._read_refresh_signal_payload()
+                    self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
+                    self._refresh_signal_pending_points = list(refresh_payload.get("pending_points", []))
+                    self._reload_payload()
+        except Exception:
+            pass
+        finally:
+            if not self._is_closing:
+                try:
+                    self._external_refresh_after_id = self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
+                except Exception:
+                    self._external_refresh_after_id = None
 
     def _selected_point(self) -> dict[str, Any]:
         return self.payload["points"][(int(self.a_index_var.get()), int(self.b_index_var.get()))]
+
+    def _has_selected_point(self) -> bool:
+        if not self.payload:
+            return False
+        if self.a_values.size == 0 or self.b_values.size == 0:
+            return False
+        points = self.payload.get("points", {})
+        if not points:
+            return False
+        key = (int(self.a_index_var.get()), int(self.b_index_var.get()))
+        return key in points
 
     def _selected_diagnostics(self) -> dict[str, Any]:
         diagnostics = dict(self.payload["diagnostics"])
         diagnostics.update(self._selected_point()["diagnostics"])
         return diagnostics
 
+    def _selected_solution_plot_context(self) -> dict[str, Any] | None:
+        if not self._has_selected_point():
+            return None
+        point = self._selected_point()
+        diagnostics = self._selected_diagnostics()
+        diagnostics["fit_q0_trials"] = np.asarray(point["fit_q0_trials"], dtype=float).tolist()
+        diagnostics["fit_metric_trials"] = np.asarray(point["fit_metric_trials"], dtype=float).tolist()
+        diagnostics["q0_recovered"] = float(point["q0"])
+        diagnostics["target_metric"] = str(point["target_metric"])
+        slice_descriptor = dict(self.payload.get("selected_slice") or {})
+        slice_label = self._slice_label(slice_descriptor) if slice_descriptor else "single slice"
+        return {
+            "model_path": Path(str(diagnostics.get("model_path", ""))),
+            "observed_noisy": np.asarray(self.payload["observed"], dtype=float),
+            "raw_modeled_best": np.asarray(point["raw_modeled_best"], dtype=float),
+            "modeled_best": np.asarray(point["modeled_best"], dtype=float),
+            "residual": np.asarray(point["residual"], dtype=float),
+            "wcs_header": self.payload["wcs_header"],
+            "frequency_ghz": float(diagnostics.get("active_frequency_ghz", diagnostics.get("frequency_ghz", 17.0))),
+            "diagnostics": diagnostics,
+            "slice_label": slice_label,
+            "wcs_header_transform": lambda hdr: with_observer_metadata(hdr, self.payload["wcs_header"], diagnostics),
+        }
+
     def _jump_to_best(self) -> None:
-        a_index, b_index = best_grid_index(self.payload, self.metric_var.get())
-        self.a_index_var.set(a_index)
-        self.b_index_var.set(b_index)
-        self._refresh_selector_values()
+        try:
+            a_index, b_index = best_grid_index(self.payload, self.metric_var.get())
+            self.a_index_var.set(a_index)
+            self.b_index_var.set(b_index)
+            self._refresh_selector_values()
+        except ValueError:
+            # No finite metric values yet (common at scan start).
+            pass
         self._refresh_all()
 
     def _on_metric_changed(self) -> None:
+        self._capture_current_slice_view_state(self._last_rendered_metric)
+        self._restore_trials_controls_for_metric(str(self.metric_var.get()))
         self._jump_to_best()
 
     def _on_a_changed(self) -> None:
-        self.a_index_var.set(int(self.a_menu.current()))
+        current = int(self.a_menu.current())
+        if current >= 0:
+            self.a_index_var.set(current)
         self._refresh_all()
 
+    def _on_slice_changed(self) -> None:
+        if self.slice_menu is None:
+            return
+        current = int(self.slice_menu.current())
+        if current < 0 or current >= len(self.available_slices):
+            return
+        selected_key = str(self.available_slices[current].get("key", "")).strip()
+        if not selected_key or selected_key == self._selected_slice_key():
+            return
+        self._capture_current_slice_view_state(self._last_rendered_metric)
+        self.slice_key_var.set(selected_key)
+        self._reload_payload()
+
     def _on_b_changed(self) -> None:
-        self.b_index_var.set(int(self.b_menu.current()))
+        current = int(self.b_menu.current())
+        if current >= 0:
+            self.b_index_var.set(current)
         self._refresh_all()
 
     def _on_canvas_click(self, event: Any) -> None:
@@ -359,35 +1320,83 @@ class PychmpViewApp:
         self.a_index_var.set(a_index)
         self.b_index_var.set(b_index)
         self._refresh_selector_values()
+        self._refresh_action_states()
         self._refresh_all()
 
     def _refresh_all(self) -> None:
         if not self.payload:
+            self._refresh_action_states()
+            self._refresh_scan_state_display()
             self.ax_heatmap.clear()
-            if self._heatmap_colorbar is not None:
-                self._heatmap_colorbar = None
-            self.ax_heatmap_cbar.clear()
+            self._reset_heatmap_colorbar_axis()
             self.ax_trials.clear()
             self.ax_heatmap.set_axis_off()
             self.ax_heatmap_cbar.set_axis_off()
             self.ax_trials.set_axis_off()
+            self._refresh_info_text()
             self.heatmap_canvas.draw_idle()
             self.trials_canvas.draw_idle()
+            if self.selected_solution_window is not None:
+                self.selected_solution_window.status_var.set("No artifact loaded.")
             return
+        if not self._has_selected_point():
+            self._refresh_scan_state_display()
+            self.ax_heatmap.clear()
+            self._reset_heatmap_colorbar_axis()
+            self.ax_trials.clear()
+            self.ax_heatmap_cbar.set_axis_off()
+            self.ax_heatmap.text(
+                0.5,
+                0.5,
+                "Waiting for first completed (a,b) point.\nUse Refresh Artifact as the scan advances.",
+                transform=self.ax_heatmap.transAxes,
+                ha="center",
+                va="center",
+            )
+            self.ax_heatmap.set_axis_off()
+            self.ax_trials.text(
+                0.5,
+                0.5,
+                "No completed search yet for the selected (a,b) pair.",
+                transform=self.ax_trials.transAxes,
+                ha="center",
+                va="center",
+            )
+            self.ax_trials.set_axis_off()
+            self.status_var.set(
+                "Displayed grid metric: waiting\n"
+                "Run target metric: "
+                f"{self.run_target_metric}\n"
+                "No completed search yet for the (a,b) pair."
+            )
+            self.summary_var.set(
+                "No completed point is available yet in this artifact.\n"
+                "Keep the viewer open and press Refresh Artifact while the scan is running."
+            )
+            self._refresh_action_states()
+            self._refresh_info_text()
+            self.heatmap_canvas.draw_idle()
+            self.trials_canvas.draw_idle()
+            if self.selected_solution_window is not None:
+                self.selected_solution_window.status_var.set("No completed point available yet.")
+            return
+        self._refresh_action_states()
+        self._refresh_scan_state_display()
         self._draw_heatmap()
         self._draw_trials()
         self._refresh_summary()
+        self._refresh_info_text()
         self.heatmap_canvas.draw_idle()
         self.trials_canvas.draw_idle()
+        if self.selected_solution_window is not None:
+            self.selected_solution_window.update_selection()
 
     def _draw_heatmap(self) -> None:
         metric_name = self.metric_var.get()
         records = list(self.display_model.get("records", []))
         record_lookup = {(int(record["a_index"]), int(record["b_index"])): record for record in records}
         self.ax_heatmap.clear()
-        if self._heatmap_colorbar is not None:
-            self._heatmap_colorbar = None
-        self.ax_heatmap_cbar.clear()
+        self._reset_heatmap_colorbar_axis()
         self.ax_heatmap_cbar.set_axis_on()
         patches = [
             Rectangle(
@@ -415,10 +1424,24 @@ class PychmpViewApp:
 
         best_markers = {"chi2": ("#d62728", "o"), "rho2": ("#1f77b4", "s"), "eta2": ("#2ca02c", "^")}
         for name, (color, marker) in best_markers.items():
-            a_index, b_index = best_grid_index(self.payload, name)
+            try:
+                a_index, b_index = best_grid_index(self.payload, name)
+            except ValueError:
+                # No finite values for this metric yet; skip marker until refresh after new points land.
+                continue
             record = record_lookup.get((a_index, b_index))
             b_value = float(record["b_center"]) if record is not None else float(self.b_values[b_index])
             a_value = float(record["a_center"]) if record is not None else float(self.a_values[a_index])
+            self.ax_heatmap.scatter(
+                [b_value],
+                [a_value],
+                s=120,
+                marker=marker,
+                facecolor="none",
+                edgecolor="white",
+                linewidth=3.2,
+                zorder=5,
+            )
             self.ax_heatmap.scatter(
                 [b_value],
                 [a_value],
@@ -426,8 +1449,8 @@ class PychmpViewApp:
                 marker=marker,
                 facecolor="none",
                 edgecolor=color,
-                linewidth=2.0,
-                zorder=5,
+                linewidth=1.8,
+                zorder=6,
             )
 
         current_a = int(self.a_index_var.get())
@@ -438,12 +1461,34 @@ class PychmpViewApp:
         self.ax_heatmap.scatter(
             [current_b_value],
             [current_a_value],
+            s=170,
+            marker="x",
+            color="black",
+            linewidth=3.6,
+            zorder=7,
+        )
+        self.ax_heatmap.scatter(
+            [current_b_value],
+            [current_a_value],
             s=120,
             marker="x",
             color="white",
             linewidth=2.2,
-            zorder=6,
+            zorder=8,
         )
+        if self._refresh_signal_pending_points:
+            pending_b = [float(b_value) for _a_value, b_value in self._refresh_signal_pending_points]
+            pending_a = [float(a_value) for a_value, _b_value in self._refresh_signal_pending_points]
+            self.ax_heatmap.scatter(
+                pending_b,
+                pending_a,
+                s=180,
+                marker="*",
+                facecolor="#f08c00",
+                edgecolor="black",
+                linewidth=0.8,
+                zorder=7,
+            )
 
     def _draw_trials(self) -> None:
         point = self._selected_point()
@@ -479,6 +1524,10 @@ class PychmpViewApp:
             self.ax_trials.set_xlabel("q0")
             self.ax_trials.set_ylabel(point_metric)
             self.ax_trials.grid(alpha=0.25)
+            self._apply_trials_axis_controls(q0_trials=q0_trials, metric_trials=metric_trials)
+            self._sync_trials_axis_controls_from_axes()
+            self._last_rendered_metric = selected_metric if selected_metric in METRICS else point_metric
+            self._capture_current_slice_view_state(self._last_rendered_metric)
         else:
             self.ax_trials.text(
                 0.02,
@@ -489,18 +1538,25 @@ class PychmpViewApp:
                 ha="left",
             )
             self.ax_trials.set_axis_off()
+            self.trials_xscale_var.set("linear")
+            self.trials_yscale_var.set("linear")
+            self._last_rendered_metric = selected_metric if selected_metric in METRICS else point_metric
+            self._capture_current_slice_view_state(self._last_rendered_metric)
         self.ax_trials.set_box_aspect(1.0)
         self.trials_figure.subplots_adjust(left=0.14, right=0.98, bottom=0.14, top=0.92)
 
         success_text = point_status if point_status != "computed" else ("success" if bool(point["success"]) else "boundary/failed")
         best_metric_value = float(np.nanmin(metric_trials)) if metric_trials.size else float("nan")
+        slice_descriptor = dict(self.payload.get("selected_slice") or {})
+        slice_text = self._slice_label(slice_descriptor) if slice_descriptor else "single slice"
         self.status_var.set(
+            f"Slice: {slice_text}\n"
             f"Displayed grid metric: {self.metric_var.get()}\n"
             f"Displayed q0-curve metric: {point_metric}\n"
             f"Run target metric: {self.run_target_metric}\n"
             f"Selected point: a={self.a_values[int(self.a_index_var.get())]:.3f}, "
             f"b={self.b_values[int(self.b_index_var.get())]:.3f}\n"
-            f"Best q0: {float(point['q0']):.6f}\n"
+            f"Best q0: {_format_scalar(point.get('q0', np.nan), '.6f')}\n"
             f"Point {point_metric}: {best_metric_value:.6e}\n"
             f"Status: {success_text}"
         )
@@ -508,15 +1564,25 @@ class PychmpViewApp:
     def _refresh_summary(self) -> None:
         point = self._selected_point()
         diagnostics = self._selected_diagnostics()
+        slice_descriptor = dict(self.payload.get("selected_slice") or {})
         lines = [
+            f"slice = {self._slice_label(slice_descriptor) if slice_descriptor else 'single slice'}",
             f"a = {self.a_values[int(self.a_index_var.get())]:.3f}",
             f"b = {self.b_values[int(self.b_index_var.get())]:.3f}",
             f"status = {point.get('status', 'computed')}",
-            f"q0 = {float(point['q0']):.6f}",
+            f"q0 = {_format_scalar(point.get('q0', np.nan), '.6f')}",
             f"chi2 = {float(diagnostics.get('chi2', np.nan)):.6e}",
             f"rho2 = {float(diagnostics.get('rho2', np.nan)):.6e}",
             f"eta2 = {float(diagnostics.get('eta2', np.nan)):.6e}",
         ]
+        elapsed_seconds = diagnostics.get("elapsed_seconds")
+        try:
+            elapsed_value = float(elapsed_seconds)
+        except Exception:
+            elapsed_value = float("nan")
+        if np.isfinite(elapsed_value):
+            lines[3] = f"{lines[3]} in {elapsed_value:.3f} s"
+            lines.append(f"elapsed = {elapsed_value:.3f} s")
         message = diagnostics.get("optimizer_message")
         if message:
             lines.extend(["", "message:", str(message)])
@@ -539,7 +1605,11 @@ class PychmpViewApp:
         if self.artifact_h5 is None:
             return
         script_path = Path(__file__).resolve().parents[2] / "examples" / "plot_ab_scan_artifacts.py"
-        cmd = [sys.executable, str(script_path), str(self.artifact_h5), *extra_args]
+        cmd = [sys.executable, str(script_path), str(self.artifact_h5)]
+        selected_slice_key = self._selected_slice_key()
+        if selected_slice_key:
+            cmd.extend(["--slice-key", selected_slice_key])
+        cmd.extend(extra_args)
         subprocess.Popen(
             cmd,
             start_new_session=True,
@@ -564,7 +1634,13 @@ class PychmpViewApp:
         self._reload_payload(Path(selected))
 
     def _open_selected_maps(self) -> None:
-        self._open_plot_script("--a-index", str(self.a_index_var.get()), "--b-index", str(self.b_index_var.get()))
+        if not self._has_selected_point():
+            self.status_var.set("No completed point available yet; refresh after the scan advances.")
+            return
+        if self.selected_solution_window is None:
+            self.selected_solution_window = _SelectedSolutionWindow(self)
+        self.selected_solution_window.present()
+        self.selected_solution_window.update_selection()
 
     def _open_grid_summary(self) -> None:
         self._open_plot_script("--grid")
@@ -573,7 +1649,7 @@ class PychmpViewApp:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Interactive viewer for consolidated `(a,b)` scan artifacts.")
     parser.add_argument("artifact_h5", type=Path, nargs="?", help="Optional consolidated H5 produced by scan_ab_obs_map.py")
-    parser.add_argument("--metric", choices=METRICS, default="chi2", help="Initial metric shown in the heatmap.")
+    parser.add_argument("--metric", choices=METRICS, default=None, help="Optional initial metric override shown in the heatmap.")
     return parser
 
 

@@ -49,6 +49,7 @@ class Q0OptimizationResult:
     used_adaptive_bracketing: bool = False
     bracket_found: bool = False
     bracket: tuple[float, float, float] | None = None
+    boundary_constrained: bool = False
     trial_q0: tuple[float, ...] = ()
     trial_objective_values: tuple[float, ...] = ()
     trial_chi2_values: tuple[float, ...] = ()
@@ -715,6 +716,15 @@ def find_best_q0(
     if message_prefix:
         result_message = f"{message_prefix}; {result_message}"
 
+    boundary_tol = max(float(effective_xatol), 1e-12)
+    boundary_failure = False
+    if (
+        math.isclose(best_q0, refinement_bounds[0], rel_tol=0.0, abs_tol=boundary_tol)
+        or math.isclose(best_q0, refinement_bounds[1], rel_tol=0.0, abs_tol=boundary_tol)
+    ):
+        boundary_failure = True
+        result_message += " WARNING: Minimum is at the boundary of the search region; true minimum may lie outside."
+
     return Q0OptimizationResult(
         q0=best_q0,
         objective_value=best_record.objective_value,
@@ -727,6 +737,7 @@ def find_best_q0(
         used_adaptive_bracketing=bool(adaptive_bracketing),
         bracket_found=bracket_found,
         bracket=bracket,
+        boundary_constrained=boundary_failure,
         trial_q0=trial_q0,
         trial_objective_values=trial_objective_values,
         trial_chi2_values=trial_chi2_values,

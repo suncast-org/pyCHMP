@@ -1,0 +1,11 @@
+mode,workers,repeat,elapsed_seconds,exit_code,artifact_h5
+serial,1,1,413.883792,0,artifacts/scan_ab_obs_map_serial_01_r01.h5
+process-pool,1,1,426.502019,0,artifacts/scan_ab_obs_map_process-pool_01_r01.h5
+process-pool,2,1,366.272588,0,artifacts/scan_ab_obs_map_process-pool_02_r01.h5
+process-pool,3,1,349.569239,0,artifacts/scan_ab_obs_map_process-pool_03_r01.h5
+process-pool,4,1,352.366673,0,artifacts/scan_ab_obs_map_process-pool_04_r01.h5
+process-pool,5,1,347.610985,0,artifacts/scan_ab_obs_map_process-pool_05_r01.h5
+process-pool,6,1,347.395458,0,artifacts/scan_ab_obs_map_process-pool_06_r01.h5
+process-pool,7,1,346.472589,0,artifacts/scan_ab_obs_map_process-pool_07_r01.h5
+process-pool,8,1,350.850045,0,artifacts/scan_ab_obs_map_process-pool_08_r01.h5
+process-pool,9,1,350.194305,0,artifacts/scan_ab_obs_map_process-pool_09_r01.h5

@@ -5,6 +5,7 @@ from pychmp.optimize import Q0MetricEvaluation, find_best_q0
 
 
 def test_find_best_q0_chi2_target() -> None:
+    """Minimize chi2 when it is the selected target metric."""
     def metric_function(q0: float) -> MetricValues:
         return MetricValues(
             chi2=(q0 - 2.5) ** 2 + 1.0,
@@ -20,6 +21,7 @@ def test_find_best_q0_chi2_target() -> None:
 
 
 def test_find_best_q0_target_metric_switch() -> None:
+    """Switch optimization to the requested target metric."""
     def metric_function(q0: float) -> MetricValues:
         return MetricValues(
             chi2=(q0 - 9.0) ** 2,
@@ -34,6 +36,7 @@ def test_find_best_q0_target_metric_switch() -> None:
 
 
 def test_find_best_q0_validates_bounds() -> None:
+    """Validate basic q0 interval bounds before optimization."""
     def metric_function(_: float) -> MetricValues:
         return MetricValues(chi2=1.0, rho2=1.0, eta2=1.0)
 
@@ -45,6 +48,7 @@ def test_find_best_q0_validates_bounds() -> None:
 
 
 def test_find_best_q0_validates_adaptive_inputs() -> None:
+    """Validate adaptive-bracketing configuration before running."""
     def metric_function(_: float) -> MetricValues:
         return MetricValues(chi2=1.0, rho2=1.0, eta2=1.0)
 
@@ -65,6 +69,7 @@ def test_find_best_q0_validates_adaptive_inputs() -> None:
 
 
 def test_find_best_q0_adaptive_bracketing_moves_right_from_flux_deficit() -> None:
+    """Grow the adaptive bracket upward when modeled flux is too low."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -96,6 +101,7 @@ def test_find_best_q0_adaptive_bracketing_moves_right_from_flux_deficit() -> Non
 
 
 def test_find_best_q0_adaptive_bracketing_moves_left_from_flux_excess() -> None:
+    """Grow the adaptive bracket downward when modeled flux is too high."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -126,6 +132,7 @@ def test_find_best_q0_adaptive_bracketing_moves_left_from_flux_excess() -> None:
 
 
 def test_find_best_q0_adaptive_corrects_initial_flux_direction_from_metric_trend() -> None:
+    """Correct the initial adaptive search direction from metric behavior."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -155,6 +162,7 @@ def test_find_best_q0_adaptive_corrects_initial_flux_direction_from_metric_trend
 
 
 def test_find_best_q0_adaptive_failure_falls_back_to_bounded_refinement() -> None:
+    """Fall back to bounded refinement when adaptive expansion stalls."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -185,6 +193,7 @@ def test_find_best_q0_adaptive_failure_falls_back_to_bounded_refinement() -> Non
 
 
 def test_find_best_q0_soft_interval_expands_beyond_initial_upper_edge() -> None:
+    """Allow adaptive search to expand beyond the initial soft upper bound."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -214,6 +223,7 @@ def test_find_best_q0_soft_interval_expands_beyond_initial_upper_edge() -> None:
 
 
 def test_find_best_q0_hard_upper_bound_stops_expansion() -> None:
+    """Stop adaptive expansion when the hard upper limit is reached."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -244,6 +254,7 @@ def test_find_best_q0_hard_upper_bound_stops_expansion() -> None:
 
 
 def test_find_best_q0_tracks_unique_trials_and_unique_evaluations() -> None:
+    """Track each unique objective evaluation in the result metadata."""
     calls: list[float] = []
 
     def metric_function(q0: float) -> MetricValues:

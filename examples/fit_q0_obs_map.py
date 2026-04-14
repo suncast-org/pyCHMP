@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import itertools
 import math
@@ -160,6 +161,60 @@ def _format_psf_report(
     )
 
 
+def _resolve_selected_psf(
+    *,
+    header_psf: dict[str, float] | None,
+    header_psf_source: str,
+    cli_psf_bmaj_arcsec: float | None,
+    cli_psf_bmin_arcsec: float | None,
+    cli_psf_bpa_deg: float | None,
+    fallback_psf_bmaj_arcsec: float | None,
+    fallback_psf_bmin_arcsec: float | None,
+    fallback_psf_bpa_deg: float | None,
+    override_header_psf: bool,
+) -> tuple[float | None, float | None, float | None, str, bool]:
+    has_cli_psf_override = any(
+        value is not None for value in (cli_psf_bmaj_arcsec, cli_psf_bmin_arcsec, cli_psf_bpa_deg)
+    )
+    has_cli_psf_fallback = any(
+        value is not None for value in (fallback_psf_bmaj_arcsec, fallback_psf_bmin_arcsec, fallback_psf_bpa_deg)
+    )
+
+    if header_psf is not None and not override_header_psf:
+        return (
+            float(header_psf["psf_bmaj_arcsec"]),
+            float(header_psf["psf_bmin_arcsec"]),
+            float(header_psf["psf_bpa_deg"]),
+            header_psf_source,
+            False,
+        )
+    if has_cli_psf_override:
+        return (
+            cli_psf_bmaj_arcsec,
+            cli_psf_bmin_arcsec,
+            cli_psf_bpa_deg,
+            "cli_override",
+            True,
+        )
+    if header_psf is not None:
+        return (
+            float(header_psf["psf_bmaj_arcsec"]),
+            float(header_psf["psf_bmin_arcsec"]),
+            float(header_psf["psf_bpa_deg"]),
+            header_psf_source,
+            False,
+        )
+    if has_cli_psf_fallback:
+        return (
+            fallback_psf_bmaj_arcsec,
+            fallback_psf_bmin_arcsec,
+            fallback_psf_bpa_deg,
+            "cli_fallback",
+            True,
+        )
+    return None, None, None, "none", False
+
+
 def load_eovsa_map(fits_path: Path) -> tuple[np.ndarray, fits.Header, float]:
     """Load EOVSA FITS map and extract data, header, frequency.
     
@@ -236,6 +291,17 @@ def _decode_h5_scalar(value: Any) -> str:
     return str(value)
 
 
+def _compute_file_sha256(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _load_model_obs_time_iso(model_path: Path) -> str | None:
     try:
         with h5py.File(model_path, "r") as f:
@@ -247,6 +313,19 @@ def _load_model_obs_time_iso(model_path: Path) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _load_model_identity(model_path: Path) -> str:
+    try:
+        with h5py.File(model_path, "r") as f:
+            for key in ("metadata/id", "meta/id", "model/id"):
+                if key in f:
+                    txt = _decode_h5_scalar(np.asarray(f[key]).reshape(-1)[0]).strip()
+                    if txt:
+                        return txt
+    except Exception:
+        pass
+    return model_path.stem
 
 
 def _load_saved_fov_from_model(model_path: Path) -> dict[str, float] | None:
@@ -734,6 +813,15 @@ Examples:
     parser.add_argument("--psf-bmaj-arcsec", type=float, default=None, help="PSF major axis FWHM")
     parser.add_argument("--psf-bmin-arcsec", type=float, default=None, help="PSF minor axis FWHM")
     parser.add_argument("--psf-bpa-deg", type=float, default=None, help="PSF position angle in degrees")
+    parser.add_argument(
+        "--override-header-psf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use user-supplied PSF or fallback reference-beam parameters even when the FITS header already contains a PSF beam",
+    )
+    parser.add_argument("--fallback-psf-bmaj-arcsec", type=float, default=None, help="Fallback PSF major axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied")
+    parser.add_argument("--fallback-psf-bmin-arcsec", type=float, default=None, help="Fallback PSF minor axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied")
+    parser.add_argument("--fallback-psf-bpa-deg", type=float, default=None, help="Fallback PSF position angle used only when the FITS header has no beam and no explicit PSF override is supplied")
     parser.add_argument("--psf-ref-frequency-ghz", type=float, default=None, help="Reference frequency for PSF axes values")
     parser.add_argument("--psf-scale-inverse-frequency", action="store_true", help="Scale PSF axes by (ref_freq / active_freq)")
 
@@ -796,6 +884,9 @@ Examples:
             "psf_bmaj_arcsec": None,
             "psf_bmin_arcsec": None,
             "psf_bpa_deg": None,
+            "fallback_psf_bmaj_arcsec": None,
+            "fallback_psf_bmin_arcsec": None,
+            "fallback_psf_bpa_deg": None,
             "psf_ref_frequency_ghz": None,
             "psf_scale_inverse_frequency": False,
             "artifacts_dir": None,
@@ -1014,14 +1105,26 @@ Examples:
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    psf_source = "cli_override"
-    if psf_bmaj_arcsec is None and psf_bmin_arcsec is None and psf_bpa_deg is None and header_psf is not None:
-        psf_bmaj_arcsec = float(header_psf["psf_bmaj_arcsec"])
-        psf_bmin_arcsec = float(header_psf["psf_bmin_arcsec"])
-        psf_bpa_deg = float(header_psf["psf_bpa_deg"])
-        psf_source = header_psf_source
-    elif psf_bmaj_arcsec is None and psf_bmin_arcsec is None and psf_bpa_deg is None:
-        psf_source = "none"
+    fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
+    fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
+    fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
+    (
+        psf_bmaj_arcsec,
+        psf_bmin_arcsec,
+        psf_bpa_deg,
+        psf_source,
+        psf_allows_frequency_scaling,
+    ) = _resolve_selected_psf(
+        header_psf=header_psf,
+        header_psf_source=header_psf_source,
+        cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
+        cli_psf_bmin_arcsec=psf_bmin_arcsec,
+        cli_psf_bpa_deg=psf_bpa_deg,
+        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
+        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
+        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
+        override_header_psf=bool(args.override_header_psf),
+    )
 
     print(
         "  "
@@ -1032,7 +1135,7 @@ Examples:
             bpa_deg=psf_bpa_deg,
             active_frequency_ghz=float(freq_ghz),
             ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
+            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
         )
     )
     print(f"  Plasma/heating: a={a_param:.3f} b={b_param:.3f} tbase={tbase:.3e} nbase={nbase:.3e}")
@@ -1063,7 +1166,7 @@ Examples:
                 bpa_deg=psf_bpa_deg,
                 active_frequency_ghz=float(freq_ghz),
                 ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
+                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
             )
             assert psf_meta is not None
             kernel = _elliptical_gaussian_kernel(
@@ -1278,6 +1381,12 @@ Examples:
         try:
             diagnostics = {
                 "model_path": str(args.model_h5),
+                "model_id": str(_load_model_identity(args.model_h5)),
+                "model_sha256": str(_compute_file_sha256(args.model_h5)),
+                "fits_file": str(args.fits_file),
+                "fits_sha256": str(_compute_file_sha256(args.fits_file)),
+                "ebtel_path": str(args.ebtel_path),
+                "ebtel_sha256": str(_compute_file_sha256(args.ebtel_path)),
                 "observer_name_effective": str(args.observer or "saved_metadata"),
                 "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
                 "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
@@ -1291,6 +1400,9 @@ Examples:
                 "q0_recovered": float(result.q0),
                 "fit_success": bool(result.success),
                 "optimizer_message": str(result.message),
+                "nfev": int(result.nfev),
+                "nit": int(result.nit),
+                "used_adaptive_bracketing": bool(result.used_adaptive_bracketing),
                 "bracket_found": bool(result.bracket_found),
                 "bracket": [float(v) for v in result.bracket] if result.bracket is not None else None,
                 "fit_q0_trials": [float(q) for q in result.trial_q0],

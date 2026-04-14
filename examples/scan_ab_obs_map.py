@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+from importlib import import_module
+import hashlib
 import json
 import os
 import shlex
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,12 +30,61 @@ from astropy.io import fits
 
 from pychmp import GXRenderMWContext, estimate_map_noise, fit_q0_to_observation
 from pychmp.ab_scan_artifacts import (
-    append_sparse_point_record,
+    COMPATIBILITY_SIGNATURE_KEY,
+    ScanArtifactCompatibilityError,
+    append_point_record,
+    build_computed_point_payload,
     detect_scan_artifact_format,
     load_scan_file,
+    load_run_history,
+    point_record_matches_compatibility_signature,
+    save_rectangular_scan_file,
+    slice_descriptor_from_diagnostics,
+    validate_scan_artifact_compatibility,
     write_sparse_scan_file,
 )
+from pychmp.ab_scan_execution import ABExecutionSettings, iter_execute_tasks, resolve_execution_plan
+from pychmp.ab_scan_tasks import ABSliceTaskDescriptor, compile_rectangular_point_tasks, compile_sparse_point_tasks
 from pychmp.ab_search import idl_q0_start_heuristic
+
+
+def _build_command_compatibility_signature(argv: list[str]) -> str:
+    normalized = json.dumps([str(item) for item in argv], separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _build_physical_compatibility_signature(payload: dict[str, Any]) -> str:
+    normalized = json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _build_run_history_entry(
+    *,
+    artifact_h5: Path,
+    viewer_cmd_text: str,
+    action: str,
+    target_metric: str,
+    recompute_existing: bool,
+) -> dict[str, Any]:
+    effective_python_argv = [str(sys.executable), *[str(item) for item in sys.argv]]
+    wrapper_command = os.environ.get("PYCHMP_WRAPPER_COMMAND", "").strip()
+    compatibility_signature = _build_command_compatibility_signature(effective_python_argv)
+    log_path = Path(f"{artifact_h5}.log")
+    return {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "action": str(action),
+        "artifact_path": str(artifact_h5),
+        "cwd": os.getcwd(),
+        "python_executable": sys.executable,
+        "wrapper_command": wrapper_command or None,
+        "effective_python_argv": effective_python_argv,
+        "effective_python_command": shlex.join(effective_python_argv),
+        "compatibility_signature": compatibility_signature,
+        "viewer_command": str(viewer_cmd_text),
+        "log_path": str(log_path),
+        "target_metric": str(target_metric),
+        "recompute_existing": bool(recompute_existing),
+    }
 
 try:
     from fit_q0_obs_map import (
@@ -48,7 +100,9 @@ try:
         _extract_psf_from_header,
         _format_psf_report,
         _format_q0_value,
+        _compute_file_sha256,
         _lookup_cached_render_pair,
+        _load_model_identity,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
         _make_trial_progress_reporter,
@@ -74,7 +128,9 @@ except ModuleNotFoundError:
         _extract_psf_from_header,
         _format_psf_report,
         _format_q0_value,
+        _compute_file_sha256,
         _lookup_cached_render_pair,
+        _load_model_identity,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
         _make_trial_progress_reporter,
@@ -102,6 +158,45 @@ class GridPointSpec:
     b: float
     q0_min: float | None = None
     q0_max: float | None = None
+
+
+class _TeeStream:
+    def __init__(self, *streams: Any) -> None:
+        self._streams = [stream for stream in streams if stream is not None]
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            try:
+                stream.write(data)
+            except UnicodeEncodeError:
+                encoding = getattr(stream, "encoding", None) or "utf-8"
+                safe_text = str(data).encode(encoding, errors="replace").decode(encoding, errors="replace")
+                stream.write(safe_text)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
+    def isatty(self) -> bool:
+        for stream in self._streams:
+            try:
+                if bool(stream.isatty()):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @property
+    def encoding(self) -> str:
+        for stream in self._streams:
+            enc = getattr(stream, "encoding", None)
+            if isinstance(enc, str) and enc:
+                return enc
+        return "utf-8"
 
 
 class _SharedContextPointRenderer:
@@ -327,6 +422,145 @@ def _match_existing_index(values: np.ndarray, value: float) -> int | None:
     return int(matches[0])
 
 
+def _merge_existing_rectangular_payload(
+    *,
+    existing_payload: dict[str, Any],
+    a_values: np.ndarray,
+    b_values: np.ndarray,
+    point_payloads: dict[tuple[int, int], dict[str, Any]],
+    best_q0: np.ndarray,
+    objective_values: np.ndarray,
+    chi2: np.ndarray,
+    rho2: np.ndarray,
+    eta2: np.ndarray,
+    success: np.ndarray,
+    target_metric: str,
+) -> tuple[dict[tuple[int, int], dict[str, Any]], int, int]:
+    existing_points = int(len(existing_payload.get("points", {})))
+    reused_points = 0
+
+    for payload in existing_payload.get("points", {}).values():
+        match_i = _match_existing_index(a_values, float(payload["a"]))
+        match_j = _match_existing_index(b_values, float(payload["b"]))
+        if match_i is None or match_j is None:
+            continue
+        key = (int(match_i), int(match_j))
+        existing_diag = dict(payload["diagnostics"])
+        point_payloads[key] = {
+            "a": float(payload["a"]),
+            "b": float(payload["b"]),
+            "a_index": int(match_i),
+            "b_index": int(match_j),
+            "q0": float(payload["q0"]),
+            "success": bool(payload["success"]),
+            "status": str(payload.get("status", "computed")),
+            "modeled_best": np.asarray(payload["modeled_best"], dtype=float),
+            "raw_modeled_best": np.asarray(payload["raw_modeled_best"], dtype=float),
+            "residual": np.asarray(payload["residual"], dtype=float),
+            "fit_q0_trials": tuple(float(v) for v in payload.get("fit_q0_trials", ())),
+            "fit_metric_trials": tuple(float(v) for v in payload.get("fit_metric_trials", ())),
+            "fit_chi2_trials": tuple(float(v) for v in payload.get("fit_chi2_trials", ())),
+            "fit_rho2_trials": tuple(float(v) for v in payload.get("fit_rho2_trials", ())),
+            "fit_eta2_trials": tuple(float(v) for v in payload.get("fit_eta2_trials", ())),
+            "target_metric": str(payload.get("target_metric", target_metric)),
+            "diagnostics": existing_diag,
+        }
+        if np.isfinite(float(payload["q0"])):
+            best_q0[key] = float(payload["q0"])
+        objective_values[key] = float(existing_diag.get("target_metric_value", np.nan))
+        chi2[key] = float(existing_diag.get("chi2", np.nan))
+        rho2[key] = float(existing_diag.get("rho2", np.nan))
+        eta2[key] = float(existing_diag.get("eta2", np.nan))
+        success[key] = bool(payload["success"])
+        reused_points += 1
+
+    return point_payloads, int(existing_points), int(reused_points)
+
+
+def _build_rectangular_pending_requests(
+    *,
+    target_tasks: list[Any],
+    point_payloads: dict[tuple[int, int], dict[str, Any]],
+    recompute_existing: bool,
+    q0_start_scalar: float | None,
+    use_idl_q0_start_heuristic: bool,
+    hard_q0_min: float | None,
+    hard_q0_max: float | None,
+    target_metric: str,
+    adaptive_bracketing: bool,
+    q0_step: float,
+    max_bracket_steps: int,
+) -> tuple[list[_RectangularPointEvaluationRequest], list[tuple[float, float]]]:
+    pending_requests: list[_RectangularPointEvaluationRequest] = []
+    skipped_points: list[tuple[float, float]] = []
+
+    for point_task in target_tasks:
+        i = int(point_task.a_index)
+        j = int(point_task.b_index)
+        a_value = float(point_task.a)
+        b_value = float(point_task.b)
+        existing_payload = point_payloads[(int(i), int(j))]
+        existing_status = str(existing_payload.get("status", "pending"))
+
+        if existing_status != "pending" and existing_status != "failed" and not bool(recompute_existing):
+            skipped_points.append((float(a_value), float(b_value)))
+            continue
+
+        q0_start = None
+        if q0_start_scalar is not None:
+            q0_start = float(q0_start_scalar)
+        elif use_idl_q0_start_heuristic:
+            q0_start = float(idl_q0_start_heuristic(a_value, b_value))
+
+        pending_requests.append(
+            _RectangularPointEvaluationRequest(
+                task=point_task,
+                q0_start=q0_start,
+                hard_q0_min=hard_q0_min,
+                hard_q0_max=hard_q0_max,
+                target_metric=str(target_metric),
+                adaptive_bracketing=bool(adaptive_bracketing),
+                q0_step=float(q0_step),
+                max_bracket_steps=int(max_bracket_steps),
+            )
+        )
+
+    return pending_requests, skipped_points
+
+
+def _build_sparse_pending_tasks(
+    *,
+    target_tasks: list[Any],
+    existing_points: dict[tuple[float, float], dict[str, Any]],
+    recompute_existing: bool,
+) -> tuple[list[Any], list[tuple[float, float]], list[tuple[float, float]]]:
+    pending_tasks: list[Any] = []
+    skipped_points: list[tuple[float, float]] = []
+    recompute_points: list[tuple[float, float]] = []
+
+    for point_task in target_tasks:
+        a_value = float(point_task.a)
+        b_value = float(point_task.b)
+        existing_point = existing_points.get((float(a_value), float(b_value)))
+        if existing_point is None:
+            pending_tasks.append(point_task)
+            continue
+
+        existing_status = str(existing_point.get("status", "computed"))
+        if existing_status == "failed" or bool(recompute_existing):
+            pending_tasks.append(point_task)
+            recompute_points.append((float(a_value), float(b_value)))
+            continue
+
+        if existing_status not in {"pending", "missing"}:
+            skipped_points.append((float(a_value), float(b_value)))
+            continue
+
+        pending_tasks.append(point_task)
+
+    return pending_tasks, skipped_points, recompute_points
+
+
 def _decode_h5_scalar(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
@@ -372,6 +606,12 @@ def _load_fit_q0_artifact_payload(
             "fit_chi2_trials": tuple(float(v) for v in diagnostics.get("fit_chi2_trials", [])),
             "fit_rho2_trials": tuple(float(v) for v in diagnostics.get("fit_rho2_trials", [])),
             "fit_eta2_trials": tuple(float(v) for v in diagnostics.get("fit_eta2_trials", [])),
+            "nfev": int(diagnostics.get("nfev", -1)),
+            "nit": int(diagnostics.get("nit", -1)),
+            "message": str(diagnostics.get("optimizer_message", "")),
+            "used_adaptive_bracketing": bool(diagnostics.get("used_adaptive_bracketing", False)),
+            "bracket_found": bool(diagnostics.get("bracket_found", False)),
+            "bracket": tuple(float(v) for v in diagnostics.get("bracket", [])) if diagnostics.get("bracket") is not None else None,
             "target_metric": target_metric,
             "diagnostics": {
                 **diagnostics,
@@ -410,6 +650,12 @@ def _failed_sparse_point_payload(
         "fit_chi2_trials": tuple(),
         "fit_rho2_trials": tuple(),
         "fit_eta2_trials": tuple(),
+        "nfev": -1,
+        "nit": -1,
+        "message": str(message),
+        "used_adaptive_bracketing": False,
+        "bracket_found": False,
+        "bracket": None,
         "target_metric": str(target_metric),
         "diagnostics": {
             "a": float(a_value),
@@ -417,6 +663,11 @@ def _failed_sparse_point_payload(
             "target_metric": str(target_metric),
             "optimizer_message": str(message),
             "fit_success": False,
+            "nfev": -1,
+            "nit": -1,
+            "used_adaptive_bracketing": False,
+            "bracket_found": False,
+            "bracket": None,
             "point_status": str(status),
         },
     }
@@ -472,6 +723,155 @@ def _run_point_worker(
         time.sleep(0.25)
 
 
+@dataclass(frozen=True)
+class _SparsePointEvaluationRequest:
+    task: Any
+    fits_file: str
+    model_h5: str
+    ebtel_path: str
+    prepared_observation_h5: str
+    point_artifacts_dir: str
+    fit_script: str
+    point_stem: str
+    q0_start: float | None
+    hard_q0_min: float | None
+    hard_q0_max: float | None
+    target_metric: str
+    adaptive_bracketing: bool
+    q0_step: float
+    max_bracket_steps: int
+    psf_bmaj_arcsec: float | None
+    psf_bmin_arcsec: float | None
+    psf_bpa_deg: float | None
+    psf_ref_frequency_ghz: float | None
+    psf_scale_inverse_frequency: bool
+    preflight_render: bool
+    preflight_q0: float | None
+    preflight_timeout_s: float
+    point_timeout_s: float | None
+    progress: bool
+    spinner: bool
+    keep_point_artifacts: bool
+
+
+@dataclass(frozen=True)
+class _SparsePointEvaluationResult:
+    task: Any
+    point_payload: dict[str, Any] | None
+    elapsed_seconds: float
+    error_message: str | None = None
+
+
+def _bootstrap_sparse_worker(_payload: None) -> None:
+    return None
+
+
+def _evaluate_sparse_point_request(
+    request: _SparsePointEvaluationRequest,
+    _worker_state: None,
+) -> _SparsePointEvaluationResult:
+    started = time.perf_counter()
+    task = request.task
+    point_h5 = Path(request.point_artifacts_dir) / f"{request.point_stem}.h5"
+
+    base_point_cmd = [
+        sys.executable,
+        str(request.fit_script),
+        str(request.fits_file),
+        str(request.model_h5),
+        "--ebtel-path",
+        str(request.ebtel_path),
+        "--prepared-observation-h5",
+        str(request.prepared_observation_h5),
+        "--a",
+        str(float(task.a)),
+        "--b",
+        str(float(task.b)),
+        "--q0-min",
+        str(float(task.q0_min)),
+        "--q0-max",
+        str(float(task.q0_max)),
+        "--target-metric",
+        str(request.target_metric),
+        "--q0-step",
+        str(float(request.q0_step)),
+        "--max-bracket-steps",
+        str(int(request.max_bracket_steps)),
+        "--artifacts-dir",
+        str(request.point_artifacts_dir),
+        "--artifacts-stem",
+        str(request.point_stem),
+        "--no-artifacts-png",
+    ]
+    if bool(request.adaptive_bracketing):
+        base_point_cmd.append("--adaptive-bracketing")
+    else:
+        base_point_cmd.append("--no-adaptive-bracketing")
+    if request.hard_q0_min is not None:
+        base_point_cmd.extend(["--hard-q0-min", str(float(request.hard_q0_min))])
+    if request.hard_q0_max is not None:
+        base_point_cmd.extend(["--hard-q0-max", str(float(request.hard_q0_max))])
+    if request.q0_start is not None:
+        base_point_cmd.extend(["--q0-start", str(float(request.q0_start))])
+    if request.psf_bmaj_arcsec is not None:
+        base_point_cmd.extend(["--psf-bmaj-arcsec", str(float(request.psf_bmaj_arcsec))])
+    if request.psf_bmin_arcsec is not None:
+        base_point_cmd.extend(["--psf-bmin-arcsec", str(float(request.psf_bmin_arcsec))])
+    if request.psf_bpa_deg is not None:
+        base_point_cmd.extend(["--psf-bpa-deg", str(float(request.psf_bpa_deg))])
+    if request.psf_ref_frequency_ghz is not None:
+        base_point_cmd.extend(["--psf-ref-frequency-ghz", str(float(request.psf_ref_frequency_ghz))])
+    if bool(request.psf_scale_inverse_frequency):
+        base_point_cmd.append("--psf-scale-inverse-frequency")
+    if not bool(request.progress):
+        base_point_cmd.append("--no-progress")
+    if not bool(request.spinner):
+        base_point_cmd.append("--no-spinner")
+
+    try:
+        if bool(request.preflight_render):
+            preflight_cmd = list(base_point_cmd)
+            preflight_cmd.extend(["--preflight-render-only", "--no-artifacts"])
+            if request.preflight_q0 is not None:
+                preflight_cmd.extend(["--preflight-q0", str(float(request.preflight_q0))])
+            _run_point_worker(
+                preflight_cmd,
+                timeout_s=float(request.preflight_timeout_s),
+                progress=bool(request.progress),
+                label="preflight worker",
+            )
+
+        _run_point_worker(
+            list(base_point_cmd),
+            timeout_s=None if request.point_timeout_s is None else float(request.point_timeout_s),
+            progress=bool(request.progress),
+            label="worker",
+        )
+        if not point_h5.exists():
+            raise FileNotFoundError(f"expected point artifact not found: {point_h5}")
+        point_payload = _load_fit_q0_artifact_payload(
+            point_h5,
+            a_value=float(task.a),
+            b_value=float(task.b),
+            fallback_target_metric=str(request.target_metric),
+        )
+        return _SparsePointEvaluationResult(
+            task=task,
+            point_payload=point_payload,
+            elapsed_seconds=time.perf_counter() - started,
+        )
+    except Exception as exc:
+        return _SparsePointEvaluationResult(
+            task=task,
+            point_payload=None,
+            elapsed_seconds=time.perf_counter() - started,
+            error_message=str(exc),
+        )
+    finally:
+        if point_h5.exists() and not bool(request.keep_point_artifacts):
+            point_h5.unlink(missing_ok=True)
+
+
 def _load_single_point_artifact(h5_path: Path) -> dict[str, Any]:
     with h5py.File(h5_path, "r") as f:
         diagnostics = json.loads(_decode_scalar(f["diagnostics_json"][()]))
@@ -511,52 +911,262 @@ def _save_ab_scan_h5(
     eta2: np.ndarray,
     success: np.ndarray,
     point_payloads: dict[tuple[int, int], dict[str, Any]],
+    run_history: list[dict[str, Any]] | None = None,
 ) -> None:
-    out_h5.parent.mkdir(parents=True, exist_ok=True)
-    tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
-    with h5py.File(tmp_h5, "w") as f:
-        common = f.create_group("common")
-        common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
-        common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
-        common.create_dataset("wcs_header", data=np.bytes_(wcs_header.tostring(sep="\n", endcard=True)))
-        common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics, sort_keys=True)))
+    save_rectangular_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=wcs_header,
+        diagnostics=diagnostics,
+        a_values=a_values,
+        b_values=b_values,
+        best_q0=best_q0,
+        objective_values=objective_values,
+        chi2=chi2,
+        rho2=rho2,
+        eta2=eta2,
+        success=success,
+        point_payloads=point_payloads,
+        slice_key=slice_descriptor_from_diagnostics(diagnostics)["key"],
+        run_history=run_history,
+    )
 
-        grid = f.create_group("grid")
-        grid.create_dataset("a_values", data=np.asarray(a_values, dtype=np.float64))
-        grid.create_dataset("b_values", data=np.asarray(b_values, dtype=np.float64))
 
-        summary = f.create_group("summary")
-        summary.create_dataset("best_q0", data=np.asarray(best_q0, dtype=np.float64))
-        summary.create_dataset("objective_values", data=np.asarray(objective_values, dtype=np.float64))
-        summary.create_dataset("chi2", data=np.asarray(chi2, dtype=np.float64))
-        summary.create_dataset("rho2", data=np.asarray(rho2, dtype=np.float64))
-        summary.create_dataset("eta2", data=np.asarray(eta2, dtype=np.float64))
-        summary.create_dataset("success", data=np.asarray(success, dtype=np.uint8))
-        summary.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
+@dataclass(frozen=True)
+class _RectangularWorkerBootstrap:
+    model_path: str
+    ebtel_path: str
+    geometry_data: dict[str, float | int]
+    observer_override_data: dict[str, float] | None
+    pixel_scale_arcsec: float
+    frequency_ghz: float
+    tbase: float
+    nbase: float
+    observed: np.ndarray
+    sigma: np.ndarray
+    psf_kernel: np.ndarray | None
 
-        points = f.create_group("points")
-        for (_ai, _bi), payload in sorted(point_payloads.items()):
-            name = f"a{payload['a_index']:03d}_b{payload['b_index']:03d}"
-            grp = points.create_group(name)
-            grp.attrs["a"] = float(payload["a"])
-            grp.attrs["b"] = float(payload["b"])
-            grp.attrs["a_index"] = int(payload["a_index"])
-            grp.attrs["b_index"] = int(payload["b_index"])
-            grp.attrs["q0"] = float(payload["q0"])
-            grp.attrs["success"] = int(bool(payload["success"]))
-            grp.attrs["status"] = np.bytes_(str(payload.get("status", "computed")))
-            grp.attrs["target_metric"] = np.bytes_(str(payload["target_metric"]))
-            grp.create_dataset("modeled_best", data=np.asarray(payload["modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
-            grp.create_dataset("raw_modeled_best", data=np.asarray(payload["raw_modeled_best"], dtype=np.float32), compression="gzip", compression_opts=4)
-            grp.create_dataset("residual", data=np.asarray(payload["residual"], dtype=np.float32), compression="gzip", compression_opts=4)
-            grp.create_dataset("fit_q0_trials", data=np.asarray(payload["fit_q0_trials"], dtype=np.float64))
-            fit_metric_ds = grp.create_dataset("fit_metric_trials", data=np.asarray(payload["fit_metric_trials"], dtype=np.float64))
-            fit_metric_ds.attrs["target_metric"] = np.bytes_(str(payload["target_metric"]))
-            grp.create_dataset("fit_chi2_trials", data=np.asarray(payload.get("fit_chi2_trials", ()), dtype=np.float64))
-            grp.create_dataset("fit_rho2_trials", data=np.asarray(payload.get("fit_rho2_trials", ()), dtype=np.float64))
-            grp.create_dataset("fit_eta2_trials", data=np.asarray(payload.get("fit_eta2_trials", ()), dtype=np.float64))
-            grp.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(payload["diagnostics"], sort_keys=True)))
-    os.replace(tmp_h5, out_h5)
+
+@dataclass(frozen=True)
+class _RectangularWorkerState:
+    context: GXRenderMWContext
+    frequency_ghz: float
+    tbase: float
+    nbase: float
+    observed: np.ndarray
+    sigma: np.ndarray
+    psf_kernel: np.ndarray | None
+
+
+@dataclass(frozen=True)
+class _RectangularPointEvaluationRequest:
+    task: Any
+    q0_start: float | None
+    hard_q0_min: float | None
+    hard_q0_max: float | None
+    target_metric: str
+    adaptive_bracketing: bool
+    q0_step: float
+    max_bracket_steps: int
+
+
+@dataclass(frozen=True)
+class _RectangularPointEvaluationResult:
+    task: Any
+    success: bool
+    q0: float
+    objective_value: float
+    chi2: float
+    rho2: float
+    eta2: float
+    message: str
+    nfev: int
+    nit: int
+    used_adaptive_bracketing: bool
+    bracket_found: bool
+    bracket: tuple[float, float, float] | None
+    trial_q0: tuple[float, ...]
+    trial_objective_values: tuple[float, ...]
+    trial_chi2_values: tuple[float, ...]
+    trial_rho2_values: tuple[float, ...]
+    trial_eta2_values: tuple[float, ...]
+    modeled_best: np.ndarray | None
+    raw_modeled_best: np.ndarray | None
+    residual: np.ndarray | None
+    trial_render_count: int
+    total_render_calls: int
+    elapsed_seconds: float
+    error_message: str | None = None
+
+
+def _geometry_snapshot(geometry: Any) -> dict[str, float | int]:
+    return {
+        "xc": float(geometry.xc),
+        "yc": float(geometry.yc),
+        "dx": float(geometry.dx),
+        "dy": float(geometry.dy),
+        "nx": int(geometry.nx),
+        "ny": int(geometry.ny),
+    }
+
+
+def _observer_override_snapshot(observer_overrides: Any | None) -> dict[str, float] | None:
+    if observer_overrides is None:
+        return None
+    return {
+        "dsun_cm": float(getattr(observer_overrides, "dsun_cm")),
+        "lonc_deg": float(getattr(observer_overrides, "lonc_deg")),
+        "b0sun_deg": float(getattr(observer_overrides, "b0sun_deg")),
+    }
+
+
+def _bootstrap_rectangular_worker(payload: _RectangularWorkerBootstrap) -> _RectangularWorkerState:
+    sdk = import_module("gxrender.sdk")
+    observer = None
+    if payload.observer_override_data is not None:
+        observer = sdk.ObserverOverrides(
+            dsun_cm=float(payload.observer_override_data["dsun_cm"]),
+            lonc_deg=float(payload.observer_override_data["lonc_deg"]),
+            b0sun_deg=float(payload.observer_override_data["b0sun_deg"]),
+        )
+    geometry = sdk.MapGeometry(
+        xc=float(payload.geometry_data["xc"]),
+        yc=float(payload.geometry_data["yc"]),
+        dx=float(payload.geometry_data["dx"]),
+        dy=float(payload.geometry_data["dy"]),
+        nx=int(payload.geometry_data["nx"]),
+        ny=int(payload.geometry_data["ny"]),
+    )
+    context = GXRenderMWContext(
+        model_path=str(payload.model_path),
+        ebtel_path=str(payload.ebtel_path),
+        geometry=geometry,
+        observer=observer,
+        pixel_scale_arcsec=float(payload.pixel_scale_arcsec),
+    )
+    return _RectangularWorkerState(
+        context=context,
+        frequency_ghz=float(payload.frequency_ghz),
+        tbase=float(payload.tbase),
+        nbase=float(payload.nbase),
+        observed=np.asarray(payload.observed, dtype=float),
+        sigma=np.asarray(payload.sigma, dtype=float),
+        psf_kernel=None if payload.psf_kernel is None else np.asarray(payload.psf_kernel, dtype=float),
+    )
+
+
+def _evaluate_rectangular_point_request(
+    request: _RectangularPointEvaluationRequest,
+    worker_state: _RectangularWorkerState,
+) -> _RectangularPointEvaluationResult:
+    started = time.perf_counter()
+    task = request.task
+    try:
+        base_renderer = _SharedContextPointRenderer(
+            worker_state.context,
+            frequency_ghz=float(worker_state.frequency_ghz),
+            tbase=float(worker_state.tbase),
+            nbase=float(worker_state.nbase),
+            a=float(task.a),
+            b=float(task.b),
+        )
+        renderer = base_renderer if worker_state.psf_kernel is None else PSFConvolvedRenderer(base_renderer, worker_state.psf_kernel)
+
+        render_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+
+        if isinstance(renderer, PSFConvolvedRenderer):
+            class _CachedObservedRenderer:
+                def render(self_inner, q0: float) -> np.ndarray:
+                    raw_arr, modeled_arr = renderer.render_pair(q0)
+                    render_cache[float(q0)] = (raw_arr, modeled_arr)
+                    return modeled_arr
+        else:
+            class _CachedObservedRenderer:
+                def render(self_inner, q0: float) -> np.ndarray:
+                    modeled_arr = base_renderer.render(q0)
+                    render_cache[float(q0)] = (modeled_arr, modeled_arr)
+                    return modeled_arr
+
+        result = fit_q0_to_observation(
+            renderer=_CachedObservedRenderer(),
+            observed=worker_state.observed,
+            sigma=worker_state.sigma,
+            q0_min=float(task.q0_min),
+            q0_max=float(task.q0_max),
+            hard_q0_min=request.hard_q0_min,
+            hard_q0_max=request.hard_q0_max,
+            target_metric=str(request.target_metric),
+            adaptive_bracketing=bool(request.adaptive_bracketing),
+            q0_start=request.q0_start,
+            q0_step=float(request.q0_step),
+            max_bracket_steps=int(request.max_bracket_steps),
+        )
+
+        cached_best_pair = _lookup_cached_render_pair(render_cache, result.q0)
+        if cached_best_pair is not None:
+            raw_modeled_best, modeled_best = cached_best_pair
+        elif isinstance(renderer, PSFConvolvedRenderer):
+            raw_modeled_best, modeled_best = renderer.render_pair(result.q0)
+        else:
+            modeled_best = base_renderer.render(result.q0)
+            raw_modeled_best = modeled_best
+
+        residual = modeled_best - worker_state.observed
+        return _RectangularPointEvaluationResult(
+            task=task,
+            success=bool(result.success),
+            q0=float(result.q0),
+            objective_value=float(result.objective_value),
+            chi2=float(result.metrics.chi2),
+            rho2=float(result.metrics.rho2),
+            eta2=float(result.metrics.eta2),
+            message=str(result.message),
+            nfev=int(result.nfev),
+            nit=int(result.nit),
+            used_adaptive_bracketing=bool(result.used_adaptive_bracketing),
+            bracket_found=bool(result.bracket_found),
+            bracket=result.bracket,
+            trial_q0=tuple(float(v) for v in result.trial_q0),
+            trial_objective_values=tuple(float(v) for v in result.trial_objective_values),
+            trial_chi2_values=tuple(float(v) for v in result.trial_chi2_values),
+            trial_rho2_values=tuple(float(v) for v in result.trial_rho2_values),
+            trial_eta2_values=tuple(float(v) for v in result.trial_eta2_values),
+            modeled_best=np.asarray(modeled_best, dtype=float),
+            raw_modeled_best=np.asarray(raw_modeled_best, dtype=float),
+            residual=np.asarray(residual, dtype=float),
+            trial_render_count=len(result.trial_q0),
+            total_render_calls=int(base_renderer.render_call_count),
+            elapsed_seconds=float(time.perf_counter() - started),
+        )
+    except Exception as exc:
+        return _RectangularPointEvaluationResult(
+            task=task,
+            success=False,
+            q0=np.nan,
+            objective_value=np.nan,
+            chi2=np.nan,
+            rho2=np.nan,
+            eta2=np.nan,
+            message=str(exc),
+            nfev=-1,
+            nit=-1,
+            used_adaptive_bracketing=False,
+            bracket_found=False,
+            bracket=None,
+            trial_q0=tuple(),
+            trial_objective_values=tuple(),
+            trial_chi2_values=tuple(),
+            trial_rho2_values=tuple(),
+            trial_eta2_values=tuple(),
+            modeled_best=None,
+            raw_modeled_best=None,
+            residual=None,
+            trial_render_count=0,
+            total_render_calls=0,
+            elapsed_seconds=float(time.perf_counter() - started),
+            error_message=str(exc),
+        )
 
 
 def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
@@ -619,6 +1229,9 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--psf-bmaj-arcsec", type=float, default=None, help="PSF major axis FWHM.")
     p.add_argument("--psf-bmin-arcsec", type=float, default=None, help="PSF minor axis FWHM.")
     p.add_argument("--psf-bpa-deg", type=float, default=None, help="PSF position angle in degrees.")
+    p.add_argument("--fallback-psf-bmaj-arcsec", type=float, default=None, help="Fallback PSF major axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied.")
+    p.add_argument("--fallback-psf-bmin-arcsec", type=float, default=None, help="Fallback PSF minor axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied.")
+    p.add_argument("--fallback-psf-bpa-deg", type=float, default=None, help="Fallback PSF position angle used only when the FITS header has no beam and no explicit PSF override is supplied.")
     p.add_argument("--psf-ref-frequency-ghz", type=float, default=None, help="Reference frequency for PSF axes values.")
     p.add_argument("--psf-scale-inverse-frequency", action="store_true", help="Scale PSF axes by (ref_freq / active_freq).")
 
@@ -629,7 +1242,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
         "--recompute-existing",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="In sparse explicit-point mode, recompute matching existing (a,b) records instead of skipping them.",
+        help="Recompute matching existing records instead of skipping them. Failed points are always retried by default.",
     )
     p.add_argument("--point-timeout-s", type=float, default=900.0, help="Per-point worker timeout in seconds. Enforced for sparse explicit-point mode.")
     p.add_argument("--preflight-render", action=argparse.BooleanOptionalAction, default=True, help="Run an isolated single-render preflight before launching a full sparse explicit-point fit.")
@@ -641,7 +1254,24 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--no-grid-png", action="store_true", help="Skip the grid-summary PNG.")
     p.add_argument("--no-point-png", action="store_true", help="Skip the selected-point PNG.")
     p.add_argument("--show-plot", action="store_true", help="Display generated plots interactively.")
-    p.add_argument("--no-viewer", action="store_true", help="Do not launch pychmp-view automatically when the scan completes.")
+    p.add_argument("--no-viewer", action="store_true", help="Do not launch pychmp-view automatically when the scan starts.")
+    p.add_argument(
+        "--execution-policy",
+        choices=("auto", "serial", "process-pool"),
+        default="serial",
+        help=(
+            "Per-point execution policy for a single-slice scan: 'serial' keeps one worker, "
+            "'process-pool' uses the requested process pool, and 'auto' stays serial for very small scans "
+            "but otherwise chooses a conservative worker count from task count and system limits."
+        ),
+    )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum number of worker processes used when the resolved execution policy is process-pool, including auto mode.",
+    )
+    p.add_argument("--worker-chunksize", type=int, default=1, help="Task chunksize passed to the process pool executor.")
     p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Print per-trial and per-point progress diagnostics.")
     p.add_argument("--spinner", action=argparse.BooleanOptionalAction, default=True, help="Show a spinner during long-running stages.")
     p.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit.")
@@ -652,6 +1282,7 @@ def main() -> int:
     import sys
 
     parser, args = parse_args()
+    suppress_auto_viewer = os.environ.get("PYCHMP_NO_AUTO_VIEWER", "").strip().lower() in {"1", "true", "yes", "on"}
     scan_start = time.perf_counter()
     if args.defaults:
         defaults = {
@@ -673,6 +1304,9 @@ def main() -> int:
             "use_idl_q0_start_heuristic": False,
             "q0_step": 1.61803398875,
             "max_bracket_steps": 12,
+            "execution_policy": "serial",
+            "max_workers": None,
+            "worker_chunksize": 1,
             "tbase": DEFAULT_TBASE,
             "nbase": DEFAULT_NBASE,
             "pixel_scale_arcsec": 2.0,
@@ -755,8 +1389,6 @@ def main() -> int:
         print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
         print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
 
-    from importlib import import_module
-
     sdk = import_module("gxrender.sdk")
 
     tbase = float(args.tbase) if args.tbase is not None else DEFAULT_TBASE
@@ -766,13 +1398,26 @@ def main() -> int:
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    psf_source = "cli_override"
-    if psf_bmaj_arcsec is None and psf_bmin_arcsec is None and psf_bpa_deg is None and header_psf is not None:
+    fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
+    fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
+    fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
+    has_cli_psf_override = any(value is not None for value in (args.psf_bmaj_arcsec, args.psf_bmin_arcsec, args.psf_bpa_deg))
+    has_cli_psf_fallback = any(
+        value is not None for value in (args.fallback_psf_bmaj_arcsec, args.fallback_psf_bmin_arcsec, args.fallback_psf_bpa_deg)
+    )
+    if header_psf is not None and not has_cli_psf_override:
         psf_bmaj_arcsec = float(header_psf["psf_bmaj_arcsec"])
         psf_bmin_arcsec = float(header_psf["psf_bmin_arcsec"])
         psf_bpa_deg = float(header_psf["psf_bpa_deg"])
         psf_source = header_psf_source
-    elif psf_bmaj_arcsec is None and psf_bmin_arcsec is None and psf_bpa_deg is None:
+    elif has_cli_psf_override:
+        psf_source = "cli_override"
+    elif has_cli_psf_fallback:
+        psf_bmaj_arcsec = fallback_psf_bmaj_arcsec
+        psf_bmin_arcsec = fallback_psf_bmin_arcsec
+        psf_bpa_deg = fallback_psf_bpa_deg
+        psf_source = "cli_fallback"
+    else:
         psf_source = "none"
 
     observer_overrides, observer_source = _resolve_observer_overrides(
@@ -863,9 +1508,58 @@ def main() -> int:
     out_h5 = args.artifact_h5 if args.artifact_h5 is not None else artifacts_dir / f"{stem}.h5"
     out_h5 = Path(out_h5)
     artifacts_dir = out_h5.parent
-    existing_format = detect_scan_artifact_format(out_h5) if out_h5.exists() else None
+    out_log = Path(f"{out_h5}.log")
+    current_slice_key = str(
+        slice_descriptor_from_diagnostics(
+            {
+                "spectral_domain": "mw",
+                "spectral_label": f"{float(freq_ghz):.3f} GHz",
+                "frequency_ghz": float(freq_ghz),
+            }
+        )["key"]
+    )
+    current_slice_descriptor = ABSliceTaskDescriptor(
+        key=current_slice_key,
+        domain="mw",
+        label=f"{float(freq_ghz):.3f} GHz",
+        display_label=f"MW: {float(freq_ghz):.3f} GHz",
+    )
+
+    live_log_handle = None
+    try:
+        out_log.parent.mkdir(parents=True, exist_ok=True)
+        live_log_handle = out_log.open("a", encoding="utf-8", buffering=1)
+        sys.stdout = _TeeStream(sys.stdout, live_log_handle)
+        sys.stderr = _TeeStream(sys.stderr, live_log_handle)
+        print(f"Live log file: {out_log}")
+    except Exception as exc:
+        print(_colorize(f"WARNING: failed to initialize live log sidecar: {exc}", "yellow"))
+
+    existing_format = detect_scan_artifact_format(out_h5, slice_key=current_slice_key) if out_h5.exists() else None
     use_sparse_mode = bool(explicit_points or existing_format == "sparse")
     target_points = explicit_points or [GridPointSpec(a=float(a), b=float(b)) for a in a_values for b in b_values]
+    if use_sparse_mode:
+        target_tasks = compile_sparse_point_tasks(
+            point_specs=[
+                (float(point.a), float(point.b), point.q0_min, point.q0_max)
+                for point in target_points
+            ],
+            a_values=a_values,
+            b_values=b_values,
+            slice_descriptor=current_slice_descriptor,
+            default_q0_min=float(args.q0_min),
+            default_q0_max=float(args.q0_max),
+            target_metric=str(args.target_metric),
+        )
+    else:
+        target_tasks = compile_rectangular_point_tasks(
+            a_values=a_values,
+            b_values=b_values,
+            slice_descriptor=current_slice_descriptor,
+            q0_min=float(args.q0_min),
+            q0_max=float(args.q0_max),
+            target_metric=str(args.target_metric),
+        )
     point_artifacts_dir = artifacts_dir / f"{stem}_point_runs" if (args.keep_point_artifacts or use_sparse_mode) else None
     if point_artifacts_dir is not None:
         point_artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -881,6 +1575,60 @@ def main() -> int:
     viewer_script = Path(__file__).with_name("pychmp_view.py")
     viewer_cmd = [sys.executable, str(viewer_script), str(out_h5)]
     viewer_cmd_text = shlex.join(viewer_cmd)
+    artifact_preexisting = out_h5.exists()
+    if artifact_preexisting:
+        try:
+            existing_run_history = load_run_history(out_h5, slice_key=current_slice_key)
+        except KeyError:
+            existing_run_history = []
+    else:
+        existing_run_history = []
+    current_run_entry = _build_run_history_entry(
+        artifact_h5=out_h5,
+        viewer_cmd_text=viewer_cmd_text,
+        action=(
+            "recompute"
+            if bool(args.recompute_existing) and artifact_preexisting
+            else ("resume" if artifact_preexisting and not bool(args.recompute_existing) else "create")
+        ),
+        target_metric=str(args.target_metric),
+        recompute_existing=bool(args.recompute_existing),
+    )
+    current_run_history = [*existing_run_history, current_run_entry]
+    viewer_process = None
+    viewer_refresh_signal = Path(f"{out_h5}.refresh")
+
+    def _notify_viewer_refresh(phase: str) -> None:
+        try:
+            viewer_refresh_signal.write_text(f"{time.time():.6f} {phase}\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _maybe_launch_viewer(phase: str) -> None:
+        nonlocal viewer_process
+        if bool(args.no_viewer) or suppress_auto_viewer:
+            return
+        if viewer_process is not None and viewer_process.poll() is None:
+            return
+        try:
+            proc = subprocess.Popen(
+                viewer_cmd,
+                start_new_session=True,
+            )
+            if proc.poll() is not None:
+                print(
+                    _colorize(
+                        f"WARNING: pychmp-view exited immediately after auto-launch ({phase}). "
+                        f"Try running manually: {viewer_cmd_text}",
+                        "yellow",
+                    )
+                )
+                return
+            viewer_process = proc
+            print(f"✓ Launched pychmp-view ({phase}) pid={proc.pid}")
+        except Exception as exc:
+            print(_colorize(f"WARNING: failed to launch pychmp-view automatically ({phase}): {exc}", "yellow"))
+
     print(f"  Live viewer command: {viewer_cmd_text}")
     print("  You may run this command while the scan is still in progress and use Refresh Artifact in the viewer.")
     if use_sparse_mode:
@@ -888,17 +1636,8 @@ def main() -> int:
     else:
         print("  Artifact storage mode: rectangular grid H5")
 
-    shared_context = None
     psf_kernel = None
     if not use_sparse_mode:
-        shared_context = GXRenderMWContext(
-            model_path=str(args.model_h5),
-            ebtel_path=str(args.ebtel_path),
-            geometry=geometry,
-            observer=observer_overrides,
-            pixel_scale_arcsec=float(args.pixel_scale_arcsec),
-        )
-
         if psf_bmaj_arcsec is not None and psf_bmin_arcsec is not None and psf_bpa_deg is not None:
             psf_meta = _effective_psf_parameters(
                 bmaj_arcsec=psf_bmaj_arcsec,
@@ -916,6 +1655,23 @@ def main() -> int:
                 dx_arcsec=float(geometry.dx),
                 dy_arcsec=float(geometry.dy),
             )
+
+    execution_plan = resolve_execution_plan(
+        task_count=int(len(target_tasks)),
+        requested_policy=str(args.execution_policy),
+        max_workers=args.max_workers,
+    )
+    if args.progress:
+        print(
+            "  Execution plan: "
+            f"requested={execution_plan.requested_policy} "
+            f"resolved={execution_plan.policy} "
+            f"workers={execution_plan.max_workers} "
+            f"cpus={execution_plan.available_cpus} "
+            f"tasks={execution_plan.task_count}"
+        )
+        if execution_plan.policy != "serial":
+            print("  Note: process-pool mode reports progress per completed point; per-trial progress remains serial-only")
 
     best_q0 = np.full((a_values.size, b_values.size), np.nan, dtype=float)
     objective_values = np.full((a_values.size, b_values.size), np.nan, dtype=float)
@@ -938,24 +1694,74 @@ def main() -> int:
         for j, b_value in enumerate(b_values)
     }
 
+    model_sha256 = _compute_file_sha256(args.model_h5)
+    fits_sha256 = _compute_file_sha256(args.fits_file)
+    ebtel_sha256 = _compute_file_sha256(args.ebtel_path)
     root_diag = {
         "artifact_kind": "pychmp_ab_scan",
+        "spectral_domain": "mw",
+        "spectral_label": f"{float(freq_ghz):.3f} GHz",
         "model_path": str(args.model_h5),
+        "model_id": str(_load_model_identity(args.model_h5)),
+        "model_sha256": str(model_sha256),
         "fits_file": str(args.fits_file),
+        "fits_sha256": str(fits_sha256),
         "ebtel_path": str(args.ebtel_path),
+        "ebtel_sha256": str(ebtel_sha256),
         "target_metric": str(args.target_metric),
         "frequency_ghz": float(freq_ghz),
         "map_xc_arcsec": float(geometry.xc),
         "map_yc_arcsec": float(geometry.yc),
         "map_dx_arcsec": float(geometry.dx),
         "map_dy_arcsec": float(geometry.dy),
+        "map_nx": int(geometry.nx),
+        "map_ny": int(geometry.ny),
         "noise_diagnostics": noise_diag,
         "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
         "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
         "observer_b0sun_deg": float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
         "observer_dsun_cm": float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)),
         "observer_obs_time": target_header.get("DATE-OBS", ""),
+        "execution_policy_requested": str(args.execution_policy),
+        "execution_policy_resolved": str(execution_plan.policy),
+        "execution_max_workers": int(execution_plan.max_workers),
+        "execution_available_cpus": int(execution_plan.available_cpus),
+        "psf_source": str(psf_source),
+        "psf_bmaj_arcsec": None if psf_bmaj_arcsec is None else float(psf_bmaj_arcsec),
+        "psf_bmin_arcsec": None if psf_bmin_arcsec is None else float(psf_bmin_arcsec),
+        "psf_bpa_deg": None if psf_bpa_deg is None else float(psf_bpa_deg),
+        "psf_ref_frequency_ghz": None if args.psf_ref_frequency_ghz is None else float(args.psf_ref_frequency_ghz),
+        "psf_scale_inverse_frequency": bool(args.psf_scale_inverse_frequency),
     }
+    compatibility_signature = _build_physical_compatibility_signature(
+        {
+            "artifact_kind": root_diag["artifact_kind"],
+            "target_metric": root_diag["target_metric"],
+            "model_sha256": root_diag["model_sha256"],
+            "fits_sha256": root_diag["fits_sha256"],
+            "ebtel_sha256": root_diag["ebtel_sha256"],
+            "frequency_ghz": root_diag["frequency_ghz"],
+            "map_xc_arcsec": root_diag["map_xc_arcsec"],
+            "map_yc_arcsec": root_diag["map_yc_arcsec"],
+            "map_dx_arcsec": root_diag["map_dx_arcsec"],
+            "map_dy_arcsec": root_diag["map_dy_arcsec"],
+            "map_nx": root_diag["map_nx"],
+            "map_ny": root_diag["map_ny"],
+            "observer_name": root_diag["observer_name"],
+            "observer_lonc_deg": root_diag["observer_lonc_deg"],
+            "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
+            "observer_dsun_cm": root_diag["observer_dsun_cm"],
+            "observer_obs_time": root_diag["observer_obs_time"],
+            "psf_source": root_diag["psf_source"],
+            "psf_bmaj_arcsec": root_diag["psf_bmaj_arcsec"],
+            "psf_bmin_arcsec": root_diag["psf_bmin_arcsec"],
+            "psf_bpa_deg": root_diag["psf_bpa_deg"],
+            "psf_ref_frequency_ghz": root_diag["psf_ref_frequency_ghz"],
+            "psf_scale_inverse_frequency": root_diag["psf_scale_inverse_frequency"],
+        }
+    )
+    root_diag[COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
+    current_run_entry["compatibility_signature"] = compatibility_signature
 
     if use_sparse_mode:
         assert point_artifacts_dir is not None
@@ -973,13 +1779,36 @@ def main() -> int:
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 point_records=[],
+                run_history=current_run_history,
             )
+            _notify_viewer_refresh("sparse artifact initialized")
 
-        existing_payload = load_scan_file(out_h5) if out_h5.exists() else None
+        if out_h5.exists():
+            try:
+                existing_payload = load_scan_file(out_h5, slice_key=current_slice_key)
+                validate_scan_artifact_compatibility(
+                    existing_payload,
+                    observed=observed_cropped,
+                    sigma_map=sigma_cropped,
+                    wcs_header=target_header,
+                    diagnostics=root_diag,
+                    artifact_path=out_h5,
+                )
+            except ScanArtifactCompatibilityError as exc:
+                parser.error(str(exc))
+            except Exception as exc:
+                parser.error(f"existing sparse artifact at {out_h5} could not be read safely: {exc}")
+        else:
+            existing_payload = None
         existing_points = {
             (float(record["a"]), float(record["b"])): record
             for record in (existing_payload.get("point_records", []) if existing_payload is not None else [])
+            if point_record_matches_compatibility_signature(
+                record,
+                compatibility_signature=compatibility_signature,
+            )
         }
+        _maybe_launch_viewer("scan start")
         prepared_observation_h5 = point_artifacts_dir / f"{stem}_prepared_observation.h5"
         save_prepared_observation_bundle(
             prepared_observation_h5,
@@ -996,15 +1825,27 @@ def main() -> int:
             noise_diagnostics=noise_diag,
         )
 
-        stage_total = int(len(target_points))
+        classified_sparse_tasks, skipped_sparse_points, recompute_sparse_points = _build_sparse_pending_tasks(
+            target_tasks=target_tasks,
+            existing_points=existing_points,
+            recompute_existing=bool(args.recompute_existing),
+        )
         run_success_count = 0
-        for point_counter, point_spec in enumerate(target_points, start=1):
-            a_value = float(point_spec.a)
-            b_value = float(point_spec.b)
-            point_q0_min = float(args.q0_min if point_spec.q0_min is None else point_spec.q0_min)
-            point_q0_max = float(args.q0_max if point_spec.q0_max is None else point_spec.q0_max)
-            point_start = time.perf_counter()
-            print(f"\nPoint {point_counter}/{stage_total}: a={float(a_value):.3f} b={float(b_value):.3f}")
+        for skipped_a, skipped_b in skipped_sparse_points:
+            existing_point = existing_points[(float(skipped_a), float(skipped_b))]
+            existing_status = str(existing_point.get("status", "computed"))
+            print(
+                f"    skipping point already present in sparse artifact "
+                f"(status={existing_status})"
+            )
+            run_success_count += int(bool(existing_point.get("success", False)))
+        pending_sparse_requests: list[_SparsePointEvaluationRequest] = []
+        fit_script = Path(__file__).with_name("fit_q0_obs_map.py")
+        for point_task in classified_sparse_tasks:
+            a_value = float(point_task.a)
+            b_value = float(point_task.b)
+            point_q0_min = float(point_task.q0_min)
+            point_q0_max = float(point_task.q0_max)
             if not point_q0_min < point_q0_max:
                 raise ValueError(
                     f"invalid q0 interval for point a={a_value:.3f}, b={b_value:.3f}: "
@@ -1012,146 +1853,112 @@ def main() -> int:
                 )
 
             existing_point = existing_points.get((float(a_value), float(b_value)))
-            if existing_point is not None and str(existing_point.get("status", "computed")) not in {"pending", "missing"}:
-                if not bool(args.recompute_existing):
+            if existing_point is not None and (float(a_value), float(b_value)) in recompute_sparse_points:
+                existing_status = str(existing_point.get("status", "computed"))
+                if existing_status == "failed":
+                    print("    recomputing failed point already present in sparse artifact")
+                else:
                     print(
-                        f"    skipping point already present in sparse artifact "
-                        f"(status={existing_point.get('status', 'computed')})"
+                        f"    recomputing point already present in sparse artifact "
+                        f"(status={existing_status})"
                     )
-                    run_success_count += int(bool(existing_point.get("success", False)))
-                    continue
-                print(
-                    f"    recomputing point already present in sparse artifact "
-                    f"(status={existing_point.get('status', 'computed')})"
-                )
 
             q0_start = None
             if args.q0_start_scalar is not None:
                 q0_start = float(args.q0_start_scalar)
             elif args.use_idl_q0_start_heuristic:
                 q0_start = float(idl_q0_start_heuristic(float(a_value), float(b_value)))
+            point_stem = f"{stem}_a{int(point_task.a_index):03d}_b{int(point_task.b_index):03d}"
+            pending_sparse_requests.append(
+                _SparsePointEvaluationRequest(
+                    task=point_task,
+                    fits_file=str(args.fits_file),
+                    model_h5=str(args.model_h5),
+                    ebtel_path=str(args.ebtel_path),
+                    prepared_observation_h5=str(prepared_observation_h5),
+                    point_artifacts_dir=str(point_artifacts_dir),
+                    fit_script=str(fit_script),
+                    point_stem=point_stem,
+                    q0_start=q0_start,
+                    hard_q0_min=args.hard_q0_min,
+                    hard_q0_max=args.hard_q0_max,
+                    target_metric=str(args.target_metric),
+                    adaptive_bracketing=bool(args.adaptive_bracketing),
+                    q0_step=float(args.q0_step),
+                    max_bracket_steps=int(args.max_bracket_steps),
+                    psf_bmaj_arcsec=psf_bmaj_arcsec,
+                    psf_bmin_arcsec=psf_bmin_arcsec,
+                    psf_bpa_deg=psf_bpa_deg,
+                    psf_ref_frequency_ghz=args.psf_ref_frequency_ghz,
+                    psf_scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
+                    preflight_render=bool(args.preflight_render),
+                    preflight_q0=args.preflight_q0,
+                    preflight_timeout_s=float(args.preflight_timeout_s),
+                    point_timeout_s=None if args.point_timeout_s is None else float(args.point_timeout_s),
+                    progress=bool(args.progress),
+                    spinner=bool(args.spinner),
+                    keep_point_artifacts=bool(args.keep_point_artifacts),
+                )
+            )
 
-            q0_start_text = _format_q0_value(q0_start) if q0_start is not None else "auto"
+        stage_total = int(len(pending_sparse_requests))
+        if stage_total == 0:
+            print("\nNo pending sparse/manual points remain after resume/skip checks.")
+        execution_settings = ABExecutionSettings(
+            policy=execution_plan.policy,
+            max_workers=int(execution_plan.max_workers),
+            chunksize=int(args.worker_chunksize),
+            yield_completion_order=True,
+        )
+        result_iter = iter_execute_tasks(
+            pending_sparse_requests,
+            bootstrap_worker=_bootstrap_sparse_worker,
+            bootstrap_payload=None,
+            evaluate_task=_evaluate_sparse_point_request,
+            settings=execution_settings,
+        )
+        request_lookup = {
+            (float(request.task.a), float(request.task.b)): request
+            for request in pending_sparse_requests
+        }
+        for point_counter, result in enumerate(result_iter, start=1):
+            point_task = result.task
+            a_value = float(point_task.a)
+            b_value = float(point_task.b)
+            request = request_lookup[(a_value, b_value)]
+            q0_start_text = _format_q0_value(request.q0_start) if request.q0_start is not None else "auto"
+            point_elapsed = float(result.elapsed_seconds)
+
+            print(f"\nPoint {point_counter}/{stage_total}: a={a_value:.3f} b={b_value:.3f}")
             if args.progress:
                 timeout_text = (
-                    f", timeout={float(args.point_timeout_s):.0f}s"
-                    if args.point_timeout_s is not None and float(args.point_timeout_s) > 0
+                    f", timeout={float(request.point_timeout_s):.0f}s"
+                    if request.point_timeout_s is not None and float(request.point_timeout_s) > 0
                     else ""
                 )
+                preflight_text = ", preflight=on" if bool(request.preflight_render) else ""
                 print(
-                    f"    launching fit_q0_obs_map.py for this point "
-                    f"(q0_start={q0_start_text}{timeout_text})...",
+                    f"    completed via {execution_plan.policy} "
+                    f"(workers={execution_plan.max_workers}, q0_start={q0_start_text}{timeout_text}{preflight_text})",
                     flush=True,
                 )
 
-            point_stem = f"{stem}_a{point_counter - 1:03d}_b{point_counter - 1:03d}"
-            point_h5 = point_artifacts_dir / f"{point_stem}.h5"
-            fit_script = Path(__file__).with_name("fit_q0_obs_map.py")
-            base_point_cmd = [
-                sys.executable,
-                str(fit_script),
-                str(args.fits_file),
-                str(args.model_h5),
-                "--ebtel-path",
-                str(args.ebtel_path),
-                "--prepared-observation-h5",
-                str(prepared_observation_h5),
-                "--a",
-                str(float(a_value)),
-                "--b",
-                str(float(b_value)),
-                "--q0-min",
-                str(point_q0_min),
-                "--q0-max",
-                str(point_q0_max),
-                "--target-metric",
-                str(args.target_metric),
-                "--q0-step",
-                str(float(args.q0_step)),
-                "--max-bracket-steps",
-                str(int(args.max_bracket_steps)),
-                "--artifacts-dir",
-                str(point_artifacts_dir),
-                "--artifacts-stem",
-                point_stem,
-                "--no-artifacts-png",
-            ]
-            if bool(args.adaptive_bracketing):
-                base_point_cmd.append("--adaptive-bracketing")
-            else:
-                base_point_cmd.append("--no-adaptive-bracketing")
-            if args.hard_q0_min is not None:
-                base_point_cmd.extend(["--hard-q0-min", str(float(args.hard_q0_min))])
-            if args.hard_q0_max is not None:
-                base_point_cmd.extend(["--hard-q0-max", str(float(args.hard_q0_max))])
-            if q0_start is not None:
-                base_point_cmd.extend(["--q0-start", str(float(q0_start))])
-            if psf_bmaj_arcsec is not None:
-                base_point_cmd.extend(["--psf-bmaj-arcsec", str(float(psf_bmaj_arcsec))])
-            if psf_bmin_arcsec is not None:
-                base_point_cmd.extend(["--psf-bmin-arcsec", str(float(psf_bmin_arcsec))])
-            if psf_bpa_deg is not None:
-                base_point_cmd.extend(["--psf-bpa-deg", str(float(psf_bpa_deg))])
-            if args.psf_ref_frequency_ghz is not None:
-                base_point_cmd.extend(["--psf-ref-frequency-ghz", str(float(args.psf_ref_frequency_ghz))])
-            if bool(args.psf_scale_inverse_frequency):
-                base_point_cmd.append("--psf-scale-inverse-frequency")
-            if not bool(args.progress):
-                base_point_cmd.append("--no-progress")
-            if not bool(args.spinner):
-                base_point_cmd.append("--no-spinner")
-
-            try:
-                if bool(args.preflight_render):
-                    preflight_cmd = list(base_point_cmd)
-                    preflight_cmd.extend(["--preflight-render-only", "--no-artifacts"])
-                    if args.preflight_q0 is not None:
-                        preflight_cmd.extend(["--preflight-q0", str(float(args.preflight_q0))])
-                    if args.progress:
-                        print(
-                            f"    running single-render preflight "
-                            f"(timeout={float(args.preflight_timeout_s):.0f}s)...",
-                            flush=True,
-                        )
-                    _run_point_worker(
-                        preflight_cmd,
-                        timeout_s=float(args.preflight_timeout_s),
-                        progress=bool(args.progress),
-                        label="preflight worker",
-                    )
-                    if args.progress:
-                        print("    preflight render succeeded; launching full fit worker...", flush=True)
-
-                _run_point_worker(
-                    list(base_point_cmd),
-                    timeout_s=None if args.point_timeout_s is None else float(args.point_timeout_s),
-                    progress=bool(args.progress),
-                    label="worker",
-                )
-                if not point_h5.exists():
-                    raise FileNotFoundError(f"expected point artifact not found: {point_h5}")
-                point_payload = _load_fit_q0_artifact_payload(
-                    point_h5,
-                    a_value=float(a_value),
-                    b_value=float(b_value),
-                    fallback_target_metric=str(args.target_metric),
-                )
-                run_success_count += int(bool(point_payload["success"]))
-            except Exception as exc:
-                print(_colorize(f"  WARNING: point evaluation failed and was skipped: {exc}", "red"))
+            if result.error_message is not None or result.point_payload is None:
+                print(_colorize(f"  WARNING: point evaluation failed and was skipped: {result.error_message}", "red"))
                 point_payload = _failed_sparse_point_payload(
                     observed_template=observed_cropped,
-                    a_value=float(a_value),
-                    b_value=float(b_value),
+                    a_value=a_value,
+                    b_value=b_value,
                     target_metric=str(args.target_metric),
-                    message=f"sparse point worker failed: {exc}",
+                    message=f"sparse point worker failed: {result.error_message}",
                 )
                 point_payload["diagnostics"]["psf_source"] = str(psf_source)
-            finally:
-                if point_h5.exists() and not bool(args.keep_point_artifacts):
-                    point_h5.unlink(missing_ok=True)
+            else:
+                point_payload = result.point_payload
+                run_success_count += int(bool(point_payload["success"]))
+            point_payload["diagnostics"][COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
 
-            append_sparse_point_record(
+            append_point_record(
                 out_h5,
                 observed=observed_cropped,
                 sigma_map=sigma_cropped,
@@ -1159,6 +1966,7 @@ def main() -> int:
                 diagnostics=root_diag,
                 point_payload=point_payload,
             )
+            _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
             existing_points[(float(a_value), float(b_value))] = point_payload
             point_elapsed = time.perf_counter() - point_start
             print(
@@ -1167,6 +1975,7 @@ def main() -> int:
                 f"{'=' * 70}\n"
             )
             print(f"Viewer command: {viewer_cmd_text}")
+            _maybe_launch_viewer(f"point {point_counter}/{stage_total} complete")
 
         payload = load_scan_file(out_h5)
         final_a_values = np.asarray(payload["a_values"], dtype=float)
@@ -1224,18 +2033,8 @@ def main() -> int:
                 )
             )
         print(f"Viewer command: {shlex.join(viewer_cmd)}")
-        if not bool(args.no_viewer):
-            try:
-                subprocess.Popen(
-                    viewer_cmd,
-                    start_new_session=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                )
-                print("✓ Launched pychmp-view")
-            except Exception as exc:
-                print(_colorize(f"WARNING: failed to launch pychmp-view automatically: {exc}", "yellow"))
+        _notify_viewer_refresh("scan complete")
+        _maybe_launch_viewer("scan complete")
         total_elapsed = time.perf_counter() - scan_start
         print(f"\n{'=' * 70}")
         print(f"SCAN COMPLETE: success={run_success_count}/{len(target_points)} total={total_elapsed:.3f}s")
@@ -1244,50 +2043,39 @@ def main() -> int:
 
     if out_h5.exists():
         try:
-            existing = load_scan_file(out_h5)
-            existing_points = int(len(existing.get("points", {})))
-            reused_points = 0
-            for payload in existing.get("points", {}).values():
-                match_i = _match_existing_index(a_values, float(payload["a"]))
-                match_j = _match_existing_index(b_values, float(payload["b"]))
-                if match_i is None or match_j is None:
-                    continue
-                key = (match_i, match_j)
-                existing_diag = dict(payload["diagnostics"])
-                point_payloads[key] = {
-                    "a": float(payload["a"]),
-                    "b": float(payload["b"]),
-                    "a_index": int(match_i),
-                    "b_index": int(match_j),
-                    "q0": float(payload["q0"]),
-                    "success": bool(payload["success"]),
-                    "status": str(payload.get("status", "computed")),
-                    "modeled_best": np.asarray(payload["modeled_best"], dtype=float),
-                    "raw_modeled_best": np.asarray(payload["raw_modeled_best"], dtype=float),
-                    "residual": np.asarray(payload["residual"], dtype=float),
-                    "fit_q0_trials": tuple(float(v) for v in payload.get("fit_q0_trials", ())),
-                    "fit_metric_trials": tuple(float(v) for v in payload.get("fit_metric_trials", ())),
-                    "fit_chi2_trials": tuple(float(v) for v in payload.get("fit_chi2_trials", ())),
-                    "fit_rho2_trials": tuple(float(v) for v in payload.get("fit_rho2_trials", ())),
-                    "fit_eta2_trials": tuple(float(v) for v in payload.get("fit_eta2_trials", ())),
-                    "target_metric": str(payload.get("target_metric", args.target_metric)),
-                    "diagnostics": existing_diag,
-                }
-                if np.isfinite(float(payload["q0"])):
-                    best_q0[key] = float(payload["q0"])
-                objective_values[key] = float(existing_diag.get("target_metric_value", np.nan))
-                chi2[key] = float(existing_diag.get("chi2", np.nan))
-                rho2[key] = float(existing_diag.get("rho2", np.nan))
-                eta2[key] = float(existing_diag.get("eta2", np.nan))
-                success[key] = bool(payload["success"])
-                reused_points += 1
+            existing = load_scan_file(out_h5, slice_key=current_slice_key)
+            validate_scan_artifact_compatibility(
+                existing,
+                observed=observed_cropped,
+                sigma_map=sigma_cropped,
+                wcs_header=target_header,
+                diagnostics=root_diag,
+                artifact_path=out_h5,
+            )
+            point_payloads, existing_points, reused_points = _merge_existing_rectangular_payload(
+                existing_payload=existing,
+                a_values=a_values,
+                b_values=b_values,
+                point_payloads=point_payloads,
+                best_q0=best_q0,
+                objective_values=objective_values,
+                chi2=chi2,
+                rho2=rho2,
+                eta2=eta2,
+                success=success,
+                target_metric=str(args.target_metric),
+            )
             if reused_points:
                 print(
                     f"  Resume: loaded {reused_points} overlapping point(s) from existing artifact {out_h5.name} "
                     f"(existing points in file: {existing_points})"
                 )
+        except KeyError:
+            existing = None
+        except ScanArtifactCompatibilityError as exc:
+            parser.error(str(exc))
         except Exception as exc:
-            print(_colorize(f"  WARNING: existing artifact could not be reused cleanly: {exc}", "yellow"))
+            parser.error(f"existing artifact at {out_h5} could not be read safely: {exc}")
 
     _save_ab_scan_h5(
         out_h5,
@@ -1304,128 +2092,160 @@ def main() -> int:
         eta2=eta2,
         success=success,
         point_payloads=point_payloads,
+        run_history=current_run_history,
     )
+    _notify_viewer_refresh("rectangular artifact initialized")
+    _maybe_launch_viewer("scan start")
 
-    stage_total = int(a_values.size * b_values.size)
-    point_counter = 0
-    for i, a_value in enumerate(a_values):
-        for j, b_value in enumerate(b_values):
-            point_counter += 1
-            point_start = time.perf_counter()
-            print(f"\nPoint {point_counter}/{stage_total}: a={float(a_value):.3f} b={float(b_value):.3f}")
-            existing_payload = point_payloads[(int(i), int(j))]
-            if str(existing_payload.get("status", "pending")) != "pending":
+    pending_requests, skipped_points = _build_rectangular_pending_requests(
+        target_tasks=target_tasks,
+        point_payloads=point_payloads,
+        recompute_existing=bool(args.recompute_existing),
+        q0_start_scalar=args.q0_start_scalar,
+        use_idl_q0_start_heuristic=bool(args.use_idl_q0_start_heuristic),
+        hard_q0_min=args.hard_q0_min,
+        hard_q0_max=args.hard_q0_max,
+        target_metric=str(args.target_metric),
+        adaptive_bracketing=bool(args.adaptive_bracketing),
+        q0_step=float(args.q0_step),
+        max_bracket_steps=int(args.max_bracket_steps),
+    )
+    for skipped_a, skipped_b in skipped_points:
+        existing_payload = point_payloads[(
+            int(_match_existing_index(a_values, float(skipped_a))),
+            int(_match_existing_index(b_values, float(skipped_b))),
+        )]
+        print(
+            f"\nSkipping existing point: a={float(skipped_a):.3f} b={float(skipped_b):.3f} "
+            f"(status={existing_payload.get('status', 'computed')})"
+        )
+    if bool(args.recompute_existing):
+        for request in pending_requests:
+            existing_payload = point_payloads[(int(request.task.a_index), int(request.task.b_index))]
+            existing_status = str(existing_payload.get("status", "pending"))
+            if existing_status != "pending":
                 print(
-                    f"    skipping point already present in artifact "
-                    f"(status={existing_payload.get('status', 'computed')})"
+                    f"\nPoint queued for recompute: a={float(request.task.a):.3f} b={float(request.task.b):.3f} "
+                    f"(status={existing_status})"
                 )
-                continue
-            q0_start = None
-            if args.q0_start_scalar is not None:
-                q0_start = float(args.q0_start_scalar)
-            elif args.use_idl_q0_start_heuristic:
-                q0_start = float(idl_q0_start_heuristic(float(a_value), float(b_value)))
-
-            point_stem = f"{stem}_a{i:03d}_b{j:03d}"
-            if args.progress:
-                q0_start_text = _format_q0_value(q0_start) if q0_start is not None else "auto"
+    else:
+        for request in pending_requests:
+            existing_status = str(point_payloads[(int(request.task.a_index), int(request.task.b_index))].get("status", "pending"))
+            if existing_status == "failed":
                 print(
-                    f"    evaluating this point in-process "
-                    f"(q0_start={q0_start_text})...",
+                    f"\nPoint queued for recompute: a={float(request.task.a):.3f} b={float(request.task.b):.3f} (existing failed)"
+                )
+
+    stage_total = int(len(pending_requests))
+    if stage_total == 0:
+        print("\nNo pending rectangular points remain after resume/skip checks.")
+    else:
+        worker_bootstrap = _RectangularWorkerBootstrap(
+            model_path=str(args.model_h5),
+            ebtel_path=str(args.ebtel_path),
+            geometry_data=_geometry_snapshot(geometry),
+            observer_override_data=_observer_override_snapshot(observer_overrides),
+            pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+            frequency_ghz=float(freq_ghz),
+            tbase=float(tbase),
+            nbase=float(nbase),
+            observed=np.asarray(observed_cropped, dtype=float),
+            sigma=np.asarray(sigma_cropped, dtype=float),
+            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+        )
+        execution_settings = ABExecutionSettings(
+            policy=execution_plan.policy,
+            max_workers=int(execution_plan.max_workers),
+            chunksize=int(args.worker_chunksize),
+            yield_completion_order=True,
+        )
+        result_iter = iter_execute_tasks(
+            pending_requests,
+            bootstrap_worker=_bootstrap_rectangular_worker,
+            bootstrap_payload=worker_bootstrap,
+            evaluate_task=_evaluate_rectangular_point_request,
+            settings=execution_settings,
+        )
+        request_lookup = {
+            (int(request.task.a_index), int(request.task.b_index)): request
+            for request in pending_requests
+        }
+        for point_counter, response in enumerate(result_iter, start=1):
+            point_task = response.task
+            i = int(point_task.a_index)
+            j = int(point_task.b_index)
+            a_value = float(point_task.a)
+            b_value = float(point_task.b)
+            request = request_lookup[(int(i), int(j))]
+            q0_start_text = _format_q0_value(request.q0_start) if request.q0_start is not None else "auto"
+            point_stem = f"{stem}_a{i:03d}_b{j:03d}"
+
+            print(f"\nPoint {point_counter}/{stage_total}: a={a_value:.3f} b={b_value:.3f}")
+            if args.progress:
+                print(
+                    f"    completed via {execution_plan.policy} "
+                    f"(workers={execution_plan.max_workers}, q0_start={q0_start_text})",
                     flush=True,
                 )
-            try:
-                base_renderer = _SharedContextPointRenderer(
-                    shared_context,
-                    frequency_ghz=float(freq_ghz),
-                    tbase=float(tbase),
-                    nbase=float(nbase),
-                    a=float(a_value),
-                    b=float(b_value),
+
+            if response.error_message is not None or response.modeled_best is None or response.raw_modeled_best is None or response.residual is None:
+                print(_colorize(f"  WARNING: point evaluation failed and was skipped: {response.error_message}", "red"))
+                point_diag = {
+                    "a": a_value,
+                    "b": b_value,
+                    "target_metric": str(args.target_metric),
+                    "optimizer_message": f"executor point failed: {response.error_message}",
+                    "fit_success": False,
+                    "psf_source": str(psf_source),
+                    "point_status": "failed",
+                }
+                point_payloads[(int(i), int(j))] = _pending_point_payload(
+                    a_value=a_value,
+                    b_value=b_value,
+                    a_index=int(i),
+                    b_index=int(j),
+                    observed_template=observed_cropped,
+                    target_metric=str(args.target_metric),
+                    status="failed",
+                    message=f"executor point failed: {response.error_message}",
                 )
-                renderer = base_renderer
-                if psf_kernel is not None:
-                    renderer = PSFConvolvedRenderer(base_renderer, psf_kernel)
-
-                render_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
-                point_stage_total = 2 + int(bool(args.keep_point_artifacts))
-                progress_start_callback = None
-                progress_callback = None
-                if args.progress:
-                    progress_start_callback, progress_callback = _make_trial_progress_reporter(
-                        target_metric=args.target_metric
-                    )
-
-                if isinstance(renderer, PSFConvolvedRenderer):
-                    class _CachedObservedRenderer:
-                        def render(self_inner, q0: float) -> np.ndarray:
-                            raw_arr, modeled_arr = renderer.render_pair(q0)
-                            render_cache[float(q0)] = (raw_arr, modeled_arr)
-                            return modeled_arr
-                else:
-                    class _CachedObservedRenderer:
-                        def render(self_inner, q0: float) -> np.ndarray:
-                            modeled_arr = base_renderer.render(q0)
-                            render_cache[float(q0)] = (modeled_arr, modeled_arr)
-                            return modeled_arr
-
-                result, _fit_elapsed = _run_stage(
-                    "Optimize q0",
-                    lambda: fit_q0_to_observation(
-                        renderer=_CachedObservedRenderer(),
-                        observed=observed_cropped,
-                        sigma=sigma_cropped,
-                        q0_min=args.q0_min,
-                        q0_max=args.q0_max,
-                        hard_q0_min=args.hard_q0_min,
-                        hard_q0_max=args.hard_q0_max,
-                        target_metric=args.target_metric,
-                        adaptive_bracketing=bool(args.adaptive_bracketing),
-                        q0_start=q0_start,
-                        q0_step=float(args.q0_step),
-                        max_bracket_steps=int(args.max_bracket_steps),
-                        progress_start_callback=progress_start_callback,
-                        progress_callback=progress_callback,
-                    ),
-                    spinner=bool(args.spinner) and not bool(args.progress),
-                    stage_index=1,
-                    stage_total=point_stage_total,
-                )
-
-                if result.success:
+                point_payloads[(int(i), int(j))]["diagnostics"] = point_diag
+            else:
+                if response.success:
                     print(_colorize("  ✓ Fitting converged", "green"))
                 else:
                     print(_colorize("  ⚠ Fitting stopped without an interior bracket", "yellow"))
-                print(f"  Fitted Q0: {result.q0:.6f}")
-                print(f"  Objective value ({result.target_metric}): {result.objective_value:.6e}")
+                print(f"  Fitted Q0: {response.q0:.6f}")
+                print(f"  Objective value ({args.target_metric}): {response.objective_value:.6e}")
                 print(
-                    f"  Metrics: chi2={result.metrics.chi2:.6e}, "
-                    f"rho2={result.metrics.rho2:.6e}, eta2={result.metrics.eta2:.6e}"
+                    f"  Metrics: chi2={response.chi2:.6e}, "
+                    f"rho2={response.rho2:.6e}, eta2={response.eta2:.6e}"
                 )
-                print(f"  Trials: nfev={result.nfev} nit={result.nit} saved_trials={len(result.trial_q0)}")
-                print(f"  Optimizer message: {result.message}")
-                if result.used_adaptive_bracketing:
+                print(f"  Trials: nfev={response.nfev} nit={response.nit} saved_trials={len(response.trial_q0)}")
+                print(f"  Optimizer message: {response.message}")
+                if response.used_adaptive_bracketing:
                     bracket_text = (
-                        f"({_format_q0_value(result.bracket[0])}, {_format_q0_value(result.bracket[1])}, {_format_q0_value(result.bracket[2])})"
-                        if result.bracket is not None
+                        f"({_format_q0_value(response.bracket[0])}, {_format_q0_value(response.bracket[1])}, {_format_q0_value(response.bracket[2])})"
+                        if response.bracket is not None
                         else "<none>"
                     )
-                    print(f"  Adaptive bracketing: found={result.bracket_found} bracket={bracket_text}")
+                    print(f"  Adaptive bracketing: found={response.bracket_found} bracket={bracket_text}")
+
                 hard_left = args.hard_q0_min
                 hard_right = args.hard_q0_max
                 near_left = False
                 near_right = False
                 if hard_left is not None and hard_right is not None:
                     span = max(abs(hard_right - hard_left), 1.0)
-                    near_left = abs(result.q0 - hard_left) <= 0.01 * span
-                    near_right = abs(result.q0 - hard_right) <= 0.01 * span
+                    near_left = abs(response.q0 - hard_left) <= 0.01 * span
+                    near_right = abs(response.q0 - hard_right) <= 0.01 * span
                 elif hard_left is not None:
-                    near_left = abs(result.q0 - hard_left) <= 0.01 * max(abs(hard_left), 1.0)
+                    near_left = abs(response.q0 - hard_left) <= 0.01 * max(abs(hard_left), 1.0)
                 elif hard_right is not None:
-                    near_right = abs(result.q0 - hard_right) <= 0.01 * max(abs(hard_right), 1.0)
-                if (near_left or near_right) and result.bracket is not None:
-                    near_left = near_left and result.q0 <= result.bracket[1]
-                    near_right = near_right and result.q0 >= result.bracket[1]
+                    near_right = abs(response.q0 - hard_right) <= 0.01 * max(abs(hard_right), 1.0)
+                if (near_left or near_right) and response.bracket is not None:
+                    near_left = near_left and response.q0 <= response.bracket[1]
+                    near_right = near_right and response.q0 >= response.bracket[1]
                 if near_left or near_right:
                     side = "lower" if near_left else "upper"
                     print(
@@ -1436,37 +2256,10 @@ def main() -> int:
                         )
                     )
 
-                cached_best_pair = _lookup_cached_render_pair(render_cache, result.q0)
-                if cached_best_pair is not None:
-                    stage_label = f"[stage 2/{point_stage_total}] Render best-fit map"
-                    print(f"{stage_label}: started")
-                    raw_modeled_best, modeled_best = cached_best_pair
-                    print(f"{stage_label}: done in 0.000s")
-                elif isinstance(renderer, PSFConvolvedRenderer):
-                    (raw_modeled_best, modeled_best), _render_elapsed = _run_stage(
-                        "Render best-fit map",
-                        lambda: renderer.render_pair(result.q0),
-                        spinner=bool(args.spinner),
-                        stage_index=2,
-                        stage_total=point_stage_total,
-                    )
-                else:
-                    modeled_best, _render_elapsed = _run_stage(
-                        "Render best-fit map",
-                        lambda: base_renderer.render(result.q0),
-                        spinner=bool(args.spinner),
-                        stage_index=2,
-                        stage_total=point_stage_total,
-                    )
-                    raw_modeled_best = modeled_best
-
-                residual = modeled_best - observed_cropped
-                trial_render_count = len(result.trial_q0)
-                total_render_calls = int(base_renderer.render_call_count)
-                final_render_calls = max(0, total_render_calls - trial_render_count)
+                final_render_calls = max(0, int(response.total_render_calls) - int(response.trial_render_count))
                 print(
-                    f"  Render diagnostics: trial_renders={trial_render_count} "
-                    f"final_renders={final_render_calls} total_gxrender_calls={total_render_calls}"
+                    f"  Render diagnostics: trial_renders={int(response.trial_render_count)} "
+                    f"final_renders={final_render_calls} total_gxrender_calls={int(response.total_render_calls)}"
                 )
 
                 point_diag = {
@@ -1476,169 +2269,109 @@ def main() -> int:
                     "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
                     "observer_b0sun_deg": float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
                     "observer_dsun_cm": float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)),
-                    "target_metric": str(result.target_metric),
-                    "target_metric_value": float(result.objective_value),
-                    "chi2": float(result.metrics.chi2),
-                    "rho2": float(result.metrics.rho2),
-                    "eta2": float(result.metrics.eta2),
-                    "q0_recovered": float(result.q0),
-                    "fit_success": bool(result.success),
-                    "optimizer_message": str(result.message),
-                    "bracket_found": bool(result.bracket_found),
-                    "bracket": [float(v) for v in result.bracket] if result.bracket is not None else None,
-                    "fit_q0_trials": [float(q) for q in result.trial_q0],
-                    "fit_metric_trials": [float(v) for v in result.trial_objective_values],
-                    "fit_chi2_trials": [float(v) for v in result.trial_chi2_values],
-                    "fit_rho2_trials": [float(v) for v in result.trial_rho2_values],
-                    "fit_eta2_trials": [float(v) for v in result.trial_eta2_values],
+                    "target_metric": str(args.target_metric),
+                    "target_metric_value": float(response.objective_value),
+                    "chi2": float(response.chi2),
+                    "rho2": float(response.rho2),
+                    "eta2": float(response.eta2),
+                    "q0_recovered": float(response.q0),
+                    "fit_success": bool(response.success),
+                    "optimizer_message": str(response.message),
+                    "nfev": int(response.nfev),
+                    "nit": int(response.nit),
+                    "used_adaptive_bracketing": bool(response.used_adaptive_bracketing),
+                    "bracket_found": bool(response.bracket_found),
+                    "bracket": [float(v) for v in response.bracket] if response.bracket is not None else None,
+                    "fit_q0_trials": [float(v) for v in response.trial_q0],
+                    "fit_metric_trials": [float(v) for v in response.trial_objective_values],
+                    "fit_chi2_trials": [float(v) for v in response.trial_chi2_values],
+                    "fit_rho2_trials": [float(v) for v in response.trial_rho2_values],
+                    "fit_eta2_trials": [float(v) for v in response.trial_eta2_values],
                     "map_xc_arcsec": float(geometry.xc),
                     "map_yc_arcsec": float(geometry.yc),
                     "map_dx_arcsec": float(geometry.dx),
                     "map_dy_arcsec": float(geometry.dy),
                     "active_frequency_ghz": float(freq_ghz),
-                    "a": float(a_value),
-                    "b": float(b_value),
+                    "a": a_value,
+                    "b": b_value,
                     "psf_bmaj_arcsec": float(psf_bmaj_arcsec) if psf_bmaj_arcsec is not None else None,
                     "psf_bmin_arcsec": float(psf_bmin_arcsec) if psf_bmin_arcsec is not None else None,
                     "psf_bpa_deg": float(psf_bpa_deg) if psf_bpa_deg is not None else None,
                     "psf_source": str(psf_source),
+                    COMPATIBILITY_SIGNATURE_KEY: compatibility_signature,
                     "observer_obs_time": target_header.get("DATE-OBS", ""),
                     "point_status": "computed",
                 }
 
                 if point_artifacts_dir is not None:
                     point_h5 = point_artifacts_dir / f"{point_stem}.h5"
-
-                    def _save_point_artifact() -> None:
-                        save_q0_artifact(
-                            point_h5,
-                            observed=observed_cropped,
-                            sigma_map=sigma_cropped,
-                            modeled_best=modeled_best,
-                            raw_modeled_best=raw_modeled_best,
-                            residual=residual,
-                            frequency_ghz=freq_ghz,
-                            q0_fitted=result.q0,
-                            metrics_dict={
-                                "chi2": result.metrics.chi2,
-                                "rho2": result.metrics.rho2,
-                                "eta2": result.metrics.eta2,
-                            },
-                            diagnostics=point_diag,
-                            noise_diagnostics=noise_diag,
-                        )
-
-                    print("\nSaving artifacts...")
-                    _, _save_elapsed = _run_stage(
-                        "Save artifacts",
-                        _save_point_artifact,
-                        spinner=bool(args.spinner),
-                        stage_index=3,
-                        stage_total=point_stage_total,
+                    save_q0_artifact(
+                        point_h5,
+                        observed=observed_cropped,
+                        sigma_map=sigma_cropped,
+                        modeled_best=response.modeled_best,
+                        raw_modeled_best=response.raw_modeled_best,
+                        residual=response.residual,
+                        frequency_ghz=freq_ghz,
+                        q0_fitted=response.q0,
+                        metrics_dict={
+                            "chi2": response.chi2,
+                            "rho2": response.rho2,
+                            "eta2": response.eta2,
+                        },
+                        diagnostics=point_diag,
+                        noise_diagnostics=noise_diag,
                     )
                     print(f"  ✓ Saved to: {point_h5}")
 
-                best_q0[i, j] = float(result.q0)
-                objective_values[i, j] = float(result.objective_value)
-                chi2[i, j] = float(result.metrics.chi2)
-                rho2[i, j] = float(result.metrics.rho2)
-                eta2[i, j] = float(result.metrics.eta2)
-                success[i, j] = bool(result.success)
-
-                point_payloads[(int(i), int(j))] = {
-                    "a": float(a_value),
-                    "b": float(b_value),
-                    "a_index": int(i),
-                    "b_index": int(j),
-                    "q0": float(result.q0),
-                    "success": bool(result.success),
-                    "status": "computed",
-                    "modeled_best": modeled_best,
-                    "raw_modeled_best": raw_modeled_best,
-                    "residual": residual,
-                    "fit_q0_trials": tuple(float(v) for v in result.trial_q0),
-                    "fit_metric_trials": tuple(float(v) for v in result.trial_objective_values),
-                    "fit_chi2_trials": tuple(float(v) for v in result.trial_chi2_values),
-                    "fit_rho2_trials": tuple(float(v) for v in result.trial_rho2_values),
-                    "fit_eta2_trials": tuple(float(v) for v in result.trial_eta2_values),
-                    "target_metric": str(result.target_metric),
-                    "diagnostics": point_diag,
-                }
-            except Exception as exc:
-                print(
-                    _colorize(
-                        f"  WARNING: point evaluation failed in-process and was skipped: {exc}",
-                        "red",
-                    )
-                )
-                point_diag = {
-                    "a": float(a_value),
-                    "b": float(b_value),
-                    "target_metric": str(args.target_metric),
-                    "optimizer_message": f"in-process point failed: {exc}",
-                    "fit_success": False,
-                    "psf_source": str(psf_source),
-                    "point_status": "failed",
-                }
-                point_payloads[(int(i), int(j))] = _pending_point_payload(
-                    a_value=float(a_value),
-                    b_value=float(b_value),
+                best_q0[i, j] = float(response.q0)
+                objective_values[i, j] = float(response.objective_value)
+                chi2[i, j] = float(response.chi2)
+                rho2[i, j] = float(response.rho2)
+                eta2[i, j] = float(response.eta2)
+                success[i, j] = bool(response.success)
+                point_payloads[(int(i), int(j))] = build_computed_point_payload(
+                    a_value=a_value,
+                    b_value=b_value,
                     a_index=int(i),
                     b_index=int(j),
-                    observed_template=observed_cropped,
+                    q0=float(response.q0),
+                    success=bool(response.success),
+                    status="computed",
+                    modeled_best=response.modeled_best,
+                    raw_modeled_best=response.raw_modeled_best,
+                    residual=response.residual,
+                    fit_q0_trials=tuple(float(v) for v in response.trial_q0),
+                    fit_metric_trials=tuple(float(v) for v in response.trial_objective_values),
+                    fit_chi2_trials=tuple(float(v) for v in response.trial_chi2_values),
+                    fit_rho2_trials=tuple(float(v) for v in response.trial_rho2_values),
+                    fit_eta2_trials=tuple(float(v) for v in response.trial_eta2_values),
+                    nfev=int(response.nfev),
+                    nit=int(response.nit),
+                    message=str(response.message),
+                    used_adaptive_bracketing=bool(response.used_adaptive_bracketing),
+                    bracket_found=bool(response.bracket_found),
+                    bracket=None if response.bracket is None else tuple(float(v) for v in response.bracket),
                     target_metric=str(args.target_metric),
-                    status="failed",
-                    message=f"in-process point failed: {exc}",
+                    diagnostics=point_diag,
                 )
-                point_payloads[(int(i), int(j))]["diagnostics"] = point_diag
-                point_elapsed = time.perf_counter() - point_start
-                _save_ab_scan_h5(
-                    out_h5,
-                    observed=observed_cropped,
-                    sigma_map=sigma_cropped,
-                    wcs_header=target_header,
-                    diagnostics=root_diag,
-                    a_values=a_values,
-                    b_values=b_values,
-                    best_q0=best_q0,
-                    objective_values=objective_values,
-                    chi2=chi2,
-                    rho2=rho2,
-                    eta2=eta2,
-                    success=success,
-                    point_payloads=point_payloads,
-                )
-                print(
-                    f"{'=' * 70}\n"
-                    f"POINT COMPLETE: success=False total={point_elapsed:.3f}s\n"
-                    f"{'=' * 70}\n"
-                )
-                print(f"Viewer command: {viewer_cmd_text}")
-                continue
 
-            point_elapsed = time.perf_counter() - point_start
-            _save_ab_scan_h5(
+            append_point_record(
                 out_h5,
                 observed=observed_cropped,
                 sigma_map=sigma_cropped,
                 wcs_header=target_header,
                 diagnostics=root_diag,
-                a_values=a_values,
-                b_values=b_values,
-                best_q0=best_q0,
-                objective_values=objective_values,
-                chi2=chi2,
-                rho2=rho2,
-                eta2=eta2,
-                success=success,
-                point_payloads=point_payloads,
+                point_payload=point_payloads[(int(i), int(j))],
             )
+            _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
             print(
                 f"{'=' * 70}\n"
-                f"POINT COMPLETE: success={bool(result.success)} total={point_elapsed:.3f}s\n"
+                f"POINT COMPLETE: success={bool(response.success and response.error_message is None)} total={float(response.elapsed_seconds):.3f}s\n"
                 f"{'=' * 70}\n"
             )
             print(f"Viewer command: {viewer_cmd_text}")
+            _maybe_launch_viewer(f"point {point_counter}/{stage_total} complete")
 
     grid_png = None if args.no_grid_png else artifacts_dir / f"{stem}_grid.png"
     point_png = None if args.no_point_png else artifacts_dir / f"{stem}_point.png"
@@ -1677,18 +2410,8 @@ def main() -> int:
         )
         print(f"✓ Selected-point PNG: {point_png}")
     print(f"Viewer command: {shlex.join(viewer_cmd)}")
-    if not bool(args.no_viewer):
-        try:
-            subprocess.Popen(
-                viewer_cmd,
-                start_new_session=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-            )
-            print("✓ Launched pychmp-view")
-        except Exception as exc:
-            print(_colorize(f"WARNING: failed to launch pychmp-view automatically: {exc}", "yellow"))
+    _notify_viewer_refresh("scan complete")
+    _maybe_launch_viewer("scan complete")
     total_elapsed = time.perf_counter() - scan_start
     success_count = int(np.count_nonzero(success))
     total_points = int(success.size)

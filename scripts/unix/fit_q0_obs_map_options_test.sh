@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Test harness for examples/fit_q0_obs_map.py with explicit user-provided inputs.
@@ -32,15 +32,10 @@ set -euo pipefail
 # - Set PYCHMP_TESTDATA_REPO to point at a non-sibling test-data checkout.
 # - Pass --dry-run to print the resolved Python command and exit without
 #   starting the fit.
-#
-# Practical usage:
-# - Keep one OBS_FITS_PATH line active in the selection block below and comment
-#   the others out for easy frequency switching.
-# - The launcher prints the resolved test-data repo, dated EOVSA folder, and
-#   dated model folder at startup so the user can verify the intended inputs.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYCHMP_REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCRIPTS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PYCHMP_REPO="$(cd "$SCRIPTS_ROOT/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$PYCHMP_REPO/.." && pwd)"
 
 TESTDATA_REPO="${PYCHMP_TESTDATA_REPO:-$WORKSPACE_ROOT/pyGXrender-test-data}"
@@ -88,32 +83,39 @@ if [[ -n "${XDG_CACHE_HOME:-}" ]]; then
   mkdir -p "$XDG_CACHE_HOME"
 fi
 
-# Python selection:
-# - Use PYTHON_BIN if provided.
-# - Otherwise probe common workspace envs and pick the first that imports gxrender.sdk.
 PYTHON_CMD=""
 if [[ -n "${PYTHON_BIN:-}" ]]; then
   PYTHON_CMD="$PYTHON_BIN"
 else
   CANDIDATES=(
     "$WORKSPACE_ROOT/pyCHMP/.conda/bin/python"
+    "$WORKSPACE_ROOT/pyCHMP/.conda/python.exe"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
+    "$WORKSPACE_ROOT/gximagecomputing/.conda/python.exe"
     "$HOME/miniforge3/bin/python"
     "$HOME/miniforge3/envs/suncast/bin/python"
-    "python"
   )
+  if [[ -d "$HOME/.conda/envs" ]]; then
+    while IFS= read -r env_python; do
+      CANDIDATES+=("$env_python")
+    done < <(find "$HOME/.conda/envs" -maxdepth 2 -type f \( -path "*/bin/python" -o -name "python.exe" \) | sort)
+  fi
 
   for CANDIDATE in "${CANDIDATES[@]}"; do
-    if [[ "$CANDIDATE" == "python" ]]; then
-      if command -v python >/dev/null 2>&1 && python -c "import gxrender.sdk" >/dev/null 2>&1; then
-        PYTHON_CMD="python"
-        break
-      fi
-    elif [[ -x "$CANDIDATE" ]] && "$CANDIDATE" -c "import gxrender.sdk" >/dev/null 2>&1; then
+    if [[ -x "$CANDIDATE" ]] && "$CANDIDATE" -c "import gxrender.sdk" >/dev/null 2>&1; then
       PYTHON_CMD="$CANDIDATE"
       break
     fi
   done
+  if [[ -z "$PYTHON_CMD" ]]; then
+    for command_name in python3 python; do
+      command_path="$(command -v "$command_name" 2>/dev/null || true)"
+      if [[ -n "$command_path" && "$command_path" != *"/WindowsApps/"* ]] && "$command_path" -c "import gxrender.sdk" >/dev/null 2>&1; then
+        PYTHON_CMD="$command_path"
+        break
+      fi
+    done
+  fi
 fi
 
 EOVSA_MAPS_ROOT="$TESTDATA_REPO/raw/eovsa_maps"
@@ -129,9 +131,6 @@ fi
 LATEST_EOVSA_DIR="$(latest_dated_dir "$EOVSA_MAPS_ROOT" "eovsa_maps")"
 LATEST_MODEL_DIR="$(latest_dated_dir "$MODELS_ROOT" "models")"
 
-# Select one observational map below. Keep one active line and comment the rest.
-# All paths resolve relative to the newest dated EOVSA folder found under:
-#   $TESTDATA_REPO/raw/eovsa_maps
 # OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f1.418GHz.tb.disk.fits}"
 OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits}"
 # OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f4.332GHz.tb.disk.fits}"
@@ -140,9 +139,6 @@ OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T
 # OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f13.917GHz.tb.disk.fits}"
 # OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f17.005GHz.tb.disk.fits}"
 
-# Select the matching model H5 below. By default this uses the newest dated
-# model folder found under:
-#   $TESTDATA_REPO/raw/models
 MODEL_H5_PATH="${MODEL_H5_PATH:-$LATEST_MODEL_DIR/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5}"
 
 ARTIFACTS_DIR="/tmp/pychmp_fit_q0_obs_map_runs"
@@ -153,94 +149,27 @@ ARTIFACTS_STEM="${OBS_STEM}_${MODEL_STEM}_${TIMESTAMP}"
 
 mkdir -p "$ARTIFACTS_DIR"
 
-if [[ -z "${LATEST_EOVSA_DIR:-}" || ! -d "$LATEST_EOVSA_DIR" ]]; then
-  echo "ERROR: No dated EOVSA map folder found under: $EOVSA_MAPS_ROOT"
-  exit 1
-fi
+[[ -n "${LATEST_EOVSA_DIR:-}" && -d "$LATEST_EOVSA_DIR" ]] || { echo "ERROR: No dated EOVSA map folder found under: $EOVSA_MAPS_ROOT"; exit 1; }
+[[ -n "${LATEST_MODEL_DIR:-}" && -d "$LATEST_MODEL_DIR" ]] || { echo "ERROR: No dated model folder found under: $MODELS_ROOT"; exit 1; }
+[[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
+[[ -f "$MODEL_H5_PATH" ]] || { echo "ERROR: Model H5 file not found: $MODEL_H5_PATH"; exit 1; }
+[[ -f "$EBTEL_PATH" ]] || { echo "ERROR: EBTEL .sav file not found: $EBTEL_PATH"; exit 1; }
+[[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with gxrender installed."; exit 1; }
 
-if [[ -z "${LATEST_MODEL_DIR:-}" || ! -d "$LATEST_MODEL_DIR" ]]; then
-  echo "ERROR: No dated model folder found under: $MODELS_ROOT"
-  exit 1
-fi
-
-if [[ ! -f "$OBS_FITS_PATH" ]]; then
-  echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"
-  exit 1
-fi
-
-if [[ ! -f "$MODEL_H5_PATH" ]]; then
-  echo "ERROR: Model H5 file not found: $MODEL_H5_PATH"
-  exit 1
-fi
-
-
-if [[ ! -f "$EBTEL_PATH" ]]; then
-  echo "ERROR: EBTEL .sav file not found: $EBTEL_PATH"
-  exit 1
-fi
-
-if [[ -z "$PYTHON_CMD" ]]; then
-  echo "ERROR: Could not find a Python interpreter with gxrender installed."
-  echo "Hint: set PYTHON_BIN to an environment where gxrender is installed."
-  exit 1
-fi
-
-# One option per line for easy comment/uncomment editing.
-
-
-# One option per line for easy comment/uncomment editing.
 ARGS=(
   "$OBS_FITS_PATH"
   "$MODEL_H5_PATH"
   --ebtel-path "$EBTEL_PATH"
-
-  # Q0 fitting controls:
   --q0-min 0.01
   --q0-max 2.5
-  # --q0-min 0.001
-  # --q0-max 0.1
-  # --q0-min 0.00001
-  # --q0-max 0.001
   --target-metric chi2
-
-  # Plasma/geometry/observer overrides (comment/uncomment as needed):
-  # --tbase 1.5e6
-  # --nbase 1e9
-  # --a 1.0
-  # --b 1.0
-  # --observer earth
-  # --observer stereo-a
-  # --observer stereo-b
-  # --dsun-cm 1.495978707e13
-  # --lonc-deg 0.0
-  # --b0sun-deg 0.0
-  # --xc -635.0
-  # --yc -300.0
-  # --dx 2.0
-  # --dy 2.0
-  # --nx 100
-  # --ny 100
-  # --pixel-scale-arcsec 2.0
-
-  # PSF/beam options:
-  # Default EOVSA fallback for these tracked test maps: use the 17 GHz beam
-  # and scale it by inverse frequency when no FITS beam cards are present.
   --psf-bmaj-arcsec 5.77
   --psf-bmin-arcsec 5.77
   --psf-bpa-deg -17.5
   --psf-ref-frequency-ghz 17.0
   --psf-scale-inverse-frequency
-
-  # Artifacts/outputs:
   --artifacts-dir "$ARTIFACTS_DIR"
-  # --artifacts-stem "$ARTIFACTS_STEM"
-  # --save-raw-h5 "$RAW_H5_PATH"
-  # --no-artifacts-png
   --show-plot
-  # --no-artifacts
-
-  # Utility:
-  # --defaults
 )
 
 cd "$PYCHMP_REPO"
