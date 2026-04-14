@@ -30,6 +30,9 @@ set "CLI_B_MIN="
 set "CLI_B_MAX="
 set "CLI_Q0_MIN="
 set "CLI_Q0_MAX="
+set "CLI_OBS_FITS_PATH="
+set "CLI_MODEL_H5_PATH="
+set "CLI_EBTEL_PATH="
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="--dry-run" (
@@ -40,6 +43,27 @@ if /I "%~1"=="--dry-run" (
     exit /b 1
   )
   set "CLI_ARTIFACT_H5=%~2"
+  shift
+) else if /I "%~1"=="--obs-fits-path" (
+  if "%~2"=="" (
+    echo ERROR: --obs-fits-path requires a path argument
+    exit /b 1
+  )
+  set "CLI_OBS_FITS_PATH=%~2"
+  shift
+) else if /I "%~1"=="--model-h5-path" (
+  if "%~2"=="" (
+    echo ERROR: --model-h5-path requires a path argument
+    exit /b 1
+  )
+  set "CLI_MODEL_H5_PATH=%~2"
+  shift
+) else if /I "%~1"=="--ebtel-path" (
+  if "%~2"=="" (
+    echo ERROR: --ebtel-path requires a path argument
+    exit /b 1
+  )
+  set "CLI_EBTEL_PATH=%~2"
   shift
 ) else if /I "%~1"=="--artifacts-dir" (
   if "%~2"=="" (
@@ -254,6 +278,9 @@ if defined CLI_B_MIN set "B_MIN=%CLI_B_MIN%"
 if defined CLI_B_MAX set "B_MAX=%CLI_B_MAX%"
 if defined CLI_Q0_MIN set "Q0_MIN=%CLI_Q0_MIN%"
 if defined CLI_Q0_MAX set "Q0_MAX=%CLI_Q0_MAX%"
+if defined CLI_OBS_FITS_PATH set "OBS_FITS_PATH=%CLI_OBS_FITS_PATH%"
+if defined CLI_MODEL_H5_PATH set "MODEL_H5_PATH=%CLI_MODEL_H5_PATH%"
+if defined CLI_EBTEL_PATH set "EBTEL_PATH=%CLI_EBTEL_PATH%"
 
 if defined CLI_ARTIFACT_H5 (
   set "ARTIFACT_H5=%CLI_ARTIFACT_H5%"
