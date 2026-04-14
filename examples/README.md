@@ -157,6 +157,21 @@ python examples/python/adaptive_ab_search_single_frequency.py --dry-run
 python examples/python/adaptive_ab_search_single_frequency.py
 ```
 
+Git Bash launcher example for the 2.874 GHz adaptive search:
+
+```bash
+bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_frequency.h5" \
+  --a-min -4.5 \
+  --a-max 3.0 \
+  --b-min -3.0 \
+  --b-max 4.8 \
+  --b-start 0.0 \
+  --q0-start 0.0001 \
+  --max-bracket-steps 30 \
+  --threshold-metric 1.3
+```
+
 ## Tracked Launcher Scripts
 
 For the heavier manual workflows, tracked launchers live in `scripts/unix/`
