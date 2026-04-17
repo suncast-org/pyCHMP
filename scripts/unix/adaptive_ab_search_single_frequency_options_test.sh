@@ -157,7 +157,10 @@ if [[ -n "${PYTHON_BIN:-}" ]]; then
   echo "Using PYTHON_BIN override; skipping interpreter probe."
   PYTHON_CMD="$PYTHON_BIN"
 else
-  if [[ -x "$HOME/miniforge3/bin/python" ]]; then
+  if [[ -x "$HOME/miniforge3/envs/suncast/bin/python" ]] && python_supports_adaptive_example "$HOME/miniforge3/envs/suncast/bin/python"; then
+    echo "Using preferred interpreter: $HOME/miniforge3/envs/suncast/bin/python"
+    PYTHON_CMD="$HOME/miniforge3/envs/suncast/bin/python"
+  elif [[ -x "$HOME/miniforge3/bin/python" ]] && python_supports_adaptive_example "$HOME/miniforge3/bin/python"; then
     echo "Using preferred interpreter: $HOME/miniforge3/bin/python"
     PYTHON_CMD="$HOME/miniforge3/bin/python"
   else
@@ -166,7 +169,6 @@ else
       "$WORKSPACE_ROOT/pyCHMP/.conda/python.exe"
       "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
       "$WORKSPACE_ROOT/gximagecomputing/.conda/python.exe"
-      "$HOME/miniforge3/envs/suncast/bin/python"
     )
     if [[ -d "$HOME/.conda/envs" ]]; then
       while IFS= read -r env_python; do
@@ -299,6 +301,20 @@ else
   VIEWER_ARTIFACT_PATH="$ARTIFACTS_DIR/$ARTIFACTS_STEM.h5"
 fi
 
+RUN_CMD=(
+  "$PYTHON_CMD"
+  examples/python/adaptive_ab_search_single_frequency.py
+  "${ARGS[@]}"
+)
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  RUN_CMD+=("${EXTRA_ARGS[@]}")
+fi
+VIEW_CMD=(
+  "$PYTHON_CMD"
+  examples/pychmp_view.py
+  "$VIEWER_ARTIFACT_PATH"
+)
+
 cd "$PYCHMP_REPO"
 echo "Using Python: $PYTHON_CMD"
 echo "Using test-data repo: $TESTDATA_REPO"
@@ -309,8 +325,8 @@ if [[ -n "${ARTIFACT_H5:-}" ]]; then
 else
   echo "Artifact mode: reusable artifacts-dir/stem ($VIEWER_ARTIFACT_PATH)"
 fi
-print_cmd "$PYTHON_CMD" examples/python/adaptive_ab_search_single_frequency.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
-print_cmd "$PYTHON_CMD" examples/pychmp_view.py "$VIEWER_ARTIFACT_PATH"
+print_cmd "${RUN_CMD[@]}"
+print_cmd "${VIEW_CMD[@]}"
 echo "Launching adaptive_ab_search_single_frequency.py..."
 if (( DRY_RUN )); then
   echo "Dry run only; command not executed."
@@ -322,8 +338,12 @@ if [[ -n "${MSYS2_ENV_CONV_EXCL:-}" ]]; then
 else
   export MSYS2_ENV_CONV_EXCL="PYCHMP_WRAPPER_COMMAND"
 fi
-PYCHMP_WRAPPER_COMMAND="$(command_text bash "$0" "${ORIGINAL_ARGS[@]}")"
-"$PYTHON_CMD" examples/python/adaptive_ab_search_single_frequency.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+WRAPPER_CMD=(bash "$0")
+if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+  WRAPPER_CMD+=("${ORIGINAL_ARGS[@]}")
+fi
+PYCHMP_WRAPPER_COMMAND="$(command_text "${WRAPPER_CMD[@]}")"
+"${RUN_CMD[@]}"
 
 echo "Artifacts directory: $ARTIFACTS_DIR"
 if [[ -n "${ARTIFACT_H5:-}" ]]; then

@@ -16,6 +16,11 @@ latest_dated_dir() {
   find "$parent" -maxdepth 1 -mindepth 1 -type d -name "${prefix}_*" | sort | tail -n 1
 }
 
+python_supports_validate_example() {
+  local pycmd="$1"
+  "$pycmd" -c 'required = ["gxrender.sdk", "h5py", "numpy", "matplotlib.pyplot"]; [__import__(name) for name in required]' >/dev/null 2>&1
+}
+
 print_cmd() {
   printf 'Command:'
   printf ' %q' "$@"
@@ -60,8 +65,8 @@ else
     "$WORKSPACE_ROOT/pyCHMP/.conda/python.exe"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
     "$WORKSPACE_ROOT/gximagecomputing/.conda/python.exe"
-    "$HOME/miniforge3/bin/python"
     "$HOME/miniforge3/envs/suncast/bin/python"
+    "$HOME/miniforge3/bin/python"
   )
   if [[ -d "$HOME/.conda/envs" ]]; then
     while IFS= read -r env_python; do
@@ -69,7 +74,7 @@ else
     done < <(find "$HOME/.conda/envs" -maxdepth 2 -type f \( -path "*/bin/python" -o -name "python.exe" \) | sort)
   fi
   for CANDIDATE in "${CANDIDATES[@]}"; do
-    if [[ -x "$CANDIDATE" ]] && "$CANDIDATE" -c "import gxrender.sdk" >/dev/null 2>&1; then
+    if [[ -x "$CANDIDATE" ]] && python_supports_validate_example "$CANDIDATE"; then
       PYTHON_CMD="$CANDIDATE"
       break
     fi
@@ -77,7 +82,7 @@ else
   if [[ -z "$PYTHON_CMD" ]]; then
     for command_name in python3 python; do
       command_path="$(command -v "$command_name" 2>/dev/null || true)"
-      if [[ -n "$command_path" && "$command_path" != *"/WindowsApps/"* ]] && "$command_path" -c "import gxrender.sdk" >/dev/null 2>&1; then
+      if [[ -n "$command_path" && "$command_path" != *"/WindowsApps/"* ]] && python_supports_validate_example "$command_path"; then
         PYTHON_CMD="$command_path"
         break
       fi
@@ -115,15 +120,24 @@ ARGS=(
   --show-plot
 )
 
+RUN_CMD=(
+  "$PYTHON_CMD"
+  examples/validate_q0_recovery.py
+  "${ARGS[@]}"
+)
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  RUN_CMD+=("${EXTRA_ARGS[@]}")
+fi
+
 cd "$PYCHMP_REPO"
 echo "Using Python: $PYTHON_CMD"
 echo "Using test-data repo: $TESTDATA_REPO"
 echo "Using model folder: $LATEST_MODEL_DIR"
-print_cmd "$PYTHON_CMD" examples/validate_q0_recovery.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+print_cmd "${RUN_CMD[@]}"
 if (( DRY_RUN )); then
   echo "Dry run only; command not executed."
   exit 0
 fi
-"$PYTHON_CMD" examples/validate_q0_recovery.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+"${RUN_CMD[@]}"
 
 echo "Artifacts directory: $ARTIFACTS_DIR"
