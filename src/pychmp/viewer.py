@@ -124,8 +124,15 @@ class _SelectedSolutionWindow:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title("pyCHMP Selected Solution")
-        self.window.geometry("1220x830")
-        self.window.minsize(980, 700)
+        screen_w = max(1, int(self.window.winfo_screenwidth()))
+        screen_h = max(1, int(self.window.winfo_screenheight()))
+        width = min(max(1180, int(round(screen_w * 0.82))), max(1180, screen_w - 60))
+        height = min(max(820, int(round(screen_h * 0.84))), max(820, screen_h - 80))
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2)
+        self.window.geometry(f"{width}x{height}+{x}+{y}")
+        self.window.minsize(1040, 720)
+        self.window.resizable(True, True)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.load_blos = False
         self.current_context: dict[str, Any] | None = None
@@ -255,11 +262,15 @@ class PychmpViewApp:
     _MAX_LOG_LINES = 3000
     _INITIAL_LOG_READ_BYTES = 262_144
     _TAB_FOOTER_HEIGHT = 108
-    _TOOLBAR_HEIGHT = 40
+    _TOOLBAR_HEIGHT = 78
     _NOTEBOOK_TAB_HEIGHT = 28
     _WINDOW_VERTICAL_CHROME = 28
     _DISPLAY_PAD = 8
     _ACTIVE_REFRESH_GRACE_S = 10.0
+    _MIN_LEFT_PANEL_WIDTH = 420
+    _MIN_CENTER_PANEL_WIDTH = 450
+    _MIN_RIGHT_PANEL_WIDTH = 300
+    _MIN_TOOLBAR_WIDTH = 1080
 
     def __init__(self, root: tk.Tk, artifact_h5: Path | None, *, initial_metric: str | None = None) -> None:
         self.root = root
@@ -339,9 +350,10 @@ class PychmpViewApp:
         screen_w = max(1, int(self.root.winfo_screenwidth()))
         screen_h = max(1, int(self.root.winfo_screenheight()))
 
-        width = max(900, int(round(screen_w * 0.75)))
-        panel_width = int(round(screen_w * 0.25))
-        square_side = max(220, panel_width - 24)
+        min_body_width = self._MIN_LEFT_PANEL_WIDTH + self._MIN_CENTER_PANEL_WIDTH + self._MIN_RIGHT_PANEL_WIDTH + 32
+        max_width = max(min_body_width, screen_w - 40)
+        width = min(max(max(self._MIN_TOOLBAR_WIDTH, min_body_width), int(round(screen_w * 0.88))), max_width)
+        self._update_panel_widths(width - 16)
 
         # Height is derived from required vertical stack: shared toolbar + tab header +
         # square display region + fixed tab footer + outer chrome/padding.
@@ -359,14 +371,26 @@ class PychmpViewApp:
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.root.minsize(width, height)
-        self.root.maxsize(width, height)
-        self.root.resizable(False, False)
+        self.root.minsize(max(self._MIN_TOOLBAR_WIDTH, min_body_width), height)
+        self.root.resizable(True, True)
 
-        self.left_panel_width = panel_width
-        self.center_panel_width = panel_width
-        self.right_panel_width = panel_width
-        self.square_display_side = square_side
+    def _update_panel_widths(self, total_width: int) -> None:
+        available_width = max(
+            self._MIN_LEFT_PANEL_WIDTH + self._MIN_CENTER_PANEL_WIDTH + self._MIN_RIGHT_PANEL_WIDTH + 8,
+            int(total_width),
+        )
+        right_width = max(self._MIN_RIGHT_PANEL_WIDTH, min(360, int(round(available_width * 0.24))))
+        left_center_width = max(
+            self._MIN_LEFT_PANEL_WIDTH + self._MIN_CENTER_PANEL_WIDTH,
+            available_width - right_width - 8,
+        )
+        left_width = max(self._MIN_LEFT_PANEL_WIDTH, left_center_width // 2)
+        center_width = max(self._MIN_CENTER_PANEL_WIDTH, left_center_width - left_width)
+
+        self.left_panel_width = int(left_width)
+        self.center_panel_width = int(center_width)
+        self.right_panel_width = int(right_width)
+        self.square_display_side = max(220, min(self.left_panel_width, self.center_panel_width) - 24)
 
     def _build_ui(self) -> None:
         outer = ttk.Frame(self.root, padding=8)
@@ -376,51 +400,59 @@ class PychmpViewApp:
 
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        toolbar.columnconfigure(99, weight=1)
+        toolbar.columnconfigure(0, weight=1)
 
-        ttk.Label(toolbar, text="Metric").grid(row=0, column=0, sticky="w")
-        metric_menu = ttk.Combobox(toolbar, width=8, state="readonly", values=list(METRICS), textvariable=self.metric_var)
+        primary_toolbar = ttk.Frame(toolbar)
+        primary_toolbar.grid(row=0, column=0, sticky="ew")
+        primary_toolbar.columnconfigure(9, weight=1)
+
+        secondary_toolbar = ttk.Frame(toolbar)
+        secondary_toolbar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        secondary_toolbar.columnconfigure(7, weight=1)
+
+        ttk.Label(primary_toolbar, text="Metric").grid(row=0, column=0, sticky="w")
+        metric_menu = ttk.Combobox(primary_toolbar, width=8, state="readonly", values=list(METRICS), textvariable=self.metric_var)
         metric_menu.grid(row=0, column=1, sticky="w", padx=(6, 8))
         metric_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_metric_changed())
 
-        ttk.Button(toolbar, text="Best", command=self._jump_to_best).grid(row=0, column=2, sticky="w", padx=(0, 10))
+        ttk.Button(primary_toolbar, text="Best", command=self._jump_to_best).grid(row=0, column=2, sticky="w", padx=(0, 10))
 
-        ttk.Label(toolbar, text="Slice").grid(row=0, column=3, sticky="w")
-        self.slice_menu = ttk.Combobox(toolbar, width=18, state="readonly")
+        ttk.Label(primary_toolbar, text="Slice").grid(row=0, column=3, sticky="w")
+        self.slice_menu = ttk.Combobox(primary_toolbar, width=18, state="readonly")
         self.slice_menu.grid(row=0, column=4, sticky="w", padx=(6, 6))
         self.slice_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_slice_changed())
-        self.slice_display_label = ttk.Label(toolbar, textvariable=self.slice_display_var, anchor=tk.W)
+        self.slice_display_label = ttk.Label(primary_toolbar, textvariable=self.slice_display_var, anchor=tk.W)
         self.slice_display_label.grid(row=0, column=4, sticky="w", padx=(6, 6))
 
-        ttk.Label(toolbar, text="a").grid(row=0, column=5, sticky="w")
-        self.a_menu = ttk.Combobox(toolbar, width=10, state="readonly")
+        ttk.Label(primary_toolbar, text="a").grid(row=0, column=5, sticky="w")
+        self.a_menu = ttk.Combobox(primary_toolbar, width=10, state="readonly")
         self.a_menu.configure(width=10)
         self.a_menu.grid(row=0, column=6, sticky="w", padx=(6, 10))
         self.a_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_a_changed())
 
-        ttk.Label(toolbar, text="b").grid(row=0, column=7, sticky="w")
-        self.b_menu = ttk.Combobox(toolbar, width=10, state="readonly")
+        ttk.Label(primary_toolbar, text="b").grid(row=0, column=7, sticky="w")
+        self.b_menu = ttk.Combobox(primary_toolbar, width=10, state="readonly")
         self.b_menu.configure(width=10)
         self.b_menu.grid(row=0, column=8, sticky="w", padx=(6, 12))
         self.b_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_b_changed())
 
-        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=9, sticky="ns", padx=(0, 10))
+        ttk.Separator(secondary_toolbar, orient=tk.VERTICAL).grid(row=0, column=0, sticky="ns", padx=(0, 10))
 
-        open_artifact_button = ttk.Button(toolbar, text="📂", width=3, command=self._open_artifact)
-        open_artifact_button.grid(row=0, column=10, sticky="w", padx=(0, 6))
+        open_artifact_button = ttk.Button(secondary_toolbar, text="📂", width=3, command=self._open_artifact)
+        open_artifact_button.grid(row=0, column=1, sticky="w", padx=(0, 6))
         self.open_artifact_button = open_artifact_button
-        display_selected_button = ttk.Button(toolbar, text="🖼", width=3, command=self._open_selected_maps)
-        display_selected_button.grid(row=0, column=11, sticky="w", padx=(0, 6))
+        display_selected_button = ttk.Button(secondary_toolbar, text="🖼", width=3, command=self._open_selected_maps)
+        display_selected_button.grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.display_selected_button = display_selected_button
-        summary_button = ttk.Button(toolbar, text="▦", width=3, command=self._open_grid_summary)
-        summary_button.grid(row=0, column=12, sticky="w", padx=(0, 6))
+        summary_button = ttk.Button(secondary_toolbar, text="▦", width=3, command=self._open_grid_summary)
+        summary_button.grid(row=0, column=3, sticky="w", padx=(0, 6))
         self.summary_button = summary_button
-        refresh_button = ttk.Button(toolbar, text="↻", width=3, command=self._reload_payload)
-        refresh_button.grid(row=0, column=13, sticky="w")
+        refresh_button = ttk.Button(secondary_toolbar, text="↻", width=3, command=self._reload_payload)
+        refresh_button.grid(row=0, column=4, sticky="w")
         self.refresh_button = refresh_button
-        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=14, sticky="ns", padx=(10, 10))
+        ttk.Separator(secondary_toolbar, orient=tk.VERTICAL).grid(row=0, column=5, sticky="ns", padx=(10, 10))
         scan_state_badge = tk.Label(
-            toolbar,
+            secondary_toolbar,
             textvariable=self.scan_state_var,
             bg="#6c757d",
             fg="white",
@@ -428,10 +460,10 @@ class PychmpViewApp:
             padx=8,
             pady=3,
         )
-        scan_state_badge.grid(row=0, column=15, sticky="w")
+        scan_state_badge.grid(row=0, column=6, sticky="w")
         self.scan_state_badge = scan_state_badge
-        scan_state_label = ttk.Label(toolbar, textvariable=self.scan_state_detail_var, anchor=tk.W)
-        scan_state_label.grid(row=0, column=16, sticky="w", padx=(8, 0))
+        scan_state_label = ttk.Label(secondary_toolbar, textvariable=self.scan_state_detail_var, anchor=tk.W)
+        scan_state_label.grid(row=0, column=7, sticky="ew", padx=(8, 0))
         self.scan_state_label = scan_state_label
         _ToolTip(open_artifact_button, "Open Artifact: choose a consolidated pyCHMP scan H5 artifact file.")
         _ToolTip(display_selected_button, "Display Selected Solution: open or refresh the persistent detailed solution window for the current (a, b) point.")
@@ -441,15 +473,15 @@ class PychmpViewApp:
 
         content = ttk.Frame(outer)
         content.grid(row=1, column=0, sticky="nsew")
-        content.columnconfigure(0, minsize=self.left_panel_width + self.center_panel_width + 8, weight=0)
+        content.columnconfigure(0, minsize=self.left_panel_width + self.center_panel_width + 8, weight=1)
         content.columnconfigure(1, minsize=self.right_panel_width, weight=0)
-        content.columnconfigure(2, weight=1)
+        content.columnconfigure(2, weight=0)
         content.rowconfigure(0, weight=1)
 
         plot_area = ttk.Frame(content)
         plot_area.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        plot_area.columnconfigure(0, minsize=self.left_panel_width, weight=0)
-        plot_area.columnconfigure(1, minsize=self.center_panel_width, weight=0)
+        plot_area.columnconfigure(0, minsize=self.left_panel_width, weight=1)
+        plot_area.columnconfigure(1, minsize=self.center_panel_width, weight=1)
         plot_area.rowconfigure(0, weight=1)
 
         info_panel = ttk.Frame(content)
@@ -592,8 +624,7 @@ class PychmpViewApp:
             pass
 
     def _on_resize(self, _event: Any) -> None:
-        total_width = max(400, int(self.root.winfo_width()) - 60)
-        side_width = max(240, int(total_width * 0.22))
+        self._update_panel_widths(int(self.root.winfo_width()) - 16)
         self._apply_fixed_body_geometry()
 
     def _apply_fixed_body_geometry(self) -> None:
