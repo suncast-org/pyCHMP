@@ -45,9 +45,9 @@ Python entry point locations:
     EOVSA/model/EBTEL inputs as the scan options-test launcher.
 
 - `unix/adaptive_ab_search_single_frequency_options_test.sh`
-  - Wraps `examples/python/adaptive_ab_search_single_frequency.py`.
-  - Runs the adaptive real-data single-frequency `(a, b)` search against the
-    matching EOVSA/model/EBTEL inputs and writes a sparse live-update artifact.
+  - Wraps `examples/python/adaptive_ab_search_single_observation.py`.
+  - Runs the adaptive real-data single-slice `(a, b)` search against the
+    matching observation/model/EBTEL inputs and writes a sparse live-update artifact.
 
 - `windows/fit_q0_obs_map_options_test.cmd`
 - `windows/validate_q0_recovery_options_test.cmd`
@@ -81,7 +81,17 @@ PYCHMP_TESTDATA_REPO=/path/to/pyGXrender-test-data
 
 ## Common Usage
 
-Run from anywhere:
+Choose the launcher family that matches the shell you are currently using:
+
+- POSIX shell launchers: `scripts/unix/*.sh`
+  - Use from `bash`, `zsh`, Linux/macOS terminals, Git Bash, or similar Unix-like shells.
+- Windows launchers: `scripts/windows/*.cmd`
+  - Use from `cmd.exe`, PowerShell, or the viewer Run tab on Windows.
+
+You can invoke the launchers either from the repository root or from any other
+working directory by using an absolute or repo-relative path.
+
+From a POSIX shell:
 
 ```bash
 pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh
@@ -90,20 +100,20 @@ pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh
 pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh
 ```
 
-From Git Bash on Windows, use the Unix launchers above. They are shell scripts
-and now run directly with either:
+Equivalent invocation from inside the `pyCHMP/` repository itself:
 
 ```bash
-./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh --dry-run
+./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh
 ```
 
-or:
+If the script is not marked executable in your current checkout, invoke it
+explicitly through the shell:
 
 ```bash
 bash scripts/unix/adaptive_ab_search_single_frequency_options_test.sh --dry-run
 ```
 
-On Windows `cmd.exe`:
+From `cmd.exe` or PowerShell on Windows:
 
 ```bat
 pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd
@@ -112,9 +122,9 @@ pyCHMP\scripts\windows\scan_ab_obs_map_options_test.cmd
 pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
 ```
 
-The `windows/*.cmd` launchers are for `cmd.exe` or PowerShell, not Git Bash.
-If you are already inside Git Bash, prefer the matching `scripts/unix/*.sh`
-launcher instead of calling the `.cmd` file directly.
+The `windows/*.cmd` launchers are intended for native Windows shells.
+If you are already inside a POSIX-style shell on Windows, prefer the matching
+`scripts/unix/*.sh` launcher instead of calling the `.cmd` file directly.
 
 All tracked launchers support:
 
@@ -143,16 +153,452 @@ artifacts, and the benchmark-specific report generator:
 
 - `reports/parallel benchmark test/generate_scan_ab_obs_map_benchmark_report.py`
 
+## `fit_q0_obs_map_options_test.sh`
+
+The Unix launcher:
+
+- `scripts/unix/fit_q0_obs_map_options_test.sh`
+
+and the Windows counterpart:
+
+- `scripts/windows/fit_q0_obs_map_options_test.cmd`
+
+both support:
+
+- MW fitting from an external observational FITS map
+- EUV/UV fitting from an internal model refmap such as `AIA_171`
+- `--obs-source external_fits|model_refmap`
+- `--obs-map-id AIA_171`
+- `--euv-instrument AIA`
+- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--tr-mask-bmin-gauss 1000`
+- `--metrics-mask-threshold 0.5`
+- `--metrics-mask-fits /path/to/mask.fits`
+
+Example MW fit from the default external EOVSA FITS path:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh
+```
+
+Equivalent Windows MW fit:
+
+```bat
+pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd
+```
+
+Example EUV fit against the internal `AIA_171` refmap:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Equivalent Windows EUV fit:
+
+```bat
+pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd ^
+  --obs-source model_refmap ^
+  --obs-map-id AIA_171 ^
+  --tr-mask-bmin-gauss 1000 ^
+  --metrics-mask-threshold 0.5
+```
+
+## `validate_q0_recovery_options_test.sh`
+
+The Unix launcher:
+
+- `scripts/unix/validate_q0_recovery_options_test.sh`
+
+and the Windows counterpart:
+
+- `scripts/windows/validate_q0_recovery_options_test.cmd`
+
+both support:
+
+- MW synthetic recovery via `--domain mw`
+- EUV/UV synthetic recovery via `--domain euv`
+- `--tr-mask-bmin-gauss 1000`
+- `--metrics-mask-threshold 0.5`
+- `--metrics-mask-fits /path/to/mask.fits`
+
+Example MW recovery run:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/validate_q0_recovery_options_test.sh \
+  --domain mw
+```
+
+Equivalent Windows MW recovery run:
+
+```bat
+pyCHMP\scripts\windows\validate_q0_recovery_options_test.cmd ^
+  --domain mw
+```
+
+Example EUV recovery run:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/validate_q0_recovery_options_test.sh \
+  --domain euv \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Equivalent Windows EUV recovery run:
+
+```bat
+pyCHMP\scripts\windows\validate_q0_recovery_options_test.cmd ^
+  --domain euv ^
+  --tr-mask-bmin-gauss 1000 ^
+  --metrics-mask-threshold 0.5
+```
+
+## `benchmark_scan_ab_obs_map.sh`
+
+The Unix launcher:
+
+- `scripts/unix/benchmark_scan_ab_obs_map.sh`
+
+wraps:
+
+- `examples/benchmark_scan_ab_obs_map.py`
+
+and now supports both:
+
+- MW benchmark scans from an external observational FITS map
+- EUV/UV benchmark scans from an internal model refmap such as `AIA_171`
+
+The launcher resolves shared defaults from `pyGXrender-test-data`:
+
+- the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
+- the matching 2020-11-26 CHR model file found under `raw/models/`
+- fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
+- newest dated response folder under `raw/responses/` for EUV/UV mode
+
+Important benchmark-specific options:
+
+- `--obs-source external_fits|model_refmap`
+- `--obs-map-id AIA_171`
+- `--euv-instrument AIA`
+- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--tr-mask-bmin-gauss 1000`
+- `--metrics-mask-threshold 0.5`
+- `--metrics-mask-fits /path/to/mask.fits`
+- `--repeats 1`
+- `--worker-counts 1,2,3,4,5,6,7,8,9`
+
+The benchmark launcher writes a CSV summary plus one per-run artifact per mode,
+worker count, and repeat. The generated benchmark artifact filenames encode the
+domain (`mw` or `euv`) so mixed-domain benchmark bundles stay distinguishable.
+
+The Windows counterpart:
+
+- `scripts/windows/benchmark_scan_ab_obs_map.cmd`
+
+accepts the same observation-selection and mask options.
+
+Example MW benchmark from the default external EOVSA FITS path:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/benchmark_scan_ab_obs_map.sh \
+  --repeats 1 \
+  --worker-counts 1,2,4
+```
+
+Equivalent Windows MW benchmark:
+
+```bat
+pyCHMP\scripts\windows\benchmark_scan_ab_obs_map.cmd ^
+  --repeats 1 ^
+  --worker-counts 1,2,4
+```
+
+Example MW benchmark with a tighter metrics mask:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/benchmark_scan_ab_obs_map.sh \
+  --repeats 1 \
+  --worker-counts 1,2,4 \
+  --metrics-mask-threshold 0.5
+```
+
+Example EUV benchmark against the internal `AIA_171` refmap:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/benchmark_scan_ab_obs_map.sh \
+  --repeats 1 \
+  --worker-counts 1,2,4 \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Example EUV benchmark using an explicit metrics-mask FITS file:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/benchmark_scan_ab_obs_map.sh \
+  --repeats 1 \
+  --worker-counts 1,2,4 \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-fits /path/to/metrics_mask.fits
+```
+
+Example EUV dry-run to inspect the resolved benchmark and scan commands without
+starting the benchmark:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/benchmark_scan_ab_obs_map.sh \
+  --dry-run \
+  --repeats 1 \
+  --worker-counts 1,2,4 \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Equivalent Windows EUV benchmark example:
+
+```bat
+pyCHMP\scripts\windows\benchmark_scan_ab_obs_map.cmd ^
+  --repeats 1 ^
+  --worker-counts 1,2,4 ^
+  --obs-source model_refmap ^
+  --obs-map-id AIA_171 ^
+  --tr-mask-bmin-gauss 1000 ^
+  --metrics-mask-threshold 0.5
+```
+
 The scan launchers reuse the same artifact by default so reruns resume and
 skip points already present in the artifact. For a fresh timestamped artifact,
 set `PYCHMP_TIMESTAMP_ARTIFACTS=1`. To force a specific artifact file, set
 `ARTIFACT_H5`.
 
-Adaptive-search example from Git Bash:
+## `scan_ab_obs_map_options_test.sh`
+
+The Unix launcher:
+
+- `scripts/unix/scan_ab_obs_map_options_test.sh`
+
+wraps:
+
+- `examples/scan_ab_obs_map.py`
+
+and now supports both:
+
+- MW scans from an external observational FITS map
+- EUV/UV scans from an internal model refmap such as `AIA_171`
+
+The launcher resolves shared defaults from `pyGXrender-test-data`:
+
+- the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
+- the matching 2020-11-26 CHR model file found under `raw/models/`
+- fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
+- newest dated response folder under `raw/responses/` for EUV/UV mode
+
+Important scan-specific options:
+
+- `--obs-source external_fits|model_refmap`
+- `--obs-map-id AIA_171`
+- `--euv-instrument AIA`
+- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--tr-mask-bmin-gauss 1000`
+- `--metrics-mask-threshold 0.5`
+- `--metrics-mask-fits /path/to/mask.fits`
+
+The launcher reuses the same consolidated artifact by default so reruns resume.
+For a fresh scan artifact:
+
+- set `ARTIFACTS_STEM=custom_name`
+- or set `PYCHMP_TIMESTAMP_ARTIFACTS=1`
+- or force a specific file with `ARTIFACT_H5=/path/to/scan.h5`
+
+The Windows counterpart:
+
+- `scripts/windows/scan_ab_obs_map_options_test.cmd`
+
+accepts the same observation-selection and mask options.
+
+Example MW scan from the default external EOVSA FITS path:
 
 ```bash
-bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
-  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_frequency.h5" \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh
+```
+
+Equivalent Windows MW scan:
+
+```bat
+pyCHMP\scripts\windows\scan_ab_obs_map_options_test.cmd
+```
+
+Example MW scan with a tighter metrics mask:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh \
+  --metrics-mask-threshold 0.5
+```
+
+Example EUV scan against the internal `AIA_171` refmap:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Example EUV scan using an explicit metrics-mask FITS file:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-fits /path/to/metrics_mask.fits
+```
+
+Example EUV dry-run to inspect the resolved Python command without starting the
+scan:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh \
+  --dry-run \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Equivalent Windows EUV scan example:
+
+```bat
+pyCHMP\scripts\windows\scan_ab_obs_map_options_test.cmd ^
+  --obs-source model_refmap ^
+  --obs-map-id AIA_171 ^
+  --tr-mask-bmin-gauss 1000 ^
+  --metrics-mask-threshold 0.5
+```
+
+## `adaptive_ab_search_single_frequency_options_test.sh`
+
+The Unix launcher:
+
+- `scripts/unix/adaptive_ab_search_single_frequency_options_test.sh`
+
+wraps:
+
+- `examples/python/adaptive_ab_search_single_observation.py`
+
+and now supports both:
+
+- MW adaptive search from an external observational FITS map
+- EUV/UV adaptive search from an internal model refmap such as `AIA_171`
+
+The launcher resolves shared defaults from `pyGXrender-test-data`:
+
+- the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
+- the matching 2020-11-26 CHR model file found under `raw/models/`
+- fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
+- newest dated response folder under `raw/responses/` for EUV/UV mode
+
+Important adaptive-search options:
+
+- `--obs-source external_fits|model_refmap`
+- `--obs-map-id AIA_171`
+- `--euv-instrument AIA`
+- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--tr-mask-bmin-gauss 1000`
+- `--metrics-mask-threshold 0.5`
+- `--metrics-mask-fits /path/to/mask.fits`
+
+The launcher reuses the same sparse artifact path by default so reruns resume.
+For a fresh adaptive artifact:
+
+- set `ARTIFACTS_STEM=custom_name`
+- or set `PYCHMP_TIMESTAMP_ARTIFACTS=1`
+- or force a specific file with `ARTIFACT_H5=/path/to/adaptive.h5`
+
+The Windows counterpart:
+
+- `scripts/windows/adaptive_ab_search_single_frequency_options_test.cmd`
+
+accepts the same observation-selection, adaptive-range, and mask options.
+
+Example MW adaptive search from the default external EOVSA FITS path:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh
+```
+
+Equivalent Windows MW adaptive search:
+
+```bat
+pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
+```
+
+Example MW adaptive search with a tighter metrics mask:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --metrics-mask-threshold 0.5
+```
+
+Example EUV adaptive search against the internal `AIA_171` refmap:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Example EUV adaptive search using an explicit metrics-mask FITS file:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-fits /path/to/metrics_mask.fits
+```
+
+Example EUV dry-run to inspect the resolved Python command without starting the
+adaptive search:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --dry-run \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --tr-mask-bmin-gauss 1000 \
+  --metrics-mask-threshold 0.5
+```
+
+Example adaptive-search invocation from a POSIX shell:
+
+```bash
+./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+  --artifact-h5 "/path/to/adaptive_ab_search_single_frequency.h5" \
   --a-min -4.5 \
   --a-max 3.0 \
   --b-min -3.0 \
@@ -167,6 +613,16 @@ Equivalent Windows launcher:
 
 ```bat
 scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
+```
+
+Equivalent Windows EUV adaptive-search example:
+
+```bat
+pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
+  --obs-source model_refmap ^
+  --obs-map-id AIA_171 ^
+  --tr-mask-bmin-gauss 1000 ^
+  --metrics-mask-threshold 0.5
 ```
 
 ## Editing Model / Map Choices
@@ -189,6 +645,20 @@ ARTIFACT_H5=/path/to/scan_output.h5
 ARTIFACTS_STEM=custom_scan_name
 ARTIFACTS_DIR=/path/to/output_dir
 PYCHMP_TIMESTAMP_ARTIFACTS=1
+```
+
+On Windows shells, set the same variables with native syntax before launching
+the `.cmd` wrapper, for example:
+
+```bat
+set MODEL_H5_PATH=C:\path\to\model.h5
+set OBS_FITS_PATH=C:\path\to\map.fits
+set EBTEL_PATH=C:\path\to\ebtel.sav
+set PYTHON_BIN=C:\path\to\python.exe
+set ARTIFACT_H5=C:\path\to\scan_output.h5
+set ARTIFACTS_STEM=custom_scan_name
+set ARTIFACTS_DIR=C:\path\to\output_dir
+set PYCHMP_TIMESTAMP_ARTIFACTS=1
 ```
 
 ## Notes
