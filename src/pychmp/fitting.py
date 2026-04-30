@@ -35,6 +35,7 @@ def fit_q0_to_observation(
     hard_q0_max: float | None = None,
     threshold: float = 0.1,
     mask_type: str = "union",
+    explicit_mask: np.ndarray | None = None,
     target_metric: MetricName = "chi2",
     xatol: float = 1e-3,
     maxiter: int = 200,
@@ -69,6 +70,10 @@ def fit_q0_to_observation(
         if observed_arr.shape != sigma_arr.shape:
             raise ValueError("observed and sigma must have identical shapes")
 
+    explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
+    if explicit_mask_arr is not None and explicit_mask_arr.shape != observed_arr.shape:
+        raise ValueError("explicit_mask must have identical shape to observed")
+
     mask_fn = resolve_threshold_mask(mask_type)
 
     def metric_function(q0: float) -> Q0MetricEvaluation:
@@ -76,7 +81,7 @@ def fit_q0_to_observation(
         if modeled_arr.shape != observed_arr.shape:
             raise ValueError("renderer output shape must match observed shape")
 
-        mask = mask_fn(observed_arr, modeled_arr, threshold)
+        mask = explicit_mask_arr if explicit_mask_arr is not None else mask_fn(observed_arr, modeled_arr, threshold)
         metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
         return Q0MetricEvaluation(
             metrics=metrics,

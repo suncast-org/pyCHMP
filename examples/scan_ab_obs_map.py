@@ -28,9 +28,10 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from pychmp import GXRenderMWContext, estimate_map_noise, fit_q0_to_observation
+from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, validate_obs_map_identity
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
+    SPARSE_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
     append_point_record,
     build_computed_point_payload,
@@ -93,6 +94,7 @@ try:
         DEFAULT_NBASE,
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
+        _load_explicit_metric_mask,
         _elliptical_gaussian_kernel,
         _build_target_header,
         _colorize,
@@ -101,18 +103,21 @@ try:
         _format_psf_report,
         _format_q0_value,
         _compute_file_sha256,
+        _default_observation_stem,
+        _resolve_existing_file,
+        _resolve_observation_request,
         _lookup_cached_render_pair,
         _load_model_identity,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
         _make_trial_progress_reporter,
+        load_blos_reference_for_fov,
         _regrid_full_disk_to_target,
         _resolve_observer_overrides,
         _run_stage,
         save_prepared_observation_bundle,
         save_q0_artifact,
         _with_observer_wcs_keywords,
-        load_eovsa_map,
     )
 except ModuleNotFoundError:
     from examples.fit_q0_obs_map import (
@@ -121,6 +126,7 @@ except ModuleNotFoundError:
         DEFAULT_NBASE,
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
+        _load_explicit_metric_mask,
         _elliptical_gaussian_kernel,
         _build_target_header,
         _colorize,
@@ -129,18 +135,21 @@ except ModuleNotFoundError:
         _format_psf_report,
         _format_q0_value,
         _compute_file_sha256,
+        _default_observation_stem,
+        _resolve_existing_file,
+        _resolve_observation_request,
         _lookup_cached_render_pair,
         _load_model_identity,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
         _make_trial_progress_reporter,
+        load_blos_reference_for_fov,
         _regrid_full_disk_to_target,
         _resolve_observer_overrides,
         _run_stage,
         save_prepared_observation_bundle,
         save_q0_artifact,
         _with_observer_wcs_keywords,
-        load_eovsa_map,
     )
 
 try:
@@ -579,52 +588,83 @@ def _load_fit_q0_artifact_payload(
     b_value: float,
     fallback_target_metric: str,
 ) -> dict[str, Any]:
-    with h5py.File(h5_path, "r") as f:
-        diagnostics = json.loads(_decode_h5_scalar(f["diagnostics_json"][()])) if "diagnostics_json" in f else {}
-        metrics_grp = f["metrics"]
-        q0_value = float(f.attrs.get("q0_fitted", np.nan))
-        target_metric = str(diagnostics.get("target_metric", fallback_target_metric))
-        target_metric_value = float(diagnostics.get("target_metric_value", np.nan))
-        if not np.isfinite(target_metric_value):
-            metric_lookup = {
-                "chi2": float(metrics_grp.attrs.get("chi2", np.nan)),
-                "rho2": float(metrics_grp.attrs.get("rho2", np.nan)),
-                "eta2": float(metrics_grp.attrs.get("eta2", np.nan)),
-            }
-            target_metric_value = metric_lookup.get(target_metric, np.nan)
-        return {
+    payload = load_scan_file(h5_path)
+    point_records = list(payload.get("point_records") or [])
+    if not point_records:
+        raise ValueError(f"single-point artifact has no point records: {h5_path}")
+    record = dict(point_records[0])
+    diagnostics = {
+        **dict(payload.get("diagnostics") or {}),
+        **dict(record.get("diagnostics") or {}),
+    }
+    target_metric = str(record.get("target_metric", diagnostics.get("target_metric", fallback_target_metric)))
+    metric_lookup = {
+        "chi2": float(diagnostics.get("chi2", np.nan)),
+        "rho2": float(diagnostics.get("rho2", np.nan)),
+        "eta2": float(diagnostics.get("eta2", np.nan)),
+    }
+    target_metric_value = float(diagnostics.get("target_metric_value", np.nan))
+    if not np.isfinite(target_metric_value):
+        target_metric_value = metric_lookup.get(target_metric, np.nan)
+    return {
+        "a": float(a_value),
+        "b": float(b_value),
+        "q0": float(record.get("q0", np.nan)),
+        "success": bool(record.get("success", diagnostics.get("fit_success", False))),
+        "status": str(record.get("status", diagnostics.get("point_status", "computed"))),
+        "modeled_best": np.asarray(record["modeled_best"], dtype=float),
+        "raw_modeled_best": np.asarray(record["raw_modeled_best"], dtype=float),
+        "residual": np.asarray(record["residual"], dtype=float),
+        "fit_q0_trials": tuple(float(v) for v in record.get("fit_q0_trials", ())),
+        "fit_metric_trials": tuple(float(v) for v in record.get("fit_metric_trials", ())),
+        "fit_chi2_trials": tuple(float(v) for v in record.get("fit_chi2_trials", ())),
+        "fit_rho2_trials": tuple(float(v) for v in record.get("fit_rho2_trials", ())),
+        "fit_eta2_trials": tuple(float(v) for v in record.get("fit_eta2_trials", ())),
+        "trial_raw_modeled_maps": (
+            None if record.get("trial_raw_modeled_maps") is None else np.asarray(record["trial_raw_modeled_maps"], dtype=float)
+        ),
+        "trial_modeled_maps": (
+            None if record.get("trial_modeled_maps") is None else np.asarray(record["trial_modeled_maps"], dtype=float)
+        ),
+        "trial_residual_maps": (
+            None if record.get("trial_residual_maps") is None else np.asarray(record["trial_residual_maps"], dtype=float)
+        ),
+        "euv_coronal_best": (
+            None if record.get("euv_coronal_best") is None else np.asarray(record["euv_coronal_best"], dtype=float)
+        ),
+        "euv_tr_best": (
+            None if record.get("euv_tr_best") is None else np.asarray(record["euv_tr_best"], dtype=float)
+        ),
+        "euv_tr_mask": (
+            None if record.get("euv_tr_mask") is None else np.asarray(record["euv_tr_mask"], dtype=bool)
+        ),
+        "trial_euv_coronal_maps": (
+            None if record.get("trial_euv_coronal_maps") is None else np.asarray(record["trial_euv_coronal_maps"], dtype=float)
+        ),
+        "trial_euv_tr_maps": (
+            None if record.get("trial_euv_tr_maps") is None else np.asarray(record["trial_euv_tr_maps"], dtype=float)
+        ),
+        "nfev": int(record.get("nfev", diagnostics.get("nfev", -1))),
+        "nit": int(record.get("nit", diagnostics.get("nit", -1))),
+        "message": str(record.get("message", diagnostics.get("optimizer_message", ""))),
+        "used_adaptive_bracketing": bool(
+            record.get("used_adaptive_bracketing", diagnostics.get("used_adaptive_bracketing", False))
+        ),
+        "bracket_found": bool(record.get("bracket_found", diagnostics.get("bracket_found", False))),
+        "bracket": None if record.get("bracket") is None else tuple(float(v) for v in record["bracket"]),
+        "target_metric": target_metric,
+        "diagnostics": {
+            **diagnostics,
             "a": float(a_value),
             "b": float(b_value),
-            "q0": q0_value,
-            "success": bool(diagnostics.get("fit_success", False)),
-            "status": "computed",
-            "modeled_best": np.asarray(f["modeled_best"], dtype=float),
-            "raw_modeled_best": np.asarray(f["raw_modeled_best"], dtype=float),
-            "residual": np.asarray(f["residual"], dtype=float),
-            "fit_q0_trials": tuple(float(v) for v in diagnostics.get("fit_q0_trials", [])),
-            "fit_metric_trials": tuple(float(v) for v in diagnostics.get("fit_metric_trials", [])),
-            "fit_chi2_trials": tuple(float(v) for v in diagnostics.get("fit_chi2_trials", [])),
-            "fit_rho2_trials": tuple(float(v) for v in diagnostics.get("fit_rho2_trials", [])),
-            "fit_eta2_trials": tuple(float(v) for v in diagnostics.get("fit_eta2_trials", [])),
-            "nfev": int(diagnostics.get("nfev", -1)),
-            "nit": int(diagnostics.get("nit", -1)),
-            "message": str(diagnostics.get("optimizer_message", "")),
-            "used_adaptive_bracketing": bool(diagnostics.get("used_adaptive_bracketing", False)),
-            "bracket_found": bool(diagnostics.get("bracket_found", False)),
-            "bracket": tuple(float(v) for v in diagnostics.get("bracket", [])) if diagnostics.get("bracket") is not None else None,
             "target_metric": target_metric,
-            "diagnostics": {
-                **diagnostics,
-                "a": float(a_value),
-                "b": float(b_value),
-                "target_metric": target_metric,
-                "target_metric_value": target_metric_value,
-                "chi2": float(metrics_grp.attrs.get("chi2", np.nan)),
-                "rho2": float(metrics_grp.attrs.get("rho2", np.nan)),
-                "eta2": float(metrics_grp.attrs.get("eta2", np.nan)),
-                "point_status": "computed",
-            },
-        }
+            "target_metric_value": target_metric_value,
+            "chi2": metric_lookup["chi2"],
+            "rho2": metric_lookup["rho2"],
+            "eta2": metric_lookup["eta2"],
+            "point_status": str(record.get("status", diagnostics.get("point_status", "computed"))),
+        },
+    }
 
 
 def _failed_sparse_point_payload(
@@ -726,10 +766,15 @@ def _run_point_worker(
 @dataclass(frozen=True)
 class _SparsePointEvaluationRequest:
     task: Any
-    fits_file: str
+    source_mode: str
+    obs_path: str | None
+    obs_map_id: str | None
+    obs_domain_hint: str | None
+    obs_frequency_ghz_hint: float | None
+    obs_wavelength_angstrom_hint: float | None
     model_h5: str
     ebtel_path: str
-    prepared_observation_h5: str
+    prepared_observation_h5: str | None
     point_artifacts_dir: str
     fit_script: str
     point_stem: str
@@ -752,6 +797,22 @@ class _SparsePointEvaluationRequest:
     progress: bool
     spinner: bool
     keep_point_artifacts: bool
+    euv_instrument: str | None
+    euv_response_sav: str | None
+    tr_mask_bmin_gauss: float | None
+    metrics_mask_threshold: float
+    metrics_mask_fits: str | None
+    observer_name: str | None
+    dsun_cm: float | None
+    lonc_deg: float | None
+    b0sun_deg: float | None
+    xc_arcsec: float | None
+    yc_arcsec: float | None
+    dx_arcsec: float | None
+    dy_arcsec: float | None
+    nx: int | None
+    ny: int | None
+    pixel_scale_arcsec: float | None
 
 
 @dataclass(frozen=True)
@@ -777,12 +838,12 @@ def _evaluate_sparse_point_request(
     base_point_cmd = [
         sys.executable,
         str(request.fit_script),
-        str(request.fits_file),
+        "--obs-source",
+        str(request.source_mode),
+        "--model-h5",
         str(request.model_h5),
         "--ebtel-path",
         str(request.ebtel_path),
-        "--prepared-observation-h5",
-        str(request.prepared_observation_h5),
         "--a",
         str(float(task.a)),
         "--b",
@@ -803,6 +864,27 @@ def _evaluate_sparse_point_request(
         str(request.point_stem),
         "--no-artifacts-png",
     ]
+    if request.prepared_observation_h5 is not None:
+        base_point_cmd.extend(["--prepared-observation-h5", str(request.prepared_observation_h5)])
+    if request.obs_path is not None:
+        base_point_cmd.extend(["--obs-path", str(request.obs_path)])
+    if request.obs_map_id is not None:
+        base_point_cmd.extend(["--obs-map-id", str(request.obs_map_id)])
+    if request.obs_domain_hint is not None:
+        base_point_cmd.extend(["--obs-domain", str(request.obs_domain_hint)])
+    if request.obs_frequency_ghz_hint is not None:
+        base_point_cmd.extend(["--obs-frequency-ghz", str(float(request.obs_frequency_ghz_hint))])
+    if request.obs_wavelength_angstrom_hint is not None:
+        base_point_cmd.extend(["--obs-wavelength-angstrom", str(float(request.obs_wavelength_angstrom_hint))])
+    if request.euv_instrument is not None:
+        base_point_cmd.extend(["--euv-instrument", str(request.euv_instrument)])
+    if request.euv_response_sav is not None:
+        base_point_cmd.extend(["--euv-response-sav", str(request.euv_response_sav)])
+    if request.tr_mask_bmin_gauss is not None:
+        base_point_cmd.extend(["--tr-mask-bmin-gauss", str(float(request.tr_mask_bmin_gauss))])
+    base_point_cmd.extend(["--metrics-mask-threshold", str(float(request.metrics_mask_threshold))])
+    if request.metrics_mask_fits is not None:
+        base_point_cmd.extend(["--metrics-mask-fits", str(request.metrics_mask_fits)])
     if bool(request.adaptive_bracketing):
         base_point_cmd.append("--adaptive-bracketing")
     else:
@@ -823,6 +905,28 @@ def _evaluate_sparse_point_request(
         base_point_cmd.extend(["--psf-ref-frequency-ghz", str(float(request.psf_ref_frequency_ghz))])
     if bool(request.psf_scale_inverse_frequency):
         base_point_cmd.append("--psf-scale-inverse-frequency")
+    if request.observer_name is not None:
+        base_point_cmd.extend(["--observer", str(request.observer_name)])
+    if request.dsun_cm is not None:
+        base_point_cmd.extend(["--dsun-cm", str(float(request.dsun_cm))])
+    if request.lonc_deg is not None:
+        base_point_cmd.extend(["--lonc-deg", str(float(request.lonc_deg))])
+    if request.b0sun_deg is not None:
+        base_point_cmd.extend(["--b0sun-deg", str(float(request.b0sun_deg))])
+    if request.xc_arcsec is not None:
+        base_point_cmd.extend(["--xc", str(float(request.xc_arcsec))])
+    if request.yc_arcsec is not None:
+        base_point_cmd.extend(["--yc", str(float(request.yc_arcsec))])
+    if request.dx_arcsec is not None:
+        base_point_cmd.extend(["--dx", str(float(request.dx_arcsec))])
+    if request.dy_arcsec is not None:
+        base_point_cmd.extend(["--dy", str(float(request.dy_arcsec))])
+    if request.nx is not None:
+        base_point_cmd.extend(["--nx", str(int(request.nx))])
+    if request.ny is not None:
+        base_point_cmd.extend(["--ny", str(int(request.ny))])
+    if request.pixel_scale_arcsec is not None:
+        base_point_cmd.extend(["--pixel-scale-arcsec", str(float(request.pixel_scale_arcsec))])
     if not bool(request.progress):
         base_point_cmd.append("--no-progress")
     if not bool(request.spinner):
@@ -873,26 +977,32 @@ def _evaluate_sparse_point_request(
 
 
 def _load_single_point_artifact(h5_path: Path) -> dict[str, Any]:
-    with h5py.File(h5_path, "r") as f:
-        diagnostics = json.loads(_decode_scalar(f["diagnostics_json"][()]))
-        metrics_grp = f["metrics"]
-        return {
-            "observed": np.asarray(f["observed"], dtype=float),
-            "sigma_map": np.asarray(f["sigma_map"], dtype=float),
-            "modeled_best": np.asarray(f["modeled_best"], dtype=float),
-            "raw_modeled_best": np.asarray(f["raw_modeled_best"], dtype=float),
-            "residual": np.asarray(f["residual"], dtype=float),
-            "q0": float(f.attrs["q0_fitted"]),
-            "chi2": float(metrics_grp.attrs["chi2"]),
-            "rho2": float(metrics_grp.attrs["rho2"]),
-            "eta2": float(metrics_grp.attrs["eta2"]),
-            "target_metric": str(diagnostics.get("target_metric", "chi2")),
-            "objective_value": float(diagnostics.get("target_metric_value", np.nan)),
-            "fit_q0_trials": tuple(float(v) for v in diagnostics.get("fit_q0_trials", [])),
-            "fit_metric_trials": tuple(float(v) for v in diagnostics.get("fit_metric_trials", [])),
-            "diagnostics": diagnostics,
-            "success": bool(diagnostics.get("fit_success", False)),
-        }
+    payload = load_scan_file(h5_path)
+    point_records = list(payload.get("point_records") or [])
+    if not point_records:
+        raise ValueError(f"single-point artifact has no point records: {h5_path}")
+    record = dict(point_records[0])
+    diagnostics = {
+        **dict(payload.get("diagnostics") or {}),
+        **dict(record.get("diagnostics") or {}),
+    }
+    return {
+        "observed": np.asarray(payload["observed"], dtype=float),
+        "sigma_map": np.asarray(payload["sigma_map"], dtype=float),
+        "modeled_best": np.asarray(record["modeled_best"], dtype=float),
+        "raw_modeled_best": np.asarray(record["raw_modeled_best"], dtype=float),
+        "residual": np.asarray(record["residual"], dtype=float),
+        "q0": float(record.get("q0", np.nan)),
+        "chi2": float(diagnostics.get("chi2", np.nan)),
+        "rho2": float(diagnostics.get("rho2", np.nan)),
+        "eta2": float(diagnostics.get("eta2", np.nan)),
+        "target_metric": str(record.get("target_metric", diagnostics.get("target_metric", "chi2"))),
+        "objective_value": float(diagnostics.get("target_metric_value", np.nan)),
+        "fit_q0_trials": tuple(float(v) for v in record.get("fit_q0_trials", ())),
+        "fit_metric_trials": tuple(float(v) for v in record.get("fit_metric_trials", ())),
+        "diagnostics": diagnostics,
+        "success": bool(record.get("success", diagnostics.get("fit_success", False))),
+    }
 
 
 def _save_ab_scan_h5(
@@ -902,6 +1012,7 @@ def _save_ab_scan_h5(
     sigma_map: np.ndarray,
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     a_values: np.ndarray,
     b_values: np.ndarray,
     best_q0: np.ndarray,
@@ -919,6 +1030,7 @@ def _save_ab_scan_h5(
         sigma_map=sigma_map,
         wcs_header=wcs_header,
         diagnostics=diagnostics,
+        blos_reference=blos_reference,
         a_values=a_values,
         b_values=b_values,
         best_q0=best_q0,
@@ -1174,9 +1286,19 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
         description="Scan a rectangular `(a,b)` grid against a real observational map.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("fits_file", type=Path, nargs="?", help="Path to EOVSA FITS file")
-    p.add_argument("model_h5", type=Path, nargs="?", help="Path to model H5 file")
+    p.add_argument("fits_file", type=Path, nargs="?", help="Path to the observational FITS map")
+    p.add_argument("model_h5", type=Path, nargs="?", help="Path to the model H5 file")
+    p.add_argument("--obs-source", choices=("external_fits", "model_refmap"), default=None, help="Select whether the observation comes from an external FITS product or an internal model refmap")
+    p.add_argument("--obs-path", type=Path, default=None, help="Explicit path to an external observational FITS map")
+    p.add_argument("--obs-map-id", default=None, help="Internal model refmap identifier, for example AIA_171")
+    p.add_argument("--obs-domain", choices=("mw", "euv", "uv", "generic"), default=None, help="Optional observation-domain hint used only for validation or to fill missing metadata")
+    p.add_argument("--obs-frequency-ghz", type=float, default=None, help="Optional MW frequency hint used only when the selected observation is missing frequency metadata")
+    p.add_argument("--obs-wavelength-angstrom", type=float, default=None, help="Optional EUV/UV wavelength hint used only when the selected observation is missing wavelength metadata")
+    p.add_argument("--euv-instrument", type=str, default=None, help="Optional EUV/UV instrument override for model-refmap observation selection. Must agree with the resolved observation when that observation already declares an instrument.")
+    p.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV forwarded to the one-point EUV/UV path.")
+    p.add_argument("--model-h5", dest="model_h5_override", type=Path, default=None, help="Explicit model H5 path used when positional model_h5 is omitted")
     p.add_argument("--ebtel-path", type=Path, default=None, help="Path to EBTEL .sav file")
+    p.add_argument("--testdata-repo", type=Path, default=None, help="Optional sibling pyGXrender-test-data checkout used for default input resolution")
 
     p.add_argument("--a-values", default=None, help="Comma-separated list of a values to scan.")
     p.add_argument("--b-values", default=None, help="Comma-separated list of b values to scan.")
@@ -1211,6 +1333,9 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--use-idl-q0-start-heuristic", action=argparse.BooleanOptionalAction, default=False, help="Use the IDL empirical Q0_start(a,b) heuristic if no scalar start is given.")
     p.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative Q0 step for adaptive bracketing.")
     p.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive bracketing expansion steps.")
+    p.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
+    p.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
+    p.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
 
     p.add_argument("--tbase", type=float, default=None, help="Override base temperature (K).")
     p.add_argument("--nbase", type=float, default=None, help="Override base density (cm^-3).")
@@ -1288,7 +1413,17 @@ def main() -> int:
         defaults = {
             "fits_file": "/path/to/eovsa_map.fits",
             "model_h5": "/path/to/model.h5",
+            "obs_source": None,
+            "obs_path": None,
+            "obs_map_id": None,
+            "obs_domain": None,
+            "obs_frequency_ghz": None,
+            "obs_wavelength_angstrom": None,
+            "euv_instrument": None,
+            "euv_response_sav": None,
+            "model_h5_override": None,
             "ebtel_path": "/path/to/ebtel.sav",
+            "testdata_repo": None,
             "a_values": "0.0,0.3,0.6",
             "b_values": "2.1,2.4,2.7",
             "ab_pairs": None,
@@ -1304,6 +1439,9 @@ def main() -> int:
             "use_idl_q0_start_heuristic": False,
             "q0_step": 1.61803398875,
             "max_bracket_steps": 12,
+            "tr_mask_bmin_gauss": 1000.0,
+            "metrics_mask_threshold": 0.1,
+            "metrics_mask_fits": None,
             "execution_policy": "serial",
             "max_workers": None,
             "worker_chunksize": 1,
@@ -1332,8 +1470,10 @@ def main() -> int:
             print(f"  {key}: {value}")
         return 0
 
-    if args.fits_file is None or args.model_h5 is None or args.ebtel_path is None:
-        parser.error("fits_file, model_h5, and --ebtel-path are required unless --defaults is used")
+    repo_root = Path(__file__).resolve().parents[1]
+    obs_request = _resolve_observation_request(args, repo_root=repo_root)
+    args.model_h5 = obs_request.model_h5
+    args.ebtel_path = obs_request.ebtel_path
 
     file_specs: list[GridPointSpec] = []
     for grid_file in args.grid_file:
@@ -1362,8 +1502,10 @@ def main() -> int:
             name="b",
         )
 
-    if not args.fits_file.exists() or not args.model_h5.exists() or not args.ebtel_path.exists():
-        parser.error("fits_file, model_h5, and --ebtel-path must all exist")
+    if obs_request.obs_path is not None and not obs_request.obs_path.exists():
+        parser.error(f"observational FITS file not found: {obs_request.obs_path}")
+    if not args.model_h5.exists() or args.ebtel_path is None or not args.ebtel_path.exists():
+        parser.error("model_h5 and --ebtel-path must both exist")
 
     print(f"\n{'=' * 70}")
     print("SCANNING (a, b) GRID AGAINST OBSERVATIONAL MAP")
@@ -1371,21 +1513,55 @@ def main() -> int:
     print(f"Process PID: {os.getpid()}")
     print(f"If the process seems inactive, you can stop it from another terminal with: kill -9 {os.getpid()}\n")
 
-    print(f"Loading FITS file: {args.fits_file.name}")
-    observed, header, freq_ghz = load_eovsa_map(args.fits_file)
+    try:
+        obs_map = load_obs_map(
+            obs_path=obs_request.obs_path,
+            model_h5=args.model_h5,
+            map_id=obs_request.obs_map_id,
+            source_mode=obs_request.source_mode,
+        )
+        obs_map = validate_obs_map_identity(
+            obs_map,
+            domain_hint=args.obs_domain,
+            frequency_ghz_hint=args.obs_frequency_ghz,
+            wavelength_angstrom_hint=args.obs_wavelength_angstrom,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if obs_map.domain == "mw" and obs_map.frequency_ghz is None:
+        parser.error("could not extract MW observing frequency from the selected observation")
+
+    obs_source_detail = (
+        str(obs_request.obs_path)
+        if obs_request.obs_path is not None
+        else f"{args.model_h5}::{obs_request.obs_map_id}"
+    )
+    observation_stem = _default_observation_stem(obs_request)
+    print(f"Observation selection: {obs_source_detail}")
+    print(
+        "Resolved observation: "
+        f"domain={obs_map.domain} "
+        f"label={obs_map.spectral_label or 'n/a'} "
+        f"instrument={obs_map.instrument or 'n/a'}"
+    )
+    print("Loading selected observational map payload")
+    observed = np.asarray(obs_map.data, dtype=float)
+    header = obs_map.header.copy()
+    freq_ghz = None if obs_map.frequency_ghz is None else float(obs_map.frequency_ghz)
     print(f"  Shape: {observed.shape}")
-    print(f"  Frequency: {freq_ghz:.3f} GHz")
+    print(f"  Slice: {obs_map.spectral_label or 'n/a'}")
+    if freq_ghz is not None:
+        print(f"  Frequency: {freq_ghz:.3f} GHz")
     print(f"  Data range: [{observed.min():.2f}, {observed.max():.2f}]")
 
     print("\nEstimating noise from map...")
-    noise_result = estimate_map_noise(observed, method="histogram_clip")
-    if noise_result is None:
-        sigma_map = np.full_like(observed, observed.std())
-        noise_diag = None
-        print(f"  Noise estimate unavailable; using sigma={float(observed.std()):.2f} K")
+    noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+    sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
+    noise_diag = noise_result.diagnostics
+    if str(noise_result.method_used) == "fallback_std":
+        print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} K")
     else:
-        sigma_map = noise_result.sigma_map
-        noise_diag = noise_result.diagnostics
         print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
         print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
 
@@ -1488,23 +1664,26 @@ def main() -> int:
     print(f"  FOV: {abs(float(geometry.dx)) * int(geometry.nx):.0f} x {abs(float(geometry.dy)) * int(geometry.ny):.0f} arcsec")
     print(f"  A-grid: {', '.join(f'{float(v):.3f}' for v in a_values)}")
     print(f"  B-grid: {', '.join(f'{float(v):.3f}' for v in b_values)}")
-    print(
-        "  "
-        + _format_psf_report(
-            source=str(psf_source),
-            bmaj_arcsec=psf_bmaj_arcsec,
-            bmin_arcsec=psf_bmin_arcsec,
-            bpa_deg=psf_bpa_deg,
-            active_frequency_ghz=float(freq_ghz),
-            ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
+    if str(obs_map.domain).lower() == "mw":
+        print(
+            "  "
+            + _format_psf_report(
+                source=str(psf_source),
+                bmaj_arcsec=psf_bmaj_arcsec,
+                bmin_arcsec=psf_bmin_arcsec,
+                bpa_deg=psf_bpa_deg,
+                active_frequency_ghz=float(freq_ghz),
+                ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
+                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
+            )
         )
-    )
+    else:
+        print("  PSF source: none (scan EUV/UV path currently delegates to the one-point direct-render path)")
     print(f"  Plasma baseline: tbase={tbase:.3e} nbase={nbase:.3e}")
 
     artifacts_dir = args.artifacts_dir or (Path(".").resolve() / "ab_scan_artifacts")
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.artifacts_stem or f"{args.fits_file.stem}_ab_scan_{args.target_metric}"
+    stem = args.artifacts_stem or f"{observation_stem}_ab_scan_{args.target_metric}"
     out_h5 = args.artifact_h5 if args.artifact_h5 is not None else artifacts_dir / f"{stem}.h5"
     out_h5 = Path(out_h5)
     artifacts_dir = out_h5.parent
@@ -1512,17 +1691,19 @@ def main() -> int:
     current_slice_key = str(
         slice_descriptor_from_diagnostics(
             {
-                "spectral_domain": "mw",
-                "spectral_label": f"{float(freq_ghz):.3f} GHz",
-                "frequency_ghz": float(freq_ghz),
+                "spectral_domain": str(obs_map.domain),
+                "spectral_label": str(obs_map.spectral_label or (f"{float(freq_ghz):.3f} GHz" if freq_ghz is not None else "slice")),
+                "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
+                "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
             }
         )["key"]
     )
+    current_slice_label = str(obs_map.spectral_label or (f"{float(freq_ghz):.3f} GHz" if freq_ghz is not None else "slice"))
     current_slice_descriptor = ABSliceTaskDescriptor(
         key=current_slice_key,
-        domain="mw",
-        label=f"{float(freq_ghz):.3f} GHz",
-        display_label=f"MW: {float(freq_ghz):.3f} GHz",
+        domain=str(obs_map.domain),
+        label=current_slice_label,
+        display_label=f"{str(obs_map.domain).upper()}: {current_slice_label}" if str(obs_map.domain).lower() in {"mw", "euv", "uv"} else current_slice_label,
     )
 
     live_log_handle = None
@@ -1536,7 +1717,15 @@ def main() -> int:
         print(_colorize(f"WARNING: failed to initialize live log sidecar: {exc}", "yellow"))
 
     existing_format = detect_scan_artifact_format(out_h5, slice_key=current_slice_key) if out_h5.exists() else None
-    use_sparse_mode = bool(explicit_points or existing_format == "sparse")
+    nondefault_metrics_mask = bool(args.metrics_mask_fits is not None) or not np.isclose(float(args.metrics_mask_threshold), 0.1, rtol=0.0, atol=1e-12)
+    tr_mask_requested = str(obs_map.domain).lower() in {"euv", "uv"} and not np.isclose(abs(float(args.tr_mask_bmin_gauss)), 1000.0, rtol=0.0, atol=1e-12)
+    use_sparse_mode = bool(
+        explicit_points
+        or existing_format == "sparse"
+        or str(obs_map.domain).lower() != "mw"
+        or nondefault_metrics_mask
+        or tr_mask_requested
+    )
     target_points = explicit_points or [GridPointSpec(a=float(a), b=float(b)) for a in a_values for b in b_values]
     if use_sparse_mode:
         target_tasks = compile_sparse_point_tasks(
@@ -1695,21 +1884,41 @@ def main() -> int:
     }
 
     model_sha256 = _compute_file_sha256(args.model_h5)
-    fits_sha256 = _compute_file_sha256(args.fits_file)
+    observation_source_path = obs_map.source_path
+    observation_source_file = _resolve_existing_file(observation_source_path)
+    observation_source_sha256 = (
+        _compute_file_sha256(observation_source_file)
+        if observation_source_file is not None and observation_source_file.is_file()
+        else None
+    )
     ebtel_sha256 = _compute_file_sha256(args.ebtel_path)
     root_diag = {
-        "artifact_kind": "pychmp_ab_scan",
-        "spectral_domain": "mw",
-        "spectral_label": f"{float(freq_ghz):.3f} GHz",
+        "artifact_kind": SPARSE_ARTIFACT_KIND if use_sparse_mode else "pychmp_ab_scan",
+        "spectral_domain": str(obs_map.domain),
+        "spectral_label": str(obs_map.spectral_label or f"{float(freq_ghz):.3f} GHz"),
         "model_path": str(args.model_h5),
         "model_id": str(_load_model_identity(args.model_h5)),
         "model_sha256": str(model_sha256),
-        "fits_file": str(args.fits_file),
-        "fits_sha256": str(fits_sha256),
+        "fits_file": str(observation_source_path or ""),
+        "fits_sha256": str(observation_source_sha256 or ""),
+        "observation_source_mode": str(obs_map.source_mode),
+        "observation_source_path": observation_source_path,
+        "observation_source_map_id": obs_map.source_map_id,
+        "observation_source_sha256": observation_source_sha256,
+        "observation_instrument": obs_map.instrument,
+        "observation_observer": obs_map.observer,
         "ebtel_path": str(args.ebtel_path),
         "ebtel_sha256": str(ebtel_sha256),
         "target_metric": str(args.target_metric),
-        "frequency_ghz": float(freq_ghz),
+        "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
+        "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        "euv_instrument": obs_map.instrument,
+        "euv_response_sav": None if args.euv_response_sav is None else str(args.euv_response_sav),
+        "tr_mask_bmin_gauss": abs(float(args.tr_mask_bmin_gauss)) if str(obs_map.domain).lower() in {"euv", "uv"} else None,
+        "tr_mask_source": ("abs_blos_ge_bmin" if str(obs_map.domain).lower() in {"euv", "uv"} else None),
+        "metrics_mask_threshold": float(args.metrics_mask_threshold),
+        "metrics_mask_fits": None if args.metrics_mask_fits is None else str(args.metrics_mask_fits),
+        "metrics_mask_source": "explicit_fits" if args.metrics_mask_fits is not None else "union_threshold",
         "map_xc_arcsec": float(geometry.xc),
         "map_yc_arcsec": float(geometry.yc),
         "map_dx_arcsec": float(geometry.dx),
@@ -1739,6 +1948,10 @@ def main() -> int:
             "target_metric": root_diag["target_metric"],
             "model_sha256": root_diag["model_sha256"],
             "fits_sha256": root_diag["fits_sha256"],
+            "observation_source_mode": root_diag["observation_source_mode"],
+            "observation_source_map_id": root_diag["observation_source_map_id"],
+            "spectral_domain": root_diag["spectral_domain"],
+            "spectral_label": root_diag["spectral_label"],
             "ebtel_sha256": root_diag["ebtel_sha256"],
             "frequency_ghz": root_diag["frequency_ghz"],
             "map_xc_arcsec": root_diag["map_xc_arcsec"],
@@ -1762,6 +1975,12 @@ def main() -> int:
     )
     root_diag[COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
     current_run_entry["compatibility_signature"] = compatibility_signature
+    common_blos_reference = load_blos_reference_for_fov(
+        args.model_h5,
+        header=target_header,
+        shape=np.asarray(observed_cropped, dtype=float).shape,
+        wcs_header_transform=None,
+    )
 
     if use_sparse_mode:
         assert point_artifacts_dir is not None
@@ -1778,6 +1997,7 @@ def main() -> int:
                 sigma_map=sigma_cropped,
                 wcs_header=target_header,
                 diagnostics=root_diag,
+                blos_reference=common_blos_reference,
                 point_records=[],
                 run_history=current_run_history,
             )
@@ -1809,21 +2029,23 @@ def main() -> int:
             )
         }
         _maybe_launch_viewer("scan start")
-        prepared_observation_h5 = point_artifacts_dir / f"{stem}_prepared_observation.h5"
-        save_prepared_observation_bundle(
-            prepared_observation_h5,
-            observed_cropped=observed_cropped,
-            sigma_cropped=sigma_cropped,
-            target_header=target_header,
-            frequency_ghz=float(freq_ghz),
-            geometry=geometry,
-            observer_source=str(observer_source),
-            observer_overrides=observer_overrides,
-            model_observer_meta=model_observer_meta,
-            header_psf=header_psf,
-            header_psf_source=str(header_psf_source),
-            noise_diagnostics=noise_diag,
-        )
+        prepared_observation_h5: Path | None = None
+        if str(obs_map.domain).lower() == "mw":
+            prepared_observation_h5 = point_artifacts_dir / f"{stem}_prepared_observation.h5"
+            save_prepared_observation_bundle(
+                prepared_observation_h5,
+                observed_cropped=observed_cropped,
+                sigma_cropped=sigma_cropped,
+                target_header=target_header,
+                frequency_ghz=float(freq_ghz),
+                geometry=geometry,
+                observer_source=str(observer_source),
+                observer_overrides=observer_overrides,
+                model_observer_meta=model_observer_meta,
+                header_psf=header_psf,
+                header_psf_source=str(header_psf_source),
+                noise_diagnostics=noise_diag,
+            )
 
         classified_sparse_tasks, skipped_sparse_points, recompute_sparse_points = _build_sparse_pending_tasks(
             target_tasks=target_tasks,
@@ -1872,10 +2094,15 @@ def main() -> int:
             pending_sparse_requests.append(
                 _SparsePointEvaluationRequest(
                     task=point_task,
-                    fits_file=str(args.fits_file),
+                    source_mode=str(obs_request.source_mode),
+                    obs_path=None if obs_request.obs_path is None else str(obs_request.obs_path),
+                    obs_map_id=obs_request.obs_map_id,
+                    obs_domain_hint=None if args.obs_domain is None else str(args.obs_domain),
+                    obs_frequency_ghz_hint=None if args.obs_frequency_ghz is None else float(args.obs_frequency_ghz),
+                    obs_wavelength_angstrom_hint=None if args.obs_wavelength_angstrom is None else float(args.obs_wavelength_angstrom),
                     model_h5=str(args.model_h5),
                     ebtel_path=str(args.ebtel_path),
-                    prepared_observation_h5=str(prepared_observation_h5),
+                    prepared_observation_h5=None if prepared_observation_h5 is None else str(prepared_observation_h5),
                     point_artifacts_dir=str(point_artifacts_dir),
                     fit_script=str(fit_script),
                     point_stem=point_stem,
@@ -1886,11 +2113,11 @@ def main() -> int:
                     adaptive_bracketing=bool(args.adaptive_bracketing),
                     q0_step=float(args.q0_step),
                     max_bracket_steps=int(args.max_bracket_steps),
-                    psf_bmaj_arcsec=psf_bmaj_arcsec,
-                    psf_bmin_arcsec=psf_bmin_arcsec,
-                    psf_bpa_deg=psf_bpa_deg,
-                    psf_ref_frequency_ghz=args.psf_ref_frequency_ghz,
-                    psf_scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
+                    psf_bmaj_arcsec=psf_bmaj_arcsec if str(obs_map.domain).lower() == "mw" else None,
+                    psf_bmin_arcsec=psf_bmin_arcsec if str(obs_map.domain).lower() == "mw" else None,
+                    psf_bpa_deg=psf_bpa_deg if str(obs_map.domain).lower() == "mw" else None,
+                    psf_ref_frequency_ghz=args.psf_ref_frequency_ghz if str(obs_map.domain).lower() == "mw" else None,
+                    psf_scale_inverse_frequency=bool(args.psf_scale_inverse_frequency) if str(obs_map.domain).lower() == "mw" else False,
                     preflight_render=bool(args.preflight_render),
                     preflight_q0=args.preflight_q0,
                     preflight_timeout_s=float(args.preflight_timeout_s),
@@ -1898,6 +2125,22 @@ def main() -> int:
                     progress=bool(args.progress),
                     spinner=bool(args.spinner),
                     keep_point_artifacts=bool(args.keep_point_artifacts),
+                    euv_instrument=None if args.euv_instrument is None else str(args.euv_instrument),
+                    euv_response_sav=None if args.euv_response_sav is None else str(args.euv_response_sav),
+                    tr_mask_bmin_gauss=abs(float(args.tr_mask_bmin_gauss)) if str(obs_map.domain).lower() in {"euv", "uv"} else None,
+                    metrics_mask_threshold=float(args.metrics_mask_threshold),
+                    metrics_mask_fits=None if args.metrics_mask_fits is None else str(args.metrics_mask_fits),
+                    observer_name=args.observer,
+                    dsun_cm=args.dsun_cm,
+                    lonc_deg=args.lonc_deg,
+                    b0sun_deg=args.b0sun_deg,
+                    xc_arcsec=args.xc,
+                    yc_arcsec=args.yc,
+                    dx_arcsec=args.dx,
+                    dy_arcsec=args.dy,
+                    nx=args.nx,
+                    ny=args.ny,
+                    pixel_scale_arcsec=args.pixel_scale_arcsec,
                 )
             )
 
@@ -1964,11 +2207,12 @@ def main() -> int:
                 sigma_map=sigma_cropped,
                 wcs_header=target_header,
                 diagnostics=root_diag,
+                blos_reference=common_blos_reference,
                 point_payload=point_payload,
             )
             _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
             existing_points[(float(a_value), float(b_value))] = point_payload
-            point_elapsed = time.perf_counter() - point_start
+            point_elapsed = float(result.elapsed_seconds)
             print(
                 f"{'=' * 70}\n"
                 f"POINT COMPLETE: success={bool(point_payload['success'])} total={point_elapsed:.3f}s\n"
@@ -2083,6 +2327,7 @@ def main() -> int:
         sigma_map=sigma_cropped,
         wcs_header=target_header,
         diagnostics=root_diag,
+        blos_reference=common_blos_reference,
         a_values=a_values,
         b_values=b_values,
         best_q0=best_q0,
@@ -2305,6 +2550,12 @@ def main() -> int:
 
                 if point_artifacts_dir is not None:
                     point_h5 = point_artifacts_dir / f"{point_stem}.h5"
+                    point_blos_reference = load_blos_reference_for_fov(
+                        model_h5,
+                        header=target_header,
+                        shape=np.asarray(observed_cropped, dtype=float).shape,
+                        wcs_header_transform=None,
+                    )
                     save_q0_artifact(
                         point_h5,
                         observed=observed_cropped,
@@ -2321,6 +2572,9 @@ def main() -> int:
                         },
                         diagnostics=point_diag,
                         noise_diagnostics=noise_diag,
+                        wcs_header=target_header,
+                        model_path=model_h5,
+                        blos_reference=point_blos_reference,
                     )
                     print(f"  ✓ Saved to: {point_h5}")
 
@@ -2362,6 +2616,7 @@ def main() -> int:
                 sigma_map=sigma_cropped,
                 wcs_header=target_header,
                 diagnostics=root_diag,
+                blos_reference=common_blos_reference,
                 point_payload=point_payloads[(int(i), int(j))],
             )
             _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")

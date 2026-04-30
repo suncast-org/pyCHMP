@@ -45,8 +45,8 @@ def parse_args() -> argparse.Namespace:
         description="Benchmark real-data 3x3 scan_ab_obs_map runs using pyGXrender-test-data inputs.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("fits_file", type=Path)
-    parser.add_argument("model_h5", type=Path)
+    parser.add_argument("fits_file", type=Path, nargs="?")
+    parser.add_argument("model_h5", type=Path, nargs="?")
     parser.add_argument("--ebtel-path", type=Path, required=True)
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--repeats", type=int, default=1)
@@ -55,6 +55,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--csv-out", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--scan-arg", action="append", default=[], help="Additional argument forwarded to examples/scan_ab_obs_map.py. May be repeated.")
+    parser.add_argument("--obs-source", choices=("external_fits", "model_refmap"), default="external_fits")
+    parser.add_argument("--obs-path", type=Path, default=None)
+    parser.add_argument("--obs-map-id", default=None)
+    parser.add_argument("--euv-instrument", default=None)
+    parser.add_argument("--euv-response-sav", type=Path, default=None)
+    parser.add_argument("--model-h5", dest="model_h5_override", type=Path, default=None)
+    parser.add_argument("--tr-mask-bmin-gauss", type=float, default=None)
+    parser.add_argument("--metrics-mask-threshold", type=float, default=None)
+    parser.add_argument("--metrics-mask-fits", type=Path, default=None)
     parser.add_argument("--a-values", default="0.0,0.3,0.6")
     parser.add_argument("--b-values", default="2.1,2.4,2.7")
     parser.add_argument("--q0-min", type=float, default=0.00001)
@@ -72,52 +81,96 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_model_h5(args: argparse.Namespace) -> Path:
+    model_h5 = args.model_h5_override or args.model_h5
+    if model_h5 is None:
+        raise ValueError("model_h5 is required; provide it positionally or via --model-h5")
+    return Path(model_h5)
+
+
+def _resolve_obs_path(args: argparse.Namespace) -> Path:
+    obs_path = args.obs_path or args.fits_file
+    if obs_path is None:
+        raise ValueError("fits_file/--obs-path is required for --obs-source=external_fits")
+    return Path(obs_path)
+
+
 def _build_scan_command(args: argparse.Namespace, *, execution_policy: str, max_workers: int, repeat_index: int) -> tuple[list[str], Path]:
     artifact_dir = Path(args.artifacts_root)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_h5 = artifact_dir / f"scan_ab_obs_map_{execution_policy}_{max_workers:02d}_r{repeat_index:02d}.h5"
-    cmd = [
-        str(args.python_bin),
-        "examples/scan_ab_obs_map.py",
-        str(args.fits_file),
-        str(args.model_h5),
-        "--ebtel-path",
-        str(args.ebtel_path),
-        "--a-values",
-        str(args.a_values),
-        "--b-values",
-        str(args.b_values),
-        "--q0-min",
-        str(float(args.q0_min)),
-        "--q0-max",
-        str(float(args.q0_max)),
-        "--target-metric",
-        str(args.target_metric),
-        "--adaptive-bracketing",
-        "--psf-bmaj-arcsec",
-        str(float(args.psf_bmaj_arcsec)),
-        "--psf-bmin-arcsec",
-        str(float(args.psf_bmin_arcsec)),
-        "--psf-bpa-deg",
-        str(float(args.psf_bpa_deg)),
-        "--psf-ref-frequency-ghz",
-        str(float(args.psf_ref_frequency_ghz)),
-        "--artifact-h5",
-        str(artifact_h5),
-        "--execution-policy",
-        str(execution_policy),
-        "--max-workers",
-        str(int(max_workers)),
-        "--worker-chunksize",
-        "1",
-        "--no-viewer",
-        "--no-grid-png",
-        "--no-point-png",
-        "--no-progress",
-        "--no-spinner",
-    ]
-    if bool(args.psf_scale_inverse_frequency):
-        cmd.append("--psf-scale-inverse-frequency")
+    domain_tag = "euv" if str(args.obs_source) == "model_refmap" else "mw"
+    artifact_h5 = artifact_dir / f"scan_ab_obs_map_{domain_tag}_{execution_policy}_{max_workers:02d}_r{repeat_index:02d}.h5"
+    model_h5 = _resolve_model_h5(args)
+    cmd = [str(args.python_bin), "examples/scan_ab_obs_map.py"]
+    if str(args.obs_source) == "model_refmap":
+        cmd.extend(
+            [
+                "--model-h5",
+                str(model_h5),
+                "--obs-source",
+                "model_refmap",
+            ]
+        )
+        if args.obs_map_id:
+            cmd.extend(["--obs-map-id", str(args.obs_map_id)])
+        if args.euv_instrument:
+            cmd.extend(["--euv-instrument", str(args.euv_instrument)])
+        if args.euv_response_sav is not None:
+            cmd.extend(["--euv-response-sav", str(args.euv_response_sav)])
+    else:
+        obs_path = _resolve_obs_path(args)
+        cmd.extend([str(obs_path), str(model_h5)])
+    cmd.extend(
+        [
+            "--ebtel-path",
+            str(args.ebtel_path),
+            "--a-values",
+            str(args.a_values),
+            "--b-values",
+            str(args.b_values),
+            "--q0-min",
+            str(float(args.q0_min)),
+            "--q0-max",
+            str(float(args.q0_max)),
+            "--target-metric",
+            str(args.target_metric),
+            "--adaptive-bracketing",
+            "--artifact-h5",
+            str(artifact_h5),
+            "--execution-policy",
+            str(execution_policy),
+            "--max-workers",
+            str(int(max_workers)),
+            "--worker-chunksize",
+            "1",
+            "--no-viewer",
+            "--no-grid-png",
+            "--no-point-png",
+            "--no-progress",
+            "--no-spinner",
+        ]
+    )
+    if str(args.obs_source) == "external_fits":
+        cmd.extend(
+            [
+                "--psf-bmaj-arcsec",
+                str(float(args.psf_bmaj_arcsec)),
+                "--psf-bmin-arcsec",
+                str(float(args.psf_bmin_arcsec)),
+                "--psf-bpa-deg",
+                str(float(args.psf_bpa_deg)),
+                "--psf-ref-frequency-ghz",
+                str(float(args.psf_ref_frequency_ghz)),
+            ]
+        )
+        if bool(args.psf_scale_inverse_frequency):
+            cmd.append("--psf-scale-inverse-frequency")
+    if args.tr_mask_bmin_gauss is not None:
+        cmd.extend(["--tr-mask-bmin-gauss", str(float(args.tr_mask_bmin_gauss))])
+    if args.metrics_mask_threshold is not None:
+        cmd.extend(["--metrics-mask-threshold", str(float(args.metrics_mask_threshold))])
+    if args.metrics_mask_fits is not None:
+        cmd.extend(["--metrics-mask-fits", str(args.metrics_mask_fits)])
     for extra_arg in args.scan_arg:
         cmd.append(str(extra_arg))
     return cmd, artifact_h5
@@ -139,11 +192,34 @@ def main() -> int:
     worker_counts = _parse_worker_counts(args.worker_counts)
     repo_root = Path(__file__).resolve().parents[1]
     rows: list[BenchmarkRow] = []
+    model_h5 = _resolve_model_h5(args)
+    if str(args.obs_source) == "model_refmap":
+        if not args.obs_map_id:
+            raise ValueError("--obs-map-id is required for --obs-source=model_refmap")
+        if args.euv_response_sav is None:
+            raise ValueError("--euv-response-sav is required for --obs-source=model_refmap")
+    else:
+        obs_path = _resolve_obs_path(args)
+        if not obs_path.is_file():
+            raise FileNotFoundError(f"observational FITS file not found: {obs_path}")
+    if not model_h5.is_file():
+        raise FileNotFoundError(f"model H5 file not found: {model_h5}")
+    if args.metrics_mask_fits is not None and not Path(args.metrics_mask_fits).is_file():
+        raise FileNotFoundError(f"metrics-mask FITS file not found: {args.metrics_mask_fits}")
+    if args.euv_response_sav is not None and not Path(args.euv_response_sav).is_file():
+        raise FileNotFoundError(f"EUV response SAV file not found: {args.euv_response_sav}")
 
     run_matrix: list[tuple[str, int]] = [("serial", 1)] + [("process-pool", worker_count) for worker_count in worker_counts]
 
     print(f"Benchmark root: {repo_root}")
-    print(f"Inputs: fits={args.fits_file} model={args.model_h5} ebtel={args.ebtel_path}")
+    if str(args.obs_source) == "model_refmap":
+        print(
+            "Inputs: "
+            f"obs_source=model_refmap obs_map_id={args.obs_map_id} "
+            f"model={model_h5} ebtel={args.ebtel_path} response={args.euv_response_sav}"
+        )
+    else:
+        print(f"Inputs: fits={_resolve_obs_path(args)} model={model_h5} ebtel={args.ebtel_path}")
     print(f"Matrix: repeats={args.repeats} runs={', '.join(f'{mode}:{workers}' for mode, workers in run_matrix)}")
 
     for mode, workers in run_matrix:
