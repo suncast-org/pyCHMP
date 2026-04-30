@@ -1677,13 +1677,15 @@ class PychmpViewApp:
         *,
         force_best: bool = False,
     ) -> int | None:
+        trial_index_var = getattr(self, "trial_index_var", None)
         if q0_trials.ndim != 1 or q0_trials.size == 0 or metric_trials.size != q0_trials.size:
             self._selected_trial_token = None
-            self.trial_index_var.set(0)
+            if trial_index_var is not None:
+                trial_index_var.set(0)
             return None
         token = self._current_trial_token(point_metric, q0_trials)
         best_index = self._best_trial_index_from_metric(metric_trials)
-        current_index = int(self.trial_index_var.get())
+        current_index = int(trial_index_var.get()) if trial_index_var is not None else -1
         if (
             force_best
             or self._selected_trial_token != token
@@ -1691,7 +1693,8 @@ class PychmpViewApp:
             or current_index >= q0_trials.size
         ):
             current_index = 0 if best_index is None else int(best_index)
-            self.trial_index_var.set(current_index)
+            if trial_index_var is not None:
+                trial_index_var.set(current_index)
             self._selected_trial_token = token
         return current_index
 
@@ -1704,15 +1707,18 @@ class PychmpViewApp:
     ) -> None:
         selected_index = self._selected_trial_index_for_point(point, q0_trials, metric_trials, point_metric)
         enabled = selected_index is not None
+        trial_label_var = getattr(self, "trial_label_var", None)
         if enabled:
             best_index = self._best_trial_index_from_metric(metric_trials)
             suffix = " [best]" if best_index is not None and int(selected_index) == int(best_index) else ""
-            self.trial_label_var.set(
-                f"trial #{int(selected_index) + 1}/{len(q0_trials)}  q0={float(q0_trials[int(selected_index)]):.6g}  "
-                f"{point_metric}={float(metric_trials[int(selected_index)]):.6g}{suffix}"
-            )
+            if trial_label_var is not None:
+                trial_label_var.set(
+                    f"trial #{int(selected_index) + 1}/{len(q0_trials)}  q0={float(q0_trials[int(selected_index)]):.6g}  "
+                    f"{point_metric}={float(metric_trials[int(selected_index)]):.6g}{suffix}"
+                )
         else:
-            self.trial_label_var.set("trial: n/a")
+            if trial_label_var is not None:
+                trial_label_var.set("trial: n/a")
         if self.trial_slider is not None:
             self._updating_trial_slider = True
             try:
