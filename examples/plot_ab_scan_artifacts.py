@@ -197,6 +197,13 @@ def _plot_selected_point(
     diagnostics["fit_metric_trials"] = np.asarray(point["fit_metric_trials"], dtype=float).tolist()
     diagnostics["q0_recovered"] = float(point["q0"])
     diagnostics["target_metric"] = str(point["target_metric"])
+    frequency_ghz_raw = diagnostics.get("active_frequency_ghz", diagnostics.get("frequency_ghz"))
+    frequency_ghz = None
+    try:
+        if frequency_ghz_raw is not None:
+            frequency_ghz = float(frequency_ghz_raw)
+    except Exception:
+        frequency_ghz = None
     out_path = out_png or Path("/tmp") / "pychmp_ab_scan_point.png"
     plot_q0_artifact_panel(
         out_path,
@@ -206,10 +213,11 @@ def _plot_selected_point(
         modeled_best=np.asarray(point["modeled_best"], dtype=float),
         residual=np.asarray(point["residual"], dtype=float),
         wcs_header=payload["wcs_header"],
-        frequency_ghz=float(diagnostics.get("active_frequency_ghz", diagnostics.get("frequency_ghz", 17.0))),
+        frequency_ghz=frequency_ghz,
         diagnostics=diagnostics,
         show_plot=show_plot,
         defer_show=defer_show,
+        blos_reference=payload.get("blos_reference"),
         wcs_header_transform=lambda hdr: with_observer_metadata(hdr, payload["wcs_header"], diagnostics),
     )
 
