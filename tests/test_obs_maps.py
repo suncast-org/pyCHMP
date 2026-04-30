@@ -100,7 +100,8 @@ def test_estimate_obs_map_noise_falls_back_to_uniform_std_for_invalid_map(tmp_pa
     fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
 
     obs_map = load_obs_map(obs_path=fits_path, domain="mw")
-    noise = estimate_obs_map_noise(obs_map, method="histogram_clip")
+    with pytest.warns(UserWarning, match="Map data quality check failed"):
+        noise = estimate_obs_map_noise(obs_map, method="histogram_clip")
 
     assert noise.method_used == "fallback_std"
     assert noise.sigma == 0.0
