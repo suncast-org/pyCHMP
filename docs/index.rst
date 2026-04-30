@@ -10,4 +10,5 @@ Sections
 .. toctree::
    :maxdepth: 1
 
+   artifact_data_contract
    provenance
