@@ -508,6 +508,45 @@ def _point_payload_from_result(
     fit_chi2_trials = tuple(float(v) for v in point.trial_chi2_values)
     fit_rho2_trials = tuple(float(v) for v in point.trial_rho2_values)
     fit_eta2_trials = tuple(float(v) for v in point.trial_eta2_values)
+    trial_raw_modeled_maps = None
+    trial_modeled_maps = None
+    trial_residual_maps = None
+    trial_euv_coronal_maps = None
+    trial_euv_tr_maps = None
+    trial_q0_values = [float(v) for v in point.trial_q0]
+    if trial_q0_values:
+        raw_trials: list[np.ndarray] = []
+        modeled_trials: list[np.ndarray] = []
+        residual_trials: list[np.ndarray] = []
+        euv_coronal_trials: list[np.ndarray] = []
+        euv_tr_trials: list[np.ndarray] = []
+        base_renderer = getattr(renderer, "_base", renderer)
+        for q0_value in trial_q0_values:
+            if hasattr(renderer, "render_pair"):
+                raw_trial, modeled_trial = renderer.render_pair(float(q0_value))
+            else:
+                modeled_trial = renderer.render(float(q0_value))
+                raw_trial = modeled_trial
+            raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
+            modeled_trial_arr = np.asarray(modeled_trial, dtype=np.float32)
+            raw_trials.append(raw_trial_arr)
+            modeled_trials.append(modeled_trial_arr)
+            residual_trials.append(modeled_trial_arr - np.asarray(observed_template, dtype=np.float32))
+
+            if hasattr(base_renderer, "render_components"):
+                components = base_renderer.render_components(float(q0_value))
+                coronal = components.get("flux_corona")
+                tr_flux = components.get("flux_tr")
+                if coronal is not None and tr_flux is not None:
+                    euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
+                    euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
+        if raw_trials and len(raw_trials) == len(trial_q0_values):
+            trial_raw_modeled_maps = np.stack(raw_trials, axis=0)
+            trial_modeled_maps = np.stack(modeled_trials, axis=0)
+            trial_residual_maps = np.stack(residual_trials, axis=0)
+        if euv_coronal_trials and len(euv_coronal_trials) == len(trial_q0_values):
+            trial_euv_coronal_maps = np.stack(euv_coronal_trials, axis=0)
+            trial_euv_tr_maps = np.stack(euv_tr_trials, axis=0)
     elapsed_seconds = float(point.elapsed_seconds)
     diagnostics = {
         "a": float(point.a),
@@ -549,6 +588,11 @@ def _point_payload_from_result(
         fit_chi2_trials=fit_chi2_trials,
         fit_rho2_trials=fit_rho2_trials,
         fit_eta2_trials=fit_eta2_trials,
+        trial_raw_modeled_maps=trial_raw_modeled_maps,
+        trial_modeled_maps=trial_modeled_maps,
+        trial_residual_maps=trial_residual_maps,
+        trial_euv_coronal_maps=trial_euv_coronal_maps,
+        trial_euv_tr_maps=trial_euv_tr_maps,
         nfev=int(point.nfev),
         nit=int(point.nit),
         message=str(point.message),

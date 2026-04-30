@@ -70,13 +70,11 @@ examples that may be added later by pull requests.
 
 - `python/adaptive_ab_search_single_observation.py`
   - Generic real-data adaptive local `(a, b)` search for a single observational map.
-  - Currently executes the MW renderer path, but the observation-selection CLI is
-    normalized around external FITS or model-refmap inputs so future EUV/UV work
-    can land here without renaming the entrypoint again.
+  - Supports both MW external FITS observations and EUV/UV model-refmap selections.
   - Defaults to the current 2.874 GHz EOVSA workflow when no explicit observation is supplied.
   - Persists each evaluated point into a sparse H5 artifact using the same
-    point schema as the fixed-grid scan path, including full stored metric
-    histories per q0 trial.
+     point schema as the fixed-grid scan path, including full stored metric
+     histories and per-trial map cubes when available.
   - Completed point results are appended as they arrive so the viewer can
     inspect progress while the run is active without waiting for a batch flush.
   - Supports `--dry-run` to resolve inputs and artifact locations without starting the search.
