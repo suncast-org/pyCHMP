@@ -86,6 +86,21 @@ while (($#)); do
       CLI_ARTIFACT_H5="$2"
       shift 2
       ;;
+    --obs-fits-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-fits-path requires a path argument"; exit 1; }
+      CLI_OBS_FITS_PATH="$2"
+      shift 2
+      ;;
+    --model-h5-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --model-h5-path requires a path argument"; exit 1; }
+      CLI_MODEL_H5_PATH="$2"
+      shift 2
+      ;;
+    --ebtel-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --ebtel-path requires a path argument"; exit 1; }
+      CLI_EBTEL_PATH="$2"
+      shift 2
+      ;;
     --artifacts-dir)
       [[ $# -ge 2 ]] || { echo "ERROR: --artifacts-dir requires a path argument"; exit 1; }
       CLI_ARTIFACTS_DIR="$2"
@@ -149,21 +164,6 @@ while (($#)); do
     --q0-max)
       [[ $# -ge 2 ]] || { echo "ERROR: --q0-max requires a value argument"; exit 1; }
       CLI_Q0_MAX="$2"
-      shift 2
-      ;;
-    --obs-fits-path)
-      [[ $# -ge 2 ]] || { echo "ERROR: --obs-fits-path requires a path argument"; exit 1; }
-      CLI_OBS_FITS_PATH="$2"
-      shift 2
-      ;;
-    --model-h5-path)
-      [[ $# -ge 2 ]] || { echo "ERROR: --model-h5-path requires a path argument"; exit 1; }
-      CLI_MODEL_H5_PATH="$2"
-      shift 2
-      ;;
-    --ebtel-path)
-      [[ $# -ge 2 ]] || { echo "ERROR: --ebtel-path requires a path argument"; exit 1; }
-      CLI_EBTEL_PATH="$2"
       shift 2
       ;;
     --obs-source=*)

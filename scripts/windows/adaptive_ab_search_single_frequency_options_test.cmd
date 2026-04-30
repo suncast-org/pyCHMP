@@ -41,13 +41,33 @@ set "METRICS_MASK_THRESHOLD=0.1"
 set "METRICS_MASK_FITS="
 set "EUV_INSTRUMENT=AIA"
 set "EUV_RESPONSE_SAV="
-
 :parse_args
 if "%~1"=="" goto args_done
 if /I "%~1"=="--dry-run" (
   set "DRY_RUN=1"
 ) else if /I "%~1"=="--artifact-h5" (
   set "CLI_ARTIFACT_H5=%~2"
+  shift
+) else if /I "%~1"=="--obs-fits-path" (
+  if "%~2"=="" (
+    echo ERROR: --obs-fits-path requires a path argument
+    exit /b 1
+  )
+  set "CLI_OBS_FITS_PATH=%~2"
+  shift
+) else if /I "%~1"=="--model-h5-path" (
+  if "%~2"=="" (
+    echo ERROR: --model-h5-path requires a path argument
+    exit /b 1
+  )
+  set "CLI_MODEL_H5_PATH=%~2"
+  shift
+) else if /I "%~1"=="--ebtel-path" (
+  if "%~2"=="" (
+    echo ERROR: --ebtel-path requires a path argument
+    exit /b 1
+  )
+  set "CLI_EBTEL_PATH=%~2"
   shift
 ) else if /I "%~1"=="--artifacts-dir" (
   set "CLI_ARTIFACTS_DIR=%~2"
@@ -87,15 +107,6 @@ if /I "%~1"=="--dry-run" (
   shift
 ) else if /I "%~1"=="--q0-max" (
   set "CLI_Q0_MAX=%~2"
-  shift
-) else if /I "%~1"=="--obs-fits-path" (
-  set "CLI_OBS_FITS_PATH=%~2"
-  shift
-) else if /I "%~1"=="--model-h5-path" (
-  set "CLI_MODEL_H5_PATH=%~2"
-  shift
-) else if /I "%~1"=="--ebtel-path" (
-  set "CLI_EBTEL_PATH=%~2"
   shift
 ) else if /I "%~1"=="--obs-source" (
   set "OBS_SOURCE=%~2"
