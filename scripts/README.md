@@ -520,6 +520,9 @@ The launcher resolves shared defaults from `pyGXrender-test-data`:
 Important adaptive-search options:
 
 - `--obs-source external_fits|model_refmap`
+- `--obs-fits-path /path/to/obs.fits`
+- `--model-h5-path /path/to/model.h5`
+- `--ebtel-path /path/to/ebtel.sav`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
 - `--euv-response-sav /path/to/resp_aia_*.sav`
@@ -533,6 +536,19 @@ For a fresh adaptive artifact:
 - set `ARTIFACTS_STEM=custom_name`
 - or set `PYCHMP_TIMESTAMP_ARTIFACTS=1`
 - or force a specific file with `ARTIFACT_H5=/path/to/adaptive.h5`
+
+Adaptive launcher path-resolution notes:
+
+- Prefer explicit launcher flags:
+  - `--obs-fits-path`
+  - `--model-h5-path`
+  - `--ebtel-path`
+- `OBS_FITS_PATH`, `MODEL_H5_PATH`, and `EBTEL_PATH` remain supported as
+  environment overrides.
+- Precedence is:
+  - explicit launcher flag
+  - environment variable
+  - shared default resolved from `pyGXrender-test-data`
 
 The Windows counterpart:
 

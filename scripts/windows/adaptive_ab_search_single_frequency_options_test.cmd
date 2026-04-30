@@ -30,6 +30,9 @@ set "CLI_B_MIN="
 set "CLI_B_MAX="
 set "CLI_Q0_MIN="
 set "CLI_Q0_MAX="
+set "CLI_OBS_FITS_PATH="
+set "CLI_MODEL_H5_PATH="
+set "CLI_EBTEL_PATH="
 set "OBS_SOURCE=external_fits"
 set "OBS_MAP_ID="
 set "OBS_PATH_OVERRIDE="
@@ -84,6 +87,15 @@ if /I "%~1"=="--dry-run" (
   shift
 ) else if /I "%~1"=="--q0-max" (
   set "CLI_Q0_MAX=%~2"
+  shift
+) else if /I "%~1"=="--obs-fits-path" (
+  set "CLI_OBS_FITS_PATH=%~2"
+  shift
+) else if /I "%~1"=="--model-h5-path" (
+  set "CLI_MODEL_H5_PATH=%~2"
+  shift
+) else if /I "%~1"=="--ebtel-path" (
+  set "CLI_EBTEL_PATH=%~2"
   shift
 ) else if /I "%~1"=="--obs-source" (
   set "OBS_SOURCE=%~2"
@@ -194,6 +206,9 @@ if defined CLI_B_MIN set "B_MIN=%CLI_B_MIN%"
 if defined CLI_B_MAX set "B_MAX=%CLI_B_MAX%"
 if defined CLI_Q0_MIN set "Q0_MIN=%CLI_Q0_MIN%"
 if defined CLI_Q0_MAX set "Q0_MAX=%CLI_Q0_MAX%"
+if defined CLI_OBS_FITS_PATH set "OBS_FITS_PATH=%CLI_OBS_FITS_PATH%"
+if defined CLI_MODEL_H5_PATH set "MODEL_H5_PATH=%CLI_MODEL_H5_PATH%"
+if defined CLI_EBTEL_PATH set "EBTEL_PATH=%CLI_EBTEL_PATH%"
 
 if /I not "%OBS_SOURCE%"=="external_fits" if /I not "%OBS_SOURCE%"=="model_refmap" (
   echo ERROR: --obs-source must be external_fits or model_refmap

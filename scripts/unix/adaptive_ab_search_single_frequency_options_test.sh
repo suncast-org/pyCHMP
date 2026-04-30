@@ -25,6 +25,9 @@ CLI_B_MIN=""
 CLI_B_MAX=""
 CLI_Q0_MIN=""
 CLI_Q0_MAX=""
+CLI_OBS_FITS_PATH=""
+CLI_MODEL_H5_PATH=""
+CLI_EBTEL_PATH=""
 OBS_SOURCE="${OBS_SOURCE:-external_fits}"
 OBS_MAP_ID="${OBS_MAP_ID:-}"
 OBS_PATH_OVERRIDE="${OBS_PATH_OVERRIDE:-}"
@@ -146,6 +149,21 @@ while (($#)); do
     --q0-max)
       [[ $# -ge 2 ]] || { echo "ERROR: --q0-max requires a value argument"; exit 1; }
       CLI_Q0_MAX="$2"
+      shift 2
+      ;;
+    --obs-fits-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-fits-path requires a path argument"; exit 1; }
+      CLI_OBS_FITS_PATH="$2"
+      shift 2
+      ;;
+    --model-h5-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --model-h5-path requires a path argument"; exit 1; }
+      CLI_MODEL_H5_PATH="$2"
+      shift 2
+      ;;
+    --ebtel-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --ebtel-path requires a path argument"; exit 1; }
+      CLI_EBTEL_PATH="$2"
       shift 2
       ;;
     --obs-source=*)
@@ -363,6 +381,15 @@ if [[ -n "$CLI_Q0_MIN" ]]; then
 fi
 if [[ -n "$CLI_Q0_MAX" ]]; then
   Q0_MAX="$CLI_Q0_MAX"
+fi
+if [[ -n "$CLI_OBS_FITS_PATH" ]]; then
+  OBS_FITS_PATH="$CLI_OBS_FITS_PATH"
+fi
+if [[ -n "$CLI_MODEL_H5_PATH" ]]; then
+  MODEL_H5_PATH="$CLI_MODEL_H5_PATH"
+fi
+if [[ -n "$CLI_EBTEL_PATH" ]]; then
+  EBTEL_PATH="$CLI_EBTEL_PATH"
 fi
 if [[ -n "$CLI_ARTIFACT_H5" ]]; then
   ARTIFACT_H5="$CLI_ARTIFACT_H5"
