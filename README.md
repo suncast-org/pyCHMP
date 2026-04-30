@@ -65,6 +65,58 @@ The `scripts/` directory remains reserved for tracked shell launchers (`.sh`
 and `.cmd`) that wrap those Python workflows; it is not the home of the Python
 entry-point files themselves.
 
+## Workflow Call Graph
+
+The package has a layered structure. The most important distinction is between:
+
+- package-level fitting/search primitives under `src/pychmp/`
+- real-data runnable workflows under `examples/`
+- shell launchers under `scripts/`
+
+The current call hierarchy for the observational workflows is:
+
+```text
+shell launchers (.sh / .cmd)
+  -> examples/fit_q0_obs_map.py
+     -> pychmp.load_obs_map(...)
+     -> pychmp.estimate_obs_map_noise(...)
+     -> pychmp.fit_q0_to_observation(...)
+
+shell launchers (.sh / .cmd)
+  -> examples/scan_ab_obs_map.py
+     -> pychmp.load_obs_map(...)
+     -> pychmp.estimate_obs_map_noise(...)
+     -> per-point fit workflow
+        -> examples/fit_q0_obs_map.py
+           -> pychmp.fit_q0_to_observation(...)
+
+shell launchers (.sh / .cmd)
+  -> examples/python/adaptive_ab_search_single_observation.py
+     -> pychmp.load_obs_map(...)
+     -> pychmp.validate_obs_map_identity(...)
+     -> pychmp.estimate_obs_map_noise(...)
+     -> pychmp.search_local_minimum_ab(...)
+        -> pychmp.evaluate_ab_point(...)
+           -> pychmp.fit_q0_to_observation(...)
+```
+
+Contributor notes:
+
+- `fit_q0_to_observation(...)` is the core single-point numerical primitive.
+- `fit_q0_obs_map.py` is the single-point real observational workflow wrapper around that primitive.
+- `scan_ab_obs_map.py` is the fixed-grid / sparse-grid orchestration layer.
+- `search_local_minimum_ab(...)` is the adaptive `(a, b)` search core.
+- `adaptive_ab_search_single_observation.py` is the real observational wrapper around the adaptive search core.
+- `src/pychmp/obs_maps.py` is the shared observation-ingestion layer used by the real observational workflows.
+
+When adding new observational workflows, prefer reusing:
+
+- `load_obs_map(...)`
+- `validate_obs_map_identity(...)`
+- `estimate_obs_map_noise(...)`
+
+instead of introducing new script-local FITS/refmap loaders.
+
 ### Version Bumping
 
 This repository uses `bumpver` to keep package versions in sync between

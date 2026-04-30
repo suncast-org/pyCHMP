@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,23 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from q0_artifact_plot import plot_q0_artifact_panel
+try:
+    from q0_artifact_plot import plot_q0_artifact_panel
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from examples.q0_artifact_plot import plot_q0_artifact_panel
+
+try:
+    from pychmp.q0_artifact_panel import load_blos_reference_for_fov, load_blos_reference_from_artifact
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from pychmp.q0_artifact_panel import load_blos_reference_for_fov, load_blos_reference_from_artifact
+
+try:
+    from pychmp.ab_scan_artifacts import detect_scan_artifact_format, load_scan_file
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from pychmp.ab_scan_artifacts import detect_scan_artifact_format, load_scan_file
 
 
 def _decode_h5_scalar(value: Any) -> str:
@@ -30,18 +47,74 @@ def _decode_h5_scalar(value: Any) -> str:
     return str(value)
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def _artifact_frequency_ghz(diagnostics: dict[str, Any]) -> float | None:
+    domain = str(diagnostics.get("spectral_domain", "")).strip().lower()
+    if domain in {"euv", "uv"}:
+        return None
+    return (
+        _optional_float(diagnostics.get("frequency_ghz"))
+        or _optional_float(diagnostics.get("active_frequency_ghz"))
+        or _optional_float(diagnostics.get("mw_frequency_ghz"))
+    )
+
+
 def _parse_artifact_h5(path: Path) -> dict[str, Any]:
+    artifact_format = detect_scan_artifact_format(path)
+    if artifact_format == "sparse":
+        payload = load_scan_file(path)
+        if not payload.get("point_records"):
+            raise SystemExit(f"artifact H5 does not contain any point records: {path}")
+        point = payload["point_records"][0]
+        diagnostics = dict(payload.get("diagnostics", {}))
+        diagnostics.update(dict(point.get("diagnostics", {})))
+        diagnostics["fit_q0_trials"] = np.asarray(point.get("fit_q0_trials", ()), dtype=float).tolist()
+        diagnostics["fit_metric_trials"] = np.asarray(point.get("fit_metric_trials", ()), dtype=float).tolist()
+        diagnostics["fit_chi2_trials"] = np.asarray(point.get("fit_chi2_trials", ()), dtype=float).tolist()
+        diagnostics["fit_rho2_trials"] = np.asarray(point.get("fit_rho2_trials", ()), dtype=float).tolist()
+        diagnostics["fit_eta2_trials"] = np.asarray(point.get("fit_eta2_trials", ()), dtype=float).tolist()
+        diagnostics["q0_recovered"] = float(point["q0"])
+        diagnostics["target_metric"] = str(point["target_metric"])
+        return {
+            "observed": np.asarray(payload["observed"], dtype=np.float32),
+            "modeled": np.asarray(point["modeled_best"], dtype=np.float32),
+            "residual": np.asarray(point["residual"], dtype=np.float32),
+            "raw_modeled": np.asarray(point["raw_modeled_best"], dtype=np.float32),
+            "fit_q0_trials": np.asarray(point.get("fit_q0_trials", ()), dtype=np.float64),
+            "fit_metric_trials": np.asarray(point.get("fit_metric_trials", ()), dtype=np.float64),
+            "wcs_header": payload["wcs_header"],
+            "diagnostics": diagnostics,
+            "blos_reference": payload.get("blos_reference"),
+        }
+
     with h5py.File(path, "r") as f:
-        cube = np.asarray(f["maps/data"], dtype=np.float32)
-        # Stored as (nx, ny, n_maps, 2[TI/TV]); convert TI planes back to (ny, nx)
-        ti_stack = np.transpose(cube[:, :, :3, 0], (1, 0, 2))
-        observed = ti_stack[:, :, 0]
-        modeled = ti_stack[:, :, 1]
-        residual = ti_stack[:, :, 2]
+        if "maps/data" in f:
+            cube = np.asarray(f["maps/data"], dtype=np.float32)
+            ti_stack = np.transpose(cube[:, :, :3, 0], (1, 0, 2))
+            observed = ti_stack[:, :, 0]
+            modeled = ti_stack[:, :, 1]
+            residual = ti_stack[:, :, 2]
+        else:
+            observed = np.asarray(f["observed"], dtype=np.float32)
+            modeled = np.asarray(f["modeled_best"], dtype=np.float32)
+            residual = np.asarray(f["residual"], dtype=np.float32)
 
         raw_modeled = None
         if "analysis/raw_modeled_best_ti" in f:
             raw_modeled = np.asarray(f["analysis/raw_modeled_best_ti"], dtype=np.float32)
+        elif "raw_modeled_best" in f:
+            raw_modeled = np.asarray(f["raw_modeled_best"], dtype=np.float32)
 
         fit_q0_trials = None
         fit_metric_trials = None
@@ -52,13 +125,26 @@ def _parse_artifact_h5(path: Path) -> dict[str, Any]:
             fit_q0_trials = np.asarray(f["analysis/fit_q0_trials"], dtype=np.float64)
             fit_metric_trials = np.asarray(f["analysis/fit_chi2_trials"], dtype=np.float64)
 
-        header_text = _decode_h5_scalar(f["metadata/wcs_header"][()])
+        if "metadata/wcs_header" in f:
+            header_text = _decode_h5_scalar(f["metadata/wcs_header"][()])
+        elif "wcs_header" in f:
+            header_text = _decode_h5_scalar(f["wcs_header"][()])
+        else:
+            raise SystemExit(
+                "artifact H5 does not contain a saved WCS header; "
+                "replotting is only supported for artifacts written by the updated save_q0_artifact path"
+            )
         wcs_header = fits.Header.fromstring(header_text, sep="\n")
 
         diagnostics = {}
+        diagnostics_dataset = None
         if "metadata/diagnostics_json" in f:
+            diagnostics_dataset = f["metadata/diagnostics_json"][()]
+        elif "diagnostics_json" in f:
+            diagnostics_dataset = f["diagnostics_json"][()]
+        if diagnostics_dataset is not None:
             try:
-                diagnostics = json.loads(_decode_h5_scalar(f["metadata/diagnostics_json"][()]))
+                diagnostics = json.loads(_decode_h5_scalar(diagnostics_dataset))
             except Exception:
                 diagnostics = {}
 
@@ -71,6 +157,7 @@ def _parse_artifact_h5(path: Path) -> dict[str, Any]:
         "fit_metric_trials": fit_metric_trials,
         "wcs_header": wcs_header,
         "diagnostics": diagnostics,
+        "blos_reference": load_blos_reference_from_artifact(path),
     }
 
 
@@ -83,7 +170,18 @@ def _plot_from_artifact(data: dict[str, Any], out_png: Path, *, log_metrics_over
     fit_metric_trials = data.get("fit_metric_trials")
     wcs_header = data["wcs_header"]
     diagnostics = data["diagnostics"]
-    freq = float(diagnostics.get("mw_frequency_ghz", 17.0))
+    blos_reference = data.get("blos_reference")
+    model_path = Path(str(diagnostics.get("model_path", ""))).expanduser()
+    if str(model_path) and model_path.exists():
+        refreshed_blos = load_blos_reference_for_fov(
+            model_path,
+            header=wcs_header,
+            shape=np.asarray(observed, dtype=float).shape,
+            wcs_header_transform=None,
+        )
+        if refreshed_blos is not None:
+            blos_reference = refreshed_blos
+    freq = _artifact_frequency_ghz(diagnostics)
     log_metrics = bool(diagnostics.get("log_metrics", False))
     if log_metrics_override is not None:
         log_metrics = bool(log_metrics_override)
@@ -107,7 +205,7 @@ def _plot_from_artifact(data: dict[str, Any], out_png: Path, *, log_metrics_over
 
     plot_q0_artifact_panel(
         out_png,
-        model_path=Path(str(diagnostics.get("model_path", ""))),
+        model_path=model_path,
         observed_noisy=observed,
         raw_modeled_best=(raw_modeled if raw_modeled is not None else modeled),
         modeled_best=modeled,
@@ -119,13 +217,14 @@ def _plot_from_artifact(data: dict[str, Any], out_png: Path, *, log_metrics_over
         log_q0=log_q0,
         zoom2best=zoom2best,
         show_plot=show_plot,
+        blos_reference=blos_reference,
     )
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Rebuild pyCHMP artifact PNG from artifact H5")
-    p.add_argument("artifacts_h5_pos", nargs="?", metavar="ARTIFACTS_H5", default=None, help="Path to q0_recovery_artifacts.h5 (positional shorthand)")
-    p.add_argument("--artifacts-h5", default=None, help="Path to q0_recovery_artifacts.h5")
+    p = argparse.ArgumentParser(description="Rebuild pyCHMP artifact PNG from a canonical single-point artifact H5")
+    p.add_argument("artifacts_h5_pos", nargs="?", metavar="ARTIFACT_H5", default=None, help="Path to the single-point artifact H5 (positional shorthand)")
+    p.add_argument("--artifacts-h5", default=None, help="Path to the single-point artifact H5")
     p.add_argument("--output-png", default=None, help="Output PNG path (default: alongside H5)")
     p.add_argument("--log-metrics", action="store_true", help="Force logarithmic y-axis (metric axis) for trials panel.")
     p.add_argument("--log-q0", action="store_true", help="Force logarithmic x-axis (q0 axis) for trials panel.")

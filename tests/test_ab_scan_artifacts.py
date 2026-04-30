@@ -14,11 +14,13 @@ from pychmp.ab_scan_artifacts import (
     append_point_record,
     append_sparse_point_record,
     backfill_artifact_diagnostics,
+    build_computed_point_payload,
     load_scan_file,
     point_record_matches_compatibility_signature,
     save_rectangular_scan_file,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
+    write_single_point_scan_file,
     write_sparse_scan_file,
 )
 
@@ -106,6 +108,12 @@ def _make_point_payload(a_value: float, b_value: float, *, a_index: int = 0, b_i
         "target_metric": "chi2",
         "diagnostics": diagnostics,
     }
+
+
+def _make_blos_reference() -> tuple[np.ndarray, fits.Header]:
+    header = _make_header(crval1=12.0)
+    data = np.asarray([[10.0, -10.0], [5.0, -5.0]], dtype=float)
+    return data, header
 
 
 def _write_rectangular_artifact(out_h5: Path) -> tuple[np.ndarray, np.ndarray, fits.Header, dict[str, object]]:
@@ -271,6 +279,94 @@ def test_sparse_artifact_round_trip_preserves_point_elapsed_seconds(tmp_path: Pa
     assert float(record["diagnostics"]["elapsed_seconds"]) == pytest.approx(12.345)
 
 
+def test_write_single_point_scan_file_round_trip_is_sparse_and_viewer_compatible(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "single_point.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_q0_recovery")
+    diagnostics.update(
+        {
+            "a": 0.3,
+            "b": 2.7,
+            "fit_q0_trials": [2.0, 2.5],
+            "fit_metric_trials": [0.4, 0.1],
+            "fit_chi2_trials": [0.4, 0.1],
+            "fit_rho2_trials": [0.5, 0.2],
+            "fit_eta2_trials": [0.6, 0.3],
+        }
+    )
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.full((2, 2), 2.0, dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        trial_raw_modeled_maps=np.stack(
+            [
+                np.full((2, 2), 2.0, dtype=float),
+                np.full((2, 2), 2.5, dtype=float),
+            ],
+            axis=0,
+        ),
+        trial_modeled_maps=np.stack(
+            [
+                np.full((2, 2), 1.0, dtype=float),
+                np.full((2, 2), 1.5, dtype=float),
+            ],
+            axis=0,
+        ),
+        trial_residual_maps=np.stack(
+            [
+                np.zeros((2, 2), dtype=float),
+                np.full((2, 2), 0.5, dtype=float),
+            ],
+            axis=0,
+        ),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics=diagnostics,
+    )
+
+    write_single_point_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=point_payload,
+        blos_reference=_make_blos_reference(),
+    )
+
+    payload = load_scan_file(out_h5)
+
+    assert payload["artifact_format"] == "sparse"
+    assert payload["target_metric"] == "chi2"
+    assert payload["a_values"].shape == (1,)
+    assert payload["b_values"].shape == (1,)
+    assert len(payload["point_records"]) == 1
+    assert float(payload["point_records"][0]["q0"]) == pytest.approx(2.5)
+    assert payload["point_records"][0]["trial_raw_modeled_maps"] is not None
+    assert payload["point_records"][0]["trial_modeled_maps"] is not None
+    assert payload["point_records"][0]["trial_residual_maps"] is not None
+    assert payload["blos_reference"] is not None
+
+
 def test_append_point_record_updates_rectangular_artifact(tmp_path: Path) -> None:
     out_h5 = tmp_path / "scan.h5"
     observed, sigma_map, header, diagnostics = _write_rectangular_artifact(out_h5)
@@ -401,6 +497,205 @@ def test_rectangular_artifact_round_trip_preserves_run_history(tmp_path: Path) -
 
     assert len(payload["run_history"]) == 1
     assert payload["run_history"][0]["action"] == "create"
+
+
+def test_rectangular_artifact_round_trip_preserves_shared_blos_reference(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan_blos.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics()
+    blos_reference = _make_blos_reference()
+    save_rectangular_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        blos_reference=blos_reference,
+        a_values=np.asarray([0.0], dtype=float),
+        b_values=np.asarray([1.0], dtype=float),
+        best_q0=np.asarray([[2.5]], dtype=float),
+        objective_values=np.asarray([[0.1]], dtype=float),
+        chi2=np.asarray([[0.1]], dtype=float),
+        rho2=np.asarray([[0.2]], dtype=float),
+        eta2=np.asarray([[0.3]], dtype=float),
+        success=np.asarray([[True]], dtype=bool),
+        point_payloads={(0, 0): _make_point_payload(0.0, 1.0)},
+    )
+
+    payload = load_scan_file(out_h5)
+
+    assert payload["blos_reference"] is not None
+    blos_data, blos_header = payload["blos_reference"]
+    np.testing.assert_allclose(blos_data, blos_reference[0])
+    assert float(blos_header["CRVAL1"]) == pytest.approx(float(blos_reference[1]["CRVAL1"]))
+
+
+def test_sparse_artifact_round_trip_preserves_shared_blos_reference(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_blos.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    blos_reference = _make_blos_reference()
+    write_sparse_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        blos_reference=blos_reference,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+
+    assert payload["blos_reference"] is not None
+    blos_data, blos_header = payload["blos_reference"]
+    np.testing.assert_allclose(blos_data, blos_reference[0])
+    assert float(blos_header["CRVAL1"]) == pytest.approx(float(blos_reference[1]["CRVAL1"]))
+
+
+def test_sparse_artifact_round_trip_exposes_canonical_slice_metadata_and_trial_logging_policy(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_contract.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "wavelength_angstrom": 171.0,
+            "euv_channel": "171",
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "wavelength_angstrom": 171.0,
+                    "channel_label": "171",
+                    "role": "target",
+                },
+                {
+                    "key": "euv_193",
+                    "domain": "euv",
+                    "label": "193 A",
+                    "wavelength_angstrom": 193.0,
+                    "channel_label": "193",
+                    "role": "auxiliary",
+                },
+            ],
+            "target_slice_key": "euv_171",
+            "store_raw_rendered_cubes": True,
+            "store_trial_metric_masks": True,
+            "store_euv_component_cubes": True,
+            "store_euv_tr_mask": True,
+        }
+    )
+    write_sparse_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+
+    assert payload["artifact_contract_version"] == "2026-04-23-a"
+    assert payload["target_slice_key"] == "euv_171"
+    assert len(payload["canonical_slice_descriptors"]) == 2
+    assert payload["canonical_slice_descriptors"][0]["key"] == "euv_171"
+    assert payload["canonical_slice_descriptors"][0]["is_target"] is True
+    assert payload["canonical_slice_descriptors"][1]["key"] == "euv_193"
+    assert payload["canonical_slice_descriptors"][1]["is_target"] is False
+    assert payload["trial_logging_policy"]["store_observed_maps"] is True
+    assert payload["trial_logging_policy"]["store_trial_metrics"] is True
+    assert payload["trial_logging_policy"]["store_raw_rendered_cubes"] is True
+    assert payload["trial_logging_policy"]["store_trial_metric_masks"] is True
+    assert payload["trial_logging_policy"]["store_euv_component_cubes"] is True
+    assert payload["trial_logging_policy"]["store_euv_tr_mask"] is True
+
+
+def test_single_point_artifact_round_trips_euv_components_and_tr_mask(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "single_point_euv_components.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "wavelength_angstrom": 171.0,
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "wavelength_angstrom": 171.0,
+                    "role": "target",
+                    "is_target": True,
+                }
+            ],
+        }
+    )
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.ones((2, 2), dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        trial_raw_modeled_maps=np.ones((2, 2, 2), dtype=float),
+        trial_modeled_maps=np.ones((2, 2, 2), dtype=float) * 2.0,
+        trial_residual_maps=np.ones((2, 2, 2), dtype=float) * -1.0,
+        euv_coronal_best=np.full((2, 2), 3.0, dtype=float),
+        euv_tr_best=np.full((2, 2), 4.0, dtype=float),
+        euv_tr_mask=np.asarray([[True, False], [False, True]], dtype=bool),
+        trial_euv_coronal_maps=np.full((2, 2, 2), 5.0, dtype=float),
+        trial_euv_tr_maps=np.full((2, 2, 2), 6.0, dtype=float),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics={"target_metric": "chi2"},
+    )
+
+    write_single_point_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=point_payload,
+        blos_reference=None,
+        run_history=None,
+    )
+
+    payload = load_scan_file(out_h5)
+    point = payload["point_records"][0]
+
+    np.testing.assert_allclose(point["euv_coronal_best"], np.full((2, 2), 3.0, dtype=float))
+    np.testing.assert_allclose(point["euv_tr_best"], np.full((2, 2), 4.0, dtype=float))
+    np.testing.assert_array_equal(point["euv_tr_mask"], np.asarray([[True, False], [False, True]], dtype=bool))
+    np.testing.assert_allclose(point["trial_euv_coronal_maps"], np.full((2, 2, 2), 5.0, dtype=float))
+    np.testing.assert_allclose(point["trial_euv_tr_maps"], np.full((2, 2, 2), 6.0, dtype=float))
 
 
 def test_append_sparse_point_record_retries_transient_file_lock(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

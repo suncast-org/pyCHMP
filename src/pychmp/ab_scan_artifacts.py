@@ -18,6 +18,11 @@ RECTANGULAR_ARTIFACT_KIND = "pychmp_ab_scan"
 SPARSE_ARTIFACT_KIND = "pychmp_ab_scan_sparse_points"
 SLICE_CONTAINER_GROUP = "slices"
 RUN_HISTORY_DATASET = "run_history_json"
+COMMON_SLICE_DESCRIPTORS_DATASET = "slice_descriptors_json"
+COMMON_TARGET_SLICE_KEY_DATASET = "target_slice_key"
+COMMON_TRIAL_LOGGING_POLICY_DATASET = "trial_logging_policy_json"
+COMMON_ARTIFACT_CONTRACT_VERSION_DATASET = "artifact_contract_version"
+CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-04-23-a"
 REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "artifact_kind",
     "target_metric",
@@ -58,6 +63,22 @@ def decode_scalar(value: Any) -> str:
             return item.decode("utf-8", errors="replace")
         return str(item)
     return str(value)
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
 
 
 def _normalize_path_like(value: Any) -> str:
@@ -239,37 +260,156 @@ def _sanitize_slice_token(value: str) -> str:
     return token or "slice"
 
 
-def slice_descriptor_from_diagnostics(diagnostics: dict[str, Any], *, fallback_key: str = "default") -> dict[str, Any]:
-    domain = str(diagnostics.get("spectral_domain", "mw")).strip().lower()
-    frequency_ghz = diagnostics.get("frequency_ghz", diagnostics.get("active_frequency_ghz"))
-    channel_label = diagnostics.get("channel_label", diagnostics.get("euv_channel", diagnostics.get("channel_name")))
-    label = str(diagnostics.get("spectral_label", "")).strip()
-    sort_value: float | None = None
+def _format_frequency_label(frequency_ghz: float) -> str:
+    return f"{float(frequency_ghz):.3f} GHz"
 
-    if domain == "mw" and frequency_ghz is not None:
-        frequency_ghz = float(frequency_ghz)
-        label = label or f"{frequency_ghz:.3f} GHz"
-        key = f"mw_{frequency_ghz:.6f}ghz".replace(".", "p")
-        sort_value = frequency_ghz
-    elif domain == "euv" and channel_label:
-        label = label or str(channel_label)
-        key = f"euv_{_sanitize_slice_token(str(channel_label))}"
-    else:
-        if channel_label and not label:
-            label = str(channel_label)
-        key = _sanitize_slice_token(str(diagnostics.get("slice_key", fallback_key)))
-        if not label:
-            label = str(diagnostics.get("slice_label", fallback_key))
 
-    display_label = f"{domain.upper()}: {label}" if domain in {"mw", "euv"} else label
-    return {
-        "key": key,
+def _format_wavelength_label(wavelength_angstrom: float) -> str:
+    rounded = round(float(wavelength_angstrom))
+    if np.isclose(float(wavelength_angstrom), float(rounded), rtol=0.0, atol=1e-9):
+        return f"{int(rounded)} A"
+    return f"{float(wavelength_angstrom):.3f} A"
+
+
+def _display_label_for_slice_descriptor(descriptor: dict[str, Any]) -> str:
+    domain = str(descriptor.get("domain", "")).strip().lower()
+    label = str(descriptor.get("label", "")).strip() or str(descriptor.get("key", "slice"))
+    if domain in {"mw", "euv", "uv"}:
+        return f"{domain.upper()}: {label}"
+    return label
+
+
+def _normalize_slice_descriptor(raw: dict[str, Any], *, fallback_key: str) -> dict[str, Any]:
+    domain = str(raw.get("domain", raw.get("spectral_domain", "generic"))).strip().lower() or "generic"
+    frequency_ghz = _optional_float(raw.get("frequency_ghz", raw.get("active_frequency_ghz")))
+    wavelength_angstrom = _optional_float(raw.get("wavelength_angstrom"))
+    channel_label_raw = raw.get("channel_label", raw.get("euv_channel", raw.get("channel_name")))
+    channel_label = None if channel_label_raw is None else str(channel_label_raw).strip() or None
+    label = str(raw.get("label", raw.get("spectral_label", ""))).strip()
+    key = str(raw.get("key", raw.get("slice_key", ""))).strip()
+    sort_value = _optional_float(raw.get("sort_value"))
+
+    if not label:
+        if domain == "mw" and frequency_ghz is not None:
+            label = _format_frequency_label(frequency_ghz)
+        elif domain in {"euv", "uv"} and wavelength_angstrom is not None:
+            label = _format_wavelength_label(wavelength_angstrom)
+        elif channel_label:
+            label = channel_label
+        else:
+            label = str(raw.get("slice_label", fallback_key))
+
+    if not key:
+        if domain == "mw" and frequency_ghz is not None:
+            key = f"mw_{frequency_ghz:.6f}ghz".replace(".", "p")
+            if sort_value is None:
+                sort_value = frequency_ghz
+        elif domain in {"euv", "uv"} and (channel_label or wavelength_angstrom is not None):
+            token_source = channel_label or _format_wavelength_label(float(wavelength_angstrom))
+            key = f"{domain}_{_sanitize_slice_token(str(token_source))}"
+        else:
+            key = _sanitize_slice_token(fallback_key)
+
+    role = str(raw.get("role", "")).strip().lower()
+    is_target_raw = raw.get("is_target")
+    is_target = bool(is_target_raw) if is_target_raw is not None else False
+    if role not in {"target", "auxiliary"}:
+        role = "target" if is_target else "auxiliary"
+    is_target = role == "target"
+
+    descriptor = {
+        "key": str(key),
         "domain": domain,
         "label": label,
-        "display_label": display_label,
-        "frequency_ghz": float(frequency_ghz) if frequency_ghz is not None else None,
-        "channel_label": None if channel_label is None else str(channel_label),
+        "display_label": str(raw.get("display_label", "")).strip(),
+        "frequency_ghz": frequency_ghz,
+        "wavelength_angstrom": wavelength_angstrom,
+        "channel_label": channel_label,
         "sort_value": sort_value,
+        "role": role,
+        "is_target": bool(is_target),
+    }
+    if not descriptor["display_label"]:
+        descriptor["display_label"] = _display_label_for_slice_descriptor(descriptor)
+    return descriptor
+
+
+def canonical_slice_descriptors_from_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    fallback_key: str = "default",
+) -> tuple[list[dict[str, Any]], str]:
+    raw_descriptors = diagnostics.get("slice_descriptors")
+    descriptors: list[dict[str, Any]] = []
+
+    if isinstance(raw_descriptors, list) and raw_descriptors:
+        for index, item in enumerate(raw_descriptors):
+            if not isinstance(item, dict):
+                continue
+            descriptors.append(
+                _normalize_slice_descriptor(
+                    item,
+                    fallback_key=str(item.get("key", item.get("slice_key", f"{fallback_key}_{index}"))),
+                )
+            )
+
+    if not descriptors:
+        descriptors = [
+            _normalize_slice_descriptor(diagnostics, fallback_key=fallback_key),
+        ]
+
+    explicit_target_key = str(diagnostics.get("target_slice_key", "")).strip()
+    target_key = explicit_target_key if explicit_target_key else ""
+    if not target_key:
+        for descriptor in descriptors:
+            if bool(descriptor.get("is_target")):
+                target_key = str(descriptor["key"])
+                break
+    if not target_key:
+        target_key = str(descriptors[0]["key"])
+
+    normalized_descriptors: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        updated = dict(descriptor)
+        updated["is_target"] = str(updated["key"]) == target_key
+        updated["role"] = "target" if bool(updated["is_target"]) else "auxiliary"
+        normalized_descriptors.append(updated)
+    return normalized_descriptors, target_key
+
+
+def canonical_trial_logging_policy_from_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    def _bool(key: str, default: bool) -> bool:
+        value = diagnostics.get(key)
+        return default if value is None else bool(value)
+
+    return {
+        "store_observed_maps": True,
+        "store_raw_rendered_cubes": _bool("store_raw_rendered_cubes", False),
+        "store_trial_metrics": _bool("store_trial_metrics", True),
+        "store_trial_metric_masks": _bool("store_trial_metric_masks", False),
+        "store_trial_explicit_metric_masks": _bool("store_trial_explicit_metric_masks", False),
+        "store_psf_metadata": _bool("store_psf_metadata", True),
+        "store_euv_component_cubes": _bool("store_euv_component_cubes", False),
+        "store_euv_tr_mask": _bool("store_euv_tr_mask", False),
+        "store_trial_convolved_cubes": _bool("store_trial_convolved_cubes", False),
+        "store_trial_residual_cubes": _bool("store_trial_residual_cubes", False),
+        "store_final_solution_views": _bool("store_final_solution_views", True),
+    }
+
+
+def slice_descriptor_from_diagnostics(diagnostics: dict[str, Any], *, fallback_key: str = "default") -> dict[str, Any]:
+    descriptor = _normalize_slice_descriptor(diagnostics, fallback_key=fallback_key)
+    return {
+        "key": descriptor["key"],
+        "domain": descriptor["domain"],
+        "label": descriptor["label"],
+        "display_label": descriptor["display_label"],
+        "frequency_ghz": descriptor["frequency_ghz"],
+        "channel_label": descriptor["channel_label"],
+        "wavelength_angstrom": descriptor["wavelength_angstrom"],
+        "sort_value": descriptor["sort_value"],
+        "role": descriptor["role"],
+        "is_target": descriptor["is_target"],
     }
 
 
@@ -329,7 +469,7 @@ def _decode_run_history(common: h5py.Group) -> list[dict[str, Any]]:
 
 
 def append_run_history_entry(h5_path: Path, entry: dict[str, Any], *, slice_key: str | None = None) -> None:
-    serialized = json.dumps(entry, sort_keys=True)
+    serialized = _json_dumps(entry)
     with _H5PY_FILE(h5_path, "a") as f:
         group, _descriptors, selected_key = _resolve_slice_group(
             f,
@@ -506,6 +646,14 @@ def build_computed_point_payload(
     fit_chi2_trials: tuple[float, ...],
     fit_rho2_trials: tuple[float, ...],
     fit_eta2_trials: tuple[float, ...],
+    trial_raw_modeled_maps: np.ndarray | None = None,
+    trial_modeled_maps: np.ndarray | None = None,
+    trial_residual_maps: np.ndarray | None = None,
+    euv_coronal_best: np.ndarray | None = None,
+    euv_tr_best: np.ndarray | None = None,
+    euv_tr_mask: np.ndarray | None = None,
+    trial_euv_coronal_maps: np.ndarray | None = None,
+    trial_euv_tr_maps: np.ndarray | None = None,
     nfev: int,
     nit: int,
     message: str,
@@ -531,6 +679,14 @@ def build_computed_point_payload(
         "fit_chi2_trials": tuple(float(v) for v in fit_chi2_trials),
         "fit_rho2_trials": tuple(float(v) for v in fit_rho2_trials),
         "fit_eta2_trials": tuple(float(v) for v in fit_eta2_trials),
+        "trial_raw_modeled_maps": None if trial_raw_modeled_maps is None else np.asarray(trial_raw_modeled_maps, dtype=float),
+        "trial_modeled_maps": None if trial_modeled_maps is None else np.asarray(trial_modeled_maps, dtype=float),
+        "trial_residual_maps": None if trial_residual_maps is None else np.asarray(trial_residual_maps, dtype=float),
+        "euv_coronal_best": None if euv_coronal_best is None else np.asarray(euv_coronal_best, dtype=float),
+        "euv_tr_best": None if euv_tr_best is None else np.asarray(euv_tr_best, dtype=float),
+        "euv_tr_mask": None if euv_tr_mask is None else np.asarray(euv_tr_mask, dtype=bool),
+        "trial_euv_coronal_maps": None if trial_euv_coronal_maps is None else np.asarray(trial_euv_coronal_maps, dtype=float),
+        "trial_euv_tr_maps": None if trial_euv_tr_maps is None else np.asarray(trial_euv_tr_maps, dtype=float),
         "nfev": int(nfev),
         "nit": int(nit),
         "message": str(message),
@@ -565,6 +721,30 @@ def _normalize_point_payload(payload: dict[str, Any], *, record_order: int) -> d
         "fit_chi2_trials": tuple(float(v) for v in payload.get("fit_chi2_trials", ())),
         "fit_rho2_trials": tuple(float(v) for v in payload.get("fit_rho2_trials", ())),
         "fit_eta2_trials": tuple(float(v) for v in payload.get("fit_eta2_trials", ())),
+        "trial_raw_modeled_maps": (
+            None if payload.get("trial_raw_modeled_maps") is None else np.asarray(payload["trial_raw_modeled_maps"], dtype=float)
+        ),
+        "trial_modeled_maps": (
+            None if payload.get("trial_modeled_maps") is None else np.asarray(payload["trial_modeled_maps"], dtype=float)
+        ),
+        "trial_residual_maps": (
+            None if payload.get("trial_residual_maps") is None else np.asarray(payload["trial_residual_maps"], dtype=float)
+        ),
+        "euv_coronal_best": (
+            None if payload.get("euv_coronal_best") is None else np.asarray(payload["euv_coronal_best"], dtype=float)
+        ),
+        "euv_tr_best": (
+            None if payload.get("euv_tr_best") is None else np.asarray(payload["euv_tr_best"], dtype=float)
+        ),
+        "euv_tr_mask": (
+            None if payload.get("euv_tr_mask") is None else np.asarray(payload["euv_tr_mask"], dtype=bool)
+        ),
+        "trial_euv_coronal_maps": (
+            None if payload.get("trial_euv_coronal_maps") is None else np.asarray(payload["trial_euv_coronal_maps"], dtype=float)
+        ),
+        "trial_euv_tr_maps": (
+            None if payload.get("trial_euv_tr_maps") is None else np.asarray(payload["trial_euv_tr_maps"], dtype=float)
+        ),
         "nfev": int(payload.get("nfev", -1)),
         "nit": int(payload.get("nit", -1)),
         "message": str(payload.get("message", "")),
@@ -621,6 +801,30 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         "fit_chi2_trials": tuple(float(v) for v in fit_chi2_trials),
         "fit_rho2_trials": tuple(float(v) for v in fit_rho2_trials),
         "fit_eta2_trials": tuple(float(v) for v in fit_eta2_trials),
+        "trial_raw_modeled_maps": (
+            np.asarray(grp["trial_raw_modeled_maps"], dtype=float) if "trial_raw_modeled_maps" in grp else None
+        ),
+        "trial_modeled_maps": (
+            np.asarray(grp["trial_modeled_maps"], dtype=float) if "trial_modeled_maps" in grp else None
+        ),
+        "trial_residual_maps": (
+            np.asarray(grp["trial_residual_maps"], dtype=float) if "trial_residual_maps" in grp else None
+        ),
+        "euv_coronal_best": (
+            np.asarray(grp["euv_coronal_best"], dtype=float) if "euv_coronal_best" in grp else None
+        ),
+        "euv_tr_best": (
+            np.asarray(grp["euv_tr_best"], dtype=float) if "euv_tr_best" in grp else None
+        ),
+        "euv_tr_mask": (
+            np.asarray(grp["euv_tr_mask"], dtype=bool) if "euv_tr_mask" in grp else None
+        ),
+        "trial_euv_coronal_maps": (
+            np.asarray(grp["trial_euv_coronal_maps"], dtype=float) if "trial_euv_coronal_maps" in grp else None
+        ),
+        "trial_euv_tr_maps": (
+            np.asarray(grp["trial_euv_tr_maps"], dtype=float) if "trial_euv_tr_maps" in grp else None
+        ),
         "nfev": int(grp.attrs.get("nfev", -1)),
         "nit": int(grp.attrs.get("nit", -1)),
         "message": decode_scalar(grp.attrs.get("message", b"")),
@@ -763,9 +967,10 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, 
         if group is None:
             raise KeyError(f"slice not found: {slice_key}")
         common = group["common"]
-        wcs_header = fits.Header.fromstring(decode_scalar(common["wcs_header"][()]), sep="\n")
-        diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
-        run_history = _decode_run_history(common)
+        common_payload = _read_common_group(common)
+        wcs_header = common_payload["wcs_header"]
+        diagnostics = common_payload["diagnostics"]
+        run_history = common_payload["run_history"]
         # Non-breaking: if mask_type is missing, assume 'union'
         if "mask_type" not in diagnostics:
             diagnostics["mask_type"] = "union"
@@ -790,6 +995,11 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, 
         payload["selected_slice_key"] = selected_key
         payload["selected_slice"] = selected_descriptor
         payload["run_history"] = run_history
+        payload["artifact_contract_version"] = common_payload.get("artifact_contract_version")
+        payload["canonical_slice_descriptors"] = common_payload.get("slice_descriptors", [])
+        payload["target_slice_key"] = common_payload.get("target_slice_key")
+        payload["trial_logging_policy"] = common_payload.get("trial_logging_policy", {})
+        payload["blos_reference"] = common_payload.get("blos_reference")
         return payload
 
 
@@ -884,7 +1094,7 @@ def backfill_artifact_diagnostics(
                 updated_fields[hash_key] = diagnostics[hash_key]
 
             if updated_fields and not dry_run:
-                _replace_text_dataset(common, "diagnostics_json", json.dumps(diagnostics, sort_keys=True))
+                _replace_text_dataset(common, "diagnostics_json", _json_dumps(diagnostics))
 
             if updated_fields:
                 report["updated_slice_count"] = int(report["updated_slice_count"]) + 1
@@ -918,6 +1128,29 @@ def point_record_matches_compatibility_signature(
     return actual == expected
 
 
+def _write_reference_map_group(
+    parent: h5py.Group,
+    *,
+    group_name: str,
+    data: np.ndarray,
+    wcs_header: fits.Header,
+) -> None:
+    ref_group = parent.create_group(group_name)
+    ref_group.create_dataset("data", data=np.asarray(data, dtype=np.float32), compression="gzip", compression_opts=4)
+    _create_text_dataset(ref_group, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
+
+
+def _read_reference_map_group(parent: h5py.Group, group_name: str) -> tuple[np.ndarray, fits.Header] | None:
+    if group_name not in parent:
+        return None
+    ref_group = parent[group_name]
+    if "data" not in ref_group or "wcs_header" not in ref_group:
+        return None
+    data = np.asarray(ref_group["data"], dtype=float)
+    header = fits.Header.fromstring(decode_scalar(ref_group["wcs_header"][()]), sep="\n")
+    return data, header
+
+
 def _write_common_group(
     common: h5py.Group,
     *,
@@ -925,17 +1158,73 @@ def _write_common_group(
     sigma_map: np.ndarray,
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
+    slice_descriptors, target_slice_key = canonical_slice_descriptors_from_diagnostics(diagnostics)
+    trial_logging_policy = canonical_trial_logging_policy_from_diagnostics(diagnostics)
     common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
     common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
     _create_text_dataset(common, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
-    _create_text_dataset(common, "diagnostics_json", json.dumps(diagnostics, sort_keys=True))
+    _create_text_dataset(common, "diagnostics_json", _json_dumps(diagnostics))
+    _create_text_dataset(common, COMMON_ARTIFACT_CONTRACT_VERSION_DATASET, CANONICAL_ARTIFACT_CONTRACT_VERSION)
+    _create_text_dataset(common, COMMON_SLICE_DESCRIPTORS_DATASET, _json_dumps(slice_descriptors))
+    _create_text_dataset(common, COMMON_TARGET_SLICE_KEY_DATASET, str(target_slice_key))
+    _create_text_dataset(common, COMMON_TRIAL_LOGGING_POLICY_DATASET, _json_dumps(trial_logging_policy))
+    if blos_reference is not None:
+        refmaps = common.create_group("refmaps")
+        blos_data, blos_header = blos_reference
+        _write_reference_map_group(
+            refmaps,
+            group_name="Bz_reference",
+            data=np.asarray(blos_data, dtype=float),
+            wcs_header=blos_header,
+        )
     dataset = _ensure_run_history_dataset(common)
     for entry in list(run_history or []):
         next_index = int(dataset.shape[0])
         dataset.resize((next_index + 1,))
-        dataset[next_index] = json.dumps(entry, sort_keys=True)
+        dataset[next_index] = _json_dumps(entry)
+
+
+def _read_common_group(common: h5py.Group) -> dict[str, Any]:
+    observed = np.asarray(common["observed"], dtype=float)
+    sigma_map = np.asarray(common["sigma_map"], dtype=float)
+    wcs_header = fits.Header.fromstring(decode_scalar(common["wcs_header"][()]), sep="\n")
+    diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
+    run_history = _decode_run_history(common)
+    artifact_contract_version = (
+        decode_scalar(common[COMMON_ARTIFACT_CONTRACT_VERSION_DATASET][()])
+        if COMMON_ARTIFACT_CONTRACT_VERSION_DATASET in common
+        else CANONICAL_ARTIFACT_CONTRACT_VERSION
+    )
+    if COMMON_SLICE_DESCRIPTORS_DATASET in common:
+        slice_descriptors = json.loads(decode_scalar(common[COMMON_SLICE_DESCRIPTORS_DATASET][()]))
+    else:
+        slice_descriptors, _target_slice_key = canonical_slice_descriptors_from_diagnostics(diagnostics)
+    if COMMON_TARGET_SLICE_KEY_DATASET in common:
+        target_slice_key = decode_scalar(common[COMMON_TARGET_SLICE_KEY_DATASET][()])
+    else:
+        _slice_descriptors_fallback, target_slice_key = canonical_slice_descriptors_from_diagnostics(diagnostics)
+    if COMMON_TRIAL_LOGGING_POLICY_DATASET in common:
+        trial_logging_policy = json.loads(decode_scalar(common[COMMON_TRIAL_LOGGING_POLICY_DATASET][()]))
+    else:
+        trial_logging_policy = canonical_trial_logging_policy_from_diagnostics(diagnostics)
+    blos_reference = None
+    if "refmaps" in common:
+        blos_reference = _read_reference_map_group(common["refmaps"], "Bz_reference")
+    return {
+        "observed": observed,
+        "sigma_map": sigma_map,
+        "wcs_header": wcs_header,
+        "diagnostics": diagnostics,
+        "run_history": run_history,
+        "artifact_contract_version": artifact_contract_version,
+        "slice_descriptors": slice_descriptors,
+        "target_slice_key": target_slice_key,
+        "trial_logging_policy": trial_logging_policy,
+        "blos_reference": blos_reference,
+    }
 
 
 def save_rectangular_scan_file(
@@ -945,6 +1234,7 @@ def save_rectangular_scan_file(
     sigma_map: np.ndarray,
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     a_values: np.ndarray,
     b_values: np.ndarray,
     best_q0: np.ndarray,
@@ -994,6 +1284,7 @@ def save_rectangular_scan_file(
             sigma_map=sigma_map,
             wcs_header=wcs_header,
             diagnostics=diagnostics,
+            blos_reference=blos_reference,
             run_history=run_history,
         )
 
@@ -1032,7 +1323,7 @@ def save_rectangular_scan_file(
             grp.create_dataset("fit_chi2_trials", data=np.asarray(payload.get("fit_chi2_trials", ()), dtype=np.float64))
             grp.create_dataset("fit_rho2_trials", data=np.asarray(payload.get("fit_rho2_trials", ()), dtype=np.float64))
             grp.create_dataset("fit_eta2_trials", data=np.asarray(payload.get("fit_eta2_trials", ()), dtype=np.float64))
-            _create_text_dataset(grp, "diagnostics_json", json.dumps(payload["diagnostics"], sort_keys=True))
+            _create_text_dataset(grp, "diagnostics_json", _json_dumps(payload["diagnostics"]))
             canonical_grp = point_records.create_group(f"r{record_order:06d}")
             _write_point_group(canonical_grp, payload, record_order=record_order)
     os.replace(tmp_h5, out_h5)
@@ -1063,7 +1354,63 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
     grp.create_dataset("fit_chi2_trials", data=np.asarray(normalized["fit_chi2_trials"], dtype=np.float64))
     grp.create_dataset("fit_rho2_trials", data=np.asarray(normalized["fit_rho2_trials"], dtype=np.float64))
     grp.create_dataset("fit_eta2_trials", data=np.asarray(normalized["fit_eta2_trials"], dtype=np.float64))
-    _create_text_dataset(grp, "diagnostics_json", json.dumps(normalized["diagnostics"], sort_keys=True))
+    if normalized["trial_raw_modeled_maps"] is not None:
+        grp.create_dataset(
+            "trial_raw_modeled_maps",
+            data=np.asarray(normalized["trial_raw_modeled_maps"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["trial_modeled_maps"] is not None:
+        grp.create_dataset(
+            "trial_modeled_maps",
+            data=np.asarray(normalized["trial_modeled_maps"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["trial_residual_maps"] is not None:
+        grp.create_dataset(
+            "trial_residual_maps",
+            data=np.asarray(normalized["trial_residual_maps"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["euv_coronal_best"] is not None:
+        grp.create_dataset(
+            "euv_coronal_best",
+            data=np.asarray(normalized["euv_coronal_best"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["euv_tr_best"] is not None:
+        grp.create_dataset(
+            "euv_tr_best",
+            data=np.asarray(normalized["euv_tr_best"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["euv_tr_mask"] is not None:
+        grp.create_dataset(
+            "euv_tr_mask",
+            data=np.asarray(normalized["euv_tr_mask"], dtype=np.uint8),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["trial_euv_coronal_maps"] is not None:
+        grp.create_dataset(
+            "trial_euv_coronal_maps",
+            data=np.asarray(normalized["trial_euv_coronal_maps"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    if normalized["trial_euv_tr_maps"] is not None:
+        grp.create_dataset(
+            "trial_euv_tr_maps",
+            data=np.asarray(normalized["trial_euv_tr_maps"], dtype=np.float32),
+            compression="gzip",
+            compression_opts=4,
+        )
+    _create_text_dataset(grp, "diagnostics_json", _json_dumps(normalized["diagnostics"]))
 
 
 def write_sparse_scan_file(
@@ -1073,6 +1420,7 @@ def write_sparse_scan_file(
     sigma_map: np.ndarray,
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_records: list[dict[str, Any]],
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -1085,20 +1433,45 @@ def write_sparse_scan_file(
         diagnostics_out["mask_type"] = diagnostics.get("mask_type", "union")
     with _H5PY_FILE(tmp_h5, "w") as f:
         common = f.create_group("common")
-        common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
-        common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
-        _create_text_dataset(common, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
-        _create_text_dataset(common, "diagnostics_json", json.dumps(diagnostics_out, sort_keys=True))
-        dataset = _ensure_run_history_dataset(common)
-        for entry in list(run_history or []):
-            next_index = int(dataset.shape[0])
-            dataset.resize((next_index + 1,))
-            dataset[next_index] = json.dumps(entry, sort_keys=True)
+        _write_common_group(
+            common,
+            observed=observed,
+            sigma_map=sigma_map,
+            wcs_header=wcs_header,
+            diagnostics=diagnostics_out,
+            blos_reference=blos_reference,
+            run_history=run_history,
+        )
         records_group = f.create_group("point_records")
         for record_order, payload in enumerate(point_records):
             grp = records_group.create_group(f"r{record_order:06d}")
             _write_point_group(grp, payload, record_order=record_order)
     os.replace(tmp_h5, out_h5)
+
+
+def write_single_point_scan_file(
+    out_h5: Path,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+    point_payload: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
+    run_history: list[dict[str, Any]] | None = None,
+) -> None:
+    diagnostics_out = dict(diagnostics)
+    diagnostics_out["artifact_kind"] = SPARSE_ARTIFACT_KIND
+    write_sparse_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=wcs_header,
+        diagnostics=diagnostics_out,
+        blos_reference=blos_reference,
+        point_records=[point_payload],
+        run_history=run_history,
+    )
 
 
 def append_sparse_point_record(
@@ -1108,6 +1481,7 @@ def append_sparse_point_record(
     sigma_map: np.ndarray,
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_payload: dict[str, Any],
 ) -> None:
     diagnostics_out = dict(diagnostics)
@@ -1120,11 +1494,24 @@ def append_sparse_point_record(
             with h5py.File(out_h5, mode) as f:
                 if "common" not in f:
                     common = f.create_group("common")
-                    common.create_dataset("observed", data=np.asarray(observed, dtype=np.float32), compression="gzip", compression_opts=4)
-                    common.create_dataset("sigma_map", data=np.asarray(sigma_map, dtype=np.float32), compression="gzip", compression_opts=4)
-                    common.create_dataset("wcs_header", data=np.bytes_(wcs_header.tostring(sep="\n", endcard=True)))
-                    common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(diagnostics_out, sort_keys=True)))
-                    _ensure_run_history_dataset(common)
+                    _write_common_group(
+                        common,
+                        observed=observed,
+                        sigma_map=sigma_map,
+                        wcs_header=wcs_header,
+                        diagnostics=diagnostics_out,
+                        blos_reference=blos_reference,
+                        run_history=None,
+                    )
+                elif blos_reference is not None and "refmaps" not in f["common"]:
+                    refmaps = f["common"].create_group("refmaps")
+                    blos_data, blos_header = blos_reference
+                    _write_reference_map_group(
+                        refmaps,
+                        group_name="Bz_reference",
+                        data=np.asarray(blos_data, dtype=float),
+                        wcs_header=blos_header,
+                    )
                 records_group = f.require_group("point_records")
                 existing_orders = [int(records_group[name].attrs.get("record_order", -1)) for name in records_group.keys()]
                 next_order = max(existing_orders, default=-1) + 1
@@ -1149,6 +1536,7 @@ def append_point_record(
     sigma_map: np.ndarray,
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_payload: dict[str, Any],
 ) -> None:
     artifact_kind = str(diagnostics.get("artifact_kind", "")).strip()
@@ -1163,6 +1551,7 @@ def append_point_record(
             sigma_map=sigma_map,
             wcs_header=wcs_header,
             diagnostics=diagnostics,
+            blos_reference=blos_reference,
             point_payload=point_payload,
         )
         return
@@ -1175,6 +1564,7 @@ def append_point_record(
             sigma_map=sigma_map,
             wcs_header=wcs_header,
             diagnostics=diagnostics,
+            blos_reference=blos_reference,
             point_payload=point_payload,
         )
         return
@@ -1215,6 +1605,7 @@ def append_point_record(
         sigma_map=np.asarray(sigma_map, dtype=float),
         wcs_header=wcs_header,
         diagnostics=dict(diagnostics),
+        blos_reference=blos_reference if blos_reference is not None else payload.get("blos_reference"),
         a_values=a_values,
         b_values=b_values,
         best_q0=best_q0,
@@ -1244,6 +1635,7 @@ def convert_rectangular_artifact_to_sparse(src_h5: Path, dst_h5: Path, *, overwr
         sigma_map=np.asarray(payload["sigma_map"], dtype=float),
         wcs_header=payload["wcs_header"],
         diagnostics=diagnostics,
+        blos_reference=payload.get("blos_reference"),
         point_records=point_records,
     )
 

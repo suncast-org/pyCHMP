@@ -68,14 +68,20 @@ examples that may be added later by pull requests.
   - Requires explicit model and EBTEL paths plus gxrender in the active environment.
   - Runs one or more fixed PSF-plus-noise recovery checks and exits nonzero if a profile fails.
 
-- `python/adaptive_ab_search_single_frequency.py`
-  - Real-data adaptive local `(a, b)` search for a single observational frequency, defaulting to the 2.874 GHz EOVSA workflow.
+- `python/adaptive_ab_search_single_observation.py`
+  - Generic real-data adaptive local `(a, b)` search for a single observational map.
+  - Supports both MW external FITS observations and EUV/UV model-refmap selections.
+  - Defaults to the current 2.874 GHz EOVSA workflow when no explicit observation is supplied.
   - Persists each evaluated point into a sparse H5 artifact using the same
-    point schema as the fixed-grid scan path, including full stored metric
-    histories per q0 trial.
+     point schema as the fixed-grid scan path, including full stored metric
+     histories and per-trial map cubes when available.
   - Completed point results are appended as they arrive so the viewer can
     inspect progress while the run is active without waiting for a batch flush.
   - Supports `--dry-run` to resolve inputs and artifact locations without starting the search.
+
+- `python/adaptive_ab_search_single_frequency.py`
+  - Compatibility wrapper that preserves the original MW-facing entrypoint name.
+  - Delegates to `python/adaptive_ab_search_single_observation.py`.
 
 ## Usage
 
@@ -153,6 +159,8 @@ python examples/python/validate_q0_recovery_earth_eovsa_psf.py \
 ```
 
 ```bash
+python examples/python/adaptive_ab_search_single_observation.py --dry-run
+python examples/python/adaptive_ab_search_single_observation.py
 python examples/python/adaptive_ab_search_single_frequency.py --dry-run
 python examples/python/adaptive_ab_search_single_frequency.py
 ```
@@ -289,7 +297,7 @@ and `scripts/windows/`:
   - Benchmarks serial and process-pool 3x3 scans and writes a CSV report.
 
 - `scripts/unix/adaptive_ab_search_single_frequency_options_test.sh`
-  - Wraps `examples/python/adaptive_ab_search_single_frequency.py` with the same
+  - Wraps `examples/python/adaptive_ab_search_single_observation.py` with the same
     sibling test-data resolution pattern used by the other real-data launchers.
   - Prints both the adaptive-search command and the matching viewer command so
     the sparse artifact can be inspected while the search is running.

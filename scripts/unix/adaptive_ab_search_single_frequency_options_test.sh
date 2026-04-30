@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPTS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYCHMP_REPO="$(cd "$SCRIPTS_ROOT/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$PYCHMP_REPO/.." && pwd)"
+ADAPTIVE_ENTRYPOINT="examples/python/adaptive_ab_search_single_observation.py"
 
 TESTDATA_REPO="${PYCHMP_TESTDATA_REPO:-$WORKSPACE_ROOT/pyGXrender-test-data}"
 DRY_RUN=0
@@ -27,11 +28,34 @@ CLI_Q0_MAX=""
 CLI_OBS_FITS_PATH=""
 CLI_MODEL_H5_PATH=""
 CLI_EBTEL_PATH=""
+OBS_SOURCE="${OBS_SOURCE:-external_fits}"
+OBS_MAP_ID="${OBS_MAP_ID:-}"
+OBS_PATH_OVERRIDE="${OBS_PATH_OVERRIDE:-}"
+TR_MASK_BMIN_GAUSS="${TR_MASK_BMIN_GAUSS:-1000}"
+METRICS_MASK_THRESHOLD="${METRICS_MASK_THRESHOLD:-0.1}"
+METRICS_MASK_FITS="${METRICS_MASK_FITS:-}"
+EUV_INSTRUMENT="${EUV_INSTRUMENT:-AIA}"
+EUV_RESPONSE_SAV="${EUV_RESPONSE_SAV:-}"
 
 latest_dated_dir() {
   local parent="$1"
   local prefix="$2"
   find "$parent" -maxdepth 1 -mindepth 1 -type d -name "${prefix}_*" | sort | tail -n 1
+}
+
+named_fixture_dir() {
+  local parent="$1"
+  local filename="$2"
+  local match
+  match="$(find "$parent" -type f -name "$filename" | sort | head -n 1)"
+  [[ -n "$match" ]] || return 1
+  dirname "$match"
+}
+
+latest_matching_file() {
+  local parent="$1"
+  local pattern="$2"
+  find "$parent" -maxdepth 1 -type f -name "$pattern" | sort | tail -n 1
 }
 
 python_supports_adaptive_example() {
@@ -142,12 +166,90 @@ while (($#)); do
       CLI_Q0_MAX="$2"
       shift 2
       ;;
+    --obs-source=*)
+      OBS_SOURCE="${1#*=}"
+      shift
+      ;;
+    --obs-source)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-source requires a value argument"; exit 1; }
+      OBS_SOURCE="$2"
+      shift 2
+      ;;
+    --obs-map-id=*)
+      OBS_MAP_ID="${1#*=}"
+      shift
+      ;;
+    --obs-map-id)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-map-id requires a value argument"; exit 1; }
+      OBS_MAP_ID="$2"
+      shift 2
+      ;;
+    --obs-path=*)
+      OBS_PATH_OVERRIDE="${1#*=}"
+      shift
+      ;;
+    --obs-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-path requires a path argument"; exit 1; }
+      OBS_PATH_OVERRIDE="$2"
+      shift 2
+      ;;
+    --tr-mask-bmin-gauss=*)
+      TR_MASK_BMIN_GAUSS="${1#*=}"
+      shift
+      ;;
+    --tr-mask-bmin-gauss)
+      [[ $# -ge 2 ]] || { echo "ERROR: --tr-mask-bmin-gauss requires a value argument"; exit 1; }
+      TR_MASK_BMIN_GAUSS="$2"
+      shift 2
+      ;;
+    --metrics-mask-threshold=*)
+      METRICS_MASK_THRESHOLD="${1#*=}"
+      shift
+      ;;
+    --metrics-mask-threshold)
+      [[ $# -ge 2 ]] || { echo "ERROR: --metrics-mask-threshold requires a value argument"; exit 1; }
+      METRICS_MASK_THRESHOLD="$2"
+      shift 2
+      ;;
+    --metrics-mask-fits=*)
+      METRICS_MASK_FITS="${1#*=}"
+      shift
+      ;;
+    --metrics-mask-fits)
+      [[ $# -ge 2 ]] || { echo "ERROR: --metrics-mask-fits requires a path argument"; exit 1; }
+      METRICS_MASK_FITS="$2"
+      shift 2
+      ;;
+    --euv-instrument=*)
+      EUV_INSTRUMENT="${1#*=}"
+      shift
+      ;;
+    --euv-instrument)
+      [[ $# -ge 2 ]] || { echo "ERROR: --euv-instrument requires a value argument"; exit 1; }
+      EUV_INSTRUMENT="$2"
+      shift 2
+      ;;
+    --euv-response-sav=*)
+      EUV_RESPONSE_SAV="${1#*=}"
+      shift
+      ;;
+    --euv-response-sav)
+      [[ $# -ge 2 ]] || { echo "ERROR: --euv-response-sav requires a path argument"; exit 1; }
+      EUV_RESPONSE_SAV="$2"
+      shift 2
+      ;;
     *)
       EXTRA_ARGS+=("$1")
       shift
       ;;
   esac
 done
+
+OBS_SOURCE="$(printf '%s' "$OBS_SOURCE" | tr '[:upper:]' '[:lower:]')"
+[[ "$OBS_SOURCE" == "external_fits" || "$OBS_SOURCE" == "model_refmap" ]] || {
+  echo "ERROR: --obs-source must be one of: external_fits, model_refmap" >&2
+  exit 1
+}
 
 RUNTIME_CACHE_ROOT="${RUNTIME_CACHE_ROOT:-/tmp/pychmp_runtime_cache}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUNTIME_CACHE_ROOT/matplotlib}"
@@ -175,7 +277,10 @@ if [[ -n "${PYTHON_BIN:-}" ]]; then
   echo "Using PYTHON_BIN override; skipping interpreter probe."
   PYTHON_CMD="$PYTHON_BIN"
 else
-  if [[ -x "$HOME/miniforge3/bin/python" ]]; then
+  if [[ -x "$HOME/miniforge3/envs/suncast/bin/python" ]] && python_supports_adaptive_example "$HOME/miniforge3/envs/suncast/bin/python"; then
+    echo "Using preferred interpreter: $HOME/miniforge3/envs/suncast/bin/python"
+    PYTHON_CMD="$HOME/miniforge3/envs/suncast/bin/python"
+  elif [[ -x "$HOME/miniforge3/bin/python" ]] && python_supports_adaptive_example "$HOME/miniforge3/bin/python"; then
     echo "Using preferred interpreter: $HOME/miniforge3/bin/python"
     PYTHON_CMD="$HOME/miniforge3/bin/python"
   else
@@ -184,7 +289,6 @@ else
       "$WORKSPACE_ROOT/pyCHMP/.conda/python.exe"
       "$WORKSPACE_ROOT/gximagecomputing/.conda/bin/python"
       "$WORKSPACE_ROOT/gximagecomputing/.conda/python.exe"
-      "$HOME/miniforge3/envs/suncast/bin/python"
     )
     if [[ -d "$HOME/.conda/envs" ]]; then
       while IFS= read -r env_python; do
@@ -212,12 +316,20 @@ fi
 EOVSA_MAPS_ROOT="$TESTDATA_REPO/raw/eovsa_maps"
 MODELS_ROOT="$TESTDATA_REPO/raw/models"
 EBTEL_PATH="${EBTEL_PATH:-$TESTDATA_REPO/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav}"
+RESPONSES_ROOT="$TESTDATA_REPO/raw/responses"
 [[ -d "$TESTDATA_REPO" ]] || { echo "ERROR: Test-data repository not found: $TESTDATA_REPO"; exit 1; }
 
-LATEST_EOVSA_DIR="$(latest_dated_dir "$EOVSA_MAPS_ROOT" "eovsa_maps")"
-LATEST_MODEL_DIR="$(latest_dated_dir "$MODELS_ROOT" "models")"
+LATEST_EOVSA_DIR="$(named_fixture_dir "$EOVSA_MAPS_ROOT" "eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" || true)"
+LATEST_MODEL_DIR="$(named_fixture_dir "$MODELS_ROOT" "hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" || true)"
 OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits}"
 MODEL_H5_PATH="${MODEL_H5_PATH:-$LATEST_MODEL_DIR/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5}"
+LATEST_RESPONSE_DIR="$(latest_dated_dir "$RESPONSES_ROOT" "*")"
+if [[ -z "${LATEST_RESPONSE_DIR:-}" || ! -d "$LATEST_RESPONSE_DIR" ]]; then
+  LATEST_RESPONSE_DIR="$(find "$RESPONSES_ROOT" -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)"
+fi
+if [[ -z "$EUV_RESPONSE_SAV" && -n "${LATEST_RESPONSE_DIR:-}" && -d "$LATEST_RESPONSE_DIR" ]]; then
+  EUV_RESPONSE_SAV="$(latest_matching_file "$LATEST_RESPONSE_DIR" 'resp_aia*.sav')"
+fi
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-/tmp/pychmp_adaptive_ab_runs}"
 ARTIFACTS_STEM="${ARTIFACTS_STEM:-adaptive_ab_search_single_frequency}"
 TARGET_METRIC="${TARGET_METRIC:-chi2}"
@@ -290,14 +402,15 @@ mkdir -p "$ARTIFACTS_DIR"
 
 [[ -n "${LATEST_EOVSA_DIR:-}" && -d "$LATEST_EOVSA_DIR" ]] || { echo "ERROR: No dated EOVSA folder found under: $EOVSA_MAPS_ROOT"; exit 1; }
 [[ -n "${LATEST_MODEL_DIR:-}" && -d "$LATEST_MODEL_DIR" ]] || { echo "ERROR: No dated model folder found under: $MODELS_ROOT"; exit 1; }
-[[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
 [[ -f "$MODEL_H5_PATH" ]] || { echo "ERROR: Model H5 file not found: $MODEL_H5_PATH"; exit 1; }
 [[ -f "$EBTEL_PATH" ]] || { echo "ERROR: EBTEL .sav file not found: $EBTEL_PATH"; exit 1; }
 [[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with the adaptive-example dependency set."; exit 1; }
+if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  [[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
+fi
 
 ARGS=(
-  "$OBS_FITS_PATH"
-  "$MODEL_H5_PATH"
+  --model-h5 "$MODEL_H5_PATH"
   --ebtel-path "$EBTEL_PATH"
   --a-start "$A_START"
   --b-start "$B_START"
@@ -311,12 +424,54 @@ ARGS=(
   --q0-max "$Q0_MAX"
   --target-metric "$TARGET_METRIC"
   --adaptive-bracketing
-  --fallback-psf-bmaj-arcsec 5.77
-  --fallback-psf-bmin-arcsec 5.77
-  --fallback-psf-bpa-deg -17.5
-  --psf-ref-frequency-ghz 17.0
-  --psf-scale-inverse-frequency
+  --metrics-mask-threshold "$METRICS_MASK_THRESHOLD"
+  --tr-mask-bmin-gauss "$TR_MASK_BMIN_GAUSS"
 )
+
+if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  ARGS=(
+    "$OBS_FITS_PATH"
+    "$MODEL_H5_PATH"
+    --ebtel-path "$EBTEL_PATH"
+    --a-start "$A_START"
+    --b-start "$B_START"
+    --da "$DA"
+    --db "$DB"
+    --a-min "$A_MIN"
+    --a-max "$A_MAX"
+    --b-min "$B_MIN"
+    --b-max "$B_MAX"
+    --q0-min "$Q0_MIN"
+    --q0-max "$Q0_MAX"
+    --target-metric "$TARGET_METRIC"
+    --adaptive-bracketing
+    --metrics-mask-threshold "$METRICS_MASK_THRESHOLD"
+    --tr-mask-bmin-gauss "$TR_MASK_BMIN_GAUSS"
+    --fallback-psf-bmaj-arcsec 5.77
+    --fallback-psf-bmin-arcsec 5.77
+    --fallback-psf-bpa-deg -17.5
+    --psf-ref-frequency-ghz 17.0
+    --psf-scale-inverse-frequency
+  )
+else
+  ARGS+=(--obs-source model_refmap)
+  if [[ -n "$OBS_MAP_ID" ]]; then
+    ARGS+=(--obs-map-id "$OBS_MAP_ID")
+  fi
+  if [[ -n "$EUV_INSTRUMENT" ]]; then
+    ARGS+=(--euv-instrument "$EUV_INSTRUMENT")
+  fi
+  if [[ -n "$EUV_RESPONSE_SAV" ]]; then
+    ARGS+=(--euv-response-sav "$EUV_RESPONSE_SAV")
+  fi
+fi
+
+if [[ -n "$METRICS_MASK_FITS" ]]; then
+  ARGS+=(--metrics-mask-fits "$METRICS_MASK_FITS")
+fi
+if [[ -n "$OBS_PATH_OVERRIDE" ]]; then
+  ARGS+=(--obs-path "$OBS_PATH_OVERRIDE")
+fi
 
 if [[ -n "${ARTIFACT_H5:-}" ]]; then
   ARGS+=(--artifact-h5 "$ARTIFACT_H5")
@@ -326,19 +481,53 @@ else
   VIEWER_ARTIFACT_PATH="$ARTIFACTS_DIR/$ARTIFACTS_STEM.h5"
 fi
 
+RUN_CMD=(
+  "$PYTHON_CMD"
+  "$ADAPTIVE_ENTRYPOINT"
+  "${ARGS[@]}"
+)
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  RUN_CMD+=("${EXTRA_ARGS[@]}")
+fi
+VIEW_CMD=(
+  "$PYTHON_CMD"
+  examples/pychmp_view.py
+  "$VIEWER_ARTIFACT_PATH"
+)
+
 cd "$PYCHMP_REPO"
 echo "Using Python: $PYTHON_CMD"
 echo "Using test-data repo: $TESTDATA_REPO"
 echo "Using EOVSA folder: $LATEST_EOVSA_DIR"
 echo "Using model folder: $LATEST_MODEL_DIR"
+echo "Using observation source: $OBS_SOURCE"
+if [[ "$OBS_SOURCE" == "model_refmap" && -n "$OBS_MAP_ID" ]]; then
+  echo "Using observation map id: $OBS_MAP_ID"
+fi
+if [[ "$OBS_SOURCE" == "model_refmap" ]]; then
+  if [[ -n "${LATEST_RESPONSE_DIR:-}" ]]; then
+    echo "Using response folder: $LATEST_RESPONSE_DIR"
+  fi
+  if [[ -n "$EUV_INSTRUMENT" ]]; then
+    echo "Using EUV instrument: $EUV_INSTRUMENT"
+  fi
+  if [[ -n "$EUV_RESPONSE_SAV" ]]; then
+    echo "Using EUV response SAV: $EUV_RESPONSE_SAV"
+  fi
+fi
+echo "Using EUV TR-mask Bmin [G]: $TR_MASK_BMIN_GAUSS"
+echo "Using metrics-mask threshold: $METRICS_MASK_THRESHOLD"
+if [[ -n "$METRICS_MASK_FITS" ]]; then
+  echo "Using metrics-mask FITS: $METRICS_MASK_FITS"
+fi
 if [[ -n "${ARTIFACT_H5:-}" ]]; then
   echo "Artifact mode: explicit artifact-h5 ($ARTIFACT_H5)"
 else
   echo "Artifact mode: reusable artifacts-dir/stem ($VIEWER_ARTIFACT_PATH)"
 fi
-print_cmd "$PYTHON_CMD" examples/python/adaptive_ab_search_single_frequency.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
-print_cmd "$PYTHON_CMD" examples/pychmp_view.py "$VIEWER_ARTIFACT_PATH"
-echo "Launching adaptive_ab_search_single_frequency.py..."
+print_cmd "${RUN_CMD[@]}"
+print_cmd "${VIEW_CMD[@]}"
+echo "Launching $(basename "$ADAPTIVE_ENTRYPOINT")..."
 if (( DRY_RUN )); then
   echo "Dry run only; command not executed."
   exit 0
@@ -349,8 +538,12 @@ if [[ -n "${MSYS2_ENV_CONV_EXCL:-}" ]]; then
 else
   export MSYS2_ENV_CONV_EXCL="PYCHMP_WRAPPER_COMMAND"
 fi
-PYCHMP_WRAPPER_COMMAND="$(command_text bash "$0" "${ORIGINAL_ARGS[@]}")"
-"$PYTHON_CMD" examples/python/adaptive_ab_search_single_frequency.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+WRAPPER_CMD=(bash "$0")
+if [[ ${#ORIGINAL_ARGS[@]} -gt 0 ]]; then
+  WRAPPER_CMD+=("${ORIGINAL_ARGS[@]}")
+fi
+PYCHMP_WRAPPER_COMMAND="$(command_text "${WRAPPER_CMD[@]}")"
+"${RUN_CMD[@]}"
 
 echo "Artifacts directory: $ARTIFACTS_DIR"
 if [[ -n "${ARTIFACT_H5:-}" ]]; then

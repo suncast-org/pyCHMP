@@ -8,7 +8,12 @@ import numpy as np
 import pytest
 
 import pychmp.gxrender_adapter as gxrender_adapter
-from pychmp.gxrender_adapter import GXRenderMWAdapter
+from pychmp.gxrender_adapter import (
+    GXRenderEUVAdapter,
+    GXRenderMWAdapter,
+    build_tr_region_mask_from_blos,
+    recombine_euv_components,
+)
 
 
 class FakeSDK:
@@ -23,6 +28,14 @@ class FakeSDK:
             self.ny = kwargs.get("ny")
             self.xrange = kwargs.get("xrange")
             self.yrange = kwargs.get("yrange")
+
+    class CoronalPlasmaParameters:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class EUVRenderOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
 
 
 class FakeGXRender:
@@ -51,6 +64,29 @@ class FakeGXRender:
         ):
             cube = np.full((int(ny), int(nx), 1), float(q0), dtype=float)
             return {"TI": cube}
+
+
+class FakeEUVResult:
+    def __init__(self, cube: np.ndarray, *, channels: list[str]):
+        self.flux_corona = cube
+        self.flux_tr = cube * 2.0
+        self.response = SimpleNamespace(channels=channels)
+
+
+class FakeSDKWithEUV(FakeSDK):
+    last_euv_options = None
+
+    @staticmethod
+    def render_euv_maps(options):
+        FakeSDKWithEUV.last_euv_options = options
+        cube = np.stack(
+            [
+                np.full((2, 3), 2.0, dtype=float),
+                np.full((2, 3), 4.0, dtype=float),
+            ],
+            axis=-1,
+        )
+        return FakeEUVResult(cube, channels=["A94", "A171"])
 
 
 class WrongCubeGXRender(FakeGXRender):
@@ -239,3 +275,111 @@ def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -
         assert FakeRenderMWWorkflow.last_args is not None
         assert FakeRenderMWWorkflow.last_args.observer == "earth"
         assert Path(tmpdir, "demo_map.h5").exists()
+
+
+def test_gxrender_euv_adapter_renders_single_channel_sum_map(monkeypatch) -> None:
+    """Render a single-channel EUV map and sum corona+TR flux."""
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
+    monkeypatch.setattr(gxrender_adapter, "_resolve_default_euv_response_sav", lambda *, instrument: Path(f"{instrument}.sav"))
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    image = adapter.render(0.0217)
+
+    assert image.shape == (2, 3)
+    assert np.allclose(image, 12.0)
+    assert FakeSDKWithEUV.last_euv_options is not None
+    assert FakeSDKWithEUV.last_euv_options.kwargs["channels"] == ["171"]
+    assert FakeSDKWithEUV.last_euv_options.kwargs["instrument"] == "AIA"
+
+
+def test_build_tr_region_mask_from_blos_uses_absolute_threshold() -> None:
+    blos = np.asarray([[500.0, -1200.0], [np.nan, 1800.0]], dtype=float)
+
+    mask = build_tr_region_mask_from_blos(blos, threshold_gauss=1000.0)
+
+    expected = np.asarray([[False, True], [False, True]], dtype=bool)
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_recombine_euv_components_applies_tr_mask() -> None:
+    coronal = np.asarray([[1.0, 1.0], [1.0, 1.0]], dtype=float)
+    tr = np.asarray([[10.0, 20.0], [30.0, 40.0]], dtype=float)
+    mask = np.asarray([[True, False], [False, True]], dtype=bool)
+
+    combined = recombine_euv_components(coronal, tr, tr_region_mask=mask)
+
+    np.testing.assert_allclose(combined, np.asarray([[11.0, 1.0], [1.0, 41.0]], dtype=float))
+
+
+def test_gxrender_euv_adapter_render_components_returns_masked_components(monkeypatch) -> None:
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
+    monkeypatch.setattr(gxrender_adapter, "_resolve_default_euv_response_sav", lambda *, instrument: Path(f"{instrument}.sav"))
+
+    tr_mask = np.asarray([[True, False, True], [False, True, False]], dtype=bool)
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+        tr_region_mask=tr_mask,
+    )
+
+    payload = adapter.render_components(0.0217)
+
+    np.testing.assert_allclose(payload["flux_corona"], np.full((2, 3), 4.0, dtype=float))
+    np.testing.assert_allclose(payload["flux_tr"], np.full((2, 3), 8.0, dtype=float))
+    np.testing.assert_array_equal(payload["tr_region_mask"], tr_mask)
+    np.testing.assert_allclose(
+        payload["rendered"],
+        np.asarray([[12.0, 4.0, 12.0], [4.0, 12.0, 4.0]], dtype=float),
+    )
+
+
+def test_gxrender_euv_adapter_sanitizes_nonfinite_pixels(monkeypatch) -> None:
+    """Clamp localized non-finite EUV pixels so the optimizer sees finite maps."""
+
+    class FakeSDKWithNonFinite(FakeSDK):
+        @staticmethod
+        def render_euv_maps(options):
+            del options
+            cube = np.stack(
+                [
+                    np.array([[1.0, np.inf], [np.nan, 4.0]], dtype=float),
+                    np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float),
+                ],
+                axis=-1,
+            )
+            return FakeEUVResult(cube, channels=["A94", "A171"])
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithNonFinite)
+    monkeypatch.setattr(gxrender_adapter, "_resolve_default_euv_response_sav", lambda *, instrument: Path(f"{instrument}.sav"))
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="94",
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    image = adapter.render(0.0217)
+
+    assert np.isfinite(image).all()
+    np.testing.assert_allclose(image, np.array([[3.0, 12.0], [0.0, 12.0]], dtype=float))

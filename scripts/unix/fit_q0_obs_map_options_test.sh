@@ -17,10 +17,10 @@ set -euo pipefail
 # Data resolution policy:
 # - EBTEL is taken from the fixed path:
 #     raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav
-# - Observational FITS maps are taken from the newest dated folder under:
-#     raw/eovsa_maps/eovsa_maps_<timestamp>/
-# - Matching models are taken from the newest dated folder under:
-#     raw/models/models_<timestamp>/
+# - Observational FITS maps are resolved by known fixture filename under:
+#     raw/eovsa_maps/eovsa_maps_<observation-epoch>/
+# - Matching models are resolved by known fixture filename under:
+#     raw/models/models_<model-epoch>/
 # - Within those dated folders, the active observational map is selected by the
 #   OBS_FITS_PATH assignment block below, and the matching model is selected by
 #   MODEL_H5_PATH below.
@@ -41,11 +41,26 @@ WORKSPACE_ROOT="$(cd "$PYCHMP_REPO/.." && pwd)"
 TESTDATA_REPO="${PYCHMP_TESTDATA_REPO:-$WORKSPACE_ROOT/pyGXrender-test-data}"
 DRY_RUN=0
 EXTRA_ARGS=()
+TR_MASK_BMIN_GAUSS="${TR_MASK_BMIN_GAUSS:-1000}"
+METRICS_MASK_THRESHOLD="${METRICS_MASK_THRESHOLD:-0.1}"
+METRICS_MASK_FITS="${METRICS_MASK_FITS:-}"
+OBS_SOURCE="${OBS_SOURCE:-external_fits}"
+OBS_MAP_ID="${OBS_MAP_ID:-}"
+OBS_PATH_OVERRIDE="${OBS_PATH_OVERRIDE:-}"
 
 latest_dated_dir() {
   local parent="$1"
   local prefix="$2"
   find "$parent" -maxdepth 1 -mindepth 1 -type d -name "${prefix}_*" | sort | tail -n 1
+}
+
+named_fixture_dir() {
+  local parent="$1"
+  local filename="$2"
+  local match
+  match="$(find "$parent" -type f -name "$filename" | sort | head -n 1)"
+  [[ -n "$match" ]] || return 1
+  dirname "$match"
 }
 
 print_cmd() {
@@ -54,13 +69,96 @@ print_cmd() {
   printf '\n'
 }
 
-for arg in "$@"; do
-  if [[ "$arg" == "--dry-run" ]]; then
-    DRY_RUN=1
-  else
-    EXTRA_ARGS+=("$arg")
-  fi
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --tr-mask-bmin-gauss=*)
+      TR_MASK_BMIN_GAUSS="${1#*=}"
+      shift
+      ;;
+    --tr-mask-bmin-gauss)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --tr-mask-bmin-gauss requires a numeric value." >&2
+        exit 1
+      fi
+      TR_MASK_BMIN_GAUSS="$2"
+      shift 2
+      ;;
+    --metrics-mask-threshold=*)
+      METRICS_MASK_THRESHOLD="${1#*=}"
+      shift
+      ;;
+    --metrics-mask-threshold)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --metrics-mask-threshold requires a numeric value." >&2
+        exit 1
+      fi
+      METRICS_MASK_THRESHOLD="$2"
+      shift 2
+      ;;
+    --metrics-mask-fits=*)
+      METRICS_MASK_FITS="${1#*=}"
+      shift
+      ;;
+    --metrics-mask-fits)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --metrics-mask-fits requires a file path." >&2
+        exit 1
+      fi
+      METRICS_MASK_FITS="$2"
+      shift 2
+      ;;
+    --obs-source=*)
+      OBS_SOURCE="${1#*=}"
+      shift
+      ;;
+    --obs-source)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --obs-source requires a value." >&2
+        exit 1
+      fi
+      OBS_SOURCE="$2"
+      shift 2
+      ;;
+    --obs-map-id=*)
+      OBS_MAP_ID="${1#*=}"
+      shift
+      ;;
+    --obs-map-id)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --obs-map-id requires a value." >&2
+        exit 1
+      fi
+      OBS_MAP_ID="$2"
+      shift 2
+      ;;
+    --obs-path=*)
+      OBS_PATH_OVERRIDE="${1#*=}"
+      shift
+      ;;
+    --obs-path)
+      if [[ $# -lt 2 ]]; then
+        echo "ERROR: --obs-path requires a file path." >&2
+        exit 1
+      fi
+      OBS_PATH_OVERRIDE="$2"
+      shift 2
+      ;;
+    *)
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
 done
+
+OBS_SOURCE="$(printf '%s' "$OBS_SOURCE" | tr '[:upper:]' '[:lower:]')"
+[[ "$OBS_SOURCE" == "external_fits" || "$OBS_SOURCE" == "model_refmap" ]] || {
+  echo "ERROR: --obs-source must be one of: external_fits, model_refmap" >&2
+  exit 1
+}
 
 RUNTIME_CACHE_ROOT="${RUNTIME_CACHE_ROOT:-/tmp/pychmp_runtime_cache}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUNTIME_CACHE_ROOT/matplotlib}"
@@ -128,8 +226,8 @@ if [[ ! -d "$TESTDATA_REPO" ]]; then
   exit 1
 fi
 
-LATEST_EOVSA_DIR="$(latest_dated_dir "$EOVSA_MAPS_ROOT" "eovsa_maps")"
-LATEST_MODEL_DIR="$(latest_dated_dir "$MODELS_ROOT" "models")"
+LATEST_EOVSA_DIR="$(named_fixture_dir "$EOVSA_MAPS_ROOT" "eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" || true)"
+LATEST_MODEL_DIR="$(named_fixture_dir "$MODELS_ROOT" "hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" || true)"
 
 # OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f1.418GHz.tb.disk.fits}"
 OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits}"
@@ -157,32 +255,75 @@ mkdir -p "$ARTIFACTS_DIR"
 [[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with gxrender installed."; exit 1; }
 
 ARGS=(
-  "$OBS_FITS_PATH"
-  "$MODEL_H5_PATH"
+  --model-h5 "$MODEL_H5_PATH"
   --ebtel-path "$EBTEL_PATH"
   --q0-min 0.01
   --q0-max 2.5
   --target-metric chi2
-  --psf-bmaj-arcsec 5.77
-  --psf-bmin-arcsec 5.77
-  --psf-bpa-deg -17.5
-  --psf-ref-frequency-ghz 17.0
-  --psf-scale-inverse-frequency
+  --metrics-mask-threshold "$METRICS_MASK_THRESHOLD"
+  --tr-mask-bmin-gauss "$TR_MASK_BMIN_GAUSS"
   --artifacts-dir "$ARTIFACTS_DIR"
   --show-plot
 )
+if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  ARGS=(
+    "$OBS_FITS_PATH"
+    "$MODEL_H5_PATH"
+    --ebtel-path "$EBTEL_PATH"
+    --q0-min 0.01
+    --q0-max 2.5
+    --target-metric chi2
+    --metrics-mask-threshold "$METRICS_MASK_THRESHOLD"
+    --tr-mask-bmin-gauss "$TR_MASK_BMIN_GAUSS"
+    --psf-bmaj-arcsec 5.77
+    --psf-bmin-arcsec 5.77
+    --psf-bpa-deg -17.5
+    --psf-ref-frequency-ghz 17.0
+    --psf-scale-inverse-frequency
+    --artifacts-dir "$ARTIFACTS_DIR"
+    --show-plot
+  )
+else
+  ARGS+=(--obs-source model_refmap)
+  if [[ -n "$OBS_MAP_ID" ]]; then
+    ARGS+=(--obs-map-id "$OBS_MAP_ID")
+  fi
+fi
+if [[ -n "$METRICS_MASK_FITS" ]]; then
+  ARGS+=(--metrics-mask-fits "$METRICS_MASK_FITS")
+fi
+if [[ -n "$OBS_PATH_OVERRIDE" ]]; then
+  ARGS+=(--obs-path "$OBS_PATH_OVERRIDE")
+fi
 
 cd "$PYCHMP_REPO"
 echo "Using Python: $PYTHON_CMD"
 echo "Using test-data repo: $TESTDATA_REPO"
 echo "Using EOVSA folder: $LATEST_EOVSA_DIR"
 echo "Using model folder: $LATEST_MODEL_DIR"
-print_cmd "$PYTHON_CMD" examples/fit_q0_obs_map.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+echo "Using observation source: $OBS_SOURCE"
+if [[ "$OBS_SOURCE" == "model_refmap" && -n "$OBS_MAP_ID" ]]; then
+  echo "Using observation map id: $OBS_MAP_ID"
+fi
+echo "Using EUV TR-mask Bmin [G]: $TR_MASK_BMIN_GAUSS"
+echo "Using metrics-mask threshold: $METRICS_MASK_THRESHOLD"
+if [[ -n "$METRICS_MASK_FITS" ]]; then
+  echo "Using metrics-mask FITS: $METRICS_MASK_FITS"
+fi
+if ((${#EXTRA_ARGS[@]})); then
+  print_cmd "$PYTHON_CMD" examples/fit_q0_obs_map.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+else
+  print_cmd "$PYTHON_CMD" examples/fit_q0_obs_map.py "${ARGS[@]}"
+fi
 if (( DRY_RUN )); then
   echo "Dry run only; command not executed."
   exit 0
 fi
-"$PYTHON_CMD" examples/fit_q0_obs_map.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+if ((${#EXTRA_ARGS[@]})); then
+  "$PYTHON_CMD" examples/fit_q0_obs_map.py "${ARGS[@]}" "${EXTRA_ARGS[@]}"
+else
+  "$PYTHON_CMD" examples/fit_q0_obs_map.py "${ARGS[@]}"
+fi
 
 echo "Artifacts directory: $ARTIFACTS_DIR"
 echo "Artifacts stem hint: $ARTIFACTS_STEM"

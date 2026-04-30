@@ -7,28 +7,30 @@ Usage:
     python estimate_map_noise_cli.py /path/to/map.fits --method histogram_clip
 """
 
+from __future__ import annotations
+
 import argparse
 from pathlib import Path
 
 import numpy as np
 from astropy.wcs import WCS
 
-from pychmp import estimate_map_noise, extract_frequency_ghz, load_2d_fits_image
+from pychmp import ObservationalMap, estimate_map_noise, estimate_obs_map_noise, load_obs_map
 
 
-def load_fits_map(fits_path: Path) -> tuple:
-    """Load FITS map and extract data, header, frequency."""
-    data, header, hdu_name = load_2d_fits_image(fits_path)
-    print(f"Loaded image HDU: {hdu_name}")
-    try:
-        freq_ghz = extract_frequency_ghz(header)
-    except ValueError:
-        freq_ghz = None
-    return data, header, freq_ghz
+def load_observational_map(fits_path: Path) -> ObservationalMap:
+    """Load a FITS observation through the shared observational-map path."""
+
+    obs_map = load_obs_map(obs_path=fits_path)
+    source_hdu = None if obs_map.wcs_metadata is None else obs_map.wcs_metadata.get("hdu_name")
+    if source_hdu is not None:
+        print(f"Loaded image HDU: {source_hdu}")
+    return obs_map
 
 
-def print_data_stats(data: np.ndarray, freq_ghz: float | None = None):
+def print_data_stats(obs_map: ObservationalMap):
     """Print summary statistics of the map data."""
+    data = np.asarray(obs_map.data, dtype=float)
     print("\n" + "=" * 70)
     print("MAP DATA STATISTICS")
     print("=" * 70)
@@ -40,17 +42,25 @@ def print_data_stats(data: np.ndarray, freq_ghz: float | None = None):
     print(f"Median:          {np.median(data):15.2f}")
     print(f"Std dev:         {np.std(data):15.2f}")
     print(f"Total pixels:    {data.size:15,d}")
-    if freq_ghz is not None:
-        print(f"Frequency:       {freq_ghz:15.3f} GHz")
+    if obs_map.instrument:
+        print(f"Instrument:      {obs_map.instrument:>15s}")
+    if obs_map.domain:
+        print(f"Domain:          {obs_map.domain:>15s}")
+    if obs_map.spectral_label:
+        print(f"Spectral label:  {obs_map.spectral_label:>15s}")
+    if obs_map.frequency_ghz is not None:
+        print(f"Frequency:       {obs_map.frequency_ghz:15.3f} GHz")
+    if obs_map.wavelength_angstrom is not None:
+        print(f"Wavelength:      {obs_map.wavelength_angstrom:15.1f} A")
 
 
-def test_histogram_clip(data: np.ndarray) -> dict:
+def test_histogram_clip(obs_map: ObservationalMap) -> dict:
     """Test histogram_clip method."""
     print("\n" + "=" * 70)
     print("METHOD: histogram_clip (percentile + sigma-clipping)")
     print("=" * 70)
 
-    result = estimate_map_noise(data, method="histogram_clip")
+    result = estimate_obs_map_noise(obs_map, method="histogram_clip")
 
     print(f"Estimated sigma:     {result.sigma:15.4f}")
     print(f"Pixels in background: {result.n_pixels_used:15,d}")
@@ -65,18 +75,18 @@ def test_histogram_clip(data: np.ndarray) -> dict:
     return {"method": "histogram_clip", "sigma": result.sigma, "result": result}
 
 
-def test_offlimb_mad(data: np.ndarray, header: dict) -> dict | None:
+def test_offlimb_mad(obs_map: ObservationalMap) -> dict | None:
     """Test offlimb_mad method with WCS from FITS header."""
     print("\n" + "=" * 70)
     print("METHOD: offlimb_mad (off-limb Median Absolute Deviation)")
     print("=" * 70)
 
     try:
-        wcs = WCS(header)
+        wcs = WCS(obs_map.header)
         print("WCS loaded successfully from FITS header")
         print(f"WCS projection: {wcs.wcs.ctype}")
 
-        result = estimate_map_noise(data, wcs=wcs, method="offlimb_mad")
+        result = estimate_map_noise(np.asarray(obs_map.data, dtype=float), wcs=wcs, method="offlimb_mad")
 
         print(f"Estimated sigma:     {result.sigma:15.4f}")
         print(f"Pixels in annulus:   {result.n_pixels_used:15,d}")
@@ -165,19 +175,19 @@ Examples:
     print(f"{'=' * 70}")
     print(f"File: {args.fits_file}")
 
-    data, header, freq_ghz = load_fits_map(args.fits_file)
+    obs_map = load_observational_map(args.fits_file)
 
     # Print statistics
-    print_data_stats(data, freq_ghz)
+    print_data_stats(obs_map)
 
     # Run selected methods
     results = []
 
     if args.method in ["histogram_clip", "all"]:
-        results.append(test_histogram_clip(data))
+        results.append(test_histogram_clip(obs_map))
 
     if args.method in ["offlimb_mad", "all"]:
-        result = test_offlimb_mad(data, header)
+        result = test_offlimb_mad(obs_map)
         if result:
             results.append(result)
 

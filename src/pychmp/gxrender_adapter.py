@@ -4,11 +4,55 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from importlib import import_module
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+
+
+def build_tr_region_mask_from_blos(
+    blos_map: np.ndarray,
+    *,
+    threshold_gauss: float = 1000.0,
+    use_absolute_field: bool = True,
+) -> np.ndarray:
+    """Build a simple EUV transition-region mask from a projected B_los map."""
+
+    arr = np.asarray(blos_map, dtype=float)
+    threshold = float(threshold_gauss)
+    if not np.isfinite(threshold) or threshold < 0.0:
+        raise ValueError(f"threshold_gauss must be a finite non-negative scalar, got {threshold_gauss!r}")
+    field = np.abs(arr) if bool(use_absolute_field) else arr
+    mask = np.isfinite(field) & (field >= threshold)
+    return np.asarray(mask, dtype=bool)
+
+
+def recombine_euv_components(
+    flux_corona: np.ndarray,
+    flux_tr: np.ndarray,
+    *,
+    tr_region_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Combine EUV coronal/TR components under a chosen transition-region mask.
+
+    Current pyCHMP assumes the TR mask is a downstream gate on an already
+    computed TR contribution. If upstream voxel typing or TR physics later
+    become mask-dependent in pyGXrender, this helper and the artifact contract
+    are the main places that must change.
+    """
+
+    cor = np.asarray(flux_corona, dtype=float)
+    tr = np.asarray(flux_tr, dtype=float)
+    if cor.shape != tr.shape:
+        raise ValueError(f"EUV component shape mismatch: {cor.shape} vs {tr.shape}")
+    if tr_region_mask is None:
+        return cor + tr
+    mask = np.asarray(tr_region_mask, dtype=bool)
+    if mask.shape != cor.shape:
+        raise ValueError(f"TR region mask shape mismatch: {mask.shape} vs {cor.shape}")
+    return cor + (tr * mask.astype(float))
 
 
 def _load_gxrender_sdk() -> Any:
@@ -57,6 +101,37 @@ def _load_render_mw_workflow() -> Any:
             "gxrender microwave workflow helpers are not importable. Install gximagecomputing/pyGXrender "
             "into the active environment before using GXRenderMWAdapter."
         ) from exc
+
+
+def _load_gxrender_test_data_helpers() -> Any:
+    try:
+        return import_module("gxrender.utils.test_data")
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "gxrender test-data helpers are not importable. Install gximagecomputing/pyGXrender "
+            "into the active environment before using GXRenderEUVAdapter."
+        ) from exc
+
+
+def _resolve_default_euv_response_sav(*, instrument: str) -> Path | None:
+    env_path = Path(str(os.environ.get("GXIMAGECOMPUTING_EUV_RESPONSE_SAV", "")).strip()).expanduser()
+    if str(env_path) and str(env_path) != ".":
+        if env_path.exists():
+            return env_path
+        raise FileNotFoundError(f"GXIMAGECOMPUTING_EUV_RESPONSE_SAV points to a missing file: {env_path}")
+
+    helpers = _load_gxrender_test_data_helpers()
+    candidate = helpers.try_find_response_file(str(instrument).strip().lower())
+    if candidate is None:
+        return None
+    return Path(candidate)
+
+
+def _normalize_euv_channel_token(value: str) -> str:
+    token = "".join(ch for ch in str(value).strip().upper() if ch not in {" ", "_", "-"})
+    while token and token[0].isalpha():
+        token = token[1:]
+    return token
 
 
 @dataclass(slots=True)
@@ -271,3 +346,144 @@ class GXRenderMWAdapter:
             selective_heating=bool(self.selective_heating),
             shtable=self.shtable,
         )
+
+
+@dataclass(slots=True)
+class GXRenderEUVAdapter:
+    """Concrete Q0 renderer backed by gxrender's EUV workflow."""
+
+    model_path: str | Path
+    channel: str
+    instrument: str = "AIA"
+    response_sav: str | Path | None = None
+    model_format: str = "auto"
+    ebtel_path: str | None = None
+    tbase: float | None = None
+    nbase: float | None = None
+    a: float | None = None
+    b: float | None = None
+    mode: int = 0
+    selective_heating: bool = False
+    shtable: Any | None = None
+    omp_threads: int = 8
+    pixel_scale_arcsec: float = 2.0
+    geometry: Any | None = None
+    observer: Any | None = None
+    tr_region_mask: np.ndarray | None = None
+    output_dir: str | Path | None = None
+    output_name: str | None = None
+    verbose: bool = False
+    render_call_count: int = 0
+
+    def __post_init__(self) -> None:
+        instrument = str(self.instrument).strip()
+        if not instrument:
+            raise ValueError("instrument must be a non-empty string")
+        self.instrument = instrument
+
+        channel = str(self.channel).strip()
+        if not channel:
+            raise ValueError("channel must be a non-empty string")
+        self.channel = channel
+
+        if self.response_sav is None:
+            self.response_sav = _resolve_default_euv_response_sav(instrument=self.instrument)
+
+    def render_components(self, q0: float) -> dict[str, Any]:
+        self.render_call_count += 1
+        sdk = _load_gxrender_sdk()
+
+        geometry = self.geometry
+        if geometry is None:
+            geometry = sdk.MapGeometry(pixel_scale_arcsec=float(self.pixel_scale_arcsec))
+
+        plasma = sdk.CoronalPlasmaParameters(
+            tbase=float(self.tbase),
+            nbase=float(self.nbase),
+            q0=float(q0),
+            a=float(self.a),
+            b=float(self.b),
+            mode=int(self.mode),
+            selective_heating=bool(self.selective_heating),
+            shtable=self.shtable,
+        )
+        options = sdk.EUVRenderOptions(
+            model_path=Path(self.model_path),
+            model_format=str(self.model_format),
+            ebtel_path=self.ebtel_path,
+            output_dir=(Path(self.output_dir) if self.output_dir is not None else None),
+            output_name=self.output_name,
+            channels=[str(self.channel)],
+            instrument=str(self.instrument),
+            response_sav=(None if self.response_sav is None else Path(self.response_sav)),
+            plasma=plasma,
+            omp_threads=int(self.omp_threads),
+            geometry=geometry,
+            observer=self.observer,
+            save_outputs=bool(self.output_dir),
+            write_preview=False,
+            verbose=bool(self.verbose),
+        )
+        result = sdk.render_euv_maps(options)
+        flux_corona = np.asarray(result.flux_corona, dtype=float)
+        flux_tr = np.asarray(result.flux_tr, dtype=float)
+        if flux_corona.shape != flux_tr.shape:
+            raise ValueError(
+                "expected EUV corona and transition-region cubes with identical shapes, got "
+                f"{flux_corona.shape} and {flux_tr.shape}"
+            )
+        if flux_corona.ndim != 3:
+            raise ValueError(f"expected EUV cubes with shape (ny, nx, nch), got {flux_corona.shape}")
+
+        response_channels = [str(channel) for channel in getattr(result.response, "channels", [])]
+        try:
+            channel_index = response_channels.index(str(self.channel))
+        except ValueError:
+            normalized_channels = [_normalize_euv_channel_token(channel) for channel in response_channels]
+            normalized_requested = _normalize_euv_channel_token(str(self.channel))
+            try:
+                channel_index = normalized_channels.index(normalized_requested)
+            except ValueError as exc:
+                raise ValueError(
+                    f"requested EUV channel {self.channel!r} was not present in the rendered response set {response_channels}"
+                ) from exc
+        except Exception as exc:
+            raise ValueError(
+                f"requested EUV channel {self.channel!r} was not present in the rendered response set {response_channels}"
+            ) from exc
+        selected_corona = np.asarray(flux_corona[:, :, channel_index], dtype=float)
+        selected_tr = np.asarray(flux_tr[:, :, channel_index], dtype=float)
+        rendered = recombine_euv_components(
+            selected_corona,
+            selected_tr,
+            tr_region_mask=self.tr_region_mask,
+        )
+        if np.isfinite(rendered).all():
+            return {
+                "rendered": rendered,
+                "flux_corona": selected_corona,
+                "flux_tr": selected_tr,
+                "tr_region_mask": (
+                    None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool)
+                ),
+            }
+
+        finite = rendered[np.isfinite(rendered)]
+        if finite.size == 0:
+            raise ValueError(
+                f"EUV render for channel {self.channel!r} produced no finite pixels; cannot evaluate the fit objective"
+            )
+        finite_min = float(np.nanmin(finite))
+        finite_max = float(np.nanmax(finite))
+        rendered = np.nan_to_num(rendered, nan=0.0, posinf=finite_max, neginf=finite_min)
+        return {
+            "rendered": rendered,
+            "flux_corona": np.nan_to_num(selected_corona, nan=0.0, posinf=finite_max, neginf=finite_min),
+            "flux_tr": np.nan_to_num(selected_tr, nan=0.0, posinf=finite_max, neginf=finite_min),
+            "tr_region_mask": (
+                None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool)
+            ),
+        }
+
+    def render(self, q0: float) -> np.ndarray:
+        return np.asarray(self.render_components(q0)["rendered"], dtype=float)
