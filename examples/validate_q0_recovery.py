@@ -776,7 +776,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--frequency-ghz", type=float, default=17.0, help="Single MW frequency used for fitting/rendering.")
     p.add_argument("--obs-map-id", default="AIA_171", help="EUV/UV channel token used when --domain=euv/uv, for example AIA_171.")
     p.add_argument("--euv-instrument", default="AIA", help="EUV/UV instrument name used when --domain=euv/uv.")
-    p.add_argument("--euv-response-sav", default=None, help="Optional gxresponse SAV used for EUV/UV rendering.")
+    p.add_argument("--euv-response-sav", default=None, help="Optional gxresponse SAV override used for EUV/UV rendering. If omitted, gximagecomputing uses its default pyEUVTools-backed response path for supported instruments.")
     p.add_argument(
         "--tr-mask-bmin-gauss",
         type=float,

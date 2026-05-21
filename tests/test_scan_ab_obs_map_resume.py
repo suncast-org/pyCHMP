@@ -10,6 +10,7 @@ from examples.scan_ab_obs_map import (
     _build_sparse_pending_tasks,
     _merge_existing_rectangular_payload,
     _pending_point_payload,
+    _rescore_existing_trial_maps_for_warm_start,
 )
 from pychmp.ab_scan_artifacts import append_sparse_point_record, load_scan_file, save_rectangular_scan_file, write_sparse_scan_file
 from pychmp.ab_scan_tasks import ABSliceTaskDescriptor, compile_rectangular_point_tasks, compile_sparse_point_tasks
@@ -61,6 +62,13 @@ def _make_root_diag() -> dict[str, object]:
 
 def _make_point_payload(a_value: float, b_value: float, *, a_index: int, b_index: int, q0: float, objective: float) -> dict[str, object]:
     modeled = np.full((2, 2), q0, dtype=float)
+    trial_maps = np.stack(
+        [
+            np.full((2, 2), float(q0) - 0.1, dtype=float),
+            np.full((2, 2), float(q0), dtype=float),
+        ],
+        axis=0,
+    )
     return {
         "a": float(a_value),
         "b": float(b_value),
@@ -77,6 +85,9 @@ def _make_point_payload(a_value: float, b_value: float, *, a_index: int, b_index
         "fit_chi2_trials": (float(objective) + 0.5, float(objective)),
         "fit_rho2_trials": (float(objective) + 0.6, float(objective) + 0.1),
         "fit_eta2_trials": (float(objective) + 0.7, float(objective) + 0.2),
+        "trial_raw_modeled_maps": trial_maps,
+        "trial_modeled_maps": trial_maps,
+        "trial_residual_maps": trial_maps - np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float),
         "target_metric": "chi2",
         "diagnostics": {
             "a": float(a_value),
@@ -284,6 +295,39 @@ def test_rectangular_partial_overlap_resume_merges_existing_and_queues_only_new_
     assert np.all(np.isfinite(np.asarray(merged_payload["best_q0"], dtype=float)))
     assert float(merged_payload["best_q0"][0, 0]) == 1.0
     assert float(merged_payload["best_q0"][2, 0]) == 90.0
+    first_point = merged_payload["points"][(0, 0)]
+    assert first_point["trial_modeled_maps"] is not None
+    assert np.asarray(first_point["trial_modeled_maps"]).shape == (2, 2, 2)
+
+
+def test_rescore_existing_trial_maps_selects_best_warm_start_under_new_threshold() -> None:
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma = np.ones_like(observed)
+    point = {
+        "fit_q0_trials": (0.1, 0.2, 0.3),
+        "trial_modeled_maps": np.stack(
+            [
+                observed * 2.0,
+                observed,
+                observed * 0.5,
+            ],
+            axis=0,
+        ),
+    }
+
+    warm_start = _rescore_existing_trial_maps_for_warm_start(
+        point,
+        observed=observed,
+        sigma=sigma,
+        threshold=0.25,
+        explicit_mask=None,
+        target_metric="chi2",
+    )
+
+    assert warm_start is not None
+    assert warm_start["q0_start"] == 0.2
+    assert warm_start["target_metric_value"] == 0.0
+    assert warm_start["trial_count"] == 3
 
 
 def test_rectangular_recompute_existing_requeues_overlapping_points_and_persists_recomputed_values(tmp_path: Path) -> None:

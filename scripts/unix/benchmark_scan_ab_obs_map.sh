@@ -155,9 +155,6 @@ LATEST_RESPONSE_DIR="$(find "$RESPONSES_ROOT" -maxdepth 1 -mindepth 1 -type d | 
 OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits}"
 MODEL_H5_PATH="${MODEL_H5_PATH:-$LATEST_MODEL_DIR/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5}"
 BENCHMARK_CSV="${BENCHMARK_CSV:-/tmp/pychmp_scan_ab_obs_map_benchmark.csv}"
-if [[ -z "$EUV_RESPONSE_SAV" && -n "$LATEST_RESPONSE_DIR" ]]; then
-  EUV_RESPONSE_SAV="$(find "$LATEST_RESPONSE_DIR" -maxdepth 1 -type f \( -iname 'resp_aia*.sav' -o -iname '*response*.sav' \) | sort | tail -n 1)"
-fi
 
 [[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with the full scan dependency set."; exit 1; }
 [[ -f "$MODEL_H5_PATH" ]] || { echo "ERROR: Model H5 file not found: $MODEL_H5_PATH"; exit 1; }
@@ -166,8 +163,9 @@ if [[ "$OBS_SOURCE" == "external_fits" ]]; then
   [[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
 elif [[ "$OBS_SOURCE" == "model_refmap" ]]; then
   [[ -n "$OBS_MAP_ID" ]] || { echo "ERROR: --obs-map-id is required for --obs-source=model_refmap"; exit 1; }
-  [[ -n "$EUV_RESPONSE_SAV" ]] || { echo "ERROR: Could not resolve an EUV response SAV file for model_refmap mode."; exit 1; }
-  [[ -f "$EUV_RESPONSE_SAV" ]] || { echo "ERROR: EUV response SAV file not found: $EUV_RESPONSE_SAV"; exit 1; }
+  if [[ -n "$EUV_RESPONSE_SAV" ]]; then
+    [[ -f "$EUV_RESPONSE_SAV" ]] || { echo "ERROR: EUV response SAV file not found: $EUV_RESPONSE_SAV"; exit 1; }
+  fi
 else
   echo "ERROR: Unsupported observation source: $OBS_SOURCE"
   exit 1
@@ -186,7 +184,7 @@ if [[ "$OBS_SOURCE" == "model_refmap" ]]; then
   echo "Using observation map id: $OBS_MAP_ID"
   [[ -n "$LATEST_RESPONSE_DIR" ]] && echo "Using response folder: $LATEST_RESPONSE_DIR"
   echo "Using EUV instrument: $EUV_INSTRUMENT"
-  echo "Using EUV response SAV: $EUV_RESPONSE_SAV"
+  [[ -n "$EUV_RESPONSE_SAV" ]] && echo "Using EUV response SAV: $EUV_RESPONSE_SAV"
   [[ -n "$TR_MASK_BMIN_GAUSS" ]] && echo "Using EUV TR-mask Bmin [G]: $TR_MASK_BMIN_GAUSS"
 fi
 [[ -n "$METRICS_MASK_THRESHOLD" ]] && echo "Using metrics-mask threshold: $METRICS_MASK_THRESHOLD"
@@ -196,7 +194,10 @@ BENCHMARK_CMD=("$PYTHON_CMD" examples/benchmark_scan_ab_obs_map.py)
 if [[ "$OBS_SOURCE" == "external_fits" ]]; then
   BENCHMARK_CMD+=("$OBS_FITS_PATH" "$MODEL_H5_PATH")
 else
-  BENCHMARK_CMD+=(--model-h5 "$MODEL_H5_PATH" --obs-source model_refmap --obs-map-id "$OBS_MAP_ID" --euv-instrument "$EUV_INSTRUMENT" --euv-response-sav "$EUV_RESPONSE_SAV")
+  BENCHMARK_CMD+=(--model-h5 "$MODEL_H5_PATH" --obs-source model_refmap --obs-map-id "$OBS_MAP_ID" --euv-instrument "$EUV_INSTRUMENT")
+  if [[ -n "$EUV_RESPONSE_SAV" ]]; then
+    BENCHMARK_CMD+=(--euv-response-sav "$EUV_RESPONSE_SAV")
+  fi
 fi
 BENCHMARK_CMD+=(--ebtel-path "$EBTEL_PATH" --csv-out "$BENCHMARK_CSV")
 print_cmd "${BENCHMARK_CMD[@]}" "${EXTRA_ARGS[@]}"

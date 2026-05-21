@@ -253,6 +253,66 @@ def test_find_best_q0_hard_upper_bound_stops_expansion() -> None:
     assert result.q0 == pytest.approx(1.0, abs=1e-12)
 
 
+def test_find_best_q0_reports_sampled_boundary_when_it_beats_local_bracket() -> None:
+    """Do not report a local bracket as success when an edge sample is better."""
+
+    def metric_function(q0: float) -> MetricValues:
+        if q0 < 1.0e-5:
+            chi2 = 210.0
+        elif q0 <= 1.0e-5 * (1.0 + 1.0e-12):
+            chi2 = 198.0
+        else:
+            chi2 = 248.0 + ((q0 - 5.0e-4) / 1.0e-4) ** 2
+        return MetricValues(chi2=chi2, rho2=chi2, eta2=chi2)
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=1.0e-5,
+        q0_max=1.0e-3,
+        adaptive_bracketing=True,
+        q0_start=1.0e-4,
+        q0_step=1.61803398875,
+        max_bracket_steps=12,
+    )
+
+    assert not result.success
+    assert result.boundary_constrained
+    assert result.q0 == pytest.approx(1.0e-5, abs=1e-15)
+    assert result.objective_value == pytest.approx(198.0)
+    assert "sampled" in result.message
+
+
+def test_find_best_q0_skips_invalid_seeded_evaluations_in_sorted_order() -> None:
+    """Optional warm-start seeds should not abort fitting when one entry is bad."""
+
+    calls: list[float] = []
+
+    def metric_function(q0: float) -> MetricValues:
+        calls.append(float(q0))
+        return MetricValues(
+            chi2=(q0 - 0.2) ** 2,
+            rho2=(q0 - 0.2) ** 2,
+            eta2=(q0 - 0.2) ** 2,
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=1.0,
+        target_metric="chi2",
+        initial_evaluations={
+            0.3: MetricValues(chi2=0.01, rho2=0.01, eta2=0.01),
+            "bad-q0": MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            0.2: object(),
+            0.1: MetricValues(chi2=0.02, rho2=0.02, eta2=0.02),
+        },
+    )
+
+    assert result.success
+    assert result.trial_q0[:2] == pytest.approx((0.1, 0.3))
+    assert 0.2 not in result.trial_q0
+
+
 def test_find_best_q0_tracks_unique_trials_and_unique_evaluations() -> None:
     """Track each unique objective evaluation in the result metadata."""
     calls: list[float] = []

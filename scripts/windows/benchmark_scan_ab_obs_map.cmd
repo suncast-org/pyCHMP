@@ -97,7 +97,6 @@ if defined MODEL_H5_PATH (
 ) else (
   set "MODEL_H5_PATH=%LATEST_MODEL_DIR%\hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5"
 )
-if not defined EUV_RESPONSE_SAV if defined LATEST_RESPONSE_DIR call :latest_matching_file "%LATEST_RESPONSE_DIR%" "resp_aia*.sav" EUV_RESPONSE_SAV
 set "BENCHMARK_CSV=%TEMP%\pychmp_scan_ab_obs_map_benchmark.csv"
 
 if /I "%OBS_SOURCE%"=="external_fits" (
@@ -110,7 +109,7 @@ if /I "%OBS_SOURCE%"=="external_fits" (
     echo ERROR: --obs-map-id is required for --obs-source=model_refmap
     exit /b 1
   )
-  if not exist "%EUV_RESPONSE_SAV%" (
+  if defined EUV_RESPONSE_SAV if not exist "%EUV_RESPONSE_SAV%" (
     echo ERROR: EUV response SAV file not found: %EUV_RESPONSE_SAV%
     exit /b 1
   )
@@ -135,7 +134,8 @@ set "RUN_CMD="%PYTHON_CMD%" examples\benchmark_scan_ab_obs_map.py"
 if /I "%OBS_SOURCE%"=="external_fits" (
   set "RUN_CMD=%RUN_CMD% "%OBS_FITS_PATH%" "%MODEL_H5_PATH%""
 ) else (
-  set "RUN_CMD=%RUN_CMD% --model-h5 "%MODEL_H5_PATH%" --obs-source model_refmap --obs-map-id "%OBS_MAP_ID%" --euv-instrument "%EUV_INSTRUMENT%" --euv-response-sav "%EUV_RESPONSE_SAV%""
+  set "RUN_CMD=%RUN_CMD% --model-h5 "%MODEL_H5_PATH%" --obs-source model_refmap --obs-map-id "%OBS_MAP_ID%" --euv-instrument "%EUV_INSTRUMENT%""
+  if defined EUV_RESPONSE_SAV set "RUN_CMD=%RUN_CMD% --euv-response-sav "%EUV_RESPONSE_SAV%""
 )
 set "RUN_CMD=%RUN_CMD% --ebtel-path "%EBTEL_PATH%" --csv-out "%BENCHMARK_CSV%""
 
@@ -148,7 +148,7 @@ if /I "%OBS_SOURCE%"=="model_refmap" (
   echo Using observation map id: %OBS_MAP_ID%
   if defined LATEST_RESPONSE_DIR echo Using response folder: %LATEST_RESPONSE_DIR%
   echo Using EUV instrument: %EUV_INSTRUMENT%
-  echo Using EUV response SAV: %EUV_RESPONSE_SAV%
+  if defined EUV_RESPONSE_SAV echo Using EUV response SAV: %EUV_RESPONSE_SAV%
   if defined TR_MASK_BMIN_GAUSS echo Using EUV TR-mask Bmin [G]: %TR_MASK_BMIN_GAUSS%
 )
 if defined METRICS_MASK_THRESHOLD echo Using metrics-mask threshold: %METRICS_MASK_THRESHOLD%

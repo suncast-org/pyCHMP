@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Literal, TypeAlias
+from typing import Callable, Literal, Mapping, TypeAlias
 
 from scipy.optimize import minimize_scalar
 
@@ -30,6 +30,7 @@ class Q0MetricEvaluation:
 
 
 MetricFunctionResult: TypeAlias = MetricValues | Q0MetricEvaluation
+InitialQ0Evaluations: TypeAlias = Mapping[float, MetricFunctionResult]
 ProgressStartCallback: TypeAlias = Callable[[int, float], None]
 ProgressCallback: TypeAlias = Callable[[float, float, bool, str, float], None]
 
@@ -139,6 +140,56 @@ def _evaluate_q0(
     if progress_callback is not None:
         progress_callback(record.q0, record.objective_value, record.is_valid, record.message, float(elapsed_s))
     return record
+
+
+def _seed_initial_evaluations(
+    initial_evaluations: InitialQ0Evaluations | None,
+    *,
+    target_metric: MetricName,
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    hard_q0_min: float | None = None,
+    hard_q0_max: float | None = None,
+) -> int:
+    """Load already-scored Q0 samples into the optimizer cache."""
+    if not initial_evaluations:
+        return 0
+    seeded = 0
+    seed_items: list[tuple[float, MetricFunctionResult]] = []
+    for q0_raw, evaluation_raw in initial_evaluations.items():
+        try:
+            q0 = float(q0_raw)
+        except Exception:
+            continue
+        seed_items.append((q0, evaluation_raw))
+    for q0, evaluation_raw in sorted(seed_items, key=lambda item: item[0]):
+        if not math.isfinite(q0) or q0 <= 0.0:
+            continue
+        if hard_q0_min is not None and q0 < float(hard_q0_min):
+            continue
+        if hard_q0_max is not None and q0 > float(hard_q0_max):
+            continue
+        if q0 in cache:
+            continue
+        try:
+            evaluation = _normalize_metric_result(evaluation_raw)
+            objective_value = float(_metric_value(evaluation.metrics, target_metric))
+        except Exception:
+            continue
+        is_valid = bool(evaluation.is_valid) and math.isfinite(objective_value)
+        record = _Q0EvaluationRecord(
+            q0=q0,
+            objective_value=objective_value,
+            metrics=evaluation.metrics,
+            total_observed_flux=evaluation.total_observed_flux,
+            total_modeled_flux=evaluation.total_modeled_flux,
+            is_valid=is_valid,
+            message=str(evaluation.message or "seeded from saved trial map"),
+        )
+        cache[q0] = record
+        evaluation_order.append(q0)
+        seeded += 1
+    return seeded
 
 
 def _find_bracket(records: dict[float, _Q0EvaluationRecord]) -> tuple[float, float, float] | None:
@@ -573,6 +624,7 @@ def find_best_q0(
     max_bracket_steps: int = 12,
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    initial_evaluations: InitialQ0Evaluations | None = None,
 ) -> Q0OptimizationResult:
     """Find best Q0 with optional adaptive multiplicative bracketing.
 
@@ -611,6 +663,14 @@ def find_best_q0(
 
     cache: dict[float, _Q0EvaluationRecord] = {}
     evaluation_order: list[float] = []
+    _seed_initial_evaluations(
+        initial_evaluations,
+        target_metric=target_metric,
+        cache=cache,
+        evaluation_order=evaluation_order,
+        hard_q0_min=hard_q0_min,
+        hard_q0_max=hard_q0_max,
+    )
 
     def objective(q0: float) -> float:
         record = _evaluate_q0(
@@ -709,18 +769,43 @@ def find_best_q0(
         progress_callback=progress_callback,
     )
 
-    trial_q0 = tuple(evaluation_order)
-    trial_objective_values = tuple(cache[q0].objective_value for q0 in evaluation_order)
-    trial_chi2_values, trial_rho2_values, trial_eta2_values = _trial_metric_histories(cache, evaluation_order)
     result_message = str(result.message)
     if message_prefix:
         result_message = f"{message_prefix}; {result_message}"
+
+    sampled_override = False
+    valid_sampled_records = [record for record in cache.values() if record.is_valid]
+    if valid_sampled_records:
+        sampled_best = min(valid_sampled_records, key=lambda item: item.objective_value)
+        objective_tol = max(1e-12, 1e-9 * max(1.0, abs(float(best_record.objective_value))))
+        if float(sampled_best.objective_value) < float(best_record.objective_value) - objective_tol:
+            best_q0 = float(sampled_best.q0)
+            best_record = sampled_best
+            sampled_override = True
+            sampled_q0_values = [float(record.q0) for record in valid_sampled_records]
+            lower_sampled = min(sampled_q0_values)
+            upper_sampled = max(sampled_q0_values)
+            if math.isclose(best_q0, lower_sampled, rel_tol=0.0, abs_tol=1e-15):
+                sampled_location = "lower sampled edge"
+            elif math.isclose(best_q0, upper_sampled, rel_tol=0.0, abs_tol=1e-15):
+                sampled_location = "upper sampled edge"
+            else:
+                sampled_location = "sampled point outside the refined local bracket"
+            result_message += (
+                f" WARNING: A {sampled_location} had a lower {target_metric} "
+                "than the refined local minimum; reporting the sampled best instead."
+            )
+
+    trial_q0 = tuple(evaluation_order)
+    trial_objective_values = tuple(cache[q0].objective_value for q0 in evaluation_order)
+    trial_chi2_values, trial_rho2_values, trial_eta2_values = _trial_metric_histories(cache, evaluation_order)
 
     boundary_tol = max(float(effective_xatol), 1e-12)
     boundary_failure = False
     if (
         math.isclose(best_q0, refinement_bounds[0], rel_tol=0.0, abs_tol=boundary_tol)
         or math.isclose(best_q0, refinement_bounds[1], rel_tol=0.0, abs_tol=boundary_tol)
+        or sampled_override
     ):
         boundary_failure = True
         result_message += " WARNING: Minimum is at the boundary of the search region; true minimum may lie outside."
@@ -730,7 +815,7 @@ def find_best_q0(
         objective_value=best_record.objective_value,
         metrics=best_record.metrics,
         target_metric=target_metric,
-        success=bool(result.success),
+        success=bool(result.success) and not boundary_failure,
         nfev=len(cache),
         nit=int(result.nit) + int(bracket_steps),
         message=result_message,

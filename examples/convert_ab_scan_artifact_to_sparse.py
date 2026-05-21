@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     convert_rectangular_artifact_to_sparse(args.src_h5, args.dst_h5, overwrite=bool(args.overwrite))
-    print(f"✓ Wrote sparse artifact: {args.dst_h5}")
+    print(f"✓ Wrote unified point-record artifact: {args.dst_h5}")
     return 0
 
 

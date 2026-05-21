@@ -8,6 +8,7 @@ import numpy as np
 
 from .metrics import MetricValues, compute_metrics, resolve_threshold_mask
 from .optimize import (
+    InitialQ0Evaluations,
     MetricName,
     ProgressCallback,
     ProgressStartCallback,
@@ -45,6 +46,7 @@ def fit_q0_to_observation(
     max_bracket_steps: int = 12,
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    initial_evaluations: InitialQ0Evaluations | None = None,
 ) -> Q0OptimizationResult:
     """Optimize Q0 by comparing rendered maps against observed maps.
 
@@ -104,4 +106,5 @@ def fit_q0_to_observation(
         max_bracket_steps=max_bracket_steps,
         progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
+        initial_evaluations=initial_evaluations,
     )

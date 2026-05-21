@@ -43,6 +43,7 @@ from pychmp import (
     resolve_default_testdata_fixture_paths,
     validate_obs_map_identity,
 )
+from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
 
 try:
     from q0_artifact_plot import plot_q0_artifact_panel
@@ -50,7 +51,7 @@ except ModuleNotFoundError:
     from examples.q0_artifact_plot import plot_q0_artifact_panel
 
 from pychmp.q0_artifact_panel import load_blos_reference_for_fov
-from pychmp.ab_scan_artifacts import build_computed_point_payload, write_single_point_scan_file
+from pychmp.ab_scan_artifacts import build_computed_point_payload, load_scan_file, write_single_point_scan_file
 
 
 DEFAULT_TBASE = 1.0e6
@@ -522,6 +523,59 @@ def _lookup_cached_render_payload(
     return None
 
 
+def _rescore_warm_start_point(
+    point: dict[str, Any],
+    *,
+    observed: np.ndarray,
+    sigma: np.ndarray,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+) -> tuple[dict[float, MetricValues], dict[float, dict[str, Any]], float | None]:
+    trial_q0 = [float(value) for value in point.get("fit_q0_trials", ())]
+    trial_maps_raw = point.get("trial_modeled_maps")
+    if not trial_q0 or trial_maps_raw is None:
+        return {}, {}, None
+    trial_maps = np.asarray(trial_maps_raw, dtype=float)
+    if trial_maps.ndim != 3 or int(trial_maps.shape[0]) != len(trial_q0):
+        return {}, {}, None
+
+    raw_maps = point.get("trial_raw_modeled_maps")
+    raw_arr = None if raw_maps is None else np.asarray(raw_maps, dtype=float)
+    observed_arr = np.asarray(observed, dtype=float)
+    sigma_arr = np.asarray(sigma, dtype=float)
+    explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
+    mask_fn = resolve_threshold_mask("union")
+    metric_name = str(target_metric)
+
+    initial_evaluations: dict[float, MetricValues] = {}
+    precomputed_maps: dict[float, dict[str, Any]] = {}
+    scored: list[tuple[float, float]] = []
+    for idx, (q0_value, modeled) in enumerate(zip(trial_q0, trial_maps, strict=False)):
+        modeled_arr = np.asarray(modeled, dtype=float)
+        try:
+            mask = explicit_mask_arr if explicit_mask_arr is not None else mask_fn(observed_arr, modeled_arr, threshold)
+            metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
+            objective = getattr(metrics, metric_name)
+        except Exception:
+            continue
+        objective = float(objective)
+        if not np.isfinite(objective):
+            continue
+        q0 = float(q0_value)
+        initial_evaluations[q0] = metrics
+        raw_map = modeled_arr
+        if raw_arr is not None and raw_arr.ndim == 3 and int(raw_arr.shape[0]) == len(trial_q0):
+            raw_map = np.asarray(raw_arr[idx], dtype=float)
+        precomputed_maps[q0] = {"raw": raw_map, "modeled": modeled_arr}
+        scored.append((q0, objective))
+
+    if not scored:
+        return {}, {}, None
+    best_q0 = min(scored, key=lambda item: item[1])[0]
+    return initial_evaluations, precomputed_maps, float(best_q0)
+
+
 def _decode_h5_scalar(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="ignore")
@@ -811,7 +865,7 @@ def save_q0_artifact(
     trial_euv_coronal_maps: np.ndarray | None = None,
     trial_euv_tr_maps: np.ndarray | None = None,
 ) -> None:
-    """Save Q0 fitting results as a canonical viewer-compatible sparse artifact."""
+    """Save Q0 fitting results as a canonical viewer-compatible artifact."""
     diagnostics_payload = dict(diagnostics or {})
     artifact_frequency_ghz = _artifact_frequency_ghz(
         frequency_ghz=frequency_ghz,
@@ -1132,11 +1186,13 @@ Examples:
         help="Optional prepared observation bundle H5; if provided, reuse precomputed cropped observation/sigma/WCS instead of reloading and regridding the FITS map.",
     )
     parser.add_argument("--euv-instrument", type=str, default=None, help="Optional EUV/UV instrument override. Must agree with the selected observation if that observation already declares an instrument.")
-    parser.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV used for EUV/UV rendering. If omitted, the adapter will try the environment/test-data discovery path.")
+    parser.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV override used for EUV/UV rendering. If omitted, gximagecomputing will use its default pyEUVTools-backed response path for supported instruments.")
     parser.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
     parser.add_argument("--tr-mask-threshold-gauss", dest="tr_mask_bmin_gauss", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     parser.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
+    parser.add_argument("--warm-start-from-existing-trials", action=argparse.BooleanOptionalAction, default=False, help="Seed Q0 fitting from saved trial maps in a compatible scan artifact, rescored with the current metric mask.")
+    parser.add_argument("--warm-start-artifact", type=Path, default=None, help="Scan artifact containing saved trial maps for this point. Used with --warm-start-from-existing-trials.")
 
     # Q0 fitting controls
     parser.add_argument("--q0-min", type=float, default=0.01, help="Lower edge of the initial Q0 search interval")
@@ -1729,9 +1785,56 @@ Examples:
             print(f"  ✗ Preflight render failed: {e}")
             exit(1)
 
+    initial_evaluations: dict[float, MetricValues] = {}
+    warm_precomputed_maps: dict[float, dict[str, Any]] = {}
+    if bool(args.warm_start_from_existing_trials):
+        warm_artifact = Path(args.warm_start_artifact).expanduser() if args.warm_start_artifact is not None else None
+        if warm_artifact is None:
+            print("  Warm start: no --warm-start-artifact provided; no saved trial maps loaded")
+        elif not warm_artifact.is_file():
+            print(f"  Warm start: artifact not found: {warm_artifact}")
+        elif args.a is None or args.b is None:
+            print("  Warm start: --a and --b are required to select a point from the artifact")
+        else:
+            try:
+                warm_payload = load_scan_file(warm_artifact)
+                warm_records = list(warm_payload.get("point_records") or warm_payload.get("points", {}).values())
+                warm_point = next(
+                    (
+                        record
+                        for record in warm_records
+                        if np.isclose(float(record.get("a")), float(args.a), rtol=0.0, atol=1e-12)
+                        and np.isclose(float(record.get("b")), float(args.b), rtol=0.0, atol=1e-12)
+                    ),
+                    None,
+                )
+                if warm_point is None:
+                    print(f"  Warm start: no saved point a={float(args.a):.3f} b={float(args.b):.3f} found in {warm_artifact.name}")
+                else:
+                    initial_evaluations, warm_precomputed_maps, warm_q0_start = _rescore_warm_start_point(
+                        warm_point,
+                        observed=observed_cropped,
+                        sigma=sigma_cropped,
+                        threshold=float(args.metrics_mask_threshold),
+                        explicit_mask=explicit_metric_mask,
+                        target_metric=str(args.target_metric),
+                    )
+                    if (
+                        warm_q0_start is not None
+                        and args.q0_start is None
+                        and float(args.q0_min) <= float(warm_q0_start) <= float(args.q0_max)
+                    ):
+                        args.q0_start = float(warm_q0_start)
+                    print(
+                        f"  Warm start: seeded {len(initial_evaluations)} saved trial map(s) "
+                        f"from {warm_artifact.name}"
+                    )
+            except Exception as exc:
+                print(f"  Warm start: could not read saved trial maps from {warm_artifact}: {exc}")
+
     # Fit Q0
     result = None
-    render_cache: dict[float, dict[str, Any]] = {}
+    render_cache: dict[float, dict[str, Any]] = dict(warm_precomputed_maps)
     print(f"\nFitting Q0 using {args.target_metric} metric...")
     print(f"  Q0 initial interval: [{_format_q0_value(args.q0_min)}, {_format_q0_value(args.q0_max)}]")
     if args.hard_q0_min is not None or args.hard_q0_max is not None:
@@ -1749,6 +1852,10 @@ Examples:
         if isinstance(renderer, PSFConvolvedRenderer):
             class _CachedObservedRenderer:
                 def render(self_inner, q0: float) -> np.ndarray:
+                    cached_pair = _lookup_cached_render_pair(render_cache, float(q0))
+                    if cached_pair is not None:
+                        _raw_arr, modeled_arr = cached_pair
+                        return modeled_arr
                     raw_arr, modeled_arr = renderer.render_pair(q0)
                     render_cache[float(q0)] = {"raw": raw_arr, "modeled": modeled_arr}
                     return modeled_arr
@@ -1757,6 +1864,10 @@ Examples:
         else:
             class _CachedObservedRenderer:
                 def render(self_inner, q0: float) -> np.ndarray:
+                    cached_pair = _lookup_cached_render_pair(render_cache, float(q0))
+                    if cached_pair is not None:
+                        _raw_arr, modeled_arr = cached_pair
+                        return modeled_arr
                     if hasattr(base_adapter, "render_components"):
                         components = base_adapter.render_components(q0)
                         modeled_arr = np.asarray(components["rendered"], dtype=float)
@@ -1796,6 +1907,7 @@ Examples:
                 max_bracket_steps=int(args.max_bracket_steps),
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
+                initial_evaluations=initial_evaluations,
             ),
             spinner=stage_spinner and not bool(args.progress),
             stage_index=1,
@@ -2118,7 +2230,8 @@ Examples:
                 print(f"  ✓ PNG panel: {png_path}")
                 print(f"  Open PNG: {_open_path_hint(png_path)}")
             print(f"  Replot PNG: {sys.executable} examples/replot_q0_artifacts.py \"{h5_path}\"")
-            print(f"  Interactive viewer: pychmp-view \"{h5_path}\"")
+            if os.environ.get("PYCHMP_SUPPRESS_VIEWER_HINT") != "1":
+                print(f"  Interactive viewer: pychmp-view \"{h5_path}\"")
         except Exception as e:
             print(f"  ✗ Failed to save artifacts: {e}")
 

@@ -196,8 +196,6 @@ def main() -> int:
     if str(args.obs_source) == "model_refmap":
         if not args.obs_map_id:
             raise ValueError("--obs-map-id is required for --obs-source=model_refmap")
-        if args.euv_response_sav is None:
-            raise ValueError("--euv-response-sav is required for --obs-source=model_refmap")
     else:
         obs_path = _resolve_obs_path(args)
         if not obs_path.is_file():
@@ -216,7 +214,7 @@ def main() -> int:
         print(
             "Inputs: "
             f"obs_source=model_refmap obs_map_id={args.obs_map_id} "
-            f"model={model_h5} ebtel={args.ebtel_path} response={args.euv_response_sav}"
+            f"model={model_h5} ebtel={args.ebtel_path} response={args.euv_response_sav or '<auto>'}"
         )
     else:
         print(f"Inputs: fits={_resolve_obs_path(args)} model={model_h5} ebtel={args.ebtel_path}")

@@ -485,6 +485,8 @@ class PychmpViewApp:
         self._last_rendered_metric = self.metric_var.get() if self.metric_var.get() in METRICS else "chi2"
         self.slice_key_var = tk.StringVar(value="")
         self.slice_display_var = tk.StringVar(value="")
+        self.search_id_var = tk.StringVar(value="")
+        self.search_display_var = tk.StringVar(value="")
         self.trials_xmin_var = tk.StringVar(value="")
         self.trials_xmax_var = tk.StringVar(value="")
         self.trials_ymin_var = tk.StringVar(value="")
@@ -532,7 +534,10 @@ class PychmpViewApp:
         self.info_text: tk.Text | None = None
         self.slice_menu: ttk.Combobox | None = None
         self.slice_display_label: ttk.Label | None = None
+        self.search_menu: ttk.Combobox | None = None
+        self.search_display_label: ttk.Label | None = None
         self.available_slices: list[dict[str, Any]] = []
+        self.available_searches: list[dict[str, Any]] = []
         self.slice_display_state: dict[str, dict[str, Any]] = {}
         self.open_artifact_button: ttk.Button | None = None
         self.display_selected_button: ttk.Button | None = None
@@ -636,16 +641,23 @@ class PychmpViewApp:
         self.slice_display_label = ttk.Label(primary_toolbar, textvariable=self.slice_display_var, anchor=tk.W)
         self.slice_display_label.grid(row=0, column=4, sticky="w", padx=(6, 6))
 
-        ttk.Label(primary_toolbar, text="a").grid(row=0, column=5, sticky="w")
+        ttk.Label(primary_toolbar, text="Search").grid(row=0, column=5, sticky="w")
+        self.search_menu = ttk.Combobox(primary_toolbar, width=28, state="readonly")
+        self.search_menu.grid(row=0, column=6, sticky="w", padx=(6, 10))
+        self.search_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_search_changed())
+        self.search_display_label = ttk.Label(primary_toolbar, textvariable=self.search_display_var, anchor=tk.W)
+        self.search_display_label.grid(row=0, column=6, sticky="w", padx=(6, 10))
+
+        ttk.Label(primary_toolbar, text="a").grid(row=0, column=7, sticky="w")
         self.a_menu = ttk.Combobox(primary_toolbar, width=10, state="readonly")
         self.a_menu.configure(width=10)
-        self.a_menu.grid(row=0, column=6, sticky="w", padx=(6, 10))
+        self.a_menu.grid(row=0, column=8, sticky="w", padx=(6, 10))
         self.a_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_a_changed())
 
-        ttk.Label(primary_toolbar, text="b").grid(row=0, column=7, sticky="w")
+        ttk.Label(primary_toolbar, text="b").grid(row=0, column=9, sticky="w")
         self.b_menu = ttk.Combobox(primary_toolbar, width=10, state="readonly")
         self.b_menu.configure(width=10)
-        self.b_menu.grid(row=0, column=8, sticky="w", padx=(6, 12))
+        self.b_menu.grid(row=0, column=10, sticky="w", padx=(6, 12))
         self.b_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_b_changed())
 
         ttk.Separator(secondary_toolbar, orient=tk.VERTICAL).grid(row=0, column=0, sticky="ns", padx=(0, 10))
@@ -941,13 +953,20 @@ class PychmpViewApp:
         slice_descriptor = dict(self.payload.get("selected_slice") or {})
         slice_label = self._slice_label(slice_descriptor) if slice_descriptor else "current slice"
         slice_count = max(1, int(len(self.available_slices) or 1))
-        adaptive_sparse = (
-            str(diagnostics.get("artifact_kind", "")).strip().lower() == "pychmp_ab_scan_sparse_points"
-            and str(diagnostics.get("search_mode", "")).strip().lower() == "adaptive_local_single_frequency"
-        )
+        selected_search = dict(self.payload.get("selected_search") or {})
+        search_display_var = getattr(self, "search_display_var", None)
+        search_display_text = search_display_var.get() if search_display_var is not None else ""
+        search_label = str(selected_search.get("label") or search_display_text or "").strip()
+        search_status = str(selected_search.get("status") or "").strip()
+        toolbar_prefix = f"{slice_label} | {search_label}" if search_label else slice_label
+        adaptive_point_run = str(diagnostics.get("search_mode", "")).strip().lower() == "adaptive_local_single_frequency"
         if total == 0:
-            toolbar_detail = f"{slice_label} | 0/{total} computed"
-            info_detail = f"Current slice: {slice_label}\nGrid points: {total}\nComputed: 0\nArtifact slices: {slice_count}"
+            toolbar_detail = f"{toolbar_prefix} | 0/{total} computed"
+            info_lines_empty = [f"Current slice: {slice_label}"]
+            if search_label:
+                info_lines_empty.append(f"Selected search: {search_label}")
+            info_lines_empty.extend([f"Grid points: {total}", "Computed: 0", f"Artifact slices: {slice_count}"])
+            info_detail = "\n".join(info_lines_empty)
             return "EMPTY", toolbar_detail, info_detail, "#6c757d", "white"
 
         statuses = [str(point.get("status", "computed")).strip().lower() for point in points.values()]
@@ -972,13 +991,13 @@ class PychmpViewApp:
         if phase_complete:
             badge = "FINISHED"
             color = "#2b8a3e"
-        elif adaptive_sparse and refresh_active:
+        elif adaptive_point_run and refresh_active:
             badge = "RUNNING"
             color = "#0b7285"
         elif (refresh_active or phase_running) and noncomputed > 0:
             badge = "RUNNING"
             color = "#0b7285"
-        elif adaptive_sparse and phase_running:
+        elif adaptive_point_run and phase_running:
             badge = "INCOMPLETE"
             color = "#b26a00"
         elif noncomputed > 0:
@@ -988,12 +1007,19 @@ class PychmpViewApp:
             badge = "FINISHED"
             color = "#2b8a3e"
 
-        toolbar_detail = f"{slice_label} | {computed}/{total} computed"
+        toolbar_detail = f"{toolbar_prefix} | {computed}/{total} computed"
         info_lines = [
             f"Current slice: {slice_label}",
             f"Grid points: {total}",
             f"Computed: {computed}",
         ]
+        if search_label:
+            info_lines.insert(1, f"Selected search: {search_label}")
+        if search_status:
+            info_lines.append(f"Search status: {search_status}")
+        available_searches = list(getattr(self, "available_searches", []) or [])
+        if available_searches:
+            info_lines.append(f"Stored searches: {len(available_searches)}")
         run_history = list(self.payload.get("run_history", [])) if self.payload else []
         info_lines.append(f"Run history entries: {len(run_history)}")
         if run_history:
@@ -1292,6 +1318,10 @@ class PychmpViewApp:
         value = str(self.slice_key_var.get()).strip()
         return value or None
 
+    def _selected_search_id(self) -> str | None:
+        value = str(self.search_id_var.get()).strip()
+        return value or None
+
     def _slice_state_token(self, slice_key: str | None = None) -> str | None:
         if self.artifact_h5 is None:
             return None
@@ -1302,7 +1332,8 @@ class PychmpViewApp:
             artifact_text = str(self.artifact_h5.expanduser().resolve())
         except Exception:
             artifact_text = str(self.artifact_h5)
-        return f"{artifact_text}::{key}"
+        search = str(self.search_id_var.get()).strip()
+        return f"{artifact_text}::{key}::{search}"
 
     def _default_point_selection(self, metric_name: str) -> tuple[int, int]:
         if not self.payload or self.a_values.size == 0 or self.b_values.size == 0:
@@ -1423,8 +1454,44 @@ class PychmpViewApp:
         elif self.slice_display_label is not None:
             self.slice_display_label.grid()
 
+    def _search_label(self, record: dict[str, Any]) -> str:
+        label = str(record.get("label", "")).strip()
+        if label:
+            return label
+        search_id = str(record.get("search_id", "search")).strip() or "search"
+        status = str(record.get("status", "unknown"))
+        metric = str(record.get("target_metric", "metric"))
+        return f"{metric} [{status}] {search_id}"
+
+    def _refresh_search_controls(self) -> None:
+        records = list(self.available_searches)
+        labels = [self._search_label(record) for record in records]
+        ids = [str(record.get("search_id", "")) for record in records]
+        selected_id = str(self.payload.get("selected_search_id", self._selected_search_id() or "") or "").strip()
+        if selected_id and selected_id in ids:
+            selected_index = ids.index(selected_id)
+        else:
+            selected_index = 0 if ids else -1
+            selected_id = ids[selected_index] if selected_index >= 0 else ""
+        self.search_id_var.set(selected_id)
+        self.search_display_var.set(labels[selected_index] if selected_index >= 0 else "legacy current")
+        if self.search_menu is not None:
+            self.search_menu.configure(values=labels)
+            if labels:
+                self.search_menu.grid()
+                if self.search_display_label is not None:
+                    self.search_display_label.grid_remove()
+                self.search_menu.current(selected_index)
+            else:
+                self.search_menu.grid_remove()
+                if self.search_display_label is not None:
+                    self.search_display_label.grid()
+        elif self.search_display_label is not None:
+            self.search_display_label.grid()
+
     def _refresh_selector_values(self) -> None:
         self._refresh_slice_controls()
+        self._refresh_search_controls()
         a_labels = [f"{i}: {value:.3f}" for i, value in enumerate(self.a_values)]
         b_labels = [f"{i}: {value:.3f}" for i, value in enumerate(self.b_values)]
         self.a_menu.configure(values=a_labels)
@@ -1443,8 +1510,11 @@ class PychmpViewApp:
             self.summary_var.set("No artifact loaded.")
             self.payload = {}
             self.available_slices = []
+            self.available_searches = []
             self.slice_key_var.set("")
             self.slice_display_var.set("")
+            self.search_id_var.set("")
+            self.search_display_var.set("")
             self.a_values = np.asarray([], dtype=float)
             self.b_values = np.asarray([], dtype=float)
             self.refresh_signal_path = None
@@ -1470,8 +1540,13 @@ class PychmpViewApp:
         prev_a = int(self.a_index_var.get())
         prev_b = int(self.b_index_var.get())
         requested_slice_key = self._selected_slice_key()
+        requested_search_id = self._selected_search_id()
         try:
-            self.payload = self._load_scan_file_with_retries(self.artifact_h5, slice_key=requested_slice_key)
+            self.payload = self._load_scan_file_with_retries(
+                self.artifact_h5,
+                slice_key=requested_slice_key,
+                search_id=requested_search_id,
+            )
         except Exception as exc:
             self.status_var.set(
                 "Artifact is currently being written or is temporarily locked. "
@@ -1482,7 +1557,9 @@ class PychmpViewApp:
             return
         self.root.title(f"pychmp-view: {self.artifact_h5.name}")
         self.available_slices = list(self.payload.get("available_slices", []))
+        self.available_searches = list(self.payload.get("search_records", []))
         self.slice_key_var.set(str(self.payload.get("selected_slice_key", "")))
+        self.search_id_var.set(str(self.payload.get("selected_search_id") or ""))
         self.a_values = np.asarray(self.payload["a_values"], dtype=float)
         self.b_values = np.asarray(self.payload["b_values"], dtype=float)
         self.display_model = build_patch_grid_model(self.payload)
@@ -1492,11 +1569,17 @@ class PychmpViewApp:
         self._refresh_action_states()
         self._refresh_all()
 
-    def _load_scan_file_with_retries(self, artifact_h5: Path, *, slice_key: str | None = None) -> dict[str, Any]:
+    def _load_scan_file_with_retries(
+        self,
+        artifact_h5: Path,
+        *,
+        slice_key: str | None = None,
+        search_id: str | None = None,
+    ) -> dict[str, Any]:
         last_exc: Exception | None = None
         for attempt in range(1, self._LOAD_RETRY_ATTEMPTS + 1):
             try:
-                return load_scan_file(artifact_h5, slice_key=slice_key)
+                return load_scan_file(artifact_h5, slice_key=slice_key, search_id=search_id)
             except (BlockingIOError, PermissionError, OSError) as exc:
                 last_exc = exc
                 if attempt >= self._LOAD_RETRY_ATTEMPTS:
@@ -1887,6 +1970,21 @@ class PychmpViewApp:
             return
         self._capture_current_slice_view_state(self._last_rendered_metric)
         self.slice_key_var.set(selected_key)
+        self.search_id_var.set("")
+        self._reload_payload()
+
+    def _on_search_changed(self) -> None:
+        if self.search_menu is None:
+            return
+        current = int(self.search_menu.current())
+        if current < 0 or current >= len(self.available_searches):
+            return
+        selected_id = str(self.available_searches[current].get("search_id", "")).strip()
+        if not selected_id or selected_id == self._selected_search_id():
+            return
+        self._capture_current_slice_view_state(self._last_rendered_metric)
+        self.search_id_var.set(selected_id)
+        self._selected_trial_token = None
         self._reload_payload()
 
     def _on_b_changed(self) -> None:

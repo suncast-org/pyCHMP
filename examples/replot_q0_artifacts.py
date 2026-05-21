@@ -72,7 +72,7 @@ def _artifact_frequency_ghz(diagnostics: dict[str, Any]) -> float | None:
 
 def _parse_artifact_h5(path: Path) -> dict[str, Any]:
     artifact_format = detect_scan_artifact_format(path)
-    if artifact_format == "sparse":
+    if artifact_format in {"sparse", "unified"}:
         payload = load_scan_file(path)
         if not payload.get("point_records"):
             raise SystemExit(f"artifact H5 does not contain any point records: {path}")

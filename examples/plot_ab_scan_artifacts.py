@@ -37,6 +37,17 @@ except ModuleNotFoundError:
 
 
 
+def _metrics_mask_label(diagnostics: dict[str, Any]) -> str:
+    source = str(diagnostics.get("metrics_mask_source", "")).strip().lower()
+    if source == "explicit_fits":
+        mask_path = str(diagnostics.get("metrics_mask_fits", "")).strip()
+        return f"mask={Path(mask_path).name}" if mask_path else "mask=explicit FITS"
+    try:
+        return f"threshold={float(diagnostics.get('metrics_mask_threshold', diagnostics.get('threshold', 0.1))):.3f}"
+    except Exception:
+        return "threshold=n/a"
+
+
 def _plot_grid_summary(
     payload: dict[str, Any],
     *,
@@ -136,7 +147,14 @@ def _plot_grid_summary(
             linewidth=2.2,
             zorder=6,
         )
-    fig.suptitle("(a, b) Scan Summary", fontsize=14)
+    diagnostics = dict(payload.get("diagnostics", {}))
+    target_metric = str(payload.get("target_metric", diagnostics.get("target_metric", "chi2")))
+    search = dict(payload.get("selected_search") or {})
+    search_text = str(search.get("label") or "").strip()
+    subtitle = f"target={target_metric}, {_metrics_mask_label(diagnostics)}"
+    if search_text:
+        subtitle = f"{subtitle} - {search_text}"
+    fig.suptitle(f"(a, b) Scan Summary\n{subtitle}", fontsize=14)
     legend_handles = [
         Line2D(
             [],
