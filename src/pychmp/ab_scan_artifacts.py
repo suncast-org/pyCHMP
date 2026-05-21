@@ -504,7 +504,18 @@ def _search_id_from_diagnostics(diagnostics: dict[str, Any], *, fallback: str = 
 def _search_status_from_records(point_records: list[dict[str, Any]]) -> str:
     if not point_records:
         return "empty"
-    statuses = {str(record.get("status", "computed")) for record in point_records}
+    statuses = {_normalize_point_status(record.get("status", "computed")) for record in point_records}
+    return _search_status_from_statuses(statuses)
+
+
+def _normalize_point_status(status: Any) -> str:
+    text = str(status if status is not None else "computed").strip().lower()
+    return text or "computed"
+
+
+def _search_status_from_statuses(statuses: set[str]) -> str:
+    if not statuses:
+        return "empty"
     if any(status in {"pending", "missing"} for status in statuses):
         return "in_progress"
     if all(status == "failed" for status in statuses):
@@ -512,6 +523,41 @@ def _search_status_from_records(point_records: list[dict[str, Any]]) -> str:
     if any(status == "failed" for status in statuses):
         return "partial"
     return "complete"
+
+
+def _search_status_counts_from_records(point_records: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"total": 0, "pending": 0, "missing": 0, "failed": 0, "computed": 0, "other": 0}
+    for record in point_records:
+        status = _normalize_point_status(record.get("status", "computed"))
+        counts["total"] += 1
+        if status in {"pending", "missing", "failed", "computed"}:
+            counts[status] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def _search_status_from_counts(counts: dict[str, int]) -> str:
+    total = int(counts.get("total", 0))
+    if total <= 0:
+        return "empty"
+    if int(counts.get("pending", 0)) > 0 or int(counts.get("missing", 0)) > 0:
+        return "in_progress"
+    failed = int(counts.get("failed", 0))
+    if failed >= total:
+        return "failed"
+    if failed > 0:
+        return "partial"
+    return "complete"
+
+
+def _write_search_status_attrs(search_group: h5py.Group, counts: dict[str, int], *, diagnostics: dict[str, Any]) -> str:
+    status = _search_status_from_counts(counts)
+    for key, value in counts.items():
+        search_group.attrs[f"{key}_point_count"] = int(value)
+    search_group.attrs["status"] = np.bytes_(status)
+    search_group.attrs["label"] = np.bytes_(_search_label_from_diagnostics(diagnostics, status=status))
+    return status
 
 
 def _search_label_from_diagnostics(diagnostics: dict[str, Any], *, status: str) -> str:
@@ -540,11 +586,11 @@ def _write_search_group(
     if search_id in searches_group:
         del searches_group[search_id]
     search_group = searches_group.create_group(search_id)
-    status = _search_status_from_records(point_records)
+    counts = _search_status_counts_from_records(point_records)
+    status = _search_status_from_counts(counts)
     search_group.attrs["search_id"] = np.bytes_(str(search_id))
-    search_group.attrs["status"] = np.bytes_(status)
     search_group.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
-    search_group.attrs["label"] = np.bytes_(_search_label_from_diagnostics(diagnostics, status=status))
+    _write_search_status_attrs(search_group, counts, diagnostics=diagnostics)
     _create_text_dataset(search_group, "diagnostics_json", _json_dumps(diagnostics))
     _create_text_dataset(search_group, "layout_json", _json_dumps(layout or {}))
     _create_text_dataset(search_group, "run_history_json", _json_dumps(list(run_history or [])))
@@ -1775,10 +1821,30 @@ def append_sparse_point_record(
                 search_next_order = max(search_orders, default=-1) + 1
                 search_point_group = search_records.create_group(f"r{search_next_order:06d}")
                 _write_point_group(search_point_group, point_payload, record_order=search_next_order)
-                status_records = _load_sparse_point_records(search_records)
-                status = _search_status_from_records(status_records)
-                search_group.attrs["status"] = np.bytes_(status)
-                search_group.attrs["label"] = np.bytes_(_search_label_from_diagnostics(diagnostics_out, status=status))
+                if "total_point_count" in search_group.attrs:
+                    counts = {
+                        "total": int(search_group.attrs.get("total_point_count", 0)),
+                        "pending": int(search_group.attrs.get("pending_point_count", 0)),
+                        "missing": int(search_group.attrs.get("missing_point_count", 0)),
+                        "failed": int(search_group.attrs.get("failed_point_count", 0)),
+                        "computed": int(search_group.attrs.get("computed_point_count", 0)),
+                        "other": int(search_group.attrs.get("other_point_count", 0)),
+                    }
+                else:
+                    counts = _search_status_counts_from_records(_load_sparse_point_records(search_records))
+                    counts["total"] = max(0, counts["total"] - 1)
+                    status = _normalize_point_status(point_payload.get("status", "computed"))
+                    if status in {"pending", "missing", "failed", "computed"}:
+                        counts[status] = max(0, counts[status] - 1)
+                    else:
+                        counts["other"] = max(0, counts["other"] - 1)
+                new_status = _normalize_point_status(point_payload.get("status", "computed"))
+                counts["total"] += 1
+                if new_status in {"pending", "missing", "failed", "computed"}:
+                    counts[new_status] += 1
+                else:
+                    counts["other"] += 1
+                _write_search_status_attrs(search_group, counts, diagnostics=diagnostics_out)
             return
         except (BlockingIOError, PermissionError, OSError) as exc:
             last_exc = exc

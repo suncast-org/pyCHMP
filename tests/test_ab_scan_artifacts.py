@@ -562,6 +562,57 @@ def test_sparse_point_record_signature_filtering() -> None:
     )
 
 
+def test_search_status_normalizes_point_status_text() -> None:
+    from pychmp.ab_scan_artifacts import _search_status_from_records
+
+    assert _search_status_from_records([{"status": " Computed "}]) == "complete"
+    assert _search_status_from_records([{"status": " PENDING "}]) == "in_progress"
+    assert _search_status_from_records([{"status": " FAILED "}, {"status": "computed"}]) == "partial"
+
+
+def test_append_sparse_point_record_maintains_incremental_status_counts(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_counts.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_sparse_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    failed_point = _make_point_payload(0.0, 1.0)
+    failed_point["status"] = " failed "
+    append_sparse_point_record(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=failed_point,
+    )
+    computed_point = _make_point_payload(0.3, 1.0)
+    append_sparse_point_record(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=computed_point,
+    )
+
+    with h5py.File(out_h5, "r") as handle:
+        search_id = handle["active_search_id"][()].decode()
+        search = handle["searches"][search_id]
+        assert int(search.attrs["total_point_count"]) == 2
+        assert int(search.attrs["failed_point_count"]) == 1
+        assert int(search.attrs["computed_point_count"]) == 1
+        assert search.attrs["status"].decode() == "partial"
+
+
 def test_rectangular_artifact_round_trip_preserves_run_history(tmp_path: Path) -> None:
     out_h5 = tmp_path / "scan.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)

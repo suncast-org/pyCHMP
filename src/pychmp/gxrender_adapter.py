@@ -18,6 +18,7 @@ _EUV_PROJECTION_FLAGS_WARNING = (
     "(parallel=False, exact=False, nthreads=0) for the DLL simbox path."
 )
 _euv_projection_flags_warning_emitted = False
+_euv_projection_flags_warning_lock = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -553,9 +554,10 @@ class GXRenderEUVAdapter:
                 issubclass(warning.category, UserWarning)
                 and str(warning.message).startswith(_EUV_PROJECTION_FLAGS_WARNING)
             ):
-                if not _euv_projection_flags_warning_emitted:
-                    warnings.warn(str(warning.message), category=warning.category, stacklevel=2)
-                    _euv_projection_flags_warning_emitted = True
+                with _euv_projection_flags_warning_lock:
+                    if not _euv_projection_flags_warning_emitted:
+                        warnings.warn(str(warning.message), category=warning.category, stacklevel=2)
+                        _euv_projection_flags_warning_emitted = True
                 continue
             warnings.warn_explicit(
                 warning.message,

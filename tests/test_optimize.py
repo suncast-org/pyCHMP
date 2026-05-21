@@ -282,6 +282,37 @@ def test_find_best_q0_reports_sampled_boundary_when_it_beats_local_bracket() -> 
     assert "sampled" in result.message
 
 
+def test_find_best_q0_skips_invalid_seeded_evaluations_in_sorted_order() -> None:
+    """Optional warm-start seeds should not abort fitting when one entry is bad."""
+
+    calls: list[float] = []
+
+    def metric_function(q0: float) -> MetricValues:
+        calls.append(float(q0))
+        return MetricValues(
+            chi2=(q0 - 0.2) ** 2,
+            rho2=(q0 - 0.2) ** 2,
+            eta2=(q0 - 0.2) ** 2,
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=1.0,
+        target_metric="chi2",
+        initial_evaluations={
+            0.3: MetricValues(chi2=0.01, rho2=0.01, eta2=0.01),
+            "bad-q0": MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            0.2: object(),
+            0.1: MetricValues(chi2=0.02, rho2=0.02, eta2=0.02),
+        },
+    )
+
+    assert result.success
+    assert result.trial_q0[:2] == pytest.approx((0.1, 0.3))
+    assert 0.2 not in result.trial_q0
+
+
 def test_find_best_q0_tracks_unique_trials_and_unique_evaluations() -> None:
     """Track each unique objective evaluation in the result metadata."""
     calls: list[float] = []

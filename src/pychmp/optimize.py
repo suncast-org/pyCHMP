@@ -155,8 +155,14 @@ def _seed_initial_evaluations(
     if not initial_evaluations:
         return 0
     seeded = 0
+    seed_items: list[tuple[float, MetricFunctionResult]] = []
     for q0_raw, evaluation_raw in initial_evaluations.items():
-        q0 = float(q0_raw)
+        try:
+            q0 = float(q0_raw)
+        except Exception:
+            continue
+        seed_items.append((q0, evaluation_raw))
+    for q0, evaluation_raw in sorted(seed_items, key=lambda item: item[0]):
         if not math.isfinite(q0) or q0 <= 0.0:
             continue
         if hard_q0_min is not None and q0 < float(hard_q0_min):
@@ -165,8 +171,11 @@ def _seed_initial_evaluations(
             continue
         if q0 in cache:
             continue
-        evaluation = _normalize_metric_result(evaluation_raw)
-        objective_value = float(_metric_value(evaluation.metrics, target_metric))
+        try:
+            evaluation = _normalize_metric_result(evaluation_raw)
+            objective_value = float(_metric_value(evaluation.metrics, target_metric))
+        except Exception:
+            continue
         is_valid = bool(evaluation.is_valid) and math.isfinite(objective_value)
         record = _Q0EvaluationRecord(
             q0=q0,
