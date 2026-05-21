@@ -4,12 +4,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from importlib import import_module
-import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from typing import Any
+import warnings
 
 import numpy as np
+
+
+_EUV_PROJECTION_FLAGS_WARNING = (
+    "Current Python EUV workflow uses projection flags off "
+    "(parallel=False, exact=False, nthreads=0) for the DLL simbox path."
+)
+_euv_projection_flags_warning_emitted = False
+
+
+@dataclass(slots=True)
+class _CachedEUVResponse:
+    response: Any
+    response_dt: Any
+    response_meta: Any
 
 
 def build_tr_region_mask_from_blos(
@@ -101,30 +116,6 @@ def _load_render_mw_workflow() -> Any:
             "gxrender microwave workflow helpers are not importable. Install gximagecomputing/pyGXrender "
             "into the active environment before using GXRenderMWAdapter."
         ) from exc
-
-
-def _load_gxrender_test_data_helpers() -> Any:
-    try:
-        return import_module("gxrender.utils.test_data")
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "gxrender test-data helpers are not importable. Install gximagecomputing/pyGXrender "
-            "into the active environment before using GXRenderEUVAdapter."
-        ) from exc
-
-
-def _resolve_default_euv_response_sav(*, instrument: str) -> Path | None:
-    env_path = Path(str(os.environ.get("GXIMAGECOMPUTING_EUV_RESPONSE_SAV", "")).strip()).expanduser()
-    if str(env_path) and str(env_path) != ".":
-        if env_path.exists():
-            return env_path
-        raise FileNotFoundError(f"GXIMAGECOMPUTING_EUV_RESPONSE_SAV points to a missing file: {env_path}")
-
-    helpers = _load_gxrender_test_data_helpers()
-    candidate = helpers.try_find_response_file(str(instrument).strip().lower())
-    if candidate is None:
-        return None
-    return Path(candidate)
 
 
 def _normalize_euv_channel_token(value: str) -> str:
@@ -374,6 +365,11 @@ class GXRenderEUVAdapter:
     output_name: str | None = None
     verbose: bool = False
     render_call_count: int = 0
+    cache_response: bool = True
+    _response_cache: _CachedEUVResponse | None = field(default=None, init=False, repr=False)
+    _response_cache_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
+    _response_cache_attempted: bool = field(default=False, init=False, repr=False)
+    _response_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         instrument = str(self.instrument).strip()
@@ -386,8 +382,117 @@ class GXRenderEUVAdapter:
             raise ValueError("channel must be a non-empty string")
         self.channel = channel
 
-        if self.response_sav is None:
-            self.response_sav = _resolve_default_euv_response_sav(instrument=self.instrument)
+    def _observer_to_kwargs(self) -> dict[str, Any]:
+        observer = self.observer
+        return {
+            "dsun_cm": None if observer is None else getattr(observer, "dsun_cm", None),
+            "lonc_deg": None if observer is None else getattr(observer, "lonc_deg", None),
+            "b0sun_deg": None if observer is None else getattr(observer, "b0sun_deg", None),
+            "observer": None,
+        }
+
+    def _geometry_to_kwargs(self) -> dict[str, Any]:
+        geometry = self.geometry
+        return {
+            "xc": None if geometry is None else getattr(geometry, "xc", None),
+            "yc": None if geometry is None else getattr(geometry, "yc", None),
+            "dx": None if geometry is None else getattr(geometry, "dx", None),
+            "dy": None if geometry is None else getattr(geometry, "dy", None),
+            "pixel_scale_arcsec": (
+                float(self.pixel_scale_arcsec)
+                if geometry is None or getattr(geometry, "pixel_scale_arcsec", None) is None
+                else getattr(geometry, "pixel_scale_arcsec", None)
+            ),
+            "nx": None if geometry is None else getattr(geometry, "nx", None),
+            "ny": None if geometry is None else getattr(geometry, "ny", None),
+            "xrange": None if geometry is None else getattr(geometry, "xrange", None),
+            "yrange": None if geometry is None else getattr(geometry, "yrange", None),
+        }
+
+    def _response_cache_key_for_current_request(self) -> tuple[Any, ...]:
+        return (
+            str(Path(self.model_path).expanduser()),
+            str(self.model_format),
+            str(self.instrument),
+            str(self.channel),
+            None if self.response_sav is None else str(Path(self.response_sav).expanduser()),
+            tuple(sorted(self._observer_to_kwargs().items())),
+        )
+
+    def _resolve_euv_response_cache(self) -> _CachedEUVResponse | None:
+        try:
+            common_mod = import_module("gxrender.workflows._render_common")
+            contracts = import_module("gxrender.policy.contracts")
+            response_policy = import_module("gxrender.policy.euv_response_policy")
+        except Exception:
+            return None
+
+        args = SimpleNamespace(
+            model_path=Path(self.model_path),
+            model_format=str(self.model_format),
+            ebtel_path=self.ebtel_path,
+            channels=[str(self.channel)],
+            instrument=str(self.instrument),
+            response_sav=(None if self.response_sav is None else Path(self.response_sav)),
+            response=None,
+            response_dt=None,
+            response_meta=None,
+            omp_threads=int(self.omp_threads),
+            output_dir=None,
+            output_name=None,
+            save_outputs=False,
+            write_preview=False,
+            tbase=float(self.tbase),
+            nbase=float(self.nbase),
+            q0=0.0,
+            a=float(self.a),
+            b=float(self.b),
+            corona_mode=int(self.mode),
+            selective_heating=bool(self.selective_heating),
+            shtable=self.shtable,
+            shtable_path=None,
+            auto_fov=False,
+            use_saved_fov=False,
+            **self._geometry_to_kwargs(),
+            **self._observer_to_kwargs(),
+        )
+        try:
+            common = common_mod.prepare_common_inputs(args, prefer_execute_center=False)
+            response_policy.apply_default_response_selection(args, observer_geometry=common.observer_geometry)
+            resolved = response_policy.resolve_euv_response(
+                contracts.EUVResponseRequest(
+                    args=args,
+                    obs_time_iso=common_mod.model_obstime_iso(common.model),
+                )
+            )
+        except Exception:
+            return None
+
+        return _CachedEUVResponse(
+            response=resolved.response,
+            response_dt=resolved.response_dt,
+            response_meta=resolved.response_meta,
+        )
+
+    def _ensure_euv_response_cache(self) -> _CachedEUVResponse | None:
+        if not bool(self.cache_response):
+            return None
+        cache_key = self._response_cache_key_for_current_request()
+        cached = self._response_cache
+        if self._response_cache_key == cache_key and (cached is not None or self._response_cache_attempted):
+            return cached
+        with self._response_cache_lock:
+            cached = self._response_cache
+            if self._response_cache_key != cache_key:
+                self._response_cache = None
+                self._response_cache_attempted = False
+                self._response_cache_key = cache_key
+                cached = None
+            if cached is None and not self._response_cache_attempted:
+                cached = self._resolve_euv_response_cache()
+                self._response_cache = cached
+                self._response_cache_attempted = True
+            return cached
 
     def render_components(self, q0: float) -> dict[str, Any]:
         self.render_call_count += 1
@@ -407,6 +512,7 @@ class GXRenderEUVAdapter:
             selective_heating=bool(self.selective_heating),
             shtable=self.shtable,
         )
+        cached_response = self._ensure_euv_response_cache()
         options = sdk.EUVRenderOptions(
             model_path=Path(self.model_path),
             model_format=str(self.model_format),
@@ -415,7 +521,14 @@ class GXRenderEUVAdapter:
             output_name=self.output_name,
             channels=[str(self.channel)],
             instrument=str(self.instrument),
-            response_sav=(None if self.response_sav is None else Path(self.response_sav)),
+            response_sav=(
+                None
+                if cached_response is not None or self.response_sav is None
+                else Path(self.response_sav)
+            ),
+            response=None if cached_response is None else cached_response.response,
+            response_dt=None if cached_response is None else cached_response.response_dt,
+            response_meta=None if cached_response is None else cached_response.response_meta,
             plasma=plasma,
             omp_threads=int(self.omp_threads),
             geometry=geometry,
@@ -424,7 +537,32 @@ class GXRenderEUVAdapter:
             write_preview=False,
             verbose=bool(self.verbose),
         )
-        result = sdk.render_euv_maps(options)
+        global _euv_projection_flags_warning_emitted
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.filterwarnings(
+                "always",
+                message=(
+                    r"Current Python EUV workflow uses projection flags off "
+                    r"\(parallel=False, exact=False, nthreads=0\) for the DLL simbox path\..*"
+                ),
+                category=UserWarning,
+            )
+            result = sdk.render_euv_maps(options)
+        for warning in caught_warnings:
+            if (
+                issubclass(warning.category, UserWarning)
+                and str(warning.message).startswith(_EUV_PROJECTION_FLAGS_WARNING)
+            ):
+                if not _euv_projection_flags_warning_emitted:
+                    warnings.warn(str(warning.message), category=warning.category, stacklevel=2)
+                    _euv_projection_flags_warning_emitted = True
+                continue
+            warnings.warn_explicit(
+                warning.message,
+                warning.category,
+                warning.filename,
+                warning.lineno,
+            )
         flux_corona = np.asarray(result.flux_corona, dtype=float)
         flux_tr = np.asarray(result.flux_tr, dtype=float)
         if flux_corona.shape != flux_tr.shape:

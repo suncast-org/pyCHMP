@@ -243,9 +243,6 @@ LATEST_RESPONSE_DIR="$(latest_dated_dir "$RESPONSES_ROOT" "*")"
 if [[ -z "${LATEST_RESPONSE_DIR:-}" || ! -d "$LATEST_RESPONSE_DIR" ]]; then
   LATEST_RESPONSE_DIR="$(find "$RESPONSES_ROOT" -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)"
 fi
-if [[ -z "$EUV_RESPONSE_SAV" && -n "${LATEST_RESPONSE_DIR:-}" && -d "$LATEST_RESPONSE_DIR" ]]; then
-  EUV_RESPONSE_SAV="$(latest_matching_file "$LATEST_RESPONSE_DIR" 'resp_aia*.sav')"
-fi
 ARTIFACTS_DIR="/tmp/pychmp_ab_scan_runs"
 ARTIFACTS_STEM="${ARTIFACTS_STEM:-scan_ab_obs_map_options_test}"
 if [[ "${PYCHMP_TIMESTAMP_ARTIFACTS:-0}" == "1" ]]; then
@@ -356,7 +353,13 @@ else
 fi
 echo "Launching scan_ab_obs_map.py..."
 if (( DRY_RUN )); then
-  echo "Dry run only; command not executed."
+  echo "Dry run validation: checking scan inputs and artifact compatibility without running scan points..."
+  if ((${#EXTRA_ARGS[@]})); then
+    "$PYTHON_CMD" examples/scan_ab_obs_map.py "${ARGS[@]}" "${EXTRA_ARGS[@]}" --validate-only --no-viewer --no-progress
+  else
+    "$PYTHON_CMD" examples/scan_ab_obs_map.py "${ARGS[@]}" --validate-only --no-viewer --no-progress
+  fi
+  echo "Dry run only; scan points were not executed."
   exit 0
 fi
 if ((${#EXTRA_ARGS[@]})); then

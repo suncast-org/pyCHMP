@@ -7,7 +7,7 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from pychmp.ab_scan_artifacts import detect_scan_artifact_format, load_scan_file
+from pychmp.ab_scan_artifacts import UNIFIED_ARTIFACT_KIND, detect_scan_artifact_format, load_scan_file
 from examples.fit_q0_obs_map import save_q0_artifact
 from examples.replot_q0_artifacts import _parse_artifact_h5
 from pychmp.q0_artifact_panel import load_blos_reference_from_artifact
@@ -66,10 +66,11 @@ def test_save_q0_artifact_writes_replot_contract_with_embedded_blos(tmp_path: Pa
         trial_residual_maps=np.stack([np.full_like(data, -1.0), np.full_like(data, -0.5), np.zeros_like(data)], axis=0),
     )
 
-    assert detect_scan_artifact_format(h5_path) == "sparse"
+    assert detect_scan_artifact_format(h5_path) == "unified"
     payload = load_scan_file(h5_path)
     point = payload["point_records"][0]
-    assert payload["artifact_format"] == "sparse"
+    assert payload["artifact_format"] == "unified"
+    assert payload["diagnostics"]["artifact_kind"] == UNIFIED_ARTIFACT_KIND
     assert payload["target_metric"] == "chi2"
     assert point["target_metric"] == "chi2"
     np.testing.assert_allclose(point["fit_q0_trials"], [1.0e-4, 2.0e-4, 3.0e-4])

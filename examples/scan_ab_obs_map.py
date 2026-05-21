@@ -32,6 +32,7 @@ from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observat
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     SPARSE_ARTIFACT_KIND,
+    UNIFIED_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
     append_point_record,
     build_computed_point_payload,
@@ -47,6 +48,7 @@ from pychmp.ab_scan_artifacts import (
 from pychmp.ab_scan_execution import ABExecutionSettings, iter_execute_tasks, resolve_execution_plan
 from pychmp.ab_scan_tasks import ABSliceTaskDescriptor, compile_rectangular_point_tasks, compile_sparse_point_tasks
 from pychmp.ab_search import idl_q0_start_heuristic
+from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
 
 
 def _build_command_compatibility_signature(argv: list[str]) -> str:
@@ -471,6 +473,15 @@ def _merge_existing_rectangular_payload(
             "fit_chi2_trials": tuple(float(v) for v in payload.get("fit_chi2_trials", ())),
             "fit_rho2_trials": tuple(float(v) for v in payload.get("fit_rho2_trials", ())),
             "fit_eta2_trials": tuple(float(v) for v in payload.get("fit_eta2_trials", ())),
+            "trial_raw_modeled_maps": (
+                None if payload.get("trial_raw_modeled_maps") is None else np.asarray(payload["trial_raw_modeled_maps"], dtype=float)
+            ),
+            "trial_modeled_maps": (
+                None if payload.get("trial_modeled_maps") is None else np.asarray(payload["trial_modeled_maps"], dtype=float)
+            ),
+            "trial_residual_maps": (
+                None if payload.get("trial_residual_maps") is None else np.asarray(payload["trial_residual_maps"], dtype=float)
+            ),
             "target_metric": str(payload.get("target_metric", target_metric)),
             "diagnostics": existing_diag,
         }
@@ -499,6 +510,7 @@ def _build_rectangular_pending_requests(
     adaptive_bracketing: bool,
     q0_step: float,
     max_bracket_steps: int,
+    warm_start_by_coord: dict[tuple[float, float], dict[str, Any]] | None = None,
 ) -> tuple[list[_RectangularPointEvaluationRequest], list[tuple[float, float]]]:
     pending_requests: list[_RectangularPointEvaluationRequest] = []
     skipped_points: list[tuple[float, float]] = []
@@ -518,8 +530,13 @@ def _build_rectangular_pending_requests(
         q0_start = None
         if q0_start_scalar is not None:
             q0_start = float(q0_start_scalar)
+        elif warm_start_by_coord and (float(a_value), float(b_value)) in warm_start_by_coord:
+            candidate_q0_start = float(warm_start_by_coord[(float(a_value), float(b_value))]["q0_start"])
+            if float(point_task.q0_min) <= candidate_q0_start <= float(point_task.q0_max):
+                q0_start = candidate_q0_start
         elif use_idl_q0_start_heuristic:
             q0_start = float(idl_q0_start_heuristic(a_value, b_value))
+        warm_start = None if not warm_start_by_coord else warm_start_by_coord.get((float(a_value), float(b_value)))
 
         pending_requests.append(
             _RectangularPointEvaluationRequest(
@@ -531,6 +548,10 @@ def _build_rectangular_pending_requests(
                 adaptive_bracketing=bool(adaptive_bracketing),
                 q0_step=float(q0_step),
                 max_bracket_steps=int(max_bracket_steps),
+                initial_evaluations=tuple() if warm_start is None else tuple(warm_start.get("initial_evaluations", ())),
+                initial_trial_q0=tuple() if warm_start is None else tuple(float(q0) for q0 in warm_start.get("trial_q0", ())),
+                initial_trial_raw_modeled_maps=None if warm_start is None else warm_start.get("trial_raw_modeled_maps"),
+                initial_trial_modeled_maps=None if warm_start is None else warm_start.get("trial_modeled_maps"),
             )
         )
 
@@ -568,6 +589,83 @@ def _build_sparse_pending_tasks(
         pending_tasks.append(point_task)
 
     return pending_tasks, skipped_points, recompute_points
+
+
+def _target_metric_value(metrics: Any, target_metric: str) -> float:
+    metric_name = str(target_metric)
+    if metric_name == "chi2":
+        return float(metrics.chi2)
+    if metric_name == "rho2":
+        return float(metrics.rho2)
+    if metric_name == "eta2":
+        return float(metrics.eta2)
+    raise ValueError(f"unsupported target metric: {target_metric!r}")
+
+
+def _rescore_existing_trial_maps_for_warm_start(
+    point: dict[str, Any],
+    *,
+    observed: np.ndarray,
+    sigma: np.ndarray,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+) -> dict[str, Any] | None:
+    trial_q0 = [float(value) for value in point.get("fit_q0_trials", ())]
+    trial_maps_raw = point.get("trial_modeled_maps")
+    if not trial_q0 or trial_maps_raw is None:
+        return None
+    trial_maps = np.asarray(trial_maps_raw, dtype=float)
+    if trial_maps.ndim != 3 or int(trial_maps.shape[0]) != len(trial_q0):
+        return None
+
+    observed_arr = np.asarray(observed, dtype=float)
+    sigma_arr = np.asarray(sigma, dtype=float)
+    explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
+    mask_fn = resolve_threshold_mask("union")
+
+    rescored: list[tuple[float, Any, float, np.ndarray]] = []
+    for q0_value, modeled in zip(trial_q0, trial_maps, strict=False):
+        modeled_arr = np.asarray(modeled, dtype=float)
+        try:
+            mask = explicit_mask_arr if explicit_mask_arr is not None else mask_fn(observed_arr, modeled_arr, threshold)
+            metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
+            objective = _target_metric_value(metrics, target_metric)
+        except Exception:
+            continue
+        if np.isfinite(objective):
+            rescored.append((float(q0_value), metrics, float(objective), modeled_arr))
+
+    if not rescored:
+        return None
+
+    best_q0, best_metrics, best_objective, _best_map = min(rescored, key=lambda item: item[2])
+    trial_raw_maps = point.get("trial_raw_modeled_maps")
+    trial_raw_arr = None if trial_raw_maps is None else np.asarray(trial_raw_maps, dtype=float)
+    raw_by_q0: dict[float, np.ndarray] = {}
+    if trial_raw_arr is not None and trial_raw_arr.ndim == 3 and int(trial_raw_arr.shape[0]) == len(trial_q0):
+        raw_by_q0 = {float(q0): np.asarray(raw_map, dtype=float) for q0, raw_map in zip(trial_q0, trial_raw_arr, strict=False)}
+    return {
+        "q0_start": float(best_q0),
+        "chi2": float(best_metrics.chi2),
+        "rho2": float(best_metrics.rho2),
+        "eta2": float(best_metrics.eta2),
+        "target_metric_value": float(best_objective),
+        "trial_count": int(len(rescored)),
+        "initial_evaluations": tuple(
+            (float(q0), float(metrics.chi2), float(metrics.rho2), float(metrics.eta2))
+            for q0, metrics, _objective, _modeled in rescored
+        ),
+        "trial_q0": tuple(float(q0) for q0, _metrics, _objective, _modeled in rescored),
+        "trial_modeled_maps": np.stack([np.asarray(modeled, dtype=float) for _q0, _metrics, _objective, modeled in rescored], axis=0),
+        "trial_raw_modeled_maps": np.stack(
+            [
+                np.asarray(raw_by_q0.get(float(q0), modeled), dtype=float)
+                for q0, _metrics, _objective, modeled in rescored
+            ],
+            axis=0,
+        ),
+    }
 
 
 def _decode_h5_scalar(value: Any) -> str:
@@ -720,7 +818,9 @@ def _run_point_worker(
     progress: bool,
     label: str,
 ) -> None:
-    proc = subprocess.Popen(cmd, start_new_session=True)
+    env = os.environ.copy()
+    env["PYCHMP_SUPPRESS_VIEWER_HINT"] = "1"
+    proc = subprocess.Popen(cmd, start_new_session=True, env=env)
     if progress:
         print(
             f"    {label} PID/PGID: {proc.pid} "
@@ -802,6 +902,8 @@ class _SparsePointEvaluationRequest:
     tr_mask_bmin_gauss: float | None
     metrics_mask_threshold: float
     metrics_mask_fits: str | None
+    warm_start_from_existing_trials: bool
+    warm_start_artifact: str | None
     observer_name: str | None
     dsun_cm: float | None
     lonc_deg: float | None
@@ -885,6 +987,10 @@ def _evaluate_sparse_point_request(
     base_point_cmd.extend(["--metrics-mask-threshold", str(float(request.metrics_mask_threshold))])
     if request.metrics_mask_fits is not None:
         base_point_cmd.extend(["--metrics-mask-fits", str(request.metrics_mask_fits)])
+    if request.warm_start_from_existing_trials:
+        base_point_cmd.append("--warm-start-from-existing-trials")
+    if request.warm_start_artifact is not None:
+        base_point_cmd.extend(["--warm-start-artifact", str(request.warm_start_artifact)])
     if bool(request.adaptive_bracketing):
         base_point_cmd.append("--adaptive-bracketing")
     else:
@@ -1081,6 +1187,10 @@ class _RectangularPointEvaluationRequest:
     adaptive_bracketing: bool
     q0_step: float
     max_bracket_steps: int
+    initial_evaluations: tuple[tuple[float, float, float, float], ...] = tuple()
+    initial_trial_q0: tuple[float, ...] = tuple()
+    initial_trial_raw_modeled_maps: np.ndarray | None = None
+    initial_trial_modeled_maps: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1106,6 +1216,9 @@ class _RectangularPointEvaluationResult:
     modeled_best: np.ndarray | None
     raw_modeled_best: np.ndarray | None
     residual: np.ndarray | None
+    trial_raw_modeled_maps: np.ndarray | None
+    trial_modeled_maps: np.ndarray | None
+    trial_residual_maps: np.ndarray | None
     trial_render_count: int
     total_render_calls: int
     elapsed_seconds: float
@@ -1131,6 +1244,39 @@ def _observer_override_snapshot(observer_overrides: Any | None) -> dict[str, flo
         "lonc_deg": float(getattr(observer_overrides, "lonc_deg")),
         "b0sun_deg": float(getattr(observer_overrides, "b0sun_deg")),
     }
+
+
+def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int | None:
+    """Return an existing pychmp viewer PID for this artifact, if visible."""
+    try:
+        artifact_text = str(Path(artifact_h5).expanduser().resolve())
+        script_name = Path(viewer_script).name
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    current_pid = os.getpid()
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if script_name in command and artifact_text in command:
+            return pid
+    return None
 
 
 def _bootstrap_rectangular_worker(payload: _RectangularWorkerBootstrap) -> _RectangularWorkerState:
@@ -1186,16 +1332,45 @@ def _evaluate_rectangular_point_request(
         renderer = base_renderer if worker_state.psf_kernel is None else PSFConvolvedRenderer(base_renderer, worker_state.psf_kernel)
 
         render_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        initial_q0_values = tuple(float(value) for value in request.initial_trial_q0)
+        initial_raw_maps = request.initial_trial_raw_modeled_maps
+        initial_modeled_maps = request.initial_trial_modeled_maps
+        if (
+            initial_q0_values
+            and initial_raw_maps is not None
+            and initial_modeled_maps is not None
+            and int(np.asarray(initial_raw_maps).shape[0]) == len(initial_q0_values)
+            and int(np.asarray(initial_modeled_maps).shape[0]) == len(initial_q0_values)
+        ):
+            for q0_value, raw_map, modeled_map in zip(
+                initial_q0_values,
+                np.asarray(initial_raw_maps, dtype=float),
+                np.asarray(initial_modeled_maps, dtype=float),
+                strict=False,
+            ):
+                render_cache[float(q0_value)] = (np.asarray(raw_map, dtype=float), np.asarray(modeled_map, dtype=float))
+        initial_evaluations = {
+            float(q0): MetricValues(chi2=float(chi2), rho2=float(rho2), eta2=float(eta2))
+            for q0, chi2, rho2, eta2 in request.initial_evaluations
+        }
 
         if isinstance(renderer, PSFConvolvedRenderer):
             class _CachedObservedRenderer:
                 def render(self_inner, q0: float) -> np.ndarray:
+                    cached_pair = _lookup_cached_render_pair(render_cache, float(q0))
+                    if cached_pair is not None:
+                        _raw_arr, modeled_arr = cached_pair
+                        return modeled_arr
                     raw_arr, modeled_arr = renderer.render_pair(q0)
                     render_cache[float(q0)] = (raw_arr, modeled_arr)
                     return modeled_arr
         else:
             class _CachedObservedRenderer:
                 def render(self_inner, q0: float) -> np.ndarray:
+                    cached_pair = _lookup_cached_render_pair(render_cache, float(q0))
+                    if cached_pair is not None:
+                        _raw_arr, modeled_arr = cached_pair
+                        return modeled_arr
                     modeled_arr = base_renderer.render(q0)
                     render_cache[float(q0)] = (modeled_arr, modeled_arr)
                     return modeled_arr
@@ -1213,6 +1388,7 @@ def _evaluate_rectangular_point_request(
             q0_start=request.q0_start,
             q0_step=float(request.q0_step),
             max_bracket_steps=int(request.max_bracket_steps),
+            initial_evaluations=initial_evaluations,
         )
 
         cached_best_pair = _lookup_cached_render_pair(render_cache, result.q0)
@@ -1225,6 +1401,26 @@ def _evaluate_rectangular_point_request(
             raw_modeled_best = modeled_best
 
         residual = modeled_best - worker_state.observed
+        raw_trial_maps: list[np.ndarray] = []
+        modeled_trial_maps: list[np.ndarray] = []
+        residual_trial_maps: list[np.ndarray] = []
+        for trial_q0 in result.trial_q0:
+            cached_pair = _lookup_cached_render_pair(render_cache, float(trial_q0))
+            if cached_pair is None:
+                continue
+            raw_trial, modeled_trial = cached_pair
+            raw_trial_maps.append(np.asarray(raw_trial, dtype=float))
+            modeled_trial_maps.append(np.asarray(modeled_trial, dtype=float))
+            residual_trial_maps.append(np.asarray(modeled_trial, dtype=float) - worker_state.observed)
+        trial_raw_modeled_maps = (
+            np.stack(raw_trial_maps, axis=0) if raw_trial_maps and len(raw_trial_maps) == len(result.trial_q0) else None
+        )
+        trial_modeled_maps = (
+            np.stack(modeled_trial_maps, axis=0) if modeled_trial_maps and len(modeled_trial_maps) == len(result.trial_q0) else None
+        )
+        trial_residual_maps = (
+            np.stack(residual_trial_maps, axis=0) if residual_trial_maps and len(residual_trial_maps) == len(result.trial_q0) else None
+        )
         return _RectangularPointEvaluationResult(
             task=task,
             success=bool(result.success),
@@ -1247,6 +1443,9 @@ def _evaluate_rectangular_point_request(
             modeled_best=np.asarray(modeled_best, dtype=float),
             raw_modeled_best=np.asarray(raw_modeled_best, dtype=float),
             residual=np.asarray(residual, dtype=float),
+            trial_raw_modeled_maps=trial_raw_modeled_maps,
+            trial_modeled_maps=trial_modeled_maps,
+            trial_residual_maps=trial_residual_maps,
             trial_render_count=len(result.trial_q0),
             total_render_calls=int(base_renderer.render_call_count),
             elapsed_seconds=float(time.perf_counter() - started),
@@ -1274,6 +1473,9 @@ def _evaluate_rectangular_point_request(
             modeled_best=None,
             raw_modeled_best=None,
             residual=None,
+            trial_raw_modeled_maps=None,
+            trial_modeled_maps=None,
+            trial_residual_maps=None,
             trial_render_count=0,
             total_render_calls=0,
             elapsed_seconds=float(time.perf_counter() - started),
@@ -1295,7 +1497,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--obs-frequency-ghz", type=float, default=None, help="Optional MW frequency hint used only when the selected observation is missing frequency metadata")
     p.add_argument("--obs-wavelength-angstrom", type=float, default=None, help="Optional EUV/UV wavelength hint used only when the selected observation is missing wavelength metadata")
     p.add_argument("--euv-instrument", type=str, default=None, help="Optional EUV/UV instrument override for model-refmap observation selection. Must agree with the resolved observation when that observation already declares an instrument.")
-    p.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV forwarded to the one-point EUV/UV path.")
+    p.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV override forwarded to the one-point EUV/UV path. If omitted, gximagecomputing uses its default pyEUVTools-backed response path for supported instruments.")
     p.add_argument("--model-h5", dest="model_h5_override", type=Path, default=None, help="Explicit model H5 path used when positional model_h5 is omitted")
     p.add_argument("--ebtel-path", type=Path, default=None, help="Path to EBTEL .sav file")
     p.add_argument("--testdata-repo", type=Path, default=None, help="Optional sibling pyGXrender-test-data checkout used for default input resolution")
@@ -1330,6 +1532,13 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--target-metric", choices=METRIC_CHOICES, default="chi2", help="Metric minimized for each `(a,b)` point.")
     p.add_argument("--adaptive-bracketing", action=argparse.BooleanOptionalAction, default=True, help="Enable adaptive Q0 bracketing for each `(a,b)` point.")
     p.add_argument("--q0-start-scalar", type=float, default=None, help="Fixed Q0 start used for every `(a,b)` point.")
+    p.add_argument(
+        "--warm-start-from-existing-trials",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When existing point records contain saved trial maps, rescore those maps with the current metric mask, seed the Q0 optimizer with the full saved metric curve, and reuse saved maps instead of rendering duplicate Q0s.",
+    )
+    p.add_argument("--warm-start-artifact", type=Path, default=None, help="Optional compatible scan artifact used as the source of saved trial maps for warm-start optimizer seeds.")
     p.add_argument("--use-idl-q0-start-heuristic", action=argparse.BooleanOptionalAction, default=False, help="Use the IDL empirical Q0_start(a,b) heuristic if no scalar start is given.")
     p.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative Q0 step for adaptive bracketing.")
     p.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive bracketing expansion steps.")
@@ -1399,6 +1608,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--worker-chunksize", type=int, default=1, help="Task chunksize passed to the process pool executor.")
     p.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True, help="Print per-trial and per-point progress diagnostics.")
     p.add_argument("--spinner", action=argparse.BooleanOptionalAction, default=True, help="Show a spinner during long-running stages.")
+    p.add_argument("--validate-only", action="store_true", help="Validate inputs and artifact compatibility, then exit before creating/updating artifacts or running scan points.")
     p.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit.")
     return p, p.parse_args()
 
@@ -1436,6 +1646,8 @@ def main() -> int:
             "target_metric": "chi2",
             "adaptive_bracketing": True,
             "q0_start_scalar": None,
+            "warm_start_from_existing_trials": False,
+            "warm_start_artifact": None,
             "use_idl_q0_start_heuristic": False,
             "q0_step": 1.61803398875,
             "max_bracket_steps": 12,
@@ -1464,6 +1676,7 @@ def main() -> int:
             "show_plot": False,
             "progress": True,
             "spinner": True,
+            "validate_only": False,
         }
         print("Assumed defaults for scan_ab_obs_map.py:")
         for key, value in defaults.items():
@@ -1721,9 +1934,9 @@ def main() -> int:
     tr_mask_requested = str(obs_map.domain).lower() in {"euv", "uv"} and not np.isclose(abs(float(args.tr_mask_bmin_gauss)), 1000.0, rtol=0.0, atol=1e-12)
     use_sparse_mode = bool(
         explicit_points
-        or existing_format == "sparse"
+        or existing_format in {"sparse", "unified"}
         or str(obs_map.domain).lower() != "mw"
-        or nondefault_metrics_mask
+        or (nondefault_metrics_mask and existing_format != "rectangular")
         or tr_mask_requested
     )
     target_points = explicit_points or [GridPointSpec(a=float(a), b=float(b)) for a in a_values for b in b_values]
@@ -1785,6 +1998,7 @@ def main() -> int:
     )
     current_run_history = [*existing_run_history, current_run_entry]
     viewer_process = None
+    viewer_reuse_reported = False
     viewer_refresh_signal = Path(f"{out_h5}.refresh")
 
     def _notify_viewer_refresh(phase: str) -> None:
@@ -1794,10 +2008,16 @@ def main() -> int:
             pass
 
     def _maybe_launch_viewer(phase: str) -> None:
-        nonlocal viewer_process
+        nonlocal viewer_process, viewer_reuse_reported
         if bool(args.no_viewer) or suppress_auto_viewer:
             return
         if viewer_process is not None and viewer_process.poll() is None:
+            return
+        existing_viewer_pid = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=out_h5)
+        if existing_viewer_pid is not None:
+            if not viewer_reuse_reported:
+                print(f"✓ Reusing existing pychmp-view ({phase}) pid={existing_viewer_pid}")
+                viewer_reuse_reported = True
             return
         try:
             proc = subprocess.Popen(
@@ -1820,10 +2040,7 @@ def main() -> int:
 
     print(f"  Live viewer command: {viewer_cmd_text}")
     print("  You may run this command while the scan is still in progress and use Refresh Artifact in the viewer.")
-    if use_sparse_mode:
-        print("  Artifact storage mode: sparse point-record H5")
-    else:
-        print("  Artifact storage mode: rectangular grid H5")
+    print("  Artifact storage mode: unified search-record H5")
 
     psf_kernel = None
     if not use_sparse_mode:
@@ -1893,7 +2110,7 @@ def main() -> int:
     )
     ebtel_sha256 = _compute_file_sha256(args.ebtel_path)
     root_diag = {
-        "artifact_kind": SPARSE_ARTIFACT_KIND if use_sparse_mode else "pychmp_ab_scan",
+        "artifact_kind": UNIFIED_ARTIFACT_KIND,
         "spectral_domain": str(obs_map.domain),
         "spectral_label": str(obs_map.spectral_label or f"{float(freq_ghz):.3f} GHz"),
         "model_path": str(args.model_h5),
@@ -1984,13 +2201,13 @@ def main() -> int:
 
     if use_sparse_mode:
         assert point_artifacts_dir is not None
-        if out_h5.exists() and existing_format != "sparse":
+        if out_h5.exists() and existing_format not in {"sparse", "unified"}:
             parser.error(
-                "Explicit sparse point-list mode requires a sparse artifact at --artifact-h5. "
-                "Convert the existing rectangular artifact first."
+                "Point-list execution requires a unified point-record artifact at --artifact-h5. "
+                "Use a new artifact stem or migrate the legacy artifact first."
             )
 
-        if not out_h5.exists():
+        if not out_h5.exists() and not bool(args.validate_only):
             write_sparse_scan_file(
                 out_h5,
                 observed=observed_cropped,
@@ -2001,7 +2218,7 @@ def main() -> int:
                 point_records=[],
                 run_history=current_run_history,
             )
-            _notify_viewer_refresh("sparse artifact initialized")
+            _notify_viewer_refresh("unified artifact initialized")
 
         if out_h5.exists():
             try:
@@ -2017,9 +2234,12 @@ def main() -> int:
             except ScanArtifactCompatibilityError as exc:
                 parser.error(str(exc))
             except Exception as exc:
-                parser.error(f"existing sparse artifact at {out_h5} could not be read safely: {exc}")
+                parser.error(f"existing artifact at {out_h5} could not be read safely: {exc}")
         else:
             existing_payload = None
+        if bool(args.validate_only):
+            print(f"\nValidation only: inputs and artifact compatibility checks passed for {out_h5}")
+            return 0
         existing_points = {
             (float(record["a"]), float(record["b"])): record
             for record in (existing_payload.get("point_records", []) if existing_payload is not None else [])
@@ -2028,6 +2248,56 @@ def main() -> int:
                 compatibility_signature=compatibility_signature,
             )
         }
+        warm_source_points = existing_points
+        if args.warm_start_artifact is not None:
+            warm_artifact = Path(args.warm_start_artifact).expanduser()
+            if not warm_artifact.is_file():
+                parser.error(f"warm-start artifact not found: {warm_artifact}")
+            try:
+                warm_payload = load_scan_file(warm_artifact, slice_key=current_slice_key)
+                validate_scan_artifact_compatibility(
+                    warm_payload,
+                    observed=observed_cropped,
+                    sigma_map=sigma_cropped,
+                    wcs_header=target_header,
+                    diagnostics=root_diag,
+                    artifact_path=warm_artifact,
+                )
+            except ScanArtifactCompatibilityError as exc:
+                parser.error(str(exc))
+            except Exception as exc:
+                parser.error(f"warm-start artifact at {warm_artifact} could not be read safely: {exc}")
+            warm_records = list(warm_payload.get("point_records") or warm_payload.get("points", {}).values())
+            warm_source_points = {
+                (float(record["a"]), float(record["b"])): record
+                for record in warm_records
+                if point_record_matches_compatibility_signature(
+                    record,
+                    compatibility_signature=compatibility_signature,
+                )
+            }
+        warm_start_by_coord: dict[tuple[float, float], dict[str, Any]] = {}
+        if bool(args.warm_start_from_existing_trials) and warm_source_points:
+            explicit_warm_mask = (
+                None
+                if args.metrics_mask_fits is None
+                else _load_explicit_metric_mask(args.metrics_mask_fits, expected_shape=tuple(np.asarray(observed_cropped).shape))
+            )
+            for coord, existing_point in warm_source_points.items():
+                warm_start = _rescore_existing_trial_maps_for_warm_start(
+                    existing_point,
+                    observed=observed_cropped,
+                    sigma=sigma_cropped,
+                    threshold=float(args.metrics_mask_threshold),
+                    explicit_mask=explicit_warm_mask,
+                    target_metric=str(args.target_metric),
+                )
+                if warm_start is not None:
+                    warm_start_by_coord[(float(coord[0]), float(coord[1]))] = warm_start
+            print(
+                f"  Warm start: rescored saved trial maps for {len(warm_start_by_coord)}/{len(warm_source_points)} "
+                f"existing point(s) with metrics-mask threshold={float(args.metrics_mask_threshold):.3f}"
+            )
         _maybe_launch_viewer("scan start")
         prepared_observation_h5: Path | None = None
         if str(obs_map.domain).lower() == "mw":
@@ -2050,14 +2320,14 @@ def main() -> int:
         classified_sparse_tasks, skipped_sparse_points, recompute_sparse_points = _build_sparse_pending_tasks(
             target_tasks=target_tasks,
             existing_points=existing_points,
-            recompute_existing=bool(args.recompute_existing),
+            recompute_existing=bool(args.recompute_existing) or bool(args.warm_start_from_existing_trials),
         )
         run_success_count = 0
         for skipped_a, skipped_b in skipped_sparse_points:
             existing_point = existing_points[(float(skipped_a), float(skipped_b))]
             existing_status = str(existing_point.get("status", "computed"))
             print(
-                f"    skipping point already present in sparse artifact "
+                f"    skipping point already present in artifact "
                 f"(status={existing_status})"
             )
             run_success_count += int(bool(existing_point.get("success", False)))
@@ -2078,16 +2348,27 @@ def main() -> int:
             if existing_point is not None and (float(a_value), float(b_value)) in recompute_sparse_points:
                 existing_status = str(existing_point.get("status", "computed"))
                 if existing_status == "failed":
-                    print("    recomputing failed point already present in sparse artifact")
+                    print("    recomputing failed point already present in artifact")
                 else:
                     print(
-                        f"    recomputing point already present in sparse artifact "
+                        f"    recomputing point already present in artifact "
                         f"(status={existing_status})"
                     )
 
             q0_start = None
             if args.q0_start_scalar is not None:
                 q0_start = float(args.q0_start_scalar)
+            elif (float(a_value), float(b_value)) in warm_start_by_coord:
+                warm_start = warm_start_by_coord[(float(a_value), float(b_value))]
+                candidate_q0_start = float(warm_start["q0_start"])
+                if point_q0_min <= candidate_q0_start <= point_q0_max:
+                    q0_start = candidate_q0_start
+                print(
+                    f"    warm-starting point a={a_value:.3f} b={b_value:.3f} "
+                    f"from saved trial q0={candidate_q0_start:.6e} "
+                    f"{args.target_metric}={float(warm_start['target_metric_value']):.6e} "
+                    f"(rescored_trials={int(warm_start['trial_count'])})"
+                )
             elif args.use_idl_q0_start_heuristic:
                 q0_start = float(idl_q0_start_heuristic(float(a_value), float(b_value)))
             point_stem = f"{stem}_a{int(point_task.a_index):03d}_b{int(point_task.b_index):03d}"
@@ -2130,6 +2411,8 @@ def main() -> int:
                     tr_mask_bmin_gauss=abs(float(args.tr_mask_bmin_gauss)) if str(obs_map.domain).lower() in {"euv", "uv"} else None,
                     metrics_mask_threshold=float(args.metrics_mask_threshold),
                     metrics_mask_fits=None if args.metrics_mask_fits is None else str(args.metrics_mask_fits),
+                    warm_start_from_existing_trials=bool(args.warm_start_from_existing_trials),
+                    warm_start_artifact=str(args.warm_start_artifact or out_h5) if bool(args.warm_start_from_existing_trials) else None,
                     observer_name=args.observer,
                     dsun_cm=args.dsun_cm,
                     lonc_deg=args.lonc_deg,
@@ -2193,7 +2476,7 @@ def main() -> int:
                     a_value=a_value,
                     b_value=b_value,
                     target_metric=str(args.target_metric),
-                    message=f"sparse point worker failed: {result.error_message}",
+                    message=f"point worker failed: {result.error_message}",
                 )
                 point_payload["diagnostics"]["psf_source"] = str(psf_source)
             else:
@@ -2321,6 +2604,10 @@ def main() -> int:
         except Exception as exc:
             parser.error(f"existing artifact at {out_h5} could not be read safely: {exc}")
 
+    if bool(args.validate_only):
+        print(f"\nValidation only: inputs and artifact compatibility checks passed for {out_h5}")
+        return 0
+
     _save_ab_scan_h5(
         out_h5,
         observed=observed_cropped,
@@ -2339,13 +2626,42 @@ def main() -> int:
         point_payloads=point_payloads,
         run_history=current_run_history,
     )
-    _notify_viewer_refresh("rectangular artifact initialized")
+    _notify_viewer_refresh("unified artifact initialized")
     _maybe_launch_viewer("scan start")
+
+    warm_start_by_coord: dict[tuple[float, float], dict[str, Any]] = {}
+    if bool(args.warm_start_from_existing_trials):
+        explicit_warm_mask = (
+            None
+            if args.metrics_mask_fits is None
+            else _load_explicit_metric_mask(args.metrics_mask_fits, expected_shape=tuple(np.asarray(observed_cropped).shape))
+        )
+        for payload in point_payloads.values():
+            if str(payload.get("status", "pending")) == "pending":
+                continue
+            try:
+                coord = (float(payload["a"]), float(payload["b"]))
+            except Exception:
+                continue
+            warm_start = _rescore_existing_trial_maps_for_warm_start(
+                payload,
+                observed=observed_cropped,
+                sigma=sigma_cropped,
+                threshold=float(args.metrics_mask_threshold),
+                explicit_mask=explicit_warm_mask,
+                target_metric=str(args.target_metric),
+            )
+            if warm_start is not None:
+                warm_start_by_coord[coord] = warm_start
+        print(
+            f"  Warm start: rescored saved trial maps for {len(warm_start_by_coord)} "
+            f"existing rectangular point(s) with metrics-mask threshold={float(args.metrics_mask_threshold):.3f}"
+        )
 
     pending_requests, skipped_points = _build_rectangular_pending_requests(
         target_tasks=target_tasks,
         point_payloads=point_payloads,
-        recompute_existing=bool(args.recompute_existing),
+        recompute_existing=bool(args.recompute_existing) or bool(args.warm_start_from_existing_trials),
         q0_start_scalar=args.q0_start_scalar,
         use_idl_q0_start_heuristic=bool(args.use_idl_q0_start_heuristic),
         hard_q0_min=args.hard_q0_min,
@@ -2354,6 +2670,7 @@ def main() -> int:
         adaptive_bracketing=bool(args.adaptive_bracketing),
         q0_step=float(args.q0_step),
         max_bracket_steps=int(args.max_bracket_steps),
+        warm_start_by_coord=warm_start_by_coord,
     )
     for skipped_a, skipped_b in skipped_points:
         existing_payload = point_payloads[(
@@ -2575,6 +2892,9 @@ def main() -> int:
                         wcs_header=target_header,
                         model_path=model_h5,
                         blos_reference=point_blos_reference,
+                        trial_raw_modeled_maps=response.trial_raw_modeled_maps,
+                        trial_modeled_maps=response.trial_modeled_maps,
+                        trial_residual_maps=response.trial_residual_maps,
                     )
                     print(f"  ✓ Saved to: {point_h5}")
 
@@ -2600,6 +2920,9 @@ def main() -> int:
                     fit_chi2_trials=tuple(float(v) for v in response.trial_chi2_values),
                     fit_rho2_trials=tuple(float(v) for v in response.trial_rho2_values),
                     fit_eta2_trials=tuple(float(v) for v in response.trial_eta2_values),
+                    trial_raw_modeled_maps=response.trial_raw_modeled_maps,
+                    trial_modeled_maps=response.trial_modeled_maps,
+                    trial_residual_maps=response.trial_residual_maps,
                     nfev=int(response.nfev),
                     nit=int(response.nit),
                     message=str(response.message),

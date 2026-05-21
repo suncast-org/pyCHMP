@@ -14,6 +14,7 @@ from astropy.io import fits
 
 
 METRICS = ("chi2", "rho2", "eta2")
+UNIFIED_ARTIFACT_KIND = "pychmp_ab_scan_unified"
 RECTANGULAR_ARTIFACT_KIND = "pychmp_ab_scan"
 SPARSE_ARTIFACT_KIND = "pychmp_ab_scan_sparse_points"
 SLICE_CONTAINER_GROUP = "slices"
@@ -22,7 +23,9 @@ COMMON_SLICE_DESCRIPTORS_DATASET = "slice_descriptors_json"
 COMMON_TARGET_SLICE_KEY_DATASET = "target_slice_key"
 COMMON_TRIAL_LOGGING_POLICY_DATASET = "trial_logging_policy_json"
 COMMON_ARTIFACT_CONTRACT_VERSION_DATASET = "artifact_contract_version"
-CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-04-23-a"
+SEARCHES_GROUP = "searches"
+ACTIVE_SEARCH_ID_DATASET = "active_search_id"
+CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-05-21-unified-searches"
 REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "artifact_kind",
     "target_metric",
@@ -43,6 +46,17 @@ REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "observer_obs_time",
 )
 COMPATIBILITY_SIGNATURE_KEY = "compatibility_signature"
+SEARCH_SPECIFIC_DIAGNOSTIC_KEYS = {
+    COMPATIBILITY_SIGNATURE_KEY,
+    "target_metric",
+    "metrics_mask_threshold",
+    "metrics_mask_source",
+    "metrics_mask_fits",
+    "mask_type",
+    "tr_mask_bmin_gauss",
+    "tr_mask_source",
+    "search_mode",
+}
 
 
 class ScanArtifactCompatibilityError(ValueError):
@@ -67,6 +81,14 @@ def decode_scalar(value: Any) -> str:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, default=str)
+
+
+def _json_loads_or_empty(value: Any) -> dict[str, Any]:
+    try:
+        loaded = json.loads(decode_scalar(value))
+    except Exception:
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
 
 
 def _optional_float(value: Any) -> float | None:
@@ -147,6 +169,14 @@ def _arrays_match_for_reuse(lhs: np.ndarray, rhs: np.ndarray) -> bool:
 
 
 def _diagnostic_values_match(key: str, existing: Any, current: Any) -> bool:
+    if key == "artifact_kind":
+        existing_text = str(existing)
+        current_text = str(current)
+        if UNIFIED_ARTIFACT_KIND in {existing_text, current_text} and {
+            existing_text,
+            current_text,
+        } & {RECTANGULAR_ARTIFACT_KIND, SPARSE_ARTIFACT_KIND}:
+            return True
     if isinstance(existing, (int, float, np.integer, np.floating)) or isinstance(current, (int, float, np.integer, np.floating)):
         try:
             existing_value = float(existing)
@@ -211,7 +241,7 @@ def scan_artifact_compatibility_issues(
     # command-signature match when present. Sparse artifacts may intentionally
     # accumulate multiple runs and therefore filter incompatible point records
     # during hydration instead of rejecting the whole file.
-    if artifact_kind != SPARSE_ARTIFACT_KIND:
+    if artifact_kind not in {SPARSE_ARTIFACT_KIND, UNIFIED_ARTIFACT_KIND}:
         existing_signature = str(existing_diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
         current_signature = str(diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
         if existing_signature and current_signature and existing_signature != current_signature:
@@ -455,6 +485,123 @@ def _ensure_run_history_dataset(common: h5py.Group) -> h5py.Dataset:
     )
 
 
+def _search_id_from_diagnostics(diagnostics: dict[str, Any], *, fallback: str = "search") -> str:
+    signature = str(diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
+    if not signature:
+        identity = {
+            str(key): value
+            for key, value in diagnostics.items()
+            if key in SEARCH_SPECIFIC_DIAGNOSTIC_KEYS
+            or str(key).startswith("metrics_")
+            or str(key).startswith("tr_mask_")
+        }
+        if not identity:
+            identity = {"target_metric": diagnostics.get("target_metric", "chi2")}
+        signature = hashlib.sha256(_json_dumps(identity).encode("utf-8")).hexdigest()
+    return f"{fallback}_{signature[:16]}"
+
+
+def _search_status_from_records(point_records: list[dict[str, Any]]) -> str:
+    if not point_records:
+        return "empty"
+    statuses = {str(record.get("status", "computed")) for record in point_records}
+    if any(status in {"pending", "missing"} for status in statuses):
+        return "in_progress"
+    if all(status == "failed" for status in statuses):
+        return "failed"
+    if any(status == "failed" for status in statuses):
+        return "partial"
+    return "complete"
+
+
+def _search_label_from_diagnostics(diagnostics: dict[str, Any], *, status: str) -> str:
+    metric = str(diagnostics.get("target_metric", "chi2"))
+    source = str(diagnostics.get("metrics_mask_source", "")).strip().lower()
+    if source == "explicit_fits":
+        mask_path = str(diagnostics.get("metrics_mask_fits", "")).strip()
+        mask_text = f"mask={Path(mask_path).name}" if mask_path else "mask=explicit FITS"
+    else:
+        try:
+            mask_text = f"threshold={float(diagnostics.get('metrics_mask_threshold')):.3f}"
+        except Exception:
+            mask_text = "threshold=n/a"
+    return f"{metric} {mask_text} [{status}]"
+
+
+def _write_search_group(
+    searches_group: h5py.Group,
+    *,
+    search_id: str,
+    diagnostics: dict[str, Any],
+    point_records: list[dict[str, Any]],
+    run_history: list[dict[str, Any]] | None,
+    layout: dict[str, Any] | None = None,
+) -> None:
+    if search_id in searches_group:
+        del searches_group[search_id]
+    search_group = searches_group.create_group(search_id)
+    status = _search_status_from_records(point_records)
+    search_group.attrs["search_id"] = np.bytes_(str(search_id))
+    search_group.attrs["status"] = np.bytes_(status)
+    search_group.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
+    search_group.attrs["label"] = np.bytes_(_search_label_from_diagnostics(diagnostics, status=status))
+    _create_text_dataset(search_group, "diagnostics_json", _json_dumps(diagnostics))
+    _create_text_dataset(search_group, "layout_json", _json_dumps(layout or {}))
+    _create_text_dataset(search_group, "run_history_json", _json_dumps(list(run_history or [])))
+    records_group = search_group.create_group("point_records")
+    for record_order, payload in enumerate(point_records):
+        grp = records_group.create_group(f"r{record_order:06d}")
+        _write_point_group(grp, payload, record_order=record_order)
+
+
+def _read_search_records(group: h5py.Group) -> list[dict[str, Any]]:
+    if SEARCHES_GROUP not in group:
+        return []
+    searches_group = group[SEARCHES_GROUP]
+    records: list[dict[str, Any]] = []
+    for name in sorted(searches_group.keys()):
+        search_group = searches_group[name]
+        diagnostics = _json_loads_or_empty(search_group["diagnostics_json"][()]) if "diagnostics_json" in search_group else {}
+        layout = _json_loads_or_empty(search_group["layout_json"][()]) if "layout_json" in search_group else {}
+        run_history: list[dict[str, Any]] = []
+        if "run_history_json" in search_group:
+            try:
+                loaded_history = json.loads(decode_scalar(search_group["run_history_json"][()]))
+                if isinstance(loaded_history, list):
+                    run_history = loaded_history
+            except Exception:
+                run_history = []
+        point_count = len(search_group["point_records"]) if "point_records" in search_group else 0
+        records.append(
+            {
+                "search_id": decode_scalar(search_group.attrs.get("search_id", name)),
+                "label": decode_scalar(search_group.attrs.get("label", name)),
+                "status": decode_scalar(search_group.attrs.get("status", "unknown")),
+                "target_metric": decode_scalar(search_group.attrs.get("target_metric", diagnostics.get("target_metric", "chi2"))),
+                "diagnostics": diagnostics,
+                "layout": layout,
+                "run_history": run_history,
+                "point_count": int(point_count),
+            }
+        )
+    return records
+
+
+def _selected_search_id(group: h5py.Group, requested_search_id: str | None = None) -> str | None:
+    if SEARCHES_GROUP not in group:
+        return None
+    searches = group[SEARCHES_GROUP]
+    if requested_search_id and str(requested_search_id) in searches:
+        return str(requested_search_id)
+    active = ""
+    if ACTIVE_SEARCH_ID_DATASET in group:
+        active = decode_scalar(group[ACTIVE_SEARCH_ID_DATASET][()]).strip()
+    if active and active in searches:
+        return active
+    names = sorted(searches.keys())
+    return names[-1] if names else None
+
+
 def _decode_run_history(common: h5py.Group) -> list[dict[str, Any]]:
     dataset = common.get(RUN_HISTORY_DATASET)
     if dataset is None:
@@ -547,6 +694,8 @@ def detect_scan_artifact_format(h5_path: Path, *, slice_key: str | None = None) 
         if group is None:
             return None
         kind = _artifact_kind_from_group(group)
+    if kind == UNIFIED_ARTIFACT_KIND:
+        return "unified"
     return "sparse" if kind == SPARSE_ARTIFACT_KIND else "rectangular"
 
 
@@ -900,7 +1049,7 @@ def _payload_from_point_records(
                 observed_template=observed,
                 target_metric=target_metric_name,
                 status="missing",
-                message="point not stored in sparse artifact",
+                message="point not stored in artifact",
             )
 
     a_lookup = {float(v): int(i) for i, v in enumerate(unique_a)}
@@ -953,11 +1102,15 @@ def _payload_from_point_records(
         "target_metric": target_metric_name,
         "points": points,
         "point_records": normalized_records,
-        "artifact_format": "sparse" if diagnostics.get("artifact_kind") == SPARSE_ARTIFACT_KIND else "rectangular",
+        "artifact_format": (
+            "unified"
+            if diagnostics.get("artifact_kind") == UNIFIED_ARTIFACT_KIND
+            else ("sparse" if diagnostics.get("artifact_kind") == SPARSE_ARTIFACT_KIND else "rectangular")
+        ),
     }
 
 
-def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, Any]:
+def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: str | None = None) -> dict[str, Any]:
     with _H5PY_FILE(h5_path, "r") as f:
         group, descriptors, selected_key = _resolve_slice_group(
             f,
@@ -974,14 +1127,37 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, 
         # Non-breaking: if mask_type is missing, assume 'union'
         if "mask_type" not in diagnostics:
             diagnostics["mask_type"] = "union"
-        kind = _artifact_kind_from_group(group)
-        if kind == SPARSE_ARTIFACT_KIND:
-            point_records = _load_sparse_point_records(group["point_records"])
-            target_metric = str(diagnostics.get("target_metric", "chi2"))
+        search_records = _read_search_records(group)
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        selected_search_record = next(
+            (record for record in search_records if str(record.get("search_id")) == str(selected_search_id)),
+            None,
+        )
+        if selected_search_id is not None and SEARCHES_GROUP in group:
+            search_group = group[SEARCHES_GROUP][selected_search_id]
+            point_records = _load_sparse_point_records(search_group["point_records"]) if "point_records" in search_group else []
+            search_diagnostics = dict(selected_search_record.get("diagnostics", {}) if selected_search_record else {})
+            search_specific_diagnostics = {
+                key: value
+                for key, value in search_diagnostics.items()
+                if key in SEARCH_SPECIFIC_DIAGNOSTIC_KEYS or str(key).startswith("metrics_") or str(key).startswith("tr_mask_")
+            }
+            diagnostics = {**diagnostics, **search_specific_diagnostics}
+            target_metric = str(search_diagnostics.get("target_metric", diagnostics.get("target_metric", "chi2")))
+            run_history = list(selected_search_record.get("run_history", run_history) if selected_search_record else run_history)
+            kind = str(diagnostics.get("artifact_kind", _artifact_kind_from_group(group)))
         else:
-            point_records = _load_canonical_point_records(group)
-            summary = group["summary"]
-            target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
+            kind = _artifact_kind_from_group(group)
+            if "point_records" in group:
+                point_records = _load_sparse_point_records(group["point_records"])
+                target_metric = str(diagnostics.get("target_metric", "chi2"))
+            else:
+                point_records = _load_canonical_point_records(group)
+                if "summary" in group:
+                    summary = group["summary"]
+                    target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
+                else:
+                    target_metric = str(diagnostics.get("target_metric", "chi2"))
         payload = _payload_from_point_records(
             observed=np.asarray(common["observed"], dtype=float),
             sigma_map=np.asarray(common["sigma_map"], dtype=float),
@@ -995,6 +1171,24 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None) -> dict[str, 
         payload["selected_slice_key"] = selected_key
         payload["selected_slice"] = selected_descriptor
         payload["run_history"] = run_history
+        payload["search_records"] = search_records
+        payload["selected_search_id"] = selected_search_id
+        payload["selected_search"] = selected_search_record
+        if not search_records:
+            legacy_status = _search_status_from_records(payload.get("point_records", []))
+            legacy_search = {
+                "search_id": "legacy_current",
+                "label": _search_label_from_diagnostics(diagnostics, status=legacy_status),
+                "status": legacy_status,
+                "target_metric": str(target_metric),
+                "diagnostics": dict(diagnostics),
+                "layout": {},
+                "run_history": list(run_history),
+                "point_count": int(len(payload.get("point_records", []))),
+            }
+            payload["search_records"] = [legacy_search]
+            payload["selected_search_id"] = "legacy_current"
+            payload["selected_search"] = legacy_search
         payload["artifact_contract_version"] = common_payload.get("artifact_contract_version")
         payload["canonical_slice_descriptors"] = common_payload.get("slice_descriptors", [])
         payload["target_slice_key"] = common_payload.get("target_slice_key")
@@ -1248,7 +1442,9 @@ def save_rectangular_scan_file(
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
     out_h5.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key=slice_key or "default")
+    diagnostics_out = dict(diagnostics)
+    diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
+    descriptor = slice_descriptor_from_diagnostics(diagnostics_out, fallback_key=slice_key or "default")
     resolved_slice_key = str(slice_key or "default")
     tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
     with _H5PY_FILE(tmp_h5, "w") as dst:
@@ -1283,7 +1479,7 @@ def save_rectangular_scan_file(
             observed=observed,
             sigma_map=sigma_map,
             wcs_header=wcs_header,
-            diagnostics=diagnostics,
+            diagnostics=diagnostics_out,
             blos_reference=blos_reference,
             run_history=run_history,
         )
@@ -1299,10 +1495,11 @@ def save_rectangular_scan_file(
         summary.create_dataset("rho2", data=np.asarray(rho2, dtype=np.float64))
         summary.create_dataset("eta2", data=np.asarray(eta2, dtype=np.float64))
         summary.create_dataset("success", data=np.asarray(success, dtype=np.uint8))
-        summary.attrs["target_metric"] = np.bytes_(str(diagnostics.get("target_metric", "chi2")))
+        summary.attrs["target_metric"] = np.bytes_(str(diagnostics_out.get("target_metric", "chi2")))
 
         points = slice_group.create_group("points")
         point_records = slice_group.create_group("point_records")
+        current_point_records: list[dict[str, Any]] = []
         for record_order, ((_ai, _bi), payload) in enumerate(sorted(point_payloads.items())):
             name = f"a{payload['a_index']:03d}_b{payload['b_index']:03d}"
             grp = points.create_group(name)
@@ -1326,6 +1523,32 @@ def save_rectangular_scan_file(
             _create_text_dataset(grp, "diagnostics_json", _json_dumps(payload["diagnostics"]))
             canonical_grp = point_records.create_group(f"r{record_order:06d}")
             _write_point_group(canonical_grp, payload, record_order=record_order)
+            current_point_records.append(payload)
+        searches_group = slice_group.create_group(SEARCHES_GROUP)
+        if out_h5.exists():
+            with _H5PY_FILE(out_h5, "r") as src:
+                src_slice = None
+                if SLICE_CONTAINER_GROUP in src and resolved_slice_key in src[SLICE_CONTAINER_GROUP]:
+                    src_slice = src[SLICE_CONTAINER_GROUP][resolved_slice_key]
+                elif "common" in src:
+                    src_slice = src
+                if src_slice is not None and SEARCHES_GROUP in src_slice:
+                    for name in src_slice[SEARCHES_GROUP].keys():
+                        src_slice[SEARCHES_GROUP].copy(name, searches_group, name=name)
+        current_search_id = _search_id_from_diagnostics(diagnostics_out)
+        _write_search_group(
+            searches_group,
+            search_id=current_search_id,
+            diagnostics=diagnostics_out,
+            point_records=current_point_records,
+            run_history=run_history,
+            layout={
+                "kind": "rectangular_grid",
+                "a_values": [float(v) for v in np.asarray(a_values, dtype=float)],
+                "b_values": [float(v) for v in np.asarray(b_values, dtype=float)],
+            },
+        )
+        _create_text_dataset(slice_group, ACTIVE_SEARCH_ID_DATASET, current_search_id)
     os.replace(tmp_h5, out_h5)
 
 
@@ -1427,7 +1650,7 @@ def write_sparse_scan_file(
     out_h5.parent.mkdir(parents=True, exist_ok=True)
     tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
     diagnostics_out = dict(diagnostics)
-    diagnostics_out["artifact_kind"] = SPARSE_ARTIFACT_KIND
+    diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
     # Always record mask_type if present, else default to 'union'
     if "mask_type" not in diagnostics_out:
         diagnostics_out["mask_type"] = diagnostics.get("mask_type", "union")
@@ -1446,6 +1669,22 @@ def write_sparse_scan_file(
         for record_order, payload in enumerate(point_records):
             grp = records_group.create_group(f"r{record_order:06d}")
             _write_point_group(grp, payload, record_order=record_order)
+        searches_group = f.create_group(SEARCHES_GROUP)
+        if out_h5.exists():
+            with _H5PY_FILE(out_h5, "r") as src:
+                if SEARCHES_GROUP in src:
+                    for name in src[SEARCHES_GROUP].keys():
+                        src[SEARCHES_GROUP].copy(name, searches_group, name=name)
+        current_search_id = _search_id_from_diagnostics(diagnostics_out)
+        _write_search_group(
+            searches_group,
+            search_id=current_search_id,
+            diagnostics=diagnostics_out,
+            point_records=list(point_records),
+            run_history=run_history,
+            layout={"kind": "point_list"},
+        )
+        _create_text_dataset(f, ACTIVE_SEARCH_ID_DATASET, current_search_id)
     os.replace(tmp_h5, out_h5)
 
 
@@ -1461,7 +1700,7 @@ def write_single_point_scan_file(
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
     diagnostics_out = dict(diagnostics)
-    diagnostics_out["artifact_kind"] = SPARSE_ARTIFACT_KIND
+    diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
     write_sparse_scan_file(
         out_h5,
         observed=observed,
@@ -1485,7 +1724,9 @@ def append_sparse_point_record(
     point_payload: dict[str, Any],
 ) -> None:
     diagnostics_out = dict(diagnostics)
-    diagnostics_out["artifact_kind"] = SPARSE_ARTIFACT_KIND
+    diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
+    if "mask_type" not in diagnostics_out:
+        diagnostics_out["mask_type"] = diagnostics.get("mask_type", "union")
     out_h5.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if out_h5.exists() else "w"
     last_exc: Exception | None = None
@@ -1517,6 +1758,27 @@ def append_sparse_point_record(
                 next_order = max(existing_orders, default=-1) + 1
                 grp = records_group.create_group(f"r{next_order:06d}")
                 _write_point_group(grp, point_payload, record_order=next_order)
+                searches_group = f.require_group(SEARCHES_GROUP)
+                current_search_id = _search_id_from_diagnostics(diagnostics_out)
+                if ACTIVE_SEARCH_ID_DATASET in f:
+                    del f[ACTIVE_SEARCH_ID_DATASET]
+                _create_text_dataset(f, ACTIVE_SEARCH_ID_DATASET, current_search_id)
+                search_group = searches_group.require_group(current_search_id)
+                if "diagnostics_json" not in search_group:
+                    search_group.attrs["search_id"] = np.bytes_(current_search_id)
+                    search_group.attrs["target_metric"] = np.bytes_(str(diagnostics_out.get("target_metric", "chi2")))
+                    _create_text_dataset(search_group, "diagnostics_json", _json_dumps(diagnostics_out))
+                    _create_text_dataset(search_group, "layout_json", _json_dumps({"kind": "point_list"}))
+                    _create_text_dataset(search_group, "run_history_json", _json_dumps([]))
+                search_records = search_group.require_group("point_records")
+                search_orders = [int(search_records[name].attrs.get("record_order", -1)) for name in search_records.keys()]
+                search_next_order = max(search_orders, default=-1) + 1
+                search_point_group = search_records.create_group(f"r{search_next_order:06d}")
+                _write_point_group(search_point_group, point_payload, record_order=search_next_order)
+                status_records = _load_sparse_point_records(search_records)
+                status = _search_status_from_records(status_records)
+                search_group.attrs["status"] = np.bytes_(status)
+                search_group.attrs["label"] = np.bytes_(_search_label_from_diagnostics(diagnostics_out, status=status))
             return
         except (BlockingIOError, PermissionError, OSError) as exc:
             last_exc = exc
@@ -1544,7 +1806,11 @@ def append_point_record(
         raise FileNotFoundError(
             f"artifact must be initialized before appending point records: {out_h5}"
         )
-    if artifact_kind == SPARSE_ARTIFACT_KIND:
+
+    with _H5PY_FILE(out_h5, "r") as f:
+        uses_slice_container = SLICE_CONTAINER_GROUP in f
+
+    if artifact_kind in {SPARSE_ARTIFACT_KIND, UNIFIED_ARTIFACT_KIND} and not uses_slice_container:
         append_sparse_point_record(
             out_h5,
             observed=observed,
@@ -1557,7 +1823,7 @@ def append_point_record(
         return
 
     payload = load_scan_file(out_h5)
-    if str(payload.get("artifact_format", "")) == "sparse":
+    if str(payload.get("artifact_format", "")) in {"sparse", "unified"} and not uses_slice_container:
         append_sparse_point_record(
             out_h5,
             observed=observed,

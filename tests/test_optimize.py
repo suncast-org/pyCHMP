@@ -253,6 +253,35 @@ def test_find_best_q0_hard_upper_bound_stops_expansion() -> None:
     assert result.q0 == pytest.approx(1.0, abs=1e-12)
 
 
+def test_find_best_q0_reports_sampled_boundary_when_it_beats_local_bracket() -> None:
+    """Do not report a local bracket as success when an edge sample is better."""
+
+    def metric_function(q0: float) -> MetricValues:
+        if q0 < 1.0e-5:
+            chi2 = 210.0
+        elif q0 <= 1.0e-5 * (1.0 + 1.0e-12):
+            chi2 = 198.0
+        else:
+            chi2 = 248.0 + ((q0 - 5.0e-4) / 1.0e-4) ** 2
+        return MetricValues(chi2=chi2, rho2=chi2, eta2=chi2)
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=1.0e-5,
+        q0_max=1.0e-3,
+        adaptive_bracketing=True,
+        q0_start=1.0e-4,
+        q0_step=1.61803398875,
+        max_bracket_steps=12,
+    )
+
+    assert not result.success
+    assert result.boundary_constrained
+    assert result.q0 == pytest.approx(1.0e-5, abs=1e-15)
+    assert result.objective_value == pytest.approx(198.0)
+    assert "sampled" in result.message
+
+
 def test_find_best_q0_tracks_unique_trials_and_unique_evaluations() -> None:
     """Track each unique objective evaluation in the result metadata."""
     calls: list[float] = []

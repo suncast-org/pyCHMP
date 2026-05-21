@@ -252,9 +252,12 @@ def _resolve_model_h5_path(model_path: Path) -> Path:
 
     converters: list[Any] = []
     try:
-        from pyampp.util.build_h5_from_sav import build_h5_from_sav as pyampp_build_h5_from_sav
+        from pyampp.io import load_model_from_sav as _pyampp_load, save_model_to_h5 as _pyampp_save
 
-        converters.append(pyampp_build_h5_from_sav)
+        def _pyampp_converter(sav_path, out_h5, template_h5=None):
+            _pyampp_save(_pyampp_load(sav_path), out_h5)
+
+        converters.append(_pyampp_converter)
     except Exception:
         pass
     try:
@@ -267,7 +270,7 @@ def _resolve_model_h5_path(model_path: Path) -> Path:
     if not converters:
         raise RuntimeError(
             "SAV model-refmap loading requires an available SAV-to-HDF5 converter "
-            "(pyampp.util.build_h5_from_sav or gxrender.io.build_h5_from_sav)."
+            "(pyampp.io or gxrender.io.build_h5_from_sav)."
         )
 
     out_h5 = Path(tempfile.gettempdir()) / f"pychmp_obs_map_{resolved_model_path.stem}.h5"

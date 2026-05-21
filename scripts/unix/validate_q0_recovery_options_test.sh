@@ -188,7 +188,6 @@ else
   fi
   OBS_MAP_ID="${OBS_MAP_ID:-AIA_171}"
   EUV_INSTRUMENT="${EUV_INSTRUMENT:-AIA}"
-  EUV_RESPONSE_SAV="${EUV_RESPONSE_SAV:-$(latest_matching_file "$LATEST_RESPONSE_DIR" 'resp_aia*.sav')}"
   CHANNEL_TAG="$(printf '%s' "$OBS_MAP_ID" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_')"
   ARTIFACTS_STEM="${ARTIFACTS_STEM:-${MODEL_STEM}_${CHANNEL_TAG}_${TIMESTAMP}}"
 fi
@@ -201,7 +200,9 @@ mkdir -p "$ARTIFACTS_DIR"
 [[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with gxrender installed."; exit 1; }
 if [[ "$VALIDATION_DOMAIN" != "mw" ]]; then
   [[ -d "${LATEST_RESPONSE_DIR:-}" ]] || { echo "ERROR: No response-data folder found under: $TESTDATA_REPO/raw/responses"; exit 1; }
-  [[ -n "${EUV_RESPONSE_SAV:-}" && -f "$EUV_RESPONSE_SAV" ]] || { echo "ERROR: EUV response SAV file not found: ${EUV_RESPONSE_SAV:-<empty>}"; exit 1; }
+  if [[ -n "${EUV_RESPONSE_SAV:-}" ]]; then
+    [[ -f "$EUV_RESPONSE_SAV" ]] || { echo "ERROR: EUV response SAV file not found: $EUV_RESPONSE_SAV"; exit 1; }
+  fi
 fi
 
 ARGS=(
@@ -222,9 +223,11 @@ else
   ARGS+=(
     --obs-map-id "$OBS_MAP_ID"
     --euv-instrument "$EUV_INSTRUMENT"
-    --euv-response-sav "$EUV_RESPONSE_SAV"
     --tr-mask-bmin-gauss "$TR_MASK_BMIN_GAUSS"
   )
+  if [[ -n "${EUV_RESPONSE_SAV:-}" ]]; then
+    ARGS+=(--euv-response-sav "$EUV_RESPONSE_SAV")
+  fi
 fi
 if [[ -n "$METRICS_MASK_FITS" ]]; then
   ARGS+=(--metrics-mask-fits "$METRICS_MASK_FITS")
@@ -250,7 +253,7 @@ else
   echo "Using response folder: $LATEST_RESPONSE_DIR"
   echo "Using EUV map id: $OBS_MAP_ID"
   echo "Using EUV instrument: $EUV_INSTRUMENT"
-  echo "Using EUV response SAV: $EUV_RESPONSE_SAV"
+  [[ -n "${EUV_RESPONSE_SAV:-}" ]] && echo "Using EUV response SAV: $EUV_RESPONSE_SAV"
   echo "Using EUV TR-mask Bmin [G]: $TR_MASK_BMIN_GAUSS"
 fi
 echo "Using metrics-mask threshold: $METRICS_MASK_THRESHOLD"

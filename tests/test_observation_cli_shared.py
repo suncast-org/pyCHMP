@@ -127,3 +127,20 @@ def test_fit_render_selection_rejects_conflicting_euv_instrument_override(tmp_pa
 
     with pytest.raises(ValueError, match="conflicting EUV instrument request"):
         fit_q0_obs_map._resolve_render_selection(args, obs_map)
+
+
+def test_fit_render_selection_defaults_euv_response_sav_to_none_for_supported_instrument(tmp_path: Path) -> None:
+    args = _make_resolution_args(tmp_path)
+    obs_map = Namespace(
+        domain="euv",
+        wavelength_angstrom=195.0,
+        instrument="EUVI",
+        frequency_ghz=None,
+    )
+
+    selection = fit_q0_obs_map._resolve_render_selection(args, obs_map)
+
+    assert selection.domain == "euv"
+    assert selection.euv_channel == "195"
+    assert selection.euv_instrument == "EUVI"
+    assert selection.euv_response_sav is None

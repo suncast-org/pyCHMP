@@ -327,9 +327,6 @@ LATEST_RESPONSE_DIR="$(latest_dated_dir "$RESPONSES_ROOT" "*")"
 if [[ -z "${LATEST_RESPONSE_DIR:-}" || ! -d "$LATEST_RESPONSE_DIR" ]]; then
   LATEST_RESPONSE_DIR="$(find "$RESPONSES_ROOT" -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)"
 fi
-if [[ -z "$EUV_RESPONSE_SAV" && -n "${LATEST_RESPONSE_DIR:-}" && -d "$LATEST_RESPONSE_DIR" ]]; then
-  EUV_RESPONSE_SAV="$(latest_matching_file "$LATEST_RESPONSE_DIR" 'resp_aia*.sav')"
-fi
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-/tmp/pychmp_adaptive_ab_runs}"
 ARTIFACTS_STEM="${ARTIFACTS_STEM:-adaptive_ab_search_single_frequency}"
 TARGET_METRIC="${TARGET_METRIC:-chi2}"

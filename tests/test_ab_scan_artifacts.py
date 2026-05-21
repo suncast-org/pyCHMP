@@ -10,6 +10,8 @@ from astropy.io import fits
 
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
+    CANONICAL_ARTIFACT_CONTRACT_VERSION,
+    UNIFIED_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
     append_point_record,
     append_sparse_point_record,
@@ -52,6 +54,8 @@ def _make_diagnostics(*, artifact_kind: str = "pychmp_ab_scan", model_id: str = 
         "artifact_kind": artifact_kind,
         COMPATIBILITY_SIGNATURE_KEY: "sig-123",
         "target_metric": "chi2",
+        "metrics_mask_threshold": 0.1,
+        "metrics_mask_source": "union_threshold",
         "model_path": "C:/tmp/model.h5",
         "model_id": model_id,
         "model_sha256": "a" * 64,
@@ -159,6 +163,49 @@ def test_validate_scan_artifact_compatibility_accepts_matching_rectangular_artif
     )
 
 
+def test_rectangular_artifact_persists_selectable_search_records(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan.h5"
+    observed, sigma_map, header, diagnostics = _write_rectangular_artifact(out_h5)
+    first_payload = load_scan_file(out_h5)
+    first_search_id = str(first_payload["selected_search_id"])
+
+    second_diagnostics = dict(diagnostics)
+    second_diagnostics[COMPATIBILITY_SIGNATURE_KEY] = "sig-456"
+    second_diagnostics["metrics_mask_threshold"] = 0.2
+    second_point = _make_point_payload(0.0, 1.0)
+    second_point["diagnostics"] = {
+        **dict(second_point["diagnostics"]),
+        COMPATIBILITY_SIGNATURE_KEY: "sig-456",
+        "metrics_mask_threshold": 0.2,
+        "target_metric_value": 0.05,
+        "chi2": 0.05,
+    }
+    save_rectangular_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=second_diagnostics,
+        a_values=np.asarray([0.0], dtype=float),
+        b_values=np.asarray([1.0], dtype=float),
+        best_q0=np.asarray([[3.0]], dtype=float),
+        objective_values=np.asarray([[0.05]], dtype=float),
+        chi2=np.asarray([[0.05]], dtype=float),
+        rho2=np.asarray([[0.2]], dtype=float),
+        eta2=np.asarray([[0.3]], dtype=float),
+        success=np.asarray([[True]], dtype=bool),
+        point_payloads={(0, 0): second_point},
+    )
+
+    latest_payload = load_scan_file(out_h5)
+    assert len(latest_payload["search_records"]) == 2
+    assert latest_payload["diagnostics"]["metrics_mask_threshold"] == pytest.approx(0.2)
+
+    first_search_payload = load_scan_file(out_h5, search_id=first_search_id)
+    assert first_search_payload["diagnostics"]["metrics_mask_threshold"] == pytest.approx(0.1)
+    assert first_search_payload["chi2"][0, 0] == pytest.approx(0.1)
+
+
 def test_validate_scan_artifact_compatibility_rejects_header_mismatch(tmp_path: Path) -> None:
     """Reject reuse when the persisted WCS header differs."""
     out_h5 = tmp_path / "scan.h5"
@@ -205,22 +252,21 @@ def test_validate_scan_artifact_compatibility_rejects_required_diagnostic_mismat
         )
 
 
-def test_validate_scan_artifact_compatibility_rejects_rectangular_signature_mismatch(tmp_path: Path) -> None:
+def test_validate_scan_artifact_compatibility_allows_new_search_signature(tmp_path: Path) -> None:
     out_h5 = tmp_path / "scan.h5"
     observed, sigma_map, header, diagnostics = _write_rectangular_artifact(out_h5)
     payload = load_scan_file(out_h5)
     changed_diagnostics = dict(diagnostics)
     changed_diagnostics[COMPATIBILITY_SIGNATURE_KEY] = "sig-other"
 
-    with pytest.raises(ScanArtifactCompatibilityError, match=COMPATIBILITY_SIGNATURE_KEY):
-        validate_scan_artifact_compatibility(
-            payload,
-            observed=observed,
-            sigma_map=sigma_map,
-            wcs_header=header,
-            diagnostics=changed_diagnostics,
-            artifact_path=out_h5,
-        )
+    validate_scan_artifact_compatibility(
+        payload,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=changed_diagnostics,
+        artifact_path=out_h5,
+    )
 
 
 def test_validate_scan_artifact_compatibility_rejects_sparse_observation_mismatch(tmp_path: Path) -> None:
@@ -279,7 +325,53 @@ def test_sparse_artifact_round_trip_preserves_point_elapsed_seconds(tmp_path: Pa
     assert float(record["diagnostics"]["elapsed_seconds"]) == pytest.approx(12.345)
 
 
-def test_write_single_point_scan_file_round_trip_is_sparse_and_viewer_compatible(tmp_path: Path) -> None:
+def test_sparse_artifact_rewrite_preserves_selectable_search_records(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_searches.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    first_diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_sparse_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=first_diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    first_payload = load_scan_file(out_h5)
+    first_search_id = str(first_payload["selected_search_id"])
+
+    second_diagnostics = dict(first_diagnostics)
+    second_diagnostics[COMPATIBILITY_SIGNATURE_KEY] = "sig-789"
+    second_diagnostics["metrics_mask_threshold"] = 0.2
+    second_point = _make_point_payload(0.0, 1.0)
+    second_point["diagnostics"] = {
+        **dict(second_point["diagnostics"]),
+        COMPATIBILITY_SIGNATURE_KEY: "sig-789",
+        "metrics_mask_threshold": 0.2,
+        "target_metric_value": 0.07,
+        "chi2": 0.07,
+    }
+    write_sparse_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=second_diagnostics,
+        point_records=[second_point],
+    )
+
+    latest_payload = load_scan_file(out_h5)
+    assert len(latest_payload["search_records"]) == 2
+    assert latest_payload["diagnostics"]["metrics_mask_threshold"] == pytest.approx(0.2)
+
+    first_search_payload = load_scan_file(out_h5, search_id=first_search_id)
+    assert first_search_payload["diagnostics"]["metrics_mask_threshold"] == pytest.approx(0.1)
+    assert first_search_payload["chi2"][0, 0] == pytest.approx(0.1)
+
+
+def test_write_single_point_scan_file_round_trip_is_unified_and_viewer_compatible(tmp_path: Path) -> None:
     out_h5 = tmp_path / "single_point.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
     sigma_map = np.ones_like(observed)
@@ -355,7 +447,8 @@ def test_write_single_point_scan_file_round_trip_is_sparse_and_viewer_compatible
 
     payload = load_scan_file(out_h5)
 
-    assert payload["artifact_format"] == "sparse"
+    assert payload["artifact_format"] == "unified"
+    assert payload["diagnostics"]["artifact_kind"] == UNIFIED_ARTIFACT_KIND
     assert payload["target_metric"] == "chi2"
     assert payload["a_values"].shape == (1,)
     assert payload["b_values"].shape == (1,)
@@ -386,7 +479,7 @@ def test_append_point_record_updates_rectangular_artifact(tmp_path: Path) -> Non
     )
 
     payload = load_scan_file(out_h5)
-    assert payload["artifact_format"] == "rectangular"
+    assert payload["artifact_format"] == "unified"
     assert float(payload["best_q0"][0, 0]) == pytest.approx(3.5)
     assert float(payload["chi2"][0, 0]) == pytest.approx(0.05)
 
@@ -427,7 +520,7 @@ def test_append_point_record_updates_sparse_artifact(tmp_path: Path) -> None:
     )
 
     payload = load_scan_file(out_h5)
-    assert payload["artifact_format"] == "sparse"
+    assert payload["artifact_format"] == "unified"
     assert len(payload["point_records"]) == 1
     assert float(payload["point_records"][0]["q0"]) == pytest.approx(2.5)
 
@@ -605,7 +698,7 @@ def test_sparse_artifact_round_trip_exposes_canonical_slice_metadata_and_trial_l
 
     payload = load_scan_file(out_h5)
 
-    assert payload["artifact_contract_version"] == "2026-04-23-a"
+    assert payload["artifact_contract_version"] == CANONICAL_ARTIFACT_CONTRACT_VERSION
     assert payload["target_slice_key"] == "euv_171"
     assert len(payload["canonical_slice_descriptors"]) == 2
     assert payload["canonical_slice_descriptors"][0]["key"] == "euv_171"

@@ -39,6 +39,12 @@ If you use the tracked launcher scripts, install `pyGXrender-test-data` as a
 sibling checkout next to `pyCHMP` so they can resolve shared models, EOVSA
 maps, and EBTEL inputs without machine-specific absolute paths.
 
+For EUV/UV model-refmap workflows, `--euv-response-sav` is now an explicit
+compatibility override rather than the default path. When omitted,
+gximagecomputing resolves supported instrument responses through its
+pyEUVTools-backed provider and surfaces the chosen `response.source` /
+`response.mode` metadata in the downstream render result.
+
 ## Development
 
 ```bash

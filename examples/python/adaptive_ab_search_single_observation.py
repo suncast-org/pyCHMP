@@ -765,7 +765,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--ebtel-path", type=Path, default=None, help="Path to the matching EBTEL .sav file")
     parser.add_argument("--testdata-repo", type=Path, default=None, help="Optional sibling pyGXrender-test-data checkout used for default input resolution")
     parser.add_argument("--euv-instrument", type=str, default=None, help="Optional EUV/UV instrument override. Must agree with the selected observation if that observation already declares an instrument.")
-    parser.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV used for EUV/UV rendering. If omitted, the adapter will try the environment/test-data discovery path.")
+    parser.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV override used for EUV/UV rendering. If omitted, gximagecomputing will use its default pyEUVTools-backed response path for supported instruments.")
     parser.add_argument("--a-start", type=float, default=DEFAULT_A, help="Adaptive search starting a value")
     parser.add_argument("--b-start", type=float, default=DEFAULT_B, help="Adaptive search starting b value")
     parser.add_argument("--da", type=float, default=0.3, help="Adaptive a step size")

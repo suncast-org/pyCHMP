@@ -81,7 +81,6 @@ if defined MODEL_PATH (
 if not defined FREQUENCY_GHZ set "FREQUENCY_GHZ=5.8"
 if not defined OBS_MAP_ID set "OBS_MAP_ID=AIA_171"
 if not defined EUV_INSTRUMENT set "EUV_INSTRUMENT=AIA"
-if not defined EUV_RESPONSE_SAV if defined LATEST_RESPONSE_DIR call :latest_matching_file "%LATEST_RESPONSE_DIR%" "resp_aia*.sav" EUV_RESPONSE_SAV
 
 set "ARTIFACTS_DIR=%TEMP%\pychmp_q0_runs"
 call :set_timestamp TIMESTAMP
@@ -105,7 +104,7 @@ if not exist "%EBTEL_PATH%" (
   exit /b 1
 )
 if /I not "%VALIDATION_DOMAIN%"=="mw" (
-  if not exist "%EUV_RESPONSE_SAV%" (
+  if defined EUV_RESPONSE_SAV if not exist "%EUV_RESPONSE_SAV%" (
     echo ERROR: EUV response SAV file not found: %EUV_RESPONSE_SAV%
     exit /b 1
   )
@@ -119,7 +118,8 @@ set "RUN_ARGS=--model-path "%MODEL_PATH%" --ebtel-path "%EBTEL_PATH%" --adaptive
 if /I "%VALIDATION_DOMAIN%"=="mw" (
   set "RUN_ARGS=%RUN_ARGS% --frequency-ghz %FREQUENCY_GHZ%"
 ) else (
-  set "RUN_ARGS=%RUN_ARGS% --obs-map-id "%OBS_MAP_ID%" --euv-instrument "%EUV_INSTRUMENT%" --euv-response-sav "%EUV_RESPONSE_SAV%" --tr-mask-bmin-gauss %TR_MASK_BMIN_GAUSS%"
+  set "RUN_ARGS=%RUN_ARGS% --obs-map-id "%OBS_MAP_ID%" --euv-instrument "%EUV_INSTRUMENT%" --tr-mask-bmin-gauss %TR_MASK_BMIN_GAUSS%"
+  if defined EUV_RESPONSE_SAV set "RUN_ARGS=%RUN_ARGS% --euv-response-sav "%EUV_RESPONSE_SAV%""
 )
 if defined METRICS_MASK_FITS set "RUN_ARGS=%RUN_ARGS% --metrics-mask-fits "%METRICS_MASK_FITS%""
 
@@ -133,7 +133,7 @@ if /I "%VALIDATION_DOMAIN%"=="mw" (
   if defined LATEST_RESPONSE_DIR echo Using response folder: %LATEST_RESPONSE_DIR%
   echo Using EUV map id: %OBS_MAP_ID%
   echo Using EUV instrument: %EUV_INSTRUMENT%
-  echo Using EUV response SAV: %EUV_RESPONSE_SAV%
+  if defined EUV_RESPONSE_SAV echo Using EUV response SAV: %EUV_RESPONSE_SAV%
   echo Using EUV TR-mask Bmin [G]: %TR_MASK_BMIN_GAUSS%
 )
 echo Using metrics-mask threshold: %METRICS_MASK_THRESHOLD%

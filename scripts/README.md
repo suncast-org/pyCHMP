@@ -170,7 +170,7 @@ both support:
 - `--obs-source external_fits|model_refmap`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
-- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
 - `--tr-mask-bmin-gauss 1000`
 - `--metrics-mask-threshold 0.5`
 - `--metrics-mask-fits /path/to/mask.fits`
@@ -279,14 +279,17 @@ The launcher resolves shared defaults from `pyGXrender-test-data`:
 - the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
 - the matching 2020-11-26 CHR model file found under `raw/models/`
 - fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
-- newest dated response folder under `raw/responses/` for EUV/UV mode
+
+Legacy EUV response SAV files are only needed when you explicitly pin
+`--euv-response-sav`; supported instruments otherwise use the default
+gximagecomputing / pyEUVTools provider path.
 
 Important benchmark-specific options:
 
 - `--obs-source external_fits|model_refmap`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
-- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
 - `--tr-mask-bmin-gauss 1000`
 - `--metrics-mask-threshold 0.5`
 - `--metrics-mask-fits /path/to/mask.fits`
@@ -406,14 +409,17 @@ The launcher resolves shared defaults from `pyGXrender-test-data`:
 - the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
 - the matching 2020-11-26 CHR model file found under `raw/models/`
 - fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
-- newest dated response folder under `raw/responses/` for EUV/UV mode
+
+Legacy EUV response SAV files are only needed when you explicitly pin
+`--euv-response-sav`; supported instruments otherwise use the default
+gximagecomputing / pyEUVTools provider path.
 
 Important scan-specific options:
 
 - `--obs-source external_fits|model_refmap`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
-- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
 - `--tr-mask-bmin-gauss 1000`
 - `--metrics-mask-threshold 0.5`
 - `--metrics-mask-fits /path/to/mask.fits`
@@ -527,7 +533,10 @@ The launcher resolves shared defaults from `pyGXrender-test-data`:
 - the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
 - the matching 2020-11-26 CHR model file found under `raw/models/`
 - fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
-- newest dated response folder under `raw/responses/` for EUV/UV mode
+
+Legacy EUV response SAV files are only needed when you explicitly pin
+`--euv-response-sav`; supported instruments otherwise use the default
+gximagecomputing / pyEUVTools provider path.
 
 Important adaptive-search options:
 
@@ -537,7 +546,7 @@ Important adaptive-search options:
 - `--ebtel-path /path/to/ebtel.sav`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
-- `--euv-response-sav /path/to/resp_aia_*.sav`
+- `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
 - `--tr-mask-bmin-gauss 1000`
 - `--metrics-mask-threshold 0.5`
 - `--metrics-mask-fits /path/to/mask.fits`

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 from types import SimpleNamespace
+import warnings
 
 import numpy as np
 import pytest
@@ -280,7 +283,6 @@ def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -
 def test_gxrender_euv_adapter_renders_single_channel_sum_map(monkeypatch) -> None:
     """Render a single-channel EUV map and sum corona+TR flux."""
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
-    monkeypatch.setattr(gxrender_adapter, "_resolve_default_euv_response_sav", lambda *, instrument: Path(f"{instrument}.sav"))
 
     adapter = GXRenderEUVAdapter(
         model_path="model.h5",
@@ -300,6 +302,172 @@ def test_gxrender_euv_adapter_renders_single_channel_sum_map(monkeypatch) -> Non
     assert FakeSDKWithEUV.last_euv_options is not None
     assert FakeSDKWithEUV.last_euv_options.kwargs["channels"] == ["171"]
     assert FakeSDKWithEUV.last_euv_options.kwargs["instrument"] == "AIA"
+    assert FakeSDKWithEUV.last_euv_options.kwargs["response_sav"] is None
+
+
+def test_gxrender_euv_adapter_leaves_supported_instrument_response_to_sdk(monkeypatch) -> None:
+    class FakeSDKWithEUVI(FakeSDK):
+        last_euv_options = None
+
+        @staticmethod
+        def render_euv_maps(options):
+            FakeSDKWithEUVI.last_euv_options = options
+            cube = np.full((2, 3, 1), 2.0, dtype=float)
+            return FakeEUVResult(cube, channels=["195"])
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUVI)
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="195",
+        instrument="EUVI",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    adapter.render(0.0217)
+
+    assert FakeSDKWithEUVI.last_euv_options is not None
+    assert FakeSDKWithEUVI.last_euv_options.kwargs["instrument"] == "EUVI"
+    assert FakeSDKWithEUVI.last_euv_options.kwargs["response_sav"] is None
+
+
+def test_gxrender_euv_adapter_reports_projection_flags_warning_once(monkeypatch) -> None:
+    class FakeSDKWithProjectionWarning(FakeSDK):
+        @staticmethod
+        def render_euv_maps(options):
+            del options
+            warnings.warn(
+                "Current Python EUV workflow uses projection flags off "
+                "(parallel=False, exact=False, nthreads=0) for the DLL simbox path. "
+                "This assumption is explicit in the workflow today because high-level projection controls are not exposed yet.",
+                stacklevel=2,
+            )
+            cube = np.full((2, 3, 1), 2.0, dtype=float)
+            return FakeEUVResult(cube, channels=["171"])
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithProjectionWarning)
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        adapter.render(0.0217)
+        adapter.render(0.0218)
+
+    projection_warnings = [
+        warning
+        for warning in caught
+        if "Current Python EUV workflow uses projection flags off" in str(warning.message)
+    ]
+    assert len(projection_warnings) == 1
+
+
+def test_gxrender_euv_adapter_reuses_cached_response_payload(monkeypatch) -> None:
+    class FakeSDKWithCachedResponse(FakeSDK):
+        options_seen = []
+
+        @staticmethod
+        def render_euv_maps(options):
+            FakeSDKWithCachedResponse.options_seen.append(options)
+            cube = np.full((2, 3, 1), 2.0, dtype=float)
+            return FakeEUVResult(cube, channels=["171"])
+
+    response = np.asarray([1.0, 2.0, 3.0], dtype=float)
+    response_dt = response.dtype
+    response_meta = SimpleNamespace(instrument="AIA", channels=["171"], source="unit-test", mode="cached")
+    resolve_calls = 0
+
+    def fake_resolve(self):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return gxrender_adapter._CachedEUVResponse(
+            response=response,
+            response_dt=response_dt,
+            response_meta=response_meta,
+        )
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithCachedResponse)
+    monkeypatch.setattr(GXRenderEUVAdapter, "_resolve_euv_response_cache", fake_resolve)
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        response_sav="legacy_override.sav",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    adapter.render(0.0217)
+    adapter.render(0.0218)
+
+    assert resolve_calls == 1
+    assert len(FakeSDKWithCachedResponse.options_seen) == 2
+    for options in FakeSDKWithCachedResponse.options_seen:
+        assert options.kwargs["response"] is response
+        assert options.kwargs["response_dt"] is response_dt
+        assert options.kwargs["response_meta"] is response_meta
+        assert options.kwargs["response_sav"] is None
+
+
+def test_gxrender_euv_adapter_response_cache_is_thread_safe(monkeypatch) -> None:
+    class FakeSDKWithCachedResponse(FakeSDK):
+        @staticmethod
+        def render_euv_maps(options):
+            del options
+            cube = np.full((2, 3, 1), 2.0, dtype=float)
+            return FakeEUVResult(cube, channels=["171"])
+
+    response = np.asarray([1.0], dtype=float)
+    response_dt = response.dtype
+    response_meta = SimpleNamespace(instrument="AIA", channels=["171"], source="unit-test", mode="cached")
+    resolve_calls = 0
+
+    def fake_resolve(self):
+        nonlocal resolve_calls
+        del self
+        time.sleep(0.05)
+        resolve_calls += 1
+        return gxrender_adapter._CachedEUVResponse(
+            response=response,
+            response_dt=response_dt,
+            response_meta=response_meta,
+        )
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithCachedResponse)
+    monkeypatch.setattr(GXRenderEUVAdapter, "_resolve_euv_response_cache", fake_resolve)
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(adapter.render, [0.0217, 0.0218]))
+
+    assert len(results) == 2
+    assert resolve_calls == 1
 
 
 def test_build_tr_region_mask_from_blos_uses_absolute_threshold() -> None:
@@ -323,7 +491,6 @@ def test_recombine_euv_components_applies_tr_mask() -> None:
 
 def test_gxrender_euv_adapter_render_components_returns_masked_components(monkeypatch) -> None:
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
-    monkeypatch.setattr(gxrender_adapter, "_resolve_default_euv_response_sav", lambda *, instrument: Path(f"{instrument}.sav"))
 
     tr_mask = np.asarray([[True, False, True], [False, True, False]], dtype=bool)
     adapter = GXRenderEUVAdapter(
@@ -366,7 +533,6 @@ def test_gxrender_euv_adapter_sanitizes_nonfinite_pixels(monkeypatch) -> None:
             return FakeEUVResult(cube, channels=["A94", "A171"])
 
     monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithNonFinite)
-    monkeypatch.setattr(gxrender_adapter, "_resolve_default_euv_response_sav", lambda *, instrument: Path(f"{instrument}.sav"))
 
     adapter = GXRenderEUVAdapter(
         model_path="model.h5",
@@ -383,3 +549,25 @@ def test_gxrender_euv_adapter_sanitizes_nonfinite_pixels(monkeypatch) -> None:
 
     assert np.isfinite(image).all()
     np.testing.assert_allclose(image, np.array([[3.0, 12.0], [0.0, 12.0]], dtype=float))
+
+
+def test_gxrender_euv_adapter_preserves_explicit_response_sav_override(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
+
+    response_sav = tmp_path / "resp_aia.sav"
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        response_sav=response_sav,
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    adapter.render(0.0217)
+
+    assert FakeSDKWithEUV.last_euv_options is not None
+    assert FakeSDKWithEUV.last_euv_options.kwargs["response_sav"] == response_sav
