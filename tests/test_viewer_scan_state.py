@@ -24,7 +24,7 @@ def _make_app(tmp_path: Path, *, phase: str, refresh_active: bool) -> PychmpView
         "selected_slice": {"label": "MW: 2.874 GHz"},
         "diagnostics": {
             "artifact_kind": "pychmp_ab_scan_sparse_points",
-            "search_mode": "adaptive_local_single_frequency",
+            "search_mode": "adaptive_local_single_observation",
         },
     }
     app.available_slices = []

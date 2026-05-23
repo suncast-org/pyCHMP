@@ -7,7 +7,7 @@ from importlib import import_module
 from pathlib import Path
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 import warnings
 
 import numpy as np
@@ -109,6 +109,75 @@ def _load_common_workflow_helpers() -> Any:
         ) from exc
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedRenderGeometry:
+    """Geometry resolved by the upstream gxrender workflow policy."""
+
+    geometry: Any
+    observer_name: str
+    observer_source: str
+    center_source: str
+    fov_x_arcsec: float
+    fov_y_arcsec: float
+
+
+def resolve_render_geometry_via_gxrender(
+    *,
+    model_path: str | Path,
+    model_format: str = "auto",
+    ebtel_path: str | None = None,
+    pixel_scale_arcsec: float = 2.0,
+    geometry: Any | None = None,
+    observer_name: str | None = None,
+    observer: Any | None = None,
+    omp_threads: int = 8,
+    prefer_execute_center: bool = True,
+) -> ResolvedRenderGeometry:
+    """Resolve render geometry by delegating observer/FOV policy to gxrender."""
+
+    sdk = _load_gxrender_sdk()
+    common_mod = _load_common_workflow_helpers()
+    args = SimpleNamespace(
+        omp_threads=int(omp_threads),
+        model_path=Path(model_path),
+        model_format=str(model_format),
+        ebtel_path=ebtel_path,
+        observer=observer_name,
+        dsun_cm=None if observer is None else getattr(observer, "dsun_cm", None),
+        lonc_deg=None if observer is None else getattr(observer, "lonc_deg", None),
+        b0sun_deg=None if observer is None else getattr(observer, "b0sun_deg", None),
+        xc=None if geometry is None else getattr(geometry, "xc", None),
+        yc=None if geometry is None else getattr(geometry, "yc", None),
+        dx=None if geometry is None else getattr(geometry, "dx", None),
+        dy=None if geometry is None else getattr(geometry, "dy", None),
+        pixel_scale_arcsec=float(pixel_scale_arcsec),
+        nx=None if geometry is None else getattr(geometry, "nx", None),
+        ny=None if geometry is None else getattr(geometry, "ny", None),
+        xrange=None if geometry is None else getattr(geometry, "xrange", None),
+        yrange=None if geometry is None else getattr(geometry, "yrange", None),
+        auto_fov=False,
+        use_saved_fov=False,
+    )
+    common = common_mod.prepare_common_inputs(args, prefer_execute_center=prefer_execute_center)
+    resolved_geometry = sdk.MapGeometry(
+        xc=float(common.xc),
+        yc=float(common.yc),
+        dx=float(common.dx),
+        dy=float(common.dy),
+        nx=int(common.nx),
+        ny=int(common.ny),
+    )
+    observer_geometry = common.observer_geometry
+    return ResolvedRenderGeometry(
+        geometry=resolved_geometry,
+        observer_name=str(getattr(observer_geometry, "observer_name", observer_name or "")),
+        observer_source=str(getattr(observer_geometry, "observer_source", "")),
+        center_source=str(common.center_source),
+        fov_x_arcsec=float(common.fov_x),
+        fov_y_arcsec=float(common.fov_y),
+    )
+
+
 def _load_render_mw_workflow() -> Any:
     try:
         return import_module("gxrender.workflows.render_mw")
@@ -142,6 +211,7 @@ class GXRenderMWContext:
     pixel_scale_arcsec: float = 2.0
     geometry: Any | None = None
     observer: Any | None = None
+    observer_name: str | None = None
     _gxi: Any = field(init=False, repr=False)
     _common: Any = field(init=False, repr=False)
     _workflow_helpers: Any = field(init=False, repr=False)
@@ -155,16 +225,17 @@ class GXRenderMWContext:
         if geometry is None:
             geometry = sdk.MapGeometry(pixel_scale_arcsec=float(self.pixel_scale_arcsec))
         observer = self.observer
+        observer_name = self.observer_name or (str(observer) if isinstance(observer, str) else None)
 
         args = SimpleNamespace(
             omp_threads=int(self.omp_threads),
             model_path=Path(self.model_path),
             model_format=str(self.model_format),
             ebtel_path=self.ebtel_path,
-            observer=self.observer,
-            dsun_cm=getattr(observer, "dsun_cm", None),
-            lonc_deg=getattr(observer, "lonc_deg", None),
-            b0sun_deg=getattr(observer, "b0sun_deg", None),
+            observer=observer_name,
+            dsun_cm=None if isinstance(observer, str) else getattr(observer, "dsun_cm", None),
+            lonc_deg=None if isinstance(observer, str) else getattr(observer, "lonc_deg", None),
+            b0sun_deg=None if isinstance(observer, str) else getattr(observer, "b0sun_deg", None),
             xc=getattr(geometry, "xc", None),
             yc=getattr(geometry, "yc", None),
             dx=getattr(geometry, "dx", None),
@@ -235,6 +306,63 @@ class GXRenderMWContext:
             raise ValueError(f"expected single-frequency TI cube with shape (ny, nx, 1), got {ti.shape}")
         return ti[:, :, 0]
 
+    def render_cube(
+        self,
+        *,
+        frequencies_ghz: Sequence[float],
+        tbase: float,
+        nbase: float,
+        q0: float,
+        a: float,
+        b: float,
+        mode: int = 0,
+        selective_heating: bool = False,
+        shtable: Any | None = None,
+    ) -> np.ndarray:
+        freqs = np.asarray([float(v) for v in frequencies_ghz], dtype=np.float64)
+        if freqs.size == 0:
+            raise ValueError("frequencies_ghz must contain at least one frequency")
+        plasma_args = SimpleNamespace(
+            tbase=tbase,
+            nbase=nbase,
+            q0=float(q0),
+            a=a,
+            b=b,
+            corona_mode=mode,
+            force_isothermal=False,
+            interpol_b=False,
+            analytical_nt=False,
+            selective_heating=bool(selective_heating),
+            shtable=shtable,
+            shtable_path=None,
+        )
+        plasma = self._workflow_helpers.resolve_plasma_parameters(plasma_args)
+        result = self._gxi.synth_model(
+            self._common.model,
+            self._common.model_dt,
+            self._common.ebtel_c,
+            self._common.ebtel_dt,
+            freqs,
+            int(self._common.nx),
+            int(self._common.ny),
+            float(self._common.xc),
+            float(self._common.yc),
+            float(self._common.dx),
+            float(self._common.dy),
+            float(plasma.tbase),
+            float(plasma.nbase),
+            float(plasma.q0),
+            float(plasma.a),
+            float(plasma.b),
+            SHtable=plasma.shtable,
+            mode=int(plasma.mode),
+            warn_defaults=False,
+        )
+        ti = np.asarray(result["TI"], dtype=float)
+        if ti.ndim != 3 or ti.shape[2] != freqs.size:
+            raise ValueError(f"expected MW TI cube with shape (ny, nx, {freqs.size}), got {ti.shape}")
+        return ti
+
 
 @dataclass(slots=True)
 class GXRenderMWAdapter:
@@ -242,6 +370,7 @@ class GXRenderMWAdapter:
 
     model_path: str | Path
     frequency_ghz: float
+    render_frequencies_ghz: Sequence[float] | None = None
     model_format: str = "auto"
     ebtel_path: str | None = None
     tbase: float | None = None
@@ -255,12 +384,14 @@ class GXRenderMWAdapter:
     pixel_scale_arcsec: float = 2.0
     geometry: Any | None = None
     observer: Any | None = None
+    observer_name: str | None = None
     output_dir: str | Path | None = None
     output_name: str | None = None
     output_format: str = "h5"
     verbose: bool = False
     render_call_count: int = 0
     _context: GXRenderMWContext = field(init=False, repr=False)
+    _cube_cache: dict[float, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._context = GXRenderMWContext(
@@ -271,10 +402,17 @@ class GXRenderMWAdapter:
             pixel_scale_arcsec=float(self.pixel_scale_arcsec),
             geometry=self.geometry,
             observer=self.observer,
+            observer_name=self.observer_name,
         )
 
     def render(self, q0: float) -> np.ndarray:
         self.render_call_count += 1
+        if not self.output_dir and self.render_frequencies_ghz:
+            cube_payload = self.render_cube(float(q0))
+            for freq, rendered in cube_payload["raw_modeled_by_frequency"].items():
+                if np.isclose(float(freq), float(self.frequency_ghz), rtol=0.0, atol=1e-12):
+                    return np.asarray(rendered, dtype=float)
+            raise ValueError(f"target frequency {self.frequency_ghz} was not present in rendered MW cube")
         if self.output_dir:
             workflow = _load_render_mw_workflow()
             geometry = self.geometry
@@ -282,6 +420,7 @@ class GXRenderMWAdapter:
                 sdk = _load_gxrender_sdk()
                 geometry = sdk.MapGeometry(pixel_scale_arcsec=float(self.pixel_scale_arcsec))
             observer = self.observer
+            observer_name = self.observer_name or (str(observer) if isinstance(observer, str) else None)
             args = SimpleNamespace(
                 model_path=Path(self.model_path),
                 model_format=str(self.model_format),
@@ -293,10 +432,10 @@ class GXRenderMWAdapter:
                 omp_threads=int(self.omp_threads),
                 save_outputs=True,
                 write_preview=False,
-                observer=self.observer,
-                dsun_cm=getattr(observer, "dsun_cm", None),
-                lonc_deg=getattr(observer, "lonc_deg", None),
-                b0sun_deg=getattr(observer, "b0sun_deg", None),
+                observer=observer_name,
+                dsun_cm=None if isinstance(observer, str) else getattr(observer, "dsun_cm", None),
+                lonc_deg=None if isinstance(observer, str) else getattr(observer, "lonc_deg", None),
+                b0sun_deg=None if isinstance(observer, str) else getattr(observer, "b0sun_deg", None),
                 xc=getattr(geometry, "xc", None),
                 yc=getattr(geometry, "yc", None),
                 dx=getattr(geometry, "dx", None),
@@ -339,6 +478,38 @@ class GXRenderMWAdapter:
             shtable=self.shtable,
         )
 
+    def render_cube(self, q0: float) -> dict[str, Any]:
+        q0_key = float(q0)
+        cached = self._cube_cache.get(q0_key)
+        if cached is not None:
+            return cached
+        frequencies = [float(self.frequency_ghz)]
+        for value in list(self.render_frequencies_ghz or []):
+            numeric = float(value)
+            if not any(np.isclose(numeric, existing, rtol=0.0, atol=1e-12) for existing in frequencies):
+                frequencies.append(numeric)
+        cube = self._context.render_cube(
+            frequencies_ghz=frequencies,
+            tbase=float(self.tbase),
+            nbase=float(self.nbase),
+            q0=float(q0),
+            a=float(self.a),
+            b=float(self.b),
+            mode=int(self.mode),
+            selective_heating=bool(self.selective_heating),
+            shtable=self.shtable,
+        )
+        payload = {
+            "frequencies_ghz": frequencies,
+            "raw_modeled_cube": cube,
+            "raw_modeled_by_frequency": {
+                float(freq): np.asarray(cube[:, :, index], dtype=float)
+                for index, freq in enumerate(frequencies)
+            },
+        }
+        self._cube_cache[q0_key] = payload
+        return payload
+
 
 @dataclass(slots=True)
 class GXRenderEUVAdapter:
@@ -346,6 +517,7 @@ class GXRenderEUVAdapter:
 
     model_path: str | Path
     channel: str
+    render_channels: Sequence[str] | None = None
     instrument: str = "AIA"
     response_sav: str | Path | None = None
     model_format: str = "auto"
@@ -361,6 +533,7 @@ class GXRenderEUVAdapter:
     pixel_scale_arcsec: float = 2.0
     geometry: Any | None = None
     observer: Any | None = None
+    observer_name: str | None = None
     tr_region_mask: np.ndarray | None = None
     output_dir: str | Path | None = None
     output_name: str | None = None
@@ -371,6 +544,7 @@ class GXRenderEUVAdapter:
     _response_cache_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
     _response_cache_attempted: bool = field(default=False, init=False, repr=False)
     _response_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _components_cache: dict[float, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         instrument = str(self.instrument).strip()
@@ -389,7 +563,7 @@ class GXRenderEUVAdapter:
             "dsun_cm": None if observer is None else getattr(observer, "dsun_cm", None),
             "lonc_deg": None if observer is None else getattr(observer, "lonc_deg", None),
             "b0sun_deg": None if observer is None else getattr(observer, "b0sun_deg", None),
-            "observer": None,
+            "observer": self.observer_name,
         }
 
     def _geometry_to_kwargs(self) -> dict[str, Any]:
@@ -416,6 +590,7 @@ class GXRenderEUVAdapter:
             str(self.model_format),
             str(self.instrument),
             str(self.channel),
+            tuple(str(channel) for channel in (self.render_channels or ())),
             None if self.response_sav is None else str(Path(self.response_sav).expanduser()),
             tuple(sorted(self._observer_to_kwargs().items())),
         )
@@ -432,7 +607,7 @@ class GXRenderEUVAdapter:
             model_path=Path(self.model_path),
             model_format=str(self.model_format),
             ebtel_path=self.ebtel_path,
-            channels=[str(self.channel)],
+            channels=list(dict.fromkeys([str(self.channel), *[str(channel) for channel in (self.render_channels or ())]])),
             instrument=str(self.instrument),
             response_sav=(None if self.response_sav is None else Path(self.response_sav)),
             response=None,
@@ -496,6 +671,10 @@ class GXRenderEUVAdapter:
             return cached
 
     def render_components(self, q0: float) -> dict[str, Any]:
+        q0_key = float(q0)
+        cached = self._components_cache.get(q0_key)
+        if cached is not None:
+            return cached
         self.render_call_count += 1
         sdk = _load_gxrender_sdk()
 
@@ -520,7 +699,7 @@ class GXRenderEUVAdapter:
             ebtel_path=self.ebtel_path,
             output_dir=(Path(self.output_dir) if self.output_dir is not None else None),
             output_name=self.output_name,
-            channels=[str(self.channel)],
+            channels=list(dict.fromkeys([str(self.channel), *[str(channel) for channel in (self.render_channels or ())]])),
             instrument=str(self.instrument),
             response_sav=(
                 None
@@ -534,6 +713,7 @@ class GXRenderEUVAdapter:
             omp_threads=int(self.omp_threads),
             geometry=geometry,
             observer=self.observer,
+            observer_name=self.observer_name,
             save_outputs=bool(self.output_dir),
             write_preview=False,
             verbose=bool(self.verbose),
@@ -593,20 +773,39 @@ class GXRenderEUVAdapter:
             ) from exc
         selected_corona = np.asarray(flux_corona[:, :, channel_index], dtype=float)
         selected_tr = np.asarray(flux_tr[:, :, channel_index], dtype=float)
+        rendered_by_channel: dict[str, np.ndarray] = {}
+        corona_by_channel: dict[str, np.ndarray] = {}
+        tr_by_channel: dict[str, np.ndarray] = {}
+        for index, channel in enumerate(response_channels):
+            coronal_slice = np.asarray(flux_corona[:, :, index], dtype=float)
+            tr_slice = np.asarray(flux_tr[:, :, index], dtype=float)
+            rendered_by_channel[str(channel)] = recombine_euv_components(
+                coronal_slice,
+                tr_slice,
+                tr_region_mask=self.tr_region_mask,
+            )
+            corona_by_channel[str(channel)] = coronal_slice
+            tr_by_channel[str(channel)] = tr_slice
         rendered = recombine_euv_components(
             selected_corona,
             selected_tr,
             tr_region_mask=self.tr_region_mask,
         )
         if np.isfinite(rendered).all():
-            return {
+            payload = {
                 "rendered": rendered,
                 "flux_corona": selected_corona,
                 "flux_tr": selected_tr,
+                "render_channels": response_channels,
+                "rendered_by_channel": rendered_by_channel,
+                "flux_corona_by_channel": corona_by_channel,
+                "flux_tr_by_channel": tr_by_channel,
                 "tr_region_mask": (
                     None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool)
                 ),
             }
+            self._components_cache[q0_key] = payload
+            return payload
 
         finite = rendered[np.isfinite(rendered)]
         if finite.size == 0:
@@ -616,14 +815,29 @@ class GXRenderEUVAdapter:
         finite_min = float(np.nanmin(finite))
         finite_max = float(np.nanmax(finite))
         rendered = np.nan_to_num(rendered, nan=0.0, posinf=finite_max, neginf=finite_min)
-        return {
+        payload = {
             "rendered": rendered,
             "flux_corona": np.nan_to_num(selected_corona, nan=0.0, posinf=finite_max, neginf=finite_min),
             "flux_tr": np.nan_to_num(selected_tr, nan=0.0, posinf=finite_max, neginf=finite_min),
+            "render_channels": response_channels,
+            "rendered_by_channel": {
+                channel: np.nan_to_num(values, nan=0.0, posinf=finite_max, neginf=finite_min)
+                for channel, values in rendered_by_channel.items()
+            },
+            "flux_corona_by_channel": {
+                channel: np.nan_to_num(values, nan=0.0, posinf=finite_max, neginf=finite_min)
+                for channel, values in corona_by_channel.items()
+            },
+            "flux_tr_by_channel": {
+                channel: np.nan_to_num(values, nan=0.0, posinf=finite_max, neginf=finite_min)
+                for channel, values in tr_by_channel.items()
+            },
             "tr_region_mask": (
                 None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool)
             ),
         }
+        self._components_cache[q0_key] = payload
+        return payload
 
     def render(self, q0: float) -> np.ndarray:
         return np.asarray(self.render_components(q0)["rendered"], dtype=float)

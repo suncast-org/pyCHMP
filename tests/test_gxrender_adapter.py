@@ -66,7 +66,13 @@ class FakeGXRender:
             mode=0,
             warn_defaults=False,
         ):
-            cube = np.full((int(ny), int(nx), 1), float(q0), dtype=float)
+            cube = np.stack(
+                [
+                    np.full((int(ny), int(nx)), float(q0) + float(index), dtype=float)
+                    for index, _freq in enumerate(frequencies)
+                ],
+                axis=-1,
+            )
             return {"TI": cube}
 
 
@@ -79,10 +85,12 @@ class FakeEUVResult:
 
 class FakeSDKWithEUV(FakeSDK):
     last_euv_options = None
+    render_count = 0
 
     @staticmethod
     def render_euv_maps(options):
         FakeSDKWithEUV.last_euv_options = options
+        FakeSDKWithEUV.render_count += 1
         cube = np.stack(
             [
                 np.full((2, 3), 2.0, dtype=float),
@@ -171,6 +179,59 @@ def test_gxrender_mw_adapter_renders_single_frequency_map(monkeypatch) -> None:
 
     assert image.shape == (2, 3)
     assert np.allclose(image, 0.0217)
+
+
+def test_gxrender_mw_adapter_renders_requested_frequency_cube(monkeypatch) -> None:
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: FakeGXRender)
+    monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
+
+    adapter = GXRenderMWAdapter(
+        model_path="model.h5",
+        frequency_ghz=5.8,
+        render_frequencies_ghz=(5.8, 8.2),
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    payload = adapter.render_cube(0.02)
+
+    assert payload["frequencies_ghz"] == [5.8, 8.2]
+    assert payload["raw_modeled_cube"].shape == (2, 3, 2)
+    np.testing.assert_allclose(payload["raw_modeled_by_frequency"][5.8], np.full((2, 3), 0.02))
+    np.testing.assert_allclose(payload["raw_modeled_by_frequency"][8.2], np.full((2, 3), 1.02))
+
+
+def test_gxrender_mw_adapter_reuses_cached_frequency_cube(monkeypatch) -> None:
+    class CountingGXRender(FakeGXRender):
+        call_count = 0
+
+        class GXRadioImageComputing(FakeGXRender.GXRadioImageComputing):
+            def synth_model(self, *args, **kwargs):
+                CountingGXRender.call_count += 1
+                return super().synth_model(*args, **kwargs)
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDK)
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_module", lambda: CountingGXRender)
+    monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpers)
+
+    adapter = GXRenderMWAdapter(
+        model_path="model.h5",
+        frequency_ghz=5.8,
+        render_frequencies_ghz=(5.8, 8.2),
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    adapter.render(0.02)
+    payload = adapter.render_cube(0.02)
+
+    assert CountingGXRender.call_count == 1
+    np.testing.assert_allclose(payload["raw_modeled_by_frequency"][8.2], np.full((2, 3), 1.02))
 
 
 def test_gxrender_mw_adapter_requires_single_frequency_cube(monkeypatch) -> None:
@@ -304,6 +365,53 @@ def test_gxrender_euv_adapter_renders_single_channel_sum_map(monkeypatch) -> Non
     assert FakeSDKWithEUV.last_euv_options.kwargs["channels"] == ["171"]
     assert FakeSDKWithEUV.last_euv_options.kwargs["instrument"] == "AIA"
     assert FakeSDKWithEUV.last_euv_options.kwargs["response_sav"] is None
+
+
+def test_gxrender_euv_adapter_retains_rendered_channel_cube(monkeypatch) -> None:
+    FakeSDKWithEUV.render_count = 0
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        render_channels=("94", "171"),
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    components = adapter.render_components(0.0217)
+
+    assert FakeSDKWithEUV.last_euv_options.kwargs["channels"] == ["171", "94"]
+    assert components["render_channels"] == ["A94", "A171"]
+    np.testing.assert_allclose(components["rendered_by_channel"]["A94"], np.full((2, 3), 6.0))
+    np.testing.assert_allclose(components["rendered_by_channel"]["A171"], np.full((2, 3), 12.0))
+
+
+def test_gxrender_euv_adapter_reuses_cached_components(monkeypatch) -> None:
+    FakeSDKWithEUV.render_count = 0
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithEUV)
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        render_channels=("94", "171"),
+        instrument="AIA",
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    adapter.render(0.0217)
+    components = adapter.render_components(0.0217)
+
+    assert FakeSDKWithEUV.render_count == 1
+    np.testing.assert_allclose(components["rendered_by_channel"]["A94"], np.full((2, 3), 6.0))
 
 
 def test_gxrender_euv_adapter_leaves_supported_instrument_response_to_sdk(monkeypatch) -> None:

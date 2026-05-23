@@ -72,6 +72,13 @@ def test_fit_observation_request_rejects_conflicting_path_selectors(tmp_path: Pa
         fit_q0_obs_map._resolve_observation_request(args, repo_root=tmp_path)
 
 
+def test_fit_observation_request_requires_explicit_external_fits_path(tmp_path: Path) -> None:
+    args = _make_resolution_args(tmp_path, obs_source="external_fits", fits_file=None, obs_path=None)
+
+    with pytest.raises(SystemExit, match="fits_file is required"):
+        fit_q0_obs_map._resolve_observation_request(args, repo_root=tmp_path)
+
+
 def test_scan_and_fit_observation_request_resolution_stay_aligned(tmp_path: Path) -> None:
     args = _make_resolution_args(tmp_path, obs_map_id="AIA_171")
 

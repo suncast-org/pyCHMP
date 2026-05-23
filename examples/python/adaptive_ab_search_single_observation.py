@@ -91,9 +91,18 @@ from pychmp import (
     build_tr_region_mask_from_blos,
     estimate_obs_map_noise,
     load_obs_map,
+    resolve_render_geometry_via_gxrender,
     resolve_default_testdata_fixture_paths,
     search_local_minimum_ab,
     validate_obs_map_identity,
+)
+from pychmp.spectral import (
+    default_euv_channels_for_instrument,
+    euv_slice_request,
+    mw_slice_request,
+    parse_csv_floats,
+    parse_csv_tokens,
+    unique_preserve_order,
 )
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
@@ -102,12 +111,15 @@ from pychmp.ab_scan_artifacts import (
     append_run_history_entry,
     build_computed_point_payload,
     detect_scan_artifact_format,
+    load_auxiliary_map_store_point_records,
     load_scan_file,
     load_run_history,
     point_record_matches_compatibility_signature,
     validate_scan_artifact_compatibility,
-    write_sparse_scan_file,
+    write_point_scan_artifact,
 )
+from pychmp.geometry_policy import resolve_geometry_policy
+from pychmp.metrics import compute_metrics, resolve_threshold_mask
 
 try:
     from fit_q0_obs_map import (
@@ -124,6 +136,7 @@ try:
         _format_psf_report,
         _load_explicit_metric_mask,
         _load_model_identity,
+        _make_trial_progress_reporter,
         _resolve_render_selection,
         _resolve_selected_psf,
         load_blos_reference_for_fov,
@@ -148,6 +161,7 @@ except ModuleNotFoundError:
         _format_psf_report,
         _load_explicit_metric_mask,
         _load_model_identity,
+        _make_trial_progress_reporter,
         _resolve_render_selection,
         _resolve_selected_psf,
         load_blos_reference_for_fov,
@@ -320,10 +334,13 @@ class _AdaptiveRendererFactory:
     euv_channel: str | None
     euv_instrument: str | None
     euv_response_sav: str | None
+    render_frequencies_ghz: tuple[float, ...]
+    render_channels: tuple[str, ...]
     tbase: float
     nbase: float
     geometry: _FactoryGeometry
     observer_overrides: _ObserverOverrideData | None
+    observer_name: str | None
     pixel_scale_arcsec: float
     psf_kernel: np.ndarray | None
     tr_region_mask: np.ndarray | None = None
@@ -352,12 +369,14 @@ class _AdaptiveRendererFactory:
                 model_path=self.model_path,
                 ebtel_path=self.ebtel_path,
                 frequency_ghz=float(self.frequency_ghz),
+                render_frequencies_ghz=self.render_frequencies_ghz,
                 tbase=float(self.tbase),
                 nbase=float(self.nbase),
                 a=float(a),
                 b=float(b),
                 geometry=geometry,
                 observer=observer,
+                observer_name=self.observer_name,
                 pixel_scale_arcsec=float(self.pixel_scale_arcsec),
             )
             if self.psf_kernel is None:
@@ -371,6 +390,7 @@ class _AdaptiveRendererFactory:
         base = GXRenderEUVAdapter(
             model_path=self.model_path,
             channel=str(self.euv_channel),
+            render_channels=self.render_channels,
             instrument=str(self.euv_instrument or "AIA"),
             response_sav=self.euv_response_sav,
             ebtel_path=self.ebtel_path,
@@ -380,6 +400,7 @@ class _AdaptiveRendererFactory:
             b=float(b),
             geometry=geometry,
             observer=observer,
+            observer_name=self.observer_name,
             tr_region_mask=None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool),
             pixel_scale_arcsec=float(self.pixel_scale_arcsec),
         )
@@ -432,19 +453,14 @@ def _resolve_observation_request(args: argparse.Namespace, *, repo_root: Path) -
     if explicit_source == "model_refmap" and obs_path is not None:
         raise SystemExit("Conflicting observation selectors: external FITS paths cannot be used with --obs-source=model_refmap")
 
-    eovsa_root, model_root, ebtel_root = _default_testdata_roots(repo_root, testdata_repo=testdata_repo)
-    default_eovsa_fits, default_model_h5, default_ebtel_path = resolve_default_testdata_fixture_paths(
+    _eovsa_root, model_root, ebtel_root = _default_testdata_roots(repo_root, testdata_repo=testdata_repo)
+    _default_eovsa_fits, default_model_h5, default_ebtel_path = resolve_default_testdata_fixture_paths(
         repo_root=repo_root,
         testdata_repo=testdata_repo,
     )
 
     if explicit_source == "external_fits" and obs_path is None:
-        if default_eovsa_fits is None:
-            raise SystemExit(
-                f"Default EOVSA test-data FITS not found under {eovsa_root}; "
-                "install the 2020-11-26 CHR/EOVSA fixture set or pass an explicit FITS path"
-            )
-        obs_path = default_eovsa_fits
+        raise SystemExit("--obs-path or positional fits_file is required when --obs-source=external_fits")
     if explicit_source == "model_refmap" and obs_map_id is None:
         raise SystemExit("--obs-map-id is required when --obs-source=model_refmap")
     if model_h5 is None:
@@ -473,6 +489,48 @@ def _default_artifact_stem(obs_request: _ObservationRequest, *, target_metric: s
         else (obs_request.obs_map_id or "observation")
     )
     return f"{source_token}_adaptive_ab_{target_metric}"
+
+
+def _resolve_render_slice_requests(
+    *,
+    domain: str,
+    frequency_ghz: float | None,
+    euv_channel: str | None,
+    euv_instrument: str | None,
+    all_channels: bool,
+    render_channels_csv: str | None,
+    render_frequencies_csv: str | None,
+) -> tuple[list[dict[str, Any]], tuple[float, ...], tuple[str, ...]]:
+    resolved_domain = str(domain).strip().lower()
+    if resolved_domain == "mw":
+        if all_channels:
+            raise SystemExit("--all-channels is only defined for fixed-channel EUV/UV instruments")
+        if frequency_ghz is None:
+            raise SystemExit("MW rendering requires a target observation frequency")
+        extra_freqs = parse_csv_floats(render_frequencies_csv, option_name="--render-frequencies-ghz")
+        requests = [mw_slice_request(float(frequency_ghz), is_target=True)]
+        for freq in extra_freqs:
+            if not np.isclose(float(freq), float(frequency_ghz), rtol=0.0, atol=1e-12):
+                requests.append(mw_slice_request(float(freq), is_target=False))
+        return [item.as_descriptor() for item in requests], tuple(float(item.frequency_ghz) for item in requests), tuple()
+
+    requested_channels = list(parse_csv_tokens(render_channels_csv, option_name="--render-channels"))
+    if all_channels:
+        requested_channels.extend(default_euv_channels_for_instrument(euv_instrument))
+        if not requested_channels:
+            raise SystemExit(
+                f"--all-channels is not known for EUV/UV instrument {euv_instrument!r}; use --render-channels instead"
+            )
+    if euv_channel:
+        requested_channels.insert(0, str(euv_channel))
+    channels = tuple(str(value) for value in unique_preserve_order(requested_channels))
+    if not channels:
+        raise SystemExit("EUV/UV rendering requires a target channel")
+    requests = [
+        euv_slice_request(channel, domain=resolved_domain, is_target=(str(channel) == str(euv_channel)))
+        for channel in channels
+    ]
+    return [item.as_descriptor() for item in requests], tuple(), channels
 
 
 def _resolve_existing_file(path_text: str | None) -> Path | None:
@@ -513,6 +571,20 @@ def _point_payload_from_result(
     trial_residual_maps = None
     trial_euv_coronal_maps = None
     trial_euv_tr_maps = None
+    map_store_arrays: dict[str, np.ndarray] = {}
+    base_renderer = getattr(renderer, "_base", renderer)
+    if hasattr(base_renderer, "render_cube"):
+        cube_payload = base_renderer.render_cube(float(point.q0))
+        for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
+            map_store_arrays[f"mw/{float(freq):.6f}ghz/raw_modeled_best"] = np.asarray(rendered, dtype=np.float32)
+    if hasattr(base_renderer, "render_components"):
+        components = base_renderer.render_components(float(point.q0))
+        for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+            map_store_arrays[f"euv/{channel}/rendered_best"] = np.asarray(rendered, dtype=np.float32)
+        for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+            map_store_arrays[f"euv/{channel}/flux_corona_best"] = np.asarray(rendered, dtype=np.float32)
+        for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+            map_store_arrays[f"euv/{channel}/flux_tr_best"] = np.asarray(rendered, dtype=np.float32)
     trial_q0_values = [float(v) for v in point.trial_q0]
     if trial_q0_values:
         raw_trials: list[np.ndarray] = []
@@ -520,7 +592,6 @@ def _point_payload_from_result(
         residual_trials: list[np.ndarray] = []
         euv_coronal_trials: list[np.ndarray] = []
         euv_tr_trials: list[np.ndarray] = []
-        base_renderer = getattr(renderer, "_base", renderer)
         for q0_value in trial_q0_values:
             if hasattr(renderer, "render_pair"):
                 raw_trial, modeled_trial = renderer.render_pair(float(q0_value))
@@ -540,6 +611,14 @@ def _point_payload_from_result(
                 if coronal is not None and tr_flux is not None:
                     euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
                     euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
+                trial_index = len(raw_trials) - 1
+                for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                    map_store_arrays[f"euv/{channel}/trial_{trial_index:03d}/rendered"] = np.asarray(rendered, dtype=np.float32)
+            if hasattr(base_renderer, "render_cube"):
+                cube_payload = base_renderer.render_cube(float(q0_value))
+                trial_index = len(raw_trials) - 1
+                for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
+                    map_store_arrays[f"mw/{float(freq):.6f}ghz/trial_{trial_index:03d}/raw_modeled"] = np.asarray(rendered, dtype=np.float32)
         if raw_trials and len(raw_trials) == len(trial_q0_values):
             trial_raw_modeled_maps = np.stack(raw_trials, axis=0)
             trial_modeled_maps = np.stack(modeled_trials, axis=0)
@@ -593,6 +672,7 @@ def _point_payload_from_result(
         trial_residual_maps=trial_residual_maps,
         trial_euv_coronal_maps=trial_euv_coronal_maps,
         trial_euv_tr_maps=trial_euv_tr_maps,
+        map_store_arrays=map_store_arrays,
         nfev=int(point.nfev),
         nit=int(point.nit),
         message=str(point.message),
@@ -640,6 +720,127 @@ def _point_from_record(record: dict[str, Any], *, target_metric: str) -> ABPoint
     )
 
 
+def _target_metric_value(metrics: Any, target_metric: str) -> float:
+    metric_name = str(target_metric)
+    if metric_name == "chi2":
+        return float(metrics.chi2)
+    if metric_name == "rho2":
+        return float(metrics.rho2)
+    if metric_name == "eta2":
+        return float(metrics.eta2)
+    raise ValueError(f"unsupported target metric: {target_metric!r}")
+
+
+def _rescore_auxiliary_map_record(
+    record: dict[str, Any],
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+) -> tuple[ABPointResult, dict[str, Any]] | None:
+    trial_q0 = tuple(float(value) for value in record.get("fit_q0_trials", ()))
+    trial_maps_raw = record.get("trial_modeled_maps")
+    if not trial_q0 or trial_maps_raw is None:
+        return None
+    trial_maps = np.asarray(trial_maps_raw, dtype=float)
+    if trial_maps.ndim != 3 or int(trial_maps.shape[0]) != len(trial_q0):
+        return None
+
+    observed_arr = np.asarray(observed, dtype=float)
+    sigma_arr = np.asarray(sigma_map, dtype=float)
+    explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
+    mask_fn = resolve_threshold_mask("union")
+
+    rescored: list[tuple[float, Any, float, np.ndarray]] = []
+    for q0_value, modeled in zip(trial_q0, trial_maps, strict=False):
+        modeled_arr = np.asarray(modeled, dtype=float)
+        try:
+            mask = explicit_mask_arr if explicit_mask_arr is not None else mask_fn(observed_arr, modeled_arr, float(threshold))
+            metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
+            objective = _target_metric_value(metrics, target_metric)
+        except Exception:
+            continue
+        if np.isfinite(objective):
+            rescored.append((float(q0_value), metrics, float(objective), modeled_arr))
+    if not rescored:
+        return None
+
+    best_q0, best_metrics, best_objective, best_map = min(rescored, key=lambda item: item[2])
+    diagnostics = dict(record.get("diagnostics") or {})
+    diagnostics.update(
+        {
+            "chi2": float(best_metrics.chi2),
+            "rho2": float(best_metrics.rho2),
+            "eta2": float(best_metrics.eta2),
+            "target_metric": str(target_metric),
+            "target_metric_value": float(best_objective),
+            "map_store_reused": True,
+            "map_store_source_slice_key": record.get("source_slice_key"),
+            "map_store_source_search_id": record.get("source_search_id"),
+        }
+    )
+    trial_metric_values = tuple(float(objective) for _q0, _metrics, objective, _modeled in rescored)
+    trial_chi2 = tuple(float(metrics.chi2) for _q0, metrics, _objective, _modeled in rescored)
+    trial_rho2 = tuple(float(metrics.rho2) for _q0, metrics, _objective, _modeled in rescored)
+    trial_eta2 = tuple(float(metrics.eta2) for _q0, metrics, _objective, _modeled in rescored)
+    ordered_trial_q0 = tuple(float(q0) for q0, _metrics, _objective, _modeled in rescored)
+    ordered_trial_maps = np.stack([np.asarray(modeled, dtype=float) for _q0, _metrics, _objective, modeled in rescored], axis=0)
+    residual = np.asarray(best_map, dtype=float) - observed_arr
+
+    point = ABPointResult(
+        a=float(record["a"]),
+        b=float(record["b"]),
+        q0=float(best_q0),
+        objective_value=float(best_objective),
+        metrics=_MetricValues(chi2=float(best_metrics.chi2), rho2=float(best_metrics.rho2), eta2=float(best_metrics.eta2)),
+        target_metric=str(target_metric),
+        success=True,
+        nfev=int(len(rescored)),
+        nit=0,
+        message="reused from map_store",
+        used_adaptive_bracketing=bool(record.get("used_adaptive_bracketing", False)),
+        bracket_found=bool(record.get("bracket_found", False)),
+        bracket=None if record.get("bracket") is None else tuple(float(v) for v in record.get("bracket")),
+        trial_q0=ordered_trial_q0,
+        trial_objective_values=trial_metric_values,
+        trial_chi2_values=trial_chi2,
+        trial_rho2_values=trial_rho2,
+        trial_eta2_values=trial_eta2,
+        elapsed_seconds=0.0,
+    )
+    payload = build_computed_point_payload(
+        a_value=float(point.a),
+        b_value=float(point.b),
+        a_index=int(record.get("a_index", 0)),
+        b_index=int(record.get("b_index", 0)),
+        q0=float(point.q0),
+        success=True,
+        status="computed",
+        modeled_best=np.asarray(best_map, dtype=float),
+        raw_modeled_best=np.asarray(record.get("raw_modeled_best", best_map), dtype=float),
+        residual=residual,
+        fit_q0_trials=ordered_trial_q0,
+        fit_metric_trials=trial_metric_values,
+        fit_chi2_trials=trial_chi2,
+        fit_rho2_trials=trial_rho2,
+        fit_eta2_trials=trial_eta2,
+        trial_raw_modeled_maps=np.asarray(record.get("trial_raw_modeled_maps", ordered_trial_maps), dtype=float),
+        trial_modeled_maps=ordered_trial_maps,
+        trial_residual_maps=ordered_trial_maps - observed_arr[None, :, :],
+        nfev=int(len(rescored)),
+        nit=0,
+        message="reused from map_store",
+        used_adaptive_bracketing=bool(record.get("used_adaptive_bracketing", False)),
+        bracket_found=bool(record.get("bracket_found", False)),
+        bracket=None if record.get("bracket") is None else tuple(float(v) for v in record.get("bracket")),
+        target_metric=str(target_metric),
+        diagnostics=diagnostics,
+    )
+    return point, payload
+
+
 class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
     def __init__(
         self,
@@ -677,10 +878,69 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if self._viewer_heartbeat is not None:
             self._viewer_heartbeat.clear_pending_points()
 
+    def _target_slice_key(self) -> str | None:
+        value = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip()
+        return value or None
+
+    def promote_auxiliary_maps_from_store(
+        self,
+        *,
+        threshold: float,
+        explicit_mask: np.ndarray | None,
+    ) -> int:
+        if not self._artifact_h5.exists():
+            return 0
+        slice_key = self._target_slice_key()
+        if not slice_key:
+            return 0
+        try:
+            records = load_auxiliary_map_store_point_records(self._artifact_h5, slice_key=slice_key)
+        except KeyError:
+            return 0
+        promoted_count = 0
+        for record in records:
+            rescored = _rescore_auxiliary_map_record(
+                record,
+                observed=self._observed,
+                sigma_map=self._sigma_map,
+                threshold=float(threshold),
+                explicit_mask=explicit_mask,
+                target_metric=self._target_metric,
+            )
+            if rescored is None:
+                continue
+            point, point_payload = rescored
+            key = (float(point.a), float(point.b))
+            if key in self._point_map:
+                continue
+            point_payload["diagnostics"] = {
+                **dict(point_payload.get("diagnostics") or {}),
+                COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
+            }
+            append_point_record(
+                self._artifact_h5,
+                observed=self._observed,
+                sigma_map=self._sigma_map,
+                wcs_header=self._target_header,
+                diagnostics=self._diagnostics,
+                blos_reference=self._blos_reference,
+                point_payload=point_payload,
+            )
+            self._point_map[key] = point
+            promoted_count += 1
+        if promoted_count and self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.set_phase(f"{promoted_count} map_store point(s) promoted")
+        return promoted_count
+
     def hydrate_from_existing(self) -> int:
         if not self._artifact_h5.exists():
             return 0
-        payload = load_scan_file(self._artifact_h5)
+        try:
+            payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key())
+        except KeyError:
+            return 0
+        if bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False)) and not payload.get("point_records"):
+            return 0
         validate_scan_artifact_compatibility(
             payload,
             observed=self._observed,
@@ -700,6 +960,80 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             self._point_map[(float(point.a), float(point.b))] = point
             count += 1
         return count
+
+    def promote_current_slice_trial_maps(
+        self,
+        *,
+        threshold: float,
+        explicit_mask: np.ndarray | None,
+    ) -> int:
+        if not self._artifact_h5.exists():
+            return 0
+        try:
+            current_payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key())
+        except KeyError:
+            return 0
+        if bool(dict(current_payload.get("diagnostics") or {}).get("render_only_slice", False)):
+            return 0
+        validate_scan_artifact_compatibility(
+            current_payload,
+            observed=self._observed,
+            sigma_map=self._sigma_map,
+            wcs_header=self._target_header,
+            diagnostics=self._diagnostics,
+            artifact_path=self._artifact_h5,
+        )
+        promoted_count = 0
+        for search in current_payload.get("search_records", []):
+            search_id = str(search.get("search_id", "")).strip()
+            if not search_id:
+                continue
+            try:
+                search_payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key(), search_id=search_id)
+            except KeyError:
+                continue
+            for record in search_payload.get("point_records", []):
+                key = (float(record["a"]), float(record["b"]))
+                if key in self._point_map:
+                    continue
+                if point_record_matches_compatibility_signature(
+                    record,
+                    compatibility_signature=self._compatibility_signature,
+                ):
+                    continue
+                rescored = _rescore_auxiliary_map_record(
+                    {
+                        **dict(record),
+                        "source_slice_key": self._target_slice_key(),
+                        "source_search_id": search_id,
+                    },
+                    observed=self._observed,
+                    sigma_map=self._sigma_map,
+                    threshold=float(threshold),
+                    explicit_mask=explicit_mask,
+                    target_metric=self._target_metric,
+                )
+                if rescored is None:
+                    continue
+                point, point_payload = rescored
+                point_payload["diagnostics"] = {
+                    **dict(point_payload.get("diagnostics") or {}),
+                    COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
+                }
+                append_point_record(
+                    self._artifact_h5,
+                    observed=self._observed,
+                    sigma_map=self._sigma_map,
+                    wcs_header=self._target_header,
+                    diagnostics=self._diagnostics,
+                    blos_reference=self._blos_reference,
+                    point_payload=point_payload,
+                )
+                self._point_map[key] = point
+                promoted_count += 1
+        if promoted_count and self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.set_phase(f"{promoted_count} current-slice map_store point(s) promoted")
+        return promoted_count
 
     def __getitem__(self, key: tuple[float, float]) -> ABPointResult:
         return self._point_map[key]
@@ -766,6 +1100,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--testdata-repo", type=Path, default=None, help="Optional sibling pyGXrender-test-data checkout used for default input resolution")
     parser.add_argument("--euv-instrument", type=str, default=None, help="Optional EUV/UV instrument override. Must agree with the selected observation if that observation already declares an instrument.")
     parser.add_argument("--euv-response-sav", type=Path, default=None, help="Optional gxresponse SAV override used for EUV/UV rendering. If omitted, gximagecomputing will use its default pyEUVTools-backed response path for supported instruments.")
+    parser.add_argument("--all-channels", action="store_true", help="For fixed-channel EUV/UV instruments, render all known channels for the same geometry while fitting only the selected observation slice.")
+    parser.add_argument("--render-channels", default=None, help="Comma-separated EUV/UV channels to render in addition to the fitted observation channel, for example 94,131,193.")
+    parser.add_argument("--render-frequencies-ghz", default=None, help="Comma-separated MW frequencies to render in addition to the fitted observation frequency. MW extra frequencies must be explicit.")
     parser.add_argument("--a-start", type=float, default=DEFAULT_A, help="Adaptive search starting a value")
     parser.add_argument("--b-start", type=float, default=DEFAULT_B, help="Adaptive search starting b value")
     parser.add_argument("--da", type=float, default=0.3, help="Adaptive a step size")
@@ -875,6 +1212,15 @@ def main() -> int:
     )
     try:
         render_selection = _resolve_render_selection(args, obs_map)
+        slice_descriptors, render_frequencies_ghz, render_channels = _resolve_render_slice_requests(
+            domain=render_selection.domain,
+            frequency_ghz=render_selection.active_frequency_ghz,
+            euv_channel=render_selection.euv_channel,
+            euv_instrument=render_selection.euv_instrument,
+            all_channels=bool(args.all_channels),
+            render_channels_csv=args.render_channels,
+            render_frequencies_csv=args.render_frequencies_ghz,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -1009,15 +1355,48 @@ def main() -> int:
     )
     model_observer_meta = _load_model_observer_metadata(model_h5)
     saved_fov = _load_saved_fov_from_model(model_h5)
-    if saved_fov is None:
-        raise SystemExit("model does not expose a saved FOV; this example requires one")
-    geometry = sdk.MapGeometry(
-        xc=float(saved_fov["xc_arcsec"]),
-        yc=float(saved_fov["yc_arcsec"]),
-        dx=float(args.pixel_scale_arcsec),
-        dy=float(args.pixel_scale_arcsec),
-        nx=max(16, int(round(float(saved_fov["xsize_arcsec"]) / abs(float(args.pixel_scale_arcsec))))),
-        ny=max(16, int(round(float(saved_fov["ysize_arcsec"]) / abs(float(args.pixel_scale_arcsec))))),
+    explicit_observer_requested = any(v is not None for v in (args.observer, args.dsun_cm, args.lonc_deg, args.b0sun_deg))
+    geometry_policy = resolve_geometry_policy(
+        obs_map=obs_map,
+        model_observer_meta=model_observer_meta,
+        saved_fov=saved_fov,
+        geometry_overrides_requested=False,
+        explicit_observer_requested=explicit_observer_requested,
+    )
+    geometry_observer_name = str(args.observer or geometry_policy.observer_name)
+    geometry_observer = observer_overrides if explicit_observer_requested else None
+    resolved_geometry = resolve_render_geometry_via_gxrender(
+        model_path=model_h5,
+        model_format="auto",
+        ebtel_path=str(ebtel_path) if ebtel_path is not None else None,
+        pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+        observer_name=geometry_observer_name,
+        observer=geometry_observer,
+        omp_threads=int(getattr(args, "omp_threads", 8)),
+    )
+    geometry = resolved_geometry.geometry
+    if not explicit_observer_requested:
+        observer_overrides = sdk.ObserverOverrides(
+            dsun_cm=float(geometry_policy.observer_dsun_cm),
+            lonc_deg=float(geometry_policy.observer_lonc_deg),
+            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
+        )
+        observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+    effective_observer_name = geometry_observer_name
+    effective_observer_lonc_deg = float(
+        getattr(observer_overrides, "lonc_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "lonc_deg", None) is not None
+        else geometry_policy.observer_lonc_deg
+    )
+    effective_observer_b0sun_deg = float(
+        getattr(observer_overrides, "b0sun_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "b0sun_deg", None) is not None
+        else geometry_policy.observer_b0sun_deg
+    )
+    effective_observer_dsun_cm = float(
+        getattr(observer_overrides, "dsun_cm", None)
+        if observer_overrides is not None and getattr(observer_overrides, "dsun_cm", None) is not None
+        else geometry_policy.observer_dsun_cm
     )
 
     target_header = _build_target_header(
@@ -1031,10 +1410,10 @@ def main() -> int:
     )
     target_header = _with_observer_wcs_keywords(
         target_header,
-        observer_name=str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        hgln_obs_deg=float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        hglt_obs_deg=float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        dsun_obs_m=float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)) / 100.0,
+        observer_name=effective_observer_name,
+        hgln_obs_deg=effective_observer_lonc_deg,
+        hglt_obs_deg=effective_observer_b0sun_deg,
+        dsun_obs_m=effective_observer_dsun_cm / 100.0,
     )
     observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
     sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
@@ -1085,6 +1464,12 @@ def main() -> int:
         print(f"  Metrics mask: union threshold={float(args.metrics_mask_threshold):.3f}")
 
     print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
+    print(
+        "  Geometry policy: "
+        f"obs_los={geometry_policy.observation_observer or '<unknown>'} "
+        f"model_los={geometry_policy.model_observer or '<unknown>'} "
+        f"aligned={geometry_policy.los_aligned}; render_geometry_resolver=gxrender"
+    )
     print(
         "  Geometry: "
         f"xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} "
@@ -1167,6 +1552,14 @@ def main() -> int:
         "artifact_kind": "pychmp_ab_scan_sparse_points",
         "spectral_domain": str(render_selection.domain),
         "spectral_label": str(render_selection.spectral_label),
+        "slice_descriptors": slice_descriptors,
+        "target_slice_key": next(
+            (str(item["key"]) for item in slice_descriptors if bool(item.get("is_target"))),
+            str(slice_descriptors[0]["key"]) if slice_descriptors else "default",
+        ),
+        "render_frequencies_ghz": [float(v) for v in render_frequencies_ghz],
+        "render_channels": [str(v) for v in render_channels],
+        "render_extra_slices": int(max(0, len(slice_descriptors) - 1)),
         "model_path": str(model_h5),
         "model_id": str(_load_model_identity(model_h5)),
         "model_sha256": str(model_sha256),
@@ -1194,12 +1587,17 @@ def main() -> int:
         "map_nx": int(geometry.nx),
         "map_ny": int(geometry.ny),
         "noise_diagnostics": noise_diag,
-        "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        "observer_b0sun_deg": float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        "observer_dsun_cm": float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)),
+        "observer_name": effective_observer_name,
+        "observer_lonc_deg": effective_observer_lonc_deg,
+        "observer_b0sun_deg": effective_observer_b0sun_deg,
+        "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
-        "search_mode": "adaptive_local_single_frequency",
+        "geometry_policy_mode": geometry_mode,
+        "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
+        "geometry_policy_observation_los": geometry_policy.observation_observer,
+        "geometry_policy_model_los": geometry_policy.model_observer,
+        "geometry_policy_los_aligned": geometry_policy.los_aligned,
+        "search_mode": "adaptive_local_single_observation",
         "a_start": float(args.a_start),
         "b_start": float(args.b_start),
         "da": float(args.da),
@@ -1268,7 +1666,7 @@ def main() -> int:
     existing_format = detect_scan_artifact_format(artifact_h5) if artifact_preexisting else None
     viewer_refresh_signal = Path(f"{artifact_h5}.refresh")
     viewer_heartbeat = _ViewerRefreshHeartbeat(viewer_refresh_signal)
-    if artifact_h5.exists() and existing_format not in {None, "sparse"}:
+    if artifact_h5.exists() and existing_format not in {None, "sparse", "unified"}:
         raise SystemExit(
             f"Existing artifact {artifact_h5} is rectangular; this adaptive example requires a sparse artifact path."
         )
@@ -1276,7 +1674,7 @@ def main() -> int:
     if bool(args.recompute_existing) and artifact_h5.exists():
         print(f"Recompute existing: resetting sparse artifact at {artifact_h5}")
     if not artifact_h5.exists() or bool(args.recompute_existing):
-        write_sparse_scan_file(
+        write_point_scan_artifact(
             artifact_h5,
             observed=observed_cropped,
             sigma_map=sigma_cropped,
@@ -1299,6 +1697,8 @@ def main() -> int:
         euv_channel=render_selection.euv_channel,
         euv_instrument=render_selection.euv_instrument,
         euv_response_sav=None if render_selection.euv_response_sav is None else str(render_selection.euv_response_sav),
+        render_frequencies_ghz=render_frequencies_ghz,
+        render_channels=render_channels,
         tbase=float(args.tbase),
         nbase=float(args.nbase),
         geometry=_FactoryGeometry(
@@ -1316,6 +1716,7 @@ def main() -> int:
             lonc_deg=None if getattr(observer_overrides, "lonc_deg", None) is None else float(observer_overrides.lonc_deg),
             b0sun_deg=None if getattr(observer_overrides, "b0sun_deg", None) is None else float(observer_overrides.b0sun_deg),
         ),
+        observer_name=effective_observer_name,
         pixel_scale_arcsec=float(args.pixel_scale_arcsec),
         psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         tr_region_mask=None if euv_tr_mask is None else np.asarray(euv_tr_mask, dtype=bool),
@@ -1335,6 +1736,24 @@ def main() -> int:
     )
     try:
         reused_points = 0 if bool(args.recompute_existing) else cache.hydrate_from_existing()
+        if not bool(args.recompute_existing):
+            current_promoted_points = cache.promote_current_slice_trial_maps(
+                threshold=float(args.metrics_mask_threshold),
+                explicit_mask=explicit_metric_mask,
+            )
+            if current_promoted_points:
+                reused_points += current_promoted_points
+                print(
+                    f"Map store reuse: promoted {current_promoted_points} current-slice point(s) "
+                    f"into search {root_diag.get(COMPATIBILITY_SIGNATURE_KEY)}"
+                )
+            promoted_points = cache.promote_auxiliary_maps_from_store(
+                threshold=float(args.metrics_mask_threshold),
+                explicit_mask=explicit_metric_mask,
+            )
+            if promoted_points:
+                reused_points += promoted_points
+                print(f"Map store reuse: promoted {promoted_points} point(s) into slice {root_diag.get('target_slice_key')}")
     except ScanArtifactCompatibilityError as exc:
         raise SystemExit(str(exc)) from exc
     append_run_history_entry(
@@ -1364,6 +1783,10 @@ def main() -> int:
 
     started = time.perf_counter()
     viewer_heartbeat.start("adaptive search running")
+    progress_start_callback = None
+    progress_callback = None
+    if str(args.execution_policy) == "serial":
+        progress_start_callback, progress_callback = _make_trial_progress_reporter(target_metric=str(args.target_metric))
     try:
         result = search_local_minimum_ab(
             factory,
@@ -1389,6 +1812,8 @@ def main() -> int:
             max_bracket_steps=int(args.max_bracket_steps),
             threshold_metric=float(args.threshold_metric),
             no_area=bool(args.no_area),
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
             cache=cache,
             execution_policy=str(args.execution_policy),
             max_workers=args.max_workers,

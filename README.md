@@ -86,12 +86,14 @@ shell launchers (.sh / .cmd)
   -> examples/fit_q0_obs_map.py
      -> pychmp.load_obs_map(...)
      -> pychmp.estimate_obs_map_noise(...)
+     -> pychmp.resolve_geometry_policy(...)
      -> pychmp.fit_q0_to_observation(...)
 
 shell launchers (.sh / .cmd)
   -> examples/scan_ab_obs_map.py
      -> pychmp.load_obs_map(...)
      -> pychmp.estimate_obs_map_noise(...)
+     -> pychmp.resolve_geometry_policy(...)
      -> per-point fit workflow
         -> examples/fit_q0_obs_map.py
            -> pychmp.fit_q0_to_observation(...)
@@ -101,6 +103,7 @@ shell launchers (.sh / .cmd)
      -> pychmp.load_obs_map(...)
      -> pychmp.validate_obs_map_identity(...)
      -> pychmp.estimate_obs_map_noise(...)
+     -> pychmp.resolve_geometry_policy(...)
      -> pychmp.search_local_minimum_ab(...)
         -> pychmp.evaluate_ab_point(...)
            -> pychmp.fit_q0_to_observation(...)
@@ -114,12 +117,14 @@ Contributor notes:
 - `search_local_minimum_ab(...)` is the adaptive `(a, b)` search core.
 - `adaptive_ab_search_single_observation.py` is the real observational wrapper around the adaptive search core.
 - `src/pychmp/obs_maps.py` is the shared observation-ingestion layer used by the real observational workflows.
+- `src/pychmp/geometry_policy.py` resolves observation LOS compatibility before workflows reuse model-saved observer/FOV metadata.
 
 When adding new observational workflows, prefer reusing:
 
 - `load_obs_map(...)`
 - `validate_obs_map_identity(...)`
 - `estimate_obs_map_noise(...)`
+- `resolve_geometry_policy(...)`
 
 instead of introducing new script-local FITS/refmap loaders.
 

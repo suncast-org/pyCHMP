@@ -15,24 +15,33 @@ if defined PYCHMP_TESTDATA_REPO (
 
 set "DRY_RUN=0"
 set "EXTRA_ARGS="
-set "VALIDATION_DOMAIN=mw"
-set "TR_MASK_BMIN_GAUSS=1000"
-set "METRICS_MASK_THRESHOLD=0.1"
-set "METRICS_MASK_FITS="
+if not defined VALIDATION_DOMAIN set "VALIDATION_DOMAIN=mw"
+if not defined TR_MASK_BMIN_GAUSS set "TR_MASK_BMIN_GAUSS=1000"
+if not defined METRICS_MASK_THRESHOLD set "METRICS_MASK_THRESHOLD=0.1"
+if not defined METRICS_MASK_FITS set "METRICS_MASK_FITS="
 
 :parse_args
 if "%~1"=="" goto args_done
+set "ARG=%~1"
 if /I "%~1"=="--dry-run" (
   set "DRY_RUN=1"
+) else if /I "!ARG:~0,9!"=="--domain=" (
+  set "VALIDATION_DOMAIN=!ARG:~9!"
 ) else if /I "%~1"=="--domain" (
   set "VALIDATION_DOMAIN=%~2"
   shift
+) else if /I "!ARG:~0,21!"=="--tr-mask-bmin-gauss=" (
+  set "TR_MASK_BMIN_GAUSS=!ARG:~21!"
 ) else if /I "%~1"=="--tr-mask-bmin-gauss" (
   set "TR_MASK_BMIN_GAUSS=%~2"
   shift
+) else if /I "!ARG:~0,25!"=="--metrics-mask-threshold=" (
+  set "METRICS_MASK_THRESHOLD=!ARG:~25!"
 ) else if /I "%~1"=="--metrics-mask-threshold" (
   set "METRICS_MASK_THRESHOLD=%~2"
   shift
+) else if /I "!ARG:~0,20!"=="--metrics-mask-fits=" (
+  set "METRICS_MASK_FITS=!ARG:~20!"
 ) else if /I "%~1"=="--metrics-mask-fits" (
   set "METRICS_MASK_FITS=%~2"
   shift
@@ -53,14 +62,19 @@ if not exist "%MPLCONFIGDIR%" mkdir "%MPLCONFIGDIR%"
 if not exist "%SUNPY_CONFIGDIR%" mkdir "%SUNPY_CONFIGDIR%"
 if not exist "%XDG_CACHE_HOME%" mkdir "%XDG_CACHE_HOME%"
 
+set "PYTHON_CMD="
+set "PYTHON_PROBE_CODE=import importlib; [importlib.import_module(name) for name in ['gxrender.sdk','h5py','numpy','matplotlib.pyplot']]"
 if defined PYTHON_BIN (
   set "PYTHON_CMD=%PYTHON_BIN%"
-) else if exist "%USERPROFILE%\miniforge3\envs\suncast\python.exe" (
-  set "PYTHON_CMD=%USERPROFILE%\miniforge3\envs\suncast\python.exe"
-) else if exist "%USERPROFILE%\miniforge3\python.exe" (
-  set "PYTHON_CMD=%USERPROFILE%\miniforge3\python.exe"
 ) else (
-  set "PYTHON_CMD=python"
+  call :try_python "%USERPROFILE%\miniforge3\envs\suncast\python.exe"
+  if not defined PYTHON_CMD call :try_python "%USERPROFILE%\miniforge3\python.exe"
+  if not defined PYTHON_CMD call :try_python "%WORKSPACE_ROOT%\pyCHMP\.conda\python.exe"
+  if not defined PYTHON_CMD call :try_python "%WORKSPACE_ROOT%\pyCHMP\.conda\Scripts\python.exe"
+  if not defined PYTHON_CMD call :try_python "%WORKSPACE_ROOT%\gximagecomputing\.conda\python.exe"
+  if not defined PYTHON_CMD call :try_python "%WORKSPACE_ROOT%\gximagecomputing\.conda\Scripts\python.exe"
+  if not defined PYTHON_CMD for /f "delims=" %%P in ('where python 2^>nul') do if not defined PYTHON_CMD call :try_python "%%P"
+  if not defined PYTHON_CMD for /f "delims=" %%P in ('where py 2^>nul') do if not defined PYTHON_CMD call :try_python "%%P"
 )
 
 set "MODELS_ROOT=%TESTDATA_REPO%\raw\models"
@@ -68,6 +82,10 @@ set "RESPONSES_ROOT=%TESTDATA_REPO%\raw\responses"
 set "EBTEL_PATH=%TESTDATA_REPO%\raw\ebtel\ebtel_gxsimulator_euv\ebtel.sav"
 if not exist "%TESTDATA_REPO%" (
   echo ERROR: Test-data repository not found: %TESTDATA_REPO%
+  exit /b 1
+)
+if not defined PYTHON_CMD (
+  echo ERROR: Could not find a Python interpreter with gxrender installed.
   exit /b 1
 )
 call :named_fixture_dir "%MODELS_ROOT%" "hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" LATEST_MODEL_DIR
@@ -205,3 +223,12 @@ if defined STAMP (
   set "STAMP=%RANDOM%%RANDOM%"
 )
 endlocal & set "%~1=%STAMP%" & exit /b 0
+
+:try_python
+if exist "%~1" goto try_python_check
+where "%~1" >nul 2>nul || exit /b 1
+:try_python_check
+"%~1" -c "%PYTHON_PROBE_CODE%" >nul 2>nul
+if errorlevel 1 exit /b 1
+set "PYTHON_CMD=%~1"
+exit /b 0

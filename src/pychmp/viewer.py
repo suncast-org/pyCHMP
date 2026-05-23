@@ -959,7 +959,8 @@ class PychmpViewApp:
         search_label = str(selected_search.get("label") or search_display_text or "").strip()
         search_status = str(selected_search.get("status") or "").strip()
         toolbar_prefix = f"{slice_label} | {search_label}" if search_label else slice_label
-        adaptive_point_run = str(diagnostics.get("search_mode", "")).strip().lower() == "adaptive_local_single_frequency"
+        search_mode = str(diagnostics.get("search_mode", "")).strip().lower()
+        adaptive_point_run = search_mode in {"adaptive_local_single_observation", "adaptive_local_single_frequency"}
         if total == 0:
             toolbar_detail = f"{toolbar_prefix} | 0/{total} computed"
             info_lines_empty = [f"Current slice: {slice_label}"]
@@ -1456,12 +1457,17 @@ class PychmpViewApp:
 
     def _search_label(self, record: dict[str, Any]) -> str:
         label = str(record.get("label", "")).strip()
+        lifecycle = dict(record.get("lifecycle") or {})
+        active = bool(record.get("active", lifecycle.get("active", False)))
+        in_progress = bool(record.get("in_progress", lifecycle.get("in_progress", False)))
+        prefix = "active " if active else ""
+        suffix = " *" if in_progress else ""
         if label:
-            return label
+            return f"{prefix}{label}{suffix}"
         search_id = str(record.get("search_id", "search")).strip() or "search"
-        status = str(record.get("status", "unknown"))
+        status = str(lifecycle.get("status", record.get("status", "unknown")))
         metric = str(record.get("target_metric", "metric"))
-        return f"{metric} [{status}] {search_id}"
+        return f"{prefix}{metric} [{status}] {search_id}{suffix}"
 
     def _refresh_search_controls(self) -> None:
         records = list(self.available_searches)

@@ -99,6 +99,38 @@ The designated optimization slice is stored separately as ``target_slice_key``.
 This allows an artifact to log multiple rendered slices while optimizing only
 one of them.
 
+Auxiliary Render Slices
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A search may optimize one observational slice while asking pyGXrender to render
+additional channels or frequencies on the same LOS, FOV, pixel scale, and image
+geometry. These extra slices are auxiliary render slices, not independent
+searches. They must use the same physical geometry signature as the target
+slice, so a later search can reuse the same rendered-map database only when its
+observer/FOV/resolution request is compatible.
+
+Current implementation status:
+
+- pyCHMP records the requested render-slice descriptors in the common metadata.
+- The adaptive single-observation workflow accepts ``--all-channels`` for known
+  fixed-channel EUV/UV instruments, ``--render-channels`` for explicit EUV/UV
+  channel lists, and ``--render-frequencies-ghz`` for explicit MW frequency
+  lists.
+- The gxrender adapters request and retain multi-channel/frequency cubes from
+  pyGXrender while the optimizer still evaluates the selected target slice.
+- The artifact writer creates ``slices/<slice_key>`` shells for auxiliary
+  render slices so the viewer and downstream tools can discover them under the
+  unified layout.
+- Auxiliary rendered arrays are stored in the root ``map_store`` and referenced
+  from the target search point records via ``map_refs_json``. Auxiliary slice
+  shells remain render-only until a later search promotes one of those slices
+  into an active rescored search.
+- When an adaptive single-observation run targets a compatible slice that
+  already has saved trial maps, pyCHMP rescoring can seed the new search from
+  stored maps instead of starting cold. This applies both to prior searches on
+  the same slice and to auxiliary render slices produced by another channel or
+  frequency search.
+
 Trial Layer
 ~~~~~~~~~~~
 
@@ -318,3 +350,25 @@ As of the current canonical single-point writer slice:
 - per-trial scalar histories are persisted in the canonical point record
 - optional per-trial raw modeled maps, convolved modeled maps, and residual
   maps are persisted when available from the one-point fitting workflow
+
+As of the canonical search point-store slice:
+
+- new grid, sparse, and adaptive artifacts write point records canonically under
+  ``slices/<slice_key>/searches/<search_id>/point_records``
+- new artifacts no longer duplicate those records under slice-level
+  ``point_records`` or rectangular ``points`` groups
+- summary grids are derived by the loader from canonical search point records
+- legacy root-level and slice-level ``point_records``/``points``/``summary``
+  layouts remain readable
+- each new search persists ``request_json`` and ``lifecycle_json`` alongside
+  its point records, including target metric, mask settings, optimizer settings,
+  requested point layout when known, active/in-progress state, status, and
+  created/started/completed timestamps
+- point records in new artifacts reference arrays in the root ``map_store``
+  instead of embedding modeled/residual map arrays directly; the loader resolves
+  these references transparently and still reads older direct-array records
+- compatible adaptive searches can promote stored map references into a new
+  search by rescoring the saved trial maps under the current metric/mask request
+- new slices added to an existing artifact are rejected when observer identity,
+  observer geometry, FOV, pixel scale, or image resolution metadata differs from
+  the existing artifact slices

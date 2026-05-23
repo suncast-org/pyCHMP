@@ -5,8 +5,8 @@ set -euo pipefail
 #
 # Supported observation modes:
 # - external_fits
-#   - Default MW path using the canonical 2020-11-26 EOVSA FITS map plus the matching
-#     model H5 and EBTEL inputs.
+#   - Explicit FITS path supplied with OBS_FITS_PATH, --obs-path, or
+#     --obs-fits-path.
 # - model_refmap
 #   - Internal model refmap path intended for EUV/UV scan experiments such as
 #     AIA_171, forwarding the same observation-selection and mask controls used
@@ -14,6 +14,7 @@ set -euo pipefail
 #
 # Key overrides:
 # - --obs-source external_fits|model_refmap
+# - --obs-fits-path /path/to/obs.fits
 # - --obs-map-id AIA_171
 # - --euv-instrument AIA
 # - --euv-response-sav /path/to/resp_aia_*.sav
@@ -34,9 +35,8 @@ WORKSPACE_ROOT="$(cd "$PYCHMP_REPO/.." && pwd)"
 TESTDATA_REPO="${PYCHMP_TESTDATA_REPO:-$WORKSPACE_ROOT/pyGXrender-test-data}"
 DRY_RUN=0
 EXTRA_ARGS=()
-OBS_SOURCE="${OBS_SOURCE:-external_fits}"
+OBS_SOURCE="${OBS_SOURCE:-}"
 OBS_MAP_ID="${OBS_MAP_ID:-}"
-OBS_PATH_OVERRIDE="${OBS_PATH_OVERRIDE:-}"
 TR_MASK_BMIN_GAUSS="${TR_MASK_BMIN_GAUSS:-1000}"
 METRICS_MASK_THRESHOLD="${METRICS_MASK_THRESHOLD:-0.1}"
 METRICS_MASK_FITS="${METRICS_MASK_FITS:-}"
@@ -99,13 +99,22 @@ while [[ $# -gt 0 ]]; do
       OBS_MAP_ID="$2"
       shift 2
       ;;
+    --obs-fits-path=*)
+      OBS_FITS_PATH="${1#*=}"
+      shift
+      ;;
+    --obs-fits-path)
+      [[ $# -ge 2 ]] || { echo "ERROR: --obs-fits-path requires a file path." >&2; exit 1; }
+      OBS_FITS_PATH="$2"
+      shift 2
+      ;;
     --obs-path=*)
-      OBS_PATH_OVERRIDE="${1#*=}"
+      OBS_FITS_PATH="${1#*=}"
       shift
       ;;
     --obs-path)
       [[ $# -ge 2 ]] || { echo "ERROR: --obs-path requires a file path." >&2; exit 1; }
-      OBS_PATH_OVERRIDE="$2"
+      OBS_FITS_PATH="$2"
       shift 2
       ;;
     --tr-mask-bmin-gauss=*)
@@ -159,12 +168,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-OBS_SOURCE="$(printf '%s' "$OBS_SOURCE" | tr '[:upper:]' '[:lower:]')"
-[[ "$OBS_SOURCE" == "external_fits" || "$OBS_SOURCE" == "model_refmap" ]] || {
-  echo "ERROR: --obs-source must be one of: external_fits, model_refmap" >&2
-  exit 1
-}
 
 RUNTIME_CACHE_ROOT="${RUNTIME_CACHE_ROOT:-/tmp/pychmp_runtime_cache}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$RUNTIME_CACHE_ROOT/matplotlib}"
@@ -235,9 +238,8 @@ EBTEL_PATH="$TESTDATA_REPO/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav"
 RESPONSES_ROOT="$TESTDATA_REPO/raw/responses"
 [[ -d "$TESTDATA_REPO" ]] || { echo "ERROR: Test-data repository not found: $TESTDATA_REPO"; exit 1; }
 
-LATEST_EOVSA_DIR="$(named_fixture_dir "$EOVSA_MAPS_ROOT" "eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" || true)"
 LATEST_MODEL_DIR="$(named_fixture_dir "$MODELS_ROOT" "hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" || true)"
-OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits}"
+OBS_FITS_PATH="${OBS_FITS_PATH:-}"
 MODEL_H5_PATH="${MODEL_H5_PATH:-$LATEST_MODEL_DIR/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5}"
 LATEST_RESPONSE_DIR="$(latest_dated_dir "$RESPONSES_ROOT" "*")"
 if [[ -z "${LATEST_RESPONSE_DIR:-}" || ! -d "$LATEST_RESPONSE_DIR" ]]; then
@@ -251,9 +253,45 @@ if [[ "${PYCHMP_TIMESTAMP_ARTIFACTS:-0}" == "1" ]]; then
 fi
 mkdir -p "$ARTIFACTS_DIR"
 
-[[ -n "${LATEST_EOVSA_DIR:-}" && -d "$LATEST_EOVSA_DIR" ]] || { echo "ERROR: No dated EOVSA folder found under: $EOVSA_MAPS_ROOT"; exit 1; }
+if [[ -z "$OBS_SOURCE" ]]; then
+  if [[ -n "$OBS_FITS_PATH" && -n "$OBS_MAP_ID" ]]; then
+    echo "ERROR: Use either an explicit external FITS path or --obs-map-id, not both." >&2
+    exit 1
+  elif [[ -n "$OBS_FITS_PATH" ]]; then
+    OBS_SOURCE="external_fits"
+  elif [[ -n "$OBS_MAP_ID" ]]; then
+    OBS_SOURCE="model_refmap"
+  else
+    echo "ERROR: Observation selection is required. Use --obs-fits-path /path/to/obs.fits for an external FITS map, or --obs-map-id MAP_ID for an internal model refmap." >&2
+    exit 1
+  fi
+fi
+OBS_SOURCE="$(printf '%s' "$OBS_SOURCE" | tr '[:upper:]' '[:lower:]')"
+[[ "$OBS_SOURCE" == "external_fits" || "$OBS_SOURCE" == "model_refmap" ]] || {
+  echo "ERROR: --obs-source must be one of: external_fits, model_refmap" >&2
+  exit 1
+}
+if [[ "$OBS_SOURCE" == "external_fits" && -n "$OBS_MAP_ID" ]]; then
+  echo "ERROR: --obs-map-id cannot be used with --obs-source=external_fits." >&2
+  exit 1
+fi
+if [[ "$OBS_SOURCE" == "model_refmap" && -n "$OBS_FITS_PATH" ]]; then
+  echo "ERROR: External FITS paths cannot be used with --obs-source=model_refmap." >&2
+  exit 1
+fi
+if [[ "$OBS_SOURCE" == "external_fits" && -z "$OBS_FITS_PATH" ]]; then
+  echo "ERROR: --obs-fits-path is required for --obs-source=external_fits." >&2
+  exit 1
+fi
+if [[ "$OBS_SOURCE" == "model_refmap" && -z "$OBS_MAP_ID" ]]; then
+  echo "ERROR: --obs-map-id is required for --obs-source=model_refmap." >&2
+  exit 1
+fi
+
 [[ -n "${LATEST_MODEL_DIR:-}" && -d "$LATEST_MODEL_DIR" ]] || { echo "ERROR: No dated model folder found under: $MODELS_ROOT"; exit 1; }
-[[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
+if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  [[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
+fi
 [[ -f "$MODEL_H5_PATH" ]] || { echo "ERROR: Model H5 file not found: $MODEL_H5_PATH"; exit 1; }
 [[ -f "$EBTEL_PATH" ]] || { echo "ERROR: EBTEL .sav file not found: $EBTEL_PATH"; exit 1; }
 [[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with the full scan dependency set."; exit 1; }
@@ -306,10 +344,6 @@ fi
 if [[ -n "$METRICS_MASK_FITS" ]]; then
   ARGS+=(--metrics-mask-fits "$METRICS_MASK_FITS")
 fi
-if [[ -n "$OBS_PATH_OVERRIDE" ]]; then
-  ARGS+=(--obs-path "$OBS_PATH_OVERRIDE")
-fi
-
 if [[ -n "${ARTIFACT_H5:-}" ]]; then
   ARGS+=(--artifact-h5 "$ARTIFACT_H5")
 else
@@ -319,9 +353,11 @@ fi
 cd "$PYCHMP_REPO"
 echo "Using Python: $PYTHON_CMD"
 echo "Using test-data repo: $TESTDATA_REPO"
-echo "Using EOVSA folder: $LATEST_EOVSA_DIR"
 echo "Using model folder: $LATEST_MODEL_DIR"
 echo "Using observation source: $OBS_SOURCE"
+if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  echo "Using observation FITS: $OBS_FITS_PATH"
+fi
 if [[ "$OBS_SOURCE" == "model_refmap" && -n "$OBS_MAP_ID" ]]; then
   echo "Using observation map id: $OBS_MAP_ID"
 fi

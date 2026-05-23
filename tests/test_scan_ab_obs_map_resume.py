@@ -12,7 +12,7 @@ from examples.scan_ab_obs_map import (
     _pending_point_payload,
     _rescore_existing_trial_maps_for_warm_start,
 )
-from pychmp.ab_scan_artifacts import append_sparse_point_record, load_scan_file, save_rectangular_scan_file, write_sparse_scan_file
+from pychmp.ab_scan_artifacts import append_scan_point_record, load_scan_file, write_grid_scan_artifact, write_point_scan_artifact
 from pychmp.ab_scan_tasks import ABSliceTaskDescriptor, compile_rectangular_point_tasks, compile_sparse_point_tasks
 
 
@@ -135,7 +135,7 @@ def _write_rectangular_artifact(
             eta2[i, j] = objective + 0.2
             success[i, j] = True
 
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -273,7 +273,7 @@ def test_rectangular_partial_overlap_resume_merges_existing_and_queues_only_new_
         eta2[i, j] = float(payload["diagnostics"]["eta2"])
         success[i, j] = bool(payload["success"])
 
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -409,7 +409,7 @@ def test_rectangular_recompute_existing_requeues_overlapping_points_and_persists
         eta2[i, j] = float(payload["diagnostics"]["eta2"])
         success[i, j] = bool(payload["success"])
 
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -489,7 +489,7 @@ def test_rectangular_fresh_scan_writes_all_points(tmp_path: Path) -> None:
         eta2[i, j] = float(payload["diagnostics"]["eta2"])
         success[i, j] = bool(payload["success"])
 
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -590,7 +590,7 @@ def test_sparse_resume_smoke_skips_existing_and_appends_only_new_points(tmp_path
     diagnostics = _make_root_diag()
     diagnostics["artifact_kind"] = "pychmp_ab_scan_sparse_points"
     existing_payload = _make_point_payload(0.3, 2.1, a_index=0, b_index=0, q0=11.0, objective=1.1)
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -630,7 +630,7 @@ def test_sparse_resume_smoke_skips_existing_and_appends_only_new_points(tmp_path
     assert recompute_points == []
     assert [(float(task.a), float(task.b)) for task in pending_tasks] == [(0.6, 2.1)]
 
-    append_sparse_point_record(
+    append_scan_point_record(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -652,7 +652,7 @@ def test_sparse_recompute_existing_smoke_keeps_latest_record_per_coordinate(tmp_
     diagnostics = _make_root_diag()
     diagnostics["artifact_kind"] = "pychmp_ab_scan_sparse_points"
     original_payload = _make_point_payload(0.3, 2.1, a_index=0, b_index=0, q0=11.0, objective=1.1)
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -692,7 +692,7 @@ def test_sparse_recompute_existing_smoke_keeps_latest_record_per_coordinate(tmp_
     assert recompute_points == [(0.3, 2.1)]
     assert sorted((float(task.a), float(task.b)) for task in pending_tasks) == [(0.3, 2.1), (0.6, 2.1)]
 
-    append_sparse_point_record(
+    append_scan_point_record(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -700,7 +700,7 @@ def test_sparse_recompute_existing_smoke_keeps_latest_record_per_coordinate(tmp_
         diagnostics=diagnostics,
         point_payload=_make_point_payload(0.3, 2.1, a_index=0, b_index=0, q0=33.0, objective=3.3),
     )
-    append_sparse_point_record(
+    append_scan_point_record(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,

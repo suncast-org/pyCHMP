@@ -14,17 +14,20 @@ from pychmp.ab_scan_artifacts import (
     UNIFIED_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
     append_point_record,
-    append_sparse_point_record,
+    append_scan_point_record,
     backfill_artifact_diagnostics,
     build_computed_point_payload,
+    load_auxiliary_map_store_point_records,
+    list_scan_slices,
     load_scan_file,
     point_record_matches_compatibility_signature,
-    save_rectangular_scan_file,
+    write_grid_scan_artifact,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
     write_single_point_scan_file,
-    write_sparse_scan_file,
+    write_point_scan_artifact,
 )
+from pychmp import ab_scan_artifacts
 
 
 def _make_header(*, crval1: float = 0.0) -> fits.Header:
@@ -127,7 +130,7 @@ def _write_rectangular_artifact(out_h5: Path) -> tuple[np.ndarray, np.ndarray, f
     diagnostics = _make_diagnostics()
     a_values = np.asarray([0.0], dtype=float)
     b_values = np.asarray([1.0], dtype=float)
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -180,7 +183,7 @@ def test_rectangular_artifact_persists_selectable_search_records(tmp_path: Path)
         "target_metric_value": 0.05,
         "chi2": 0.05,
     }
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -276,7 +279,7 @@ def test_validate_scan_artifact_compatibility_rejects_sparse_observation_mismatc
     sigma_map = np.ones_like(observed)
     header = _make_header()
     diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -310,7 +313,7 @@ def test_sparse_artifact_round_trip_preserves_point_elapsed_seconds(tmp_path: Pa
     point = _make_point_payload(0.0, 1.0)
     point["diagnostics"] = dict(point["diagnostics"])
     point["diagnostics"]["elapsed_seconds"] = 12.345
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -331,7 +334,7 @@ def test_sparse_artifact_rewrite_preserves_selectable_search_records(tmp_path: P
     sigma_map = np.ones_like(observed)
     header = _make_header()
     first_diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -353,7 +356,7 @@ def test_sparse_artifact_rewrite_preserves_selectable_search_records(tmp_path: P
         "target_metric_value": 0.07,
         "chi2": 0.07,
     }
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -460,6 +463,145 @@ def test_write_single_point_scan_file_round_trip_is_unified_and_viewer_compatibl
     assert payload["blos_reference"] is not None
 
 
+def test_single_point_artifact_stores_auxiliary_maps_in_map_store(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "single_point_aux_maps.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_q0_recovery")
+    aux_map = np.asarray([[10.0, 20.0], [30.0, 40.0]], dtype=float)
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.full((2, 2), 2.0, dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics=diagnostics,
+        map_store_arrays={"euv/193/rendered_best": aux_map},
+    )
+
+    write_single_point_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=point_payload,
+    )
+
+    payload = load_scan_file(out_h5)
+    np.testing.assert_allclose(payload["point_records"][0]["modeled_best"], np.ones((2, 2), dtype=float))
+
+    with h5py.File(out_h5, "r") as handle:
+        search_id = handle["slices/default/active_search_id"][()].decode()
+        record = handle[f"slices/default/searches/{search_id}/point_records/r000000"]
+        refs = json.loads(record["map_refs_json"][()].decode())
+        assert "extra/euv/193/rendered_best" in refs
+        ref_path = refs["extra/euv/193/rendered_best"]
+        np.testing.assert_allclose(handle[ref_path]["data"][()], aux_map)
+        assert "euv" not in record
+
+
+def test_auxiliary_map_store_records_can_seed_render_only_slice(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "aux_seed.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "wavelength_angstrom": 171.0,
+            "target_slice_key": "euv_171",
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "channel_label": "171",
+                    "wavelength_angstrom": 171.0,
+                    "role": "target",
+                    "is_target": True,
+                },
+                {
+                    "key": "euv_193",
+                    "domain": "euv",
+                    "label": "193 A",
+                    "channel_label": "193",
+                    "wavelength_angstrom": 193.0,
+                    "role": "auxiliary",
+                    "is_target": False,
+                },
+            ],
+        }
+    )
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.ones((2, 2), dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics=diagnostics,
+        map_store_arrays={
+            "euv/193/trial_000/rendered": np.full((2, 2), 2.0, dtype=float),
+            "euv/193/trial_001/rendered": np.full((2, 2), 2.5, dtype=float),
+            "euv/193/rendered_best": np.full((2, 2), 2.5, dtype=float),
+        },
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_payload],
+    )
+
+    records = load_auxiliary_map_store_point_records(out_h5, slice_key="euv_193")
+
+    assert len(records) == 1
+    assert records[0]["source_slice_key"] == "euv_171"
+    assert records[0]["source_auxiliary_map_prefix"] == "extra/euv/193"
+    assert records[0]["fit_q0_trials"] == (2.0, 2.5)
+    np.testing.assert_allclose(records[0]["trial_modeled_maps"][0], np.full((2, 2), 2.0, dtype=float))
+    np.testing.assert_allclose(records[0]["modeled_best"], np.full((2, 2), 2.5, dtype=float))
+
+
 def test_append_point_record_updates_rectangular_artifact(tmp_path: Path) -> None:
     out_h5 = tmp_path / "scan.h5"
     observed, sigma_map, header, diagnostics = _write_rectangular_artifact(out_h5)
@@ -484,14 +626,66 @@ def test_append_point_record_updates_rectangular_artifact(tmp_path: Path) -> Non
     assert float(payload["chi2"][0, 0]) == pytest.approx(0.05)
 
 
-def test_new_rectangular_artifact_writes_canonical_point_records(tmp_path: Path) -> None:
+def test_new_rectangular_artifact_uses_search_point_records_as_canonical_store(tmp_path: Path) -> None:
     out_h5 = tmp_path / "scan.h5"
     _write_rectangular_artifact(out_h5)
 
     with h5py.File(out_h5, "r") as handle:
         slice_group = handle["slices/default"]
-        assert "point_records" in slice_group
-        assert "points" in slice_group
+        assert "point_records" not in slice_group
+        assert "points" not in slice_group
+        assert "summary" not in slice_group
+        search_id = slice_group["active_search_id"][()].decode()
+        record = slice_group["searches"][search_id]["point_records/r000000"]
+        assert "point_records" in slice_group["searches"][search_id]
+        assert "map_refs_json" in record
+        assert "modeled_best" not in record
+        assert "raw_modeled_best" not in record
+        assert "residual" not in record
+        assert "map_store" in handle
+        assert "common" not in handle
+        assert "point_records" not in handle
+        assert "searches" not in handle
+
+
+def test_new_sparse_artifact_uses_slice_layout(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    with h5py.File(out_h5, "r") as handle:
+        assert "slices" in handle
+        slice_group = handle["slices/default"]
+        assert "common" in slice_group
+        assert "point_records" not in slice_group
+        assert "searches" in slice_group
+        search_id = slice_group["active_search_id"][()].decode()
+        record = slice_group["searches"][search_id]["point_records/r000000"]
+        assert "point_records" in slice_group["searches"][search_id]
+        assert "map_refs_json" in record
+        assert "modeled_best" not in record
+        assert "raw_modeled_best" not in record
+        assert "residual" not in record
+        assert "map_store" in handle
+        assert "common" not in handle
+        assert "point_records" not in handle
+        assert "searches" not in handle
+
+
+def test_legacy_writer_names_remain_compatibility_wrappers() -> None:
+    assert ab_scan_artifacts.save_rectangular_scan_file is not write_grid_scan_artifact
+    assert ab_scan_artifacts.write_sparse_scan_file is not write_point_scan_artifact
+    assert ab_scan_artifacts.append_sparse_point_record is not append_scan_point_record
 
 
 def test_append_point_record_updates_sparse_artifact(tmp_path: Path) -> None:
@@ -500,7 +694,7 @@ def test_append_point_record_updates_sparse_artifact(tmp_path: Path) -> None:
     sigma_map = np.ones_like(observed)
     header = _make_header()
     diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -570,13 +764,13 @@ def test_search_status_normalizes_point_status_text() -> None:
     assert _search_status_from_records([{"status": " FAILED "}, {"status": "computed"}]) == "partial"
 
 
-def test_append_sparse_point_record_maintains_incremental_status_counts(tmp_path: Path) -> None:
+def test_append_scan_point_record_maintains_incremental_status_counts(tmp_path: Path) -> None:
     out_h5 = tmp_path / "sparse_counts.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
     sigma_map = np.ones_like(observed)
     header = _make_header()
     diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -586,7 +780,7 @@ def test_append_sparse_point_record_maintains_incremental_status_counts(tmp_path
     )
     failed_point = _make_point_payload(0.0, 1.0)
     failed_point["status"] = " failed "
-    append_sparse_point_record(
+    append_scan_point_record(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -595,7 +789,7 @@ def test_append_sparse_point_record_maintains_incremental_status_counts(tmp_path
         point_payload=failed_point,
     )
     computed_point = _make_point_payload(0.3, 1.0)
-    append_sparse_point_record(
+    append_scan_point_record(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -605,12 +799,133 @@ def test_append_sparse_point_record_maintains_incremental_status_counts(tmp_path
     )
 
     with h5py.File(out_h5, "r") as handle:
-        search_id = handle["active_search_id"][()].decode()
-        search = handle["searches"][search_id]
+        slice_group = handle["slices/default"]
+        search_id = slice_group["active_search_id"][()].decode()
+        search = slice_group["searches"][search_id]
         assert int(search.attrs["total_point_count"]) == 2
         assert int(search.attrs["failed_point_count"]) == 1
         assert int(search.attrs["computed_point_count"]) == 1
         assert search.attrs["status"].decode() == "partial"
+        assert search.attrs["in_progress"] == 1
+        assert "request_json" in search
+        assert "lifecycle_json" in search
+
+
+def test_search_records_expose_request_and_lifecycle_metadata(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan_lifecycle.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics()
+    diagnostics.update(
+        {
+            "target_metric": "eta2",
+            "metrics_mask_threshold": 0.25,
+            "q0_min": 1.0e-5,
+            "q0_max": 1.0e-3,
+            "max_bracket_steps": 15,
+            "search_created_at": "2026-05-22T00:00:00Z",
+            "search_started_at": "2026-05-22T00:00:01Z",
+        }
+    )
+    write_grid_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        a_values=np.asarray([0.0, 0.3], dtype=float),
+        b_values=np.asarray([2.4], dtype=float),
+        best_q0=np.asarray([[1.0], [2.0]], dtype=float),
+        objective_values=np.asarray([[3.0], [4.0]], dtype=float),
+        chi2=np.asarray([[5.0], [6.0]], dtype=float),
+        rho2=np.asarray([[7.0], [8.0]], dtype=float),
+        eta2=np.asarray([[9.0], [10.0]], dtype=float),
+        success=np.asarray([[True], [True]], dtype=bool),
+        point_payloads={
+            (0, 0): _make_point_payload(0.0, 2.4, a_index=0, b_index=0),
+            (1, 0): _make_point_payload(0.3, 2.4, a_index=1, b_index=0),
+        },
+    )
+
+    payload = load_scan_file(out_h5)
+    search = payload["selected_search"]
+
+    assert search["status"] == "complete"
+    assert search["active"] is True
+    assert search["in_progress"] is False
+    assert search["created_at"] == "2026-05-22T00:00:00Z"
+    assert search["started_at"] == "2026-05-22T00:00:01Z"
+    assert search["completed_at"]
+    assert search["request"]["target_metric"] == "eta2"
+    assert search["request"]["metrics_mask"]["threshold"] == 0.25
+    assert search["request"]["optimizer"]["q0_min"] == 1.0e-5
+    assert search["request"]["optimizer"]["q0_max"] == 1.0e-3
+    assert search["request"]["optimizer"]["max_bracket_steps"] == 15
+    assert search["request"]["requested_points"] == [{"a": 0.0, "b": 2.4}, {"a": 0.3, "b": 2.4}]
+
+
+def test_new_slice_reuse_rejects_geometry_mismatch(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "slices.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    first_diag = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    first_diag["slice_key"] = "mw_5p7"
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=first_diag,
+        point_records=[],
+    )
+
+    incompatible_diag = dict(first_diag)
+    incompatible_diag["slice_key"] = "mw_8p2"
+    incompatible_diag["frequency_ghz"] = 8.2
+    incompatible_diag["map_nx"] = 3
+
+    with pytest.raises(ScanArtifactCompatibilityError, match="geometry mismatch"):
+        write_point_scan_artifact(
+            out_h5,
+            observed=observed,
+            sigma_map=sigma_map,
+            wcs_header=header,
+            diagnostics=incompatible_diag,
+            point_records=[],
+        )
+
+
+def test_new_slice_reuse_accepts_matching_geometry(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "slices.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    first_diag = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    first_diag["slice_key"] = "mw_5p7"
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=first_diag,
+        point_records=[],
+    )
+
+    compatible_diag = dict(first_diag)
+    compatible_diag["slice_key"] = "mw_8p2"
+    compatible_diag["frequency_ghz"] = 8.2
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=compatible_diag,
+        point_records=[],
+    )
+
+    assert [item["key"] for item in list_scan_slices(out_h5)] == ["mw_5p7", "mw_8p2"]
 
 
 def test_rectangular_artifact_round_trip_preserves_run_history(tmp_path: Path) -> None:
@@ -619,7 +934,7 @@ def test_rectangular_artifact_round_trip_preserves_run_history(tmp_path: Path) -
     sigma_map = np.ones_like(observed)
     header = _make_header()
     diagnostics = _make_diagnostics()
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -650,7 +965,7 @@ def test_rectangular_artifact_round_trip_preserves_shared_blos_reference(tmp_pat
     header = _make_header()
     diagnostics = _make_diagnostics()
     blos_reference = _make_blos_reference()
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -683,7 +998,7 @@ def test_sparse_artifact_round_trip_preserves_shared_blos_reference(tmp_path: Pa
     header = _make_header()
     diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
     blos_reference = _make_blos_reference()
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -738,7 +1053,7 @@ def test_sparse_artifact_round_trip_exposes_canonical_slice_metadata_and_trial_l
             "store_euv_tr_mask": True,
         }
     )
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -762,6 +1077,14 @@ def test_sparse_artifact_round_trip_exposes_canonical_slice_metadata_and_trial_l
     assert payload["trial_logging_policy"]["store_trial_metric_masks"] is True
     assert payload["trial_logging_policy"]["store_euv_component_cubes"] is True
     assert payload["trial_logging_policy"]["store_euv_tr_mask"] is True
+
+    slices = list_scan_slices(out_h5)
+    assert [item["key"] for item in slices] == ["euv_171", "euv_193"]
+    aux_payload = load_scan_file(out_h5, slice_key="euv_193")
+    assert aux_payload["selected_slice_key"] == "euv_193"
+    assert aux_payload["diagnostics"]["render_only_slice"] is True
+    assert aux_payload["point_records"] == []
+    assert np.isnan(aux_payload["observed"]).all()
 
 
 def test_single_point_artifact_round_trips_euv_components_and_tr_mask(tmp_path: Path) -> None:
@@ -842,14 +1165,14 @@ def test_single_point_artifact_round_trips_euv_components_and_tr_mask(tmp_path: 
     np.testing.assert_allclose(point["trial_euv_tr_maps"], np.full((2, 2, 2), 6.0, dtype=float))
 
 
-def test_append_sparse_point_record_retries_transient_file_lock(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_append_scan_point_record_retries_transient_file_lock(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Retry transient HDF5 open failures so viewer/read contention does not abort the run."""
     out_h5 = tmp_path / "sparse_retry.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
     sigma_map = np.ones_like(observed)
     header = _make_header()
     diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
-    write_sparse_scan_file(
+    write_point_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -872,7 +1195,7 @@ def test_append_sparse_point_record_retries_transient_file_lock(monkeypatch: pyt
     monkeypatch.setattr(artifacts.h5py, "File", flaky_file)
     monkeypatch.setattr(artifacts.time, "sleep", lambda _seconds: None)
 
-    append_sparse_point_record(
+    append_scan_point_record(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,

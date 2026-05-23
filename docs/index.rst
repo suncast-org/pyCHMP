@@ -11,4 +11,5 @@ Sections
    :maxdepth: 1
 
    artifact_data_contract
+   geometry_policy
    provenance

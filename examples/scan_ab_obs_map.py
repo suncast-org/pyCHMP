@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Scan a rectangular `(a, b)` grid against a real observational map.
 
-This is the first usable single-frequency `MultiScanAB`-style workflow for
+This is the first usable target-observation `MultiScanAB`-style workflow for
 pyCHMP. It reuses the validated observational preprocessing path from
 `fit_q0_obs_map.py`, then fits one best `q0` per `(a, b)` point and stores all
 results in one consolidated HDF5 file.
@@ -40,14 +40,16 @@ from pychmp.ab_scan_artifacts import (
     load_scan_file,
     load_run_history,
     point_record_matches_compatibility_signature,
-    save_rectangular_scan_file,
+    write_grid_scan_artifact,
     slice_descriptor_from_diagnostics,
     validate_scan_artifact_compatibility,
-    write_sparse_scan_file,
+    write_point_scan_artifact,
 )
 from pychmp.ab_scan_execution import ABExecutionSettings, iter_execute_tasks, resolve_execution_plan
 from pychmp.ab_scan_tasks import ABSliceTaskDescriptor, compile_rectangular_point_tasks, compile_sparse_point_tasks
 from pychmp.ab_search import idl_q0_start_heuristic
+from pychmp import resolve_render_geometry_via_gxrender
+from pychmp.geometry_policy import resolve_geometry_policy
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
 
 
@@ -1130,7 +1132,7 @@ def _save_ab_scan_h5(
     point_payloads: dict[tuple[int, int], dict[str, Any]],
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -1820,27 +1822,64 @@ def main() -> int:
     model_observer_meta = _load_model_observer_metadata(args.model_h5)
 
     geometry_overrides_requested = any(v is not None for v in (args.xc, args.yc, args.dx, args.dy, args.nx, args.ny))
+    explicit_observer_requested = any(v is not None for v in (args.observer, args.dsun_cm, args.lonc_deg, args.b0sun_deg))
     saved_fov = None
     if geometry_overrides_requested:
         geometry = sdk.MapGeometry(xc=args.xc, yc=args.yc, dx=args.dx, dy=args.dy, nx=args.nx, ny=args.ny)
-        geometry_mode = "explicit"
+        geometry_policy = resolve_geometry_policy(
+            obs_map=obs_map,
+            model_observer_meta=model_observer_meta,
+            saved_fov=None,
+            geometry_overrides_requested=True,
+            explicit_observer_requested=explicit_observer_requested,
+        )
+        geometry_mode = geometry_policy.geometry_mode
     else:
         saved_fov = _load_saved_fov_from_model(args.model_h5)
-        if saved_fov is None:
-            parser.error("model does not expose a saved FOV; provide explicit geometry overrides")
-        dx_eff = float(args.pixel_scale_arcsec)
-        dy_eff = float(args.pixel_scale_arcsec)
-        nx_eff = max(16, int(round(float(saved_fov["xsize_arcsec"]) / abs(dx_eff))))
-        ny_eff = max(16, int(round(float(saved_fov["ysize_arcsec"]) / abs(dy_eff))))
-        geometry = sdk.MapGeometry(
-            xc=float(saved_fov["xc_arcsec"]),
-            yc=float(saved_fov["yc_arcsec"]),
-            dx=dx_eff,
-            dy=dy_eff,
-            nx=nx_eff,
-            ny=ny_eff,
+        geometry_policy = resolve_geometry_policy(
+            obs_map=obs_map,
+            model_observer_meta=model_observer_meta,
+            saved_fov=saved_fov,
+            geometry_overrides_requested=False,
+            explicit_observer_requested=explicit_observer_requested,
         )
-        geometry_mode = "saved_fov"
+        geometry_observer_name = str(args.observer or geometry_policy.observer_name)
+        geometry_observer = observer_overrides if explicit_observer_requested else None
+        resolved_geometry = resolve_render_geometry_via_gxrender(
+            model_path=args.model_h5,
+            model_format="auto",
+            ebtel_path=str(args.ebtel_path) if args.ebtel_path is not None else None,
+            pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+            observer_name=geometry_observer_name,
+            observer=geometry_observer,
+            omp_threads=int(getattr(args, "omp_threads", 8)),
+        )
+        geometry = resolved_geometry.geometry
+        geometry_mode = f"gxrender:{resolved_geometry.center_source}"
+
+    if not explicit_observer_requested:
+        observer_overrides = sdk.ObserverOverrides(
+            dsun_cm=float(geometry_policy.observer_dsun_cm),
+            lonc_deg=float(geometry_policy.observer_lonc_deg),
+            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
+        )
+        observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+    effective_observer_name = str(args.observer or geometry_policy.observer_name)
+    effective_observer_lonc_deg = float(
+        getattr(observer_overrides, "lonc_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "lonc_deg", None) is not None
+        else geometry_policy.observer_lonc_deg
+    )
+    effective_observer_b0sun_deg = float(
+        getattr(observer_overrides, "b0sun_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "b0sun_deg", None) is not None
+        else geometry_policy.observer_b0sun_deg
+    )
+    effective_observer_dsun_cm = float(
+        getattr(observer_overrides, "dsun_cm", None)
+        if observer_overrides is not None and getattr(observer_overrides, "dsun_cm", None) is not None
+        else geometry_policy.observer_dsun_cm
+    )
 
     target_header = _build_target_header(
         nx=int(geometry.nx),
@@ -1853,10 +1892,10 @@ def main() -> int:
     )
     target_header = _with_observer_wcs_keywords(
         target_header,
-        observer_name=str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        hgln_obs_deg=float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        hglt_obs_deg=float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        dsun_obs_m=float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)) / 100.0,
+        observer_name=effective_observer_name,
+        hgln_obs_deg=effective_observer_lonc_deg,
+        hglt_obs_deg=effective_observer_b0sun_deg,
+        dsun_obs_m=effective_observer_dsun_cm / 100.0,
     )
     observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
     sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
@@ -1870,6 +1909,12 @@ def main() -> int:
 
     print("\nPreparing model-aligned observational submap...")
     print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
+    print(
+        "  Geometry policy: "
+        f"obs_los={geometry_policy.observation_observer or '<unknown>'} "
+        f"model_los={geometry_policy.model_observer or '<unknown>'} "
+        f"aligned={geometry_policy.los_aligned}; render_geometry_resolver=gxrender"
+    )
     print(f"  Geometry mode: {geometry_mode} xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} nx={int(geometry.nx)} ny={int(geometry.ny)}")
     print(f"  Observed submap grid: Ny={observed_cropped.shape[0]} Nx={observed_cropped.shape[1]}")
     print(f"  Model render grid: Ny={int(geometry.ny)} Nx={int(geometry.nx)}")
@@ -2143,11 +2188,16 @@ def main() -> int:
         "map_nx": int(geometry.nx),
         "map_ny": int(geometry.ny),
         "noise_diagnostics": noise_diag,
-        "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        "observer_b0sun_deg": float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        "observer_dsun_cm": float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)),
+        "observer_name": effective_observer_name,
+        "observer_lonc_deg": effective_observer_lonc_deg,
+        "observer_b0sun_deg": effective_observer_b0sun_deg,
+        "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
+        "geometry_policy_mode": geometry_mode,
+        "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
+        "geometry_policy_observation_los": geometry_policy.observation_observer,
+        "geometry_policy_model_los": geometry_policy.model_observer,
+        "geometry_policy_los_aligned": geometry_policy.los_aligned,
         "execution_policy_requested": str(args.execution_policy),
         "execution_policy_resolved": str(execution_plan.policy),
         "execution_max_workers": int(execution_plan.max_workers),
@@ -2208,7 +2258,7 @@ def main() -> int:
             )
 
         if not out_h5.exists() and not bool(args.validate_only):
-            write_sparse_scan_file(
+            write_point_scan_artifact(
                 out_h5,
                 observed=observed_cropped,
                 sigma_map=sigma_cropped,

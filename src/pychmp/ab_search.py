@@ -1,4 +1,4 @@
-"""Higher-level single-frequency `(a, b, q0)` search workflows."""
+"""Higher-level target-slice `(a, b, q0)` search workflows."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .ab_scan_execution import ABExecutionSettings, ABRequestedExecutionPolicy, 
 from .ab_scan_tasks import ABPointTask, ABSliceTaskDescriptor, compile_rectangular_point_tasks
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .metrics import MetricValues
-from .optimize import MetricName, ProgressCallback, Q0OptimizationResult
+from .optimize import MetricName, ProgressCallback, ProgressStartCallback, Q0OptimizationResult
 
 
 class ABRendererFactory(Protocol):
@@ -49,7 +49,7 @@ class ABPointResult:
 
 @dataclass(frozen=True)
 class ABScanResult:
-    """Summary of a rectangular `(a, b)` single-frequency scan."""
+    """Summary of a rectangular `(a, b)` target-slice scan."""
 
     a_values: tuple[float, ...]
     b_values: tuple[float, ...]
@@ -125,6 +125,8 @@ class ABSearchWorkerPayload:
     renderer_factory: ABRendererFactory
     observed: np.ndarray
     sigma: np.ndarray | None
+    progress_start_callback: ProgressStartCallback | None = None
+    progress_callback: ProgressCallback | None = None
 
 
 def idl_q0_start_heuristic(a: float, b: float) -> float:
@@ -176,6 +178,7 @@ def evaluate_ab_point(
     q0_start: float | None = None,
     q0_step: float = 1.61803398875,
     max_bracket_steps: int = 12,
+    progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> ABPointResult:
     """Evaluate the best-fit `q0` for one `(a, b)` point."""
@@ -199,6 +202,7 @@ def evaluate_ab_point(
         q0_start=q0_start,
         q0_step=q0_step,
         max_bracket_steps=max_bracket_steps,
+        progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
     )
     return ABPointResult(
@@ -265,7 +269,8 @@ def _evaluate_ab_search_request(
             q0_start=q0_start,
             q0_step=float(request.q0_step),
             max_bracket_steps=int(request.max_bracket_steps),
-            progress_callback=None,
+            progress_callback=worker_payload.progress_callback,
+            progress_start_callback=worker_payload.progress_start_callback,
         )
     except BaseException:
         print(
@@ -333,6 +338,7 @@ def _execute_ab_requests(
     execution_policy: ABRequestedExecutionPolicy,
     max_workers: int | None,
     worker_chunksize: int,
+    progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
 ) -> Iterator[ABPointResult]:
     if not pending_requests:
@@ -354,6 +360,8 @@ def _execute_ab_requests(
         renderer_factory=renderer_factory,
         observed=np.asarray(observed, dtype=float),
         sigma=None if sigma is None else np.asarray(sigma, dtype=float),
+        progress_start_callback=progress_start_callback if execution_plan.policy == "serial" else None,
+        progress_callback=progress_callback if execution_plan.policy == "serial" else None,
     )
     return iter_execute_tasks(
         pending_requests,
@@ -612,6 +620,7 @@ def _evaluate_adaptive_index_batch(
     execution_policy: ABRequestedExecutionPolicy,
     max_workers: int | None,
     worker_chunksize: int,
+    progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
 ) -> list[ABPointResult]:
     pending_requests: list[ABPointEvaluationRequest] = []
@@ -678,6 +687,7 @@ def _evaluate_adaptive_index_batch(
                     execution_policy="serial",
                     max_workers=1,
                     worker_chunksize=worker_chunksize,
+                    progress_start_callback=progress_start_callback,
                     progress_callback=progress_callback,
                 ):
                     _persist_adaptive_point(
@@ -695,6 +705,7 @@ def _evaluate_adaptive_index_batch(
                 execution_policy=execution_policy,
                 max_workers=max_workers,
                 worker_chunksize=worker_chunksize,
+                progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
             ):
                 _persist_adaptive_point(
@@ -740,6 +751,7 @@ def _evaluate_adaptive_neighbor_batch(
     execution_policy: ABRequestedExecutionPolicy,
     max_workers: int | None,
     worker_chunksize: int,
+    progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
 ) -> list[ABPointResult]:
     candidate_points: list[tuple[int, int, float | None]] = []
@@ -774,6 +786,7 @@ def _evaluate_adaptive_neighbor_batch(
         execution_policy=execution_policy,
         max_workers=max_workers,
         worker_chunksize=worker_chunksize,
+        progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
     )
 
@@ -1079,6 +1092,7 @@ def search_local_minimum_ab(
     max_bracket_steps: int = 12,
     threshold_metric: float = 2.0,
     no_area: bool = False,
+    progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
     cache: ABPointCache | None = None,
     execution_policy: ABRequestedExecutionPolicy = "serial",
@@ -1150,6 +1164,7 @@ def search_local_minimum_ab(
                 execution_policy=execution_policy,
                 max_workers=max_workers,
                 worker_chunksize=int(worker_chunksize),
+                progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
             )
             if not point_results:
@@ -1201,6 +1216,7 @@ def search_local_minimum_ab(
             execution_policy=execution_policy,
             max_workers=max_workers,
             worker_chunksize=int(worker_chunksize),
+            progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
         )
 
@@ -1297,6 +1313,7 @@ def search_local_minimum_ab(
                 execution_policy=execution_policy,
                 max_workers=max_workers,
                 worker_chunksize=int(worker_chunksize),
+                progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
             )
             if not expanded_a and not expanded_b and not evaluated_phase2_points:
@@ -1470,6 +1487,7 @@ def multi_scan_ab(
             execution_policy=execution_policy,
             max_workers=max_workers,
             worker_chunksize=int(worker_chunksize),
+            progress_start_callback=None,
             progress_callback=progress_callback,
         ):
             key = (float(point.a), float(point.b))

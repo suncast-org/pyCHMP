@@ -6,8 +6,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from examples.python import adaptive_ab_search_single_frequency as frequency_wrapper
-from examples.python.adaptive_ab_search_single_observation import _point_payload_from_result, _resolve_observation_request
+from examples.python.adaptive_ab_search_single_observation import (
+    _point_payload_from_result,
+    _rescore_auxiliary_map_record,
+    _resolve_observation_request,
+    _resolve_render_slice_requests,
+)
 from pychmp.ab_search import ABPointResult
 from pychmp.metrics import MetricValues
 
@@ -62,8 +66,66 @@ def test_resolve_observation_request_rejects_conflicting_path_selectors(tmp_path
         _resolve_observation_request(args, repo_root=tmp_path)
 
 
-def test_frequency_wrapper_reexports_generic_entrypoint_helper() -> None:
-    assert frequency_wrapper._resolve_observation_request is _resolve_observation_request
+def test_resolve_observation_request_requires_explicit_external_fits_path(tmp_path: Path) -> None:
+    args = _make_args(tmp_path, obs_source="external_fits", fits_file=None, obs_path=None)
+
+    with pytest.raises(SystemExit, match="fits_file is required"):
+        _resolve_observation_request(args, repo_root=tmp_path)
+
+
+def test_resolve_render_slice_requests_expands_aia_all_channels() -> None:
+    descriptors, freqs, channels = _resolve_render_slice_requests(
+        domain="euv",
+        frequency_ghz=None,
+        euv_channel="171",
+        euv_instrument="AIA",
+        all_channels=True,
+        render_channels_csv=None,
+        render_frequencies_csv=None,
+    )
+
+    assert freqs == tuple()
+    assert channels == ("171", "94", "131", "193", "211", "304", "335")
+    assert [item["key"] for item in descriptors] == [
+        "euv_171",
+        "euv_94",
+        "euv_131",
+        "euv_193",
+        "euv_211",
+        "euv_304",
+        "euv_335",
+    ]
+    assert descriptors[0]["is_target"] is True
+    assert all(item["role"] == "auxiliary" for item in descriptors[1:])
+
+
+def test_resolve_render_slice_requests_requires_explicit_mw_frequency_list() -> None:
+    descriptors, freqs, channels = _resolve_render_slice_requests(
+        domain="mw",
+        frequency_ghz=2.874,
+        euv_channel=None,
+        euv_instrument=None,
+        all_channels=False,
+        render_channels_csv=None,
+        render_frequencies_csv="3.2,5.8",
+    )
+
+    assert channels == tuple()
+    assert freqs == (2.874, 3.2, 5.8)
+    assert [item["key"] for item in descriptors] == ["mw_2p874000ghz", "mw_3p200000ghz", "mw_5p800000ghz"]
+
+
+def test_resolve_render_slice_requests_rejects_all_channels_for_mw() -> None:
+    with pytest.raises(SystemExit, match="only defined for fixed-channel"):
+        _resolve_render_slice_requests(
+            domain="mw",
+            frequency_ghz=2.874,
+            euv_channel=None,
+            euv_instrument=None,
+            all_channels=True,
+            render_channels_csv=None,
+            render_frequencies_csv=None,
+        )
 
 
 class _FakeEUVRenderer:
@@ -136,3 +198,43 @@ def test_adaptive_point_payload_persists_trial_maps_and_euv_components() -> None
     np.testing.assert_allclose(payload["trial_modeled_maps"][1], np.full((2, 2), 10.0002, dtype=float))
     np.testing.assert_allclose(payload["trial_euv_coronal_maps"][0], np.full((2, 2), 1.0001, dtype=float))
     np.testing.assert_allclose(payload["trial_euv_tr_maps"][1], np.full((2, 2), 2.0002, dtype=float))
+
+
+def test_rescore_auxiliary_map_record_builds_promoted_point_payload() -> None:
+    observed = np.ones((2, 2), dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    record = {
+        "a": 0.3,
+        "b": 2.7,
+        "a_index": 0,
+        "b_index": 0,
+        "fit_q0_trials": (1.0, 2.0),
+        "trial_modeled_maps": np.stack(
+            [
+                np.full((2, 2), 1.0, dtype=float),
+                np.full((2, 2), 3.0, dtype=float),
+            ],
+            axis=0,
+        ),
+        "diagnostics": {"target_metric": "chi2"},
+        "source_slice_key": "euv_171",
+        "source_search_id": "search_a",
+    }
+
+    promoted = _rescore_auxiliary_map_record(
+        record,
+        observed=observed,
+        sigma_map=sigma,
+        threshold=0.0,
+        explicit_mask=None,
+        target_metric="chi2",
+    )
+
+    assert promoted is not None
+    point, payload = promoted
+    assert point.q0 == pytest.approx(1.0)
+    assert point.objective_value == pytest.approx(0.0)
+    assert payload["diagnostics"]["map_store_reused"] is True
+    assert payload["diagnostics"]["map_store_source_slice_key"] == "euv_171"
+    np.testing.assert_allclose(payload["modeled_best"], np.ones((2, 2), dtype=float))
+    np.testing.assert_allclose(payload["trial_modeled_maps"][1], np.full((2, 2), 3.0, dtype=float))

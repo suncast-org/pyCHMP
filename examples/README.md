@@ -71,17 +71,15 @@ examples that may be added later by pull requests.
 - `python/adaptive_ab_search_single_observation.py`
   - Generic real-data adaptive local `(a, b)` search for a single observational map.
   - Supports both MW external FITS observations and EUV/UV model-refmap selections.
-  - Defaults to the current 2.874 GHz EOVSA workflow when no explicit observation is supplied.
+  - Requires an explicit observation selector: an external FITS path or an internal refmap id.
+  - Resolves observation LOS before reusing model-saved observer/FOV metadata;
+    mismatches use an observation-inscribed FOV and are recorded in artifact diagnostics.
   - Persists each evaluated point into a sparse H5 artifact using the same
      point schema as the fixed-grid scan path, including full stored metric
      histories and per-trial map cubes when available.
   - Completed point results are appended as they arrive so the viewer can
     inspect progress while the run is active without waiting for a batch flush.
   - Supports `--dry-run` to resolve inputs and artifact locations without starting the search.
-
-- `python/adaptive_ab_search_single_frequency.py`
-  - Compatibility wrapper that preserves the original MW-facing entrypoint name.
-  - Delegates to `python/adaptive_ab_search_single_observation.py`.
 
 ## Usage
 
@@ -159,10 +157,8 @@ python examples/python/validate_q0_recovery_earth_eovsa_psf.py \
 ```
 
 ```bash
-python examples/python/adaptive_ab_search_single_observation.py --dry-run
-python examples/python/adaptive_ab_search_single_observation.py
-python examples/python/adaptive_ab_search_single_frequency.py --dry-run
-python examples/python/adaptive_ab_search_single_frequency.py
+python examples/python/adaptive_ab_search_single_observation.py /path/to/obs.fits /path/to/model.h5 --dry-run
+python examples/python/adaptive_ab_search_single_observation.py /path/to/obs.fits /path/to/model.h5
 ```
 
 Using your own data with the adaptive search:
@@ -171,19 +167,22 @@ Using your own data with the adaptive search:
   `--obs-fits-path`, `--model-h5-path`, and `--ebtel-path`.
 - `OBS_FITS_PATH`, `MODEL_H5_PATH`, and `EBTEL_PATH` remain supported as
   fallback environment overrides when that is more convenient.
-- Precedence is: explicit launcher flag, then environment variable, then the
-  launcher's built-in default.
+- The adaptive launcher does not choose an observation FITS implicitly. Use
+  `--obs-fits-path` for an external FITS map, or `--obs-map-id` for an internal
+  model refmap.
+- Precedence for paths is: explicit launcher flag, then environment variable,
+  then built-in defaults only for the model and EBTEL paths.
 - `--artifact-h5`, `--a-min`, `--a-max`, and similar flags are normal command
   line options forwarded by the launcher to the Python workflow.
 
 Git Bash launcher example with your own files:
 
 ```bash
-bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash ./scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --obs-fits-path "/path/to/your_map.fits" \
   --model-h5-path "/path/to/your_model.h5" \
   --ebtel-path "/path/to/your_ebtel.sav" \
-  --artifact-h5 "/path/to/output/adaptive_ab_search_single_frequency.h5" \
+  --artifact-h5 "/path/to/output/adaptive_ab_search_single_observation.h5" \
   --a-min -4.5 \
   --a-max 3.0 \
   --b-min -3.0 \
@@ -197,11 +196,11 @@ bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
 PowerShell launcher example with your own files:
 
 ```powershell
-bash .\scripts\unix\adaptive_ab_search_single_frequency_options_test.sh `
+bash .\scripts\unix\adaptive_ab_search_single_observation_options_test.sh `
   --obs-fits-path "C:\path\to\your_map.fits" `
   --model-h5-path "C:\path\to\your_model.h5" `
   --ebtel-path "C:\path\to\your_ebtel.sav" `
-  --artifact-h5 "C:\path\to\output\adaptive_ab_search_single_frequency.h5" `
+  --artifact-h5 "C:\path\to\output\adaptive_ab_search_single_observation.h5" `
   --a-min -4.5 `
   --a-max 3.0 `
   --b-min -3.0 `
@@ -215,11 +214,11 @@ bash .\scripts\unix\adaptive_ab_search_single_frequency_options_test.sh `
 `cmd.exe` launcher example with your own files:
 
 ```bat
-scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
+scripts\windows\adaptive_ab_search_single_observation_options_test.cmd ^
   --obs-fits-path C:\path\to\your_map.fits ^
   --model-h5-path C:\path\to\your_model.h5 ^
   --ebtel-path C:\path\to\your_ebtel.sav ^
-  --artifact-h5 C:\path\to\output\adaptive_ab_search_single_frequency.h5 ^
+  --artifact-h5 C:\path\to\output\adaptive_ab_search_single_observation.h5 ^
   --a-min -4.5 ^
   --a-max 3.0 ^
   --b-min -3.0 ^
@@ -233,11 +232,11 @@ scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
 Direct Python example with your own files:
 
 ```bash
-python examples/python/adaptive_ab_search_single_frequency.py \
+python examples/python/adaptive_ab_search_single_observation.py \
   /path/to/your_map.fits \
   /path/to/your_model.h5 \
   --ebtel-path /path/to/your_ebtel.sav \
-  --artifact-h5 /path/to/output/adaptive_ab_search_single_frequency.h5 \
+  --artifact-h5 /path/to/output/adaptive_ab_search_single_observation.h5 \
   --a-min -4.5 \
   --a-max 3.0 \
   --b-min -3.0 \
@@ -251,11 +250,11 @@ python examples/python/adaptive_ab_search_single_frequency.py \
 Tracked 2.874 GHz development-data example:
 
 ```bash
-bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash ./scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --obs-fits-path "/path/to/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20260323T195655/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" \
   --model-h5-path "/path/to/pyGXrender-test-data/raw/models/models_20260323T195655/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" \
   --ebtel-path "/path/to/pyGXrender-test-data/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav" \
-  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_frequency.h5" \
+  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_observation.h5" \
   --a-min -4.5 \
   --a-max 3.0 \
   --b-min -3.0 \
@@ -296,7 +295,7 @@ and `scripts/windows/`:
     resolution pattern as the scan options-test launcher.
   - Benchmarks serial and process-pool 3x3 scans and writes a CSV report.
 
-- `scripts/unix/adaptive_ab_search_single_frequency_options_test.sh`
+- `scripts/unix/adaptive_ab_search_single_observation_options_test.sh`
   - Wraps `examples/python/adaptive_ab_search_single_observation.py` with the same
     sibling test-data resolution pattern used by the other real-data launchers.
   - Prints both the adaptive-search command and the matching viewer command so

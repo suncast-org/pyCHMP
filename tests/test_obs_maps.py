@@ -30,6 +30,47 @@ def test_load_obs_map_mw_external_fits_extracts_frequency(tmp_path) -> None:
     np.testing.assert_allclose(obs_map.data, data)
 
 
+@pytest.mark.parametrize(
+    ("cards", "expected"),
+    [
+        ({"CUNIT3": "GHz", "CRVAL3": 5.7}, 5.7),
+        ({"CTYPE4": "FREQ", "CUNIT4": "MHz", "CRVAL4": 5700.0}, 5.7),
+        ({"RESTFRQ": 5.7e9}, 5.7),
+        ({"RESTFREQ": 5.7e9}, 5.7),
+        ({"OBSFREQ": 5700.0, "FREQUNIT": "MHz"}, 5.7),
+        ({"FREQ": 5.7}, 5.7),
+    ],
+)
+def test_load_obs_map_mw_external_fits_extracts_common_radio_frequency_metadata(
+    tmp_path,
+    cards: dict[str, object],
+    expected: float,
+) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    for key, value in cards.items():
+        header[key] = value
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="mw")
+
+    assert obs_map.frequency_ghz == pytest.approx(expected)
+    assert obs_map.spectral_label == f"{expected:.3f} GHz"
+
+
+def test_load_obs_map_mw_external_fits_rejects_non_frequency_wcs_axis(tmp_path) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CTYPE3"] = "STOKES"
+    header["CRVAL3"] = 1
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    with pytest.raises(ValueError, match="extract frequency"):
+        load_obs_map(obs_path=fits_path, domain="mw")
+
+
 def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     fits_path = tmp_path / "aia_171.fits"
     data = np.ones((3, 5), dtype=np.float32)
