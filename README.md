@@ -45,6 +45,36 @@ gximagecomputing resolves supported instrument responses through its
 pyEUVTools-backed provider and surfaces the chosen `response.source` /
 `response.mode` metadata in the downstream render result.
 
+## User Manual
+
+### Artifact Reuse Policy
+
+pyCHMP artifacts are meant to represent meaningful scientific products, not to
+act as an audit log of failed or abandoned attempts.
+
+- A new slice should appear only when the scientific target changes in a way
+   that changes slice identity, such as a different EUV channel, MW frequency,
+   geometry/WCS, observer contract, or other incompatibility that makes the
+   stored maps physically non-reusable.
+- If the current run is compatible with the existing artifact and `--start-over`
+   is not requested, pyCHMP should resume implicitly from the existing search
+   state. Changing only search boundaries does not create a new slice or a new
+   search lineage.
+- `--start-over` means reset the existing search history for that same target
+   and begin again in place. pyCHMP should still take advantage of already
+   computed compatible maps, but it should not retain abandoned same-target
+   search history as additional visible slice/search clutter.
+- Changes that alter the scientific meaning of the stored results, such as
+   different masks, thresholds, or beams, must not silently reuse incompatible
+   results. They should branch only when the metadata signature requires it.
+
+Practical interpretation:
+
+- same target + same compatible signature + no `--start-over`: resume
+- same target + same compatible signature + `--start-over`: erase prior search
+   history for that target, keep compatible map reuse, restart in place
+- changed slice identity: create a new slice
+
 ## Development
 
 ```bash

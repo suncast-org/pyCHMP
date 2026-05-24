@@ -17,10 +17,12 @@ from pychmp.ab_scan_artifacts import (
     append_scan_point_record,
     backfill_artifact_diagnostics,
     build_computed_point_payload,
+    default_point_index,
     load_auxiliary_map_store_point_records,
     list_scan_slices,
     load_scan_file,
     point_record_matches_compatibility_signature,
+    resolve_point_index,
     write_grid_scan_artifact,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
@@ -209,6 +211,123 @@ def test_rectangular_artifact_persists_selectable_search_records(tmp_path: Path)
     assert first_search_payload["chi2"][0, 0] == pytest.approx(0.1)
 
 
+def test_point_artifact_start_over_reuses_same_search_id_and_replaces_history(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    first_payload = load_scan_file(out_h5)
+    first_search_id = str(first_payload["selected_search_id"])
+
+    second_diagnostics = dict(diagnostics)
+    second_point = _make_point_payload(0.3, 1.3)
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=second_diagnostics,
+        point_records=[second_point],
+        preserve_existing_searches=False,
+    )
+
+    latest_payload = load_scan_file(out_h5)
+    latest_search_id = str(latest_payload["selected_search_id"])
+    assert latest_search_id == first_search_id
+    assert len(latest_payload["search_records"]) == 1
+    assert len(latest_payload["point_records"]) == 1
+    assert latest_payload["point_records"][0]["a"] == pytest.approx(0.3)
+
+
+def test_point_artifact_start_over_rewrite_preserves_existing_map_store_refs(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+
+    first_point = _make_point_payload(0.0, 1.0)
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[first_point],
+    )
+
+    first_payload = load_scan_file(out_h5)
+    first_record = first_payload["point_records"][0]
+    first_search_id = str(first_payload["selected_search_id"])
+    with h5py.File(out_h5, "r") as handle:
+        refs = json.loads(
+            handle[f"slices/default/searches/{first_search_id}/point_records/r000000/map_refs_json"][()].decode()
+        )
+    expected_ref_paths = tuple(str(path) for path in refs.values())
+
+    second_diagnostics = dict(diagnostics)
+    second_point = _make_point_payload(0.3, 1.3)
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=second_diagnostics,
+        point_records=[second_point],
+        preserve_existing_searches=False,
+    )
+
+    with h5py.File(out_h5, "r") as handle:
+        for ref_path in expected_ref_paths:
+            assert ref_path in handle
+
+
+def test_point_artifact_persists_single_common_psf_kernel(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    kernel = np.asarray(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 4.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=float,
+    )
+
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        psf_kernel=kernel,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+    loaded_kernel = np.asarray(payload.get("psf_kernel"), dtype=float)
+    assert loaded_kernel.shape == (3, 3)
+    np.testing.assert_allclose(loaded_kernel.sum(), 1.0, rtol=0.0, atol=1e-6)
+
+    selected_slice_key = str(payload.get("selected_slice_key"))
+    with h5py.File(out_h5, "r") as handle:
+        assert f"slices/{selected_slice_key}/common/psf_kernel" in handle
+        assert f"slices/{selected_slice_key}/common/psf_kernel_meta_json" in handle
+
+
 def test_validate_scan_artifact_compatibility_rejects_header_mismatch(tmp_path: Path) -> None:
     """Reject reuse when the persisted WCS header differs."""
     out_h5 = tmp_path / "scan.h5"
@@ -301,6 +420,37 @@ def test_validate_scan_artifact_compatibility_rejects_sparse_observation_mismatc
             diagnostics=diagnostics,
             artifact_path=out_h5,
         )
+
+
+def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+    changed_diagnostics = dict(diagnostics)
+    changed_diagnostics["target_metric"] = "eta2"
+    changed_diagnostics["metrics_mask_threshold"] = 0.5
+    changed_diagnostics[COMPATIBILITY_SIGNATURE_KEY] = "sig-eta2-threshold-0p5"
+
+    validate_scan_artifact_compatibility(
+        payload,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=changed_diagnostics,
+        artifact_path=out_h5,
+    )
 
 
 def test_sparse_artifact_round_trip_preserves_point_elapsed_seconds(tmp_path: Path) -> None:
@@ -517,6 +667,44 @@ def test_single_point_artifact_stores_auxiliary_maps_in_map_store(tmp_path: Path
         ref_path = refs["extra/euv/193/rendered_best"]
         np.testing.assert_allclose(handle[ref_path]["data"][()], aux_map)
         assert "euv" not in record
+
+
+def test_load_scan_file_replaces_missing_display_map_refs_with_blank_maps(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "missing_display_maps.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    point_payload = _make_point_payload(0.0, 1.0)
+
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_payload],
+    )
+
+    with h5py.File(out_h5, "r+") as handle:
+        search_id = handle["slices/default/active_search_id"][()].decode()
+        record = handle[f"slices/default/searches/{search_id}/point_records/r000000"]
+        refs = json.loads(record["map_refs_json"][()].decode())
+        for key in ("raw_modeled_best", "modeled_best", "residual"):
+            ref_path = refs.pop(key)
+            del handle[ref_path]
+        record["map_refs_json"][()] = np.bytes_(json.dumps(refs, sort_keys=True))
+
+    payload = load_scan_file(out_h5)
+    point = payload["point_records"][0]
+
+    assert point["raw_modeled_best"].shape == observed.shape
+    assert point["modeled_best"].shape == observed.shape
+    assert point["residual"].shape == observed.shape
+    assert np.isnan(point["raw_modeled_best"]).all()
+    assert np.isnan(point["modeled_best"]).all()
+    assert np.isnan(point["residual"]).all()
+    assert point["diagnostics"]["stored_display_maps_available"] is False
 
 
 def test_auxiliary_map_store_records_can_seed_render_only_slice(tmp_path: Path) -> None:
@@ -1085,6 +1273,71 @@ def test_sparse_artifact_round_trip_exposes_canonical_slice_metadata_and_trial_l
     assert aux_payload["diagnostics"]["render_only_slice"] is True
     assert aux_payload["point_records"] == []
     assert np.isnan(aux_payload["observed"]).all()
+
+
+def test_load_scan_file_prefers_target_slice_key_when_unspecified(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "target_slice_default.h5"
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind=UNIFIED_ARTIFACT_KIND)
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "193 A",
+            "wavelength_angstrom": 193.0,
+            "euv_channel": "193",
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "wavelength_angstrom": 171.0,
+                    "channel_label": "171",
+                    "role": "auxiliary",
+                },
+                {
+                    "key": "euv_193",
+                    "domain": "euv",
+                    "label": "193 A",
+                    "wavelength_angstrom": 193.0,
+                    "channel_label": "193",
+                    "role": "target",
+                },
+            ],
+            "target_slice_key": "euv_193",
+        }
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.3, 2.1)],
+    )
+
+    payload = load_scan_file(out_h5)
+
+    assert payload["selected_slice_key"] == "euv_193"
+
+
+def test_point_selection_helpers_use_existing_sparse_point_records() -> None:
+    point = {
+        **_make_point_payload(0.3, 2.1, a_index=1, b_index=0),
+        "record_order": 2,
+        "metrics": {"chi2": 1.0, "rho2": 2.0, "eta2": 3.0},
+        "diagnostics": {"chi2": 1.0, "rho2": 2.0, "eta2": 3.0},
+    }
+    payload = {
+        "a_values": np.asarray([0.0, 0.3], dtype=float),
+        "b_values": np.asarray([2.1, 2.4], dtype=float),
+        "points": {(1, 0): point},
+        "point_records": [point],
+    }
+
+    assert default_point_index(payload, "chi2") == (1, 0)
+    assert resolve_point_index(payload, metric="chi2", a_index=0, b_index=0) == (1, 0)
 
 
 def test_single_point_artifact_round_trips_euv_components_and_tr_mask(tmp_path: Path) -> None:

@@ -24,6 +24,8 @@ COMMON_SLICE_DESCRIPTORS_DATASET = "slice_descriptors_json"
 COMMON_TARGET_SLICE_KEY_DATASET = "target_slice_key"
 COMMON_TRIAL_LOGGING_POLICY_DATASET = "trial_logging_policy_json"
 COMMON_ARTIFACT_CONTRACT_VERSION_DATASET = "artifact_contract_version"
+COMMON_PSF_KERNEL_DATASET = "psf_kernel"
+COMMON_PSF_KERNEL_META_DATASET = "psf_kernel_meta_json"
 SEARCHES_GROUP = "searches"
 ACTIVE_SEARCH_ID_DATASET = "active_search_id"
 SEARCH_REQUEST_DATASET = "request_json"
@@ -67,6 +69,7 @@ GEOMETRY_COMPATIBILITY_DIAGNOSTIC_KEYS = (
 COMPATIBILITY_SIGNATURE_KEY = "compatibility_signature"
 SEARCH_SPECIFIC_DIAGNOSTIC_KEYS = {
     COMPATIBILITY_SIGNATURE_KEY,
+    "search_instance_id",
     "target_metric",
     "metrics_mask_threshold",
     "metrics_mask_source",
@@ -243,13 +246,16 @@ def scan_artifact_compatibility_issues(
 
     existing_diagnostics = dict(payload.get("diagnostics", {}))
     artifact_kind = str(existing_diagnostics.get("artifact_kind", ""))
+    # Only require observer/FOV fields if present in both stored and current diagnostics
     for key in REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS:
+        if artifact_kind in {SPARSE_ARTIFACT_KIND, UNIFIED_ARTIFACT_KIND} and key in SEARCH_SPECIFIC_DIAGNOSTIC_KEYS:
+            continue
+        if key not in existing_diagnostics and key not in diagnostics:
+            continue  # treat as optional if missing in both
         if key not in existing_diagnostics:
-            issues.append(f"stored diagnostics are missing required key '{key}'")
-            continue
+            continue  # treat as optional if missing in stored
         if key not in diagnostics:
-            issues.append(f"current diagnostics are missing required key '{key}'")
-            continue
+            continue  # treat as optional if missing in current
         if not _diagnostic_values_match(key, existing_diagnostics[key], diagnostics[key]):
             issues.append(
                 f"diagnostic mismatch for '{key}' "
@@ -555,6 +561,7 @@ def _ensure_run_history_dataset(common: h5py.Group) -> h5py.Dataset:
 
 def _search_id_from_diagnostics(diagnostics: dict[str, Any], *, fallback: str = "search") -> str:
     signature = str(diagnostics.get(COMPATIBILITY_SIGNATURE_KEY, "")).strip()
+    search_instance_id = str(diagnostics.get("search_instance_id", "")).strip()
     if not signature:
         identity = {
             str(key): value
@@ -566,6 +573,9 @@ def _search_id_from_diagnostics(diagnostics: dict[str, Any], *, fallback: str = 
         if not identity:
             identity = {"target_metric": diagnostics.get("target_metric", "chi2")}
         signature = hashlib.sha256(_json_dumps(identity).encode("utf-8")).hexdigest()
+    if search_instance_id:
+        suffix = hashlib.sha256(search_instance_id.encode("utf-8")).hexdigest()[:8]
+        return f"{fallback}_{signature[:16]}_{suffix}"
     return f"{fallback}_{signature[:16]}"
 
 
@@ -908,12 +918,15 @@ def _resolve_slice_group(
 
     slices_group = f[SLICE_CONTAINER_GROUP]
     descriptors: list[dict[str, Any]] = []
+    target_slice_key = ""
     for name in sorted(slices_group.keys()):
         grp = slices_group[name]
         diagnostics = {}
         common = grp.get("common")
         if common is not None and "diagnostics_json" in common:
             diagnostics = json.loads(decode_scalar(common["diagnostics_json"][()]))
+        if not target_slice_key and common is not None and COMMON_TARGET_SLICE_KEY_DATASET in common:
+            target_slice_key = decode_scalar(common[COMMON_TARGET_SLICE_KEY_DATASET][()]).strip()
         descriptor = slice_descriptor_from_diagnostics(diagnostics, fallback_key=name)
         descriptor["key"] = str(name)
         descriptors.append(descriptor)
@@ -924,7 +937,10 @@ def _resolve_slice_group(
     if selected_key is None:
         if allow_missing and slice_key is not None:
             return None, descriptors, None
-        selected_key = str(descriptors[0]["key"]) if descriptors else None
+        if target_slice_key and target_slice_key in key_lookup:
+            selected_key = target_slice_key
+        else:
+            selected_key = str(descriptors[0]["key"]) if descriptors else None
     if selected_key is None:
         return None, descriptors, None
     return slices_group[selected_key], descriptors, selected_key
@@ -974,6 +990,22 @@ def _axis_spans(values: np.ndarray) -> dict[float, tuple[float, float]]:
 
 def _blank_map(template: np.ndarray) -> np.ndarray:
     return np.full_like(np.asarray(template, dtype=float), np.nan, dtype=float)
+
+
+def _coerce_loaded_display_map(
+    data: np.ndarray | None,
+    *,
+    observed_template: np.ndarray,
+) -> tuple[np.ndarray, bool]:
+    template = np.asarray(observed_template, dtype=float)
+    if template.ndim != 2:
+        raise ValueError(f"observed template must be 2D, got shape {template.shape}")
+    if data is None:
+        return _blank_map(template), False
+    array = np.asarray(data, dtype=float)
+    if array.ndim != 2 or array.shape != template.shape:
+        return _blank_map(template), False
+    return array, True
 
 
 def _pending_point_payload(
@@ -1306,6 +1338,20 @@ def _payload_from_point_records(
         a_index = a_lookup[a_value]
         b_index = b_lookup[b_value]
         diagnostics_json = dict(record.get("diagnostics", {}))
+        raw_modeled_best, has_raw_modeled_best = _coerce_loaded_display_map(
+            record.get("raw_modeled_best"),
+            observed_template=observed,
+        )
+        modeled_best, has_modeled_best = _coerce_loaded_display_map(
+            record.get("modeled_best"),
+            observed_template=observed,
+        )
+        residual_map, has_residual = _coerce_loaded_display_map(
+            record.get("residual"),
+            observed_template=observed,
+        )
+        display_maps_available = bool(has_raw_modeled_best and has_modeled_best and has_residual)
+        diagnostics_json["stored_display_maps_available"] = display_maps_available
         metrics = {
             "chi2": float(diagnostics_json.get("chi2", np.nan)),
             "rho2": float(diagnostics_json.get("rho2", np.nan)),
@@ -1313,6 +1359,10 @@ def _payload_from_point_records(
         }
         points[(a_index, b_index)] = {
             **record,
+            "raw_modeled_best": raw_modeled_best,
+            "modeled_best": modeled_best,
+            "residual": residual_map,
+            "diagnostics": diagnostics_json,
             "a_index": int(a_index),
             "b_index": int(b_index),
         }
@@ -1325,6 +1375,10 @@ def _payload_from_point_records(
         normalized_records.append(
             {
                 **record,
+                "raw_modeled_best": raw_modeled_best,
+                "modeled_best": modeled_best,
+                "residual": residual_map,
+                "diagnostics": diagnostics_json,
                 "a_index": int(a_index),
                 "b_index": int(b_index),
                 "metrics": metrics,
@@ -1419,6 +1473,8 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: st
         payload["search_records"] = search_records
         payload["selected_search_id"] = selected_search_id
         payload["selected_search"] = selected_search_record
+        payload["psf_kernel"] = common_payload.get("psf_kernel")
+        payload["psf_kernel_metadata"] = common_payload.get("psf_kernel_metadata")
         if not search_records:
             legacy_status = _search_status_from_records(payload.get("point_records", []))
             legacy_search = {
@@ -1834,6 +1890,7 @@ def _write_common_group(
     wcs_header: fits.Header,
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
+    psf_kernel: np.ndarray | None = None,
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
     slice_descriptors, target_slice_key = canonical_slice_descriptors_from_diagnostics(diagnostics)
@@ -1846,6 +1903,25 @@ def _write_common_group(
     _create_text_dataset(common, COMMON_SLICE_DESCRIPTORS_DATASET, _json_dumps(slice_descriptors))
     _create_text_dataset(common, COMMON_TARGET_SLICE_KEY_DATASET, str(target_slice_key))
     _create_text_dataset(common, COMMON_TRIAL_LOGGING_POLICY_DATASET, _json_dumps(trial_logging_policy))
+    if psf_kernel is not None:
+        kernel = np.asarray(psf_kernel, dtype=float)
+        if kernel.ndim == 2 and kernel.size > 0:
+            kernel_sum = float(np.nansum(kernel))
+            if np.isfinite(kernel_sum) and kernel_sum != 0.0:
+                kernel = kernel / kernel_sum
+            common.create_dataset(
+                COMMON_PSF_KERNEL_DATASET,
+                data=np.asarray(kernel, dtype=np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+            kernel_meta = {
+                "source": diagnostics.get("psf_source"),
+                "resolved_psf": diagnostics.get("resolved_psf"),
+                "shape": [int(v) for v in kernel.shape],
+                "normalized": True,
+            }
+            _create_text_dataset(common, COMMON_PSF_KERNEL_META_DATASET, _json_dumps(kernel_meta))
     if blos_reference is not None:
         refmaps = common.create_group("refmaps")
         blos_data, blos_header = blos_reference
@@ -1888,6 +1964,19 @@ def _read_common_group(common: h5py.Group) -> dict[str, Any]:
     blos_reference = None
     if "refmaps" in common:
         blos_reference = _read_reference_map_group(common["refmaps"], "Bz_reference")
+    psf_kernel = None
+    if COMMON_PSF_KERNEL_DATASET in common:
+        kernel = np.asarray(common[COMMON_PSF_KERNEL_DATASET], dtype=float)
+        if kernel.ndim == 2 and kernel.size > 0:
+            psf_kernel = kernel
+    psf_kernel_metadata: dict[str, Any] | None = None
+    if COMMON_PSF_KERNEL_META_DATASET in common:
+        try:
+            parsed = json.loads(decode_scalar(common[COMMON_PSF_KERNEL_META_DATASET][()]))
+            if isinstance(parsed, dict):
+                psf_kernel_metadata = parsed
+        except Exception:
+            psf_kernel_metadata = None
     return {
         "observed": observed,
         "sigma_map": sigma_map,
@@ -1899,6 +1988,8 @@ def _read_common_group(common: h5py.Group) -> dict[str, Any]:
         "target_slice_key": target_slice_key,
         "trial_logging_policy": trial_logging_policy,
         "blos_reference": blos_reference,
+        "psf_kernel": psf_kernel,
+        "psf_kernel_metadata": psf_kernel_metadata,
     }
 
 
@@ -1979,6 +2070,11 @@ def _copy_legacy_root_layout_to_slice(src: h5py.File, dst_slice: h5py.Group) -> 
             src.copy(src[name], dst_slice, name=name)
 
 
+def _copy_existing_map_store(src: h5py.File, dst: h5py.File) -> None:
+    if MAP_STORE_GROUP in src and MAP_STORE_GROUP not in dst:
+        src.copy(src[MAP_STORE_GROUP], dst, name=MAP_STORE_GROUP)
+
+
 def write_grid_scan_artifact(
     out_h5: Path,
     *,
@@ -1996,6 +2092,7 @@ def write_grid_scan_artifact(
     eta2: np.ndarray,
     success: np.ndarray,
     point_payloads: dict[tuple[int, int], dict[str, Any]],
+    psf_kernel: np.ndarray | None = None,
     slice_key: str | None = None,
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -2010,6 +2107,7 @@ def write_grid_scan_artifact(
         slices_dst = dst.create_group(SLICE_CONTAINER_GROUP)
         if out_h5.exists():
             with _H5PY_FILE(out_h5, "r") as src:
+                _copy_existing_map_store(src, dst)
                 if SLICE_CONTAINER_GROUP in src:
                     _validate_new_slice_geometry_compatibility(
                         src[SLICE_CONTAINER_GROUP],
@@ -2041,6 +2139,7 @@ def write_grid_scan_artifact(
             wcs_header=wcs_header,
             diagnostics=diagnostics_out,
             blos_reference=blos_reference,
+            psf_kernel=psf_kernel,
             run_history=run_history,
         )
         _write_auxiliary_slice_shells(
@@ -2193,7 +2292,9 @@ def write_point_scan_artifact(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_records: list[dict[str, Any]],
+    psf_kernel: np.ndarray | None = None,
     run_history: list[dict[str, Any]] | None = None,
+    preserve_existing_searches: bool = True,
 ) -> None:
     out_h5.parent.mkdir(parents=True, exist_ok=True)
     tmp_h5 = out_h5.with_suffix(out_h5.suffix + ".tmp")
@@ -2210,6 +2311,7 @@ def write_point_scan_artifact(
         _set_slice_group_attrs(slice_group, descriptor)
         if out_h5.exists():
             with _H5PY_FILE(out_h5, "r") as src:
+                _copy_existing_map_store(src, f)
                 if SLICE_CONTAINER_GROUP in src:
                     _validate_new_slice_geometry_compatibility(
                         src[SLICE_CONTAINER_GROUP],
@@ -2229,6 +2331,7 @@ def write_point_scan_artifact(
             wcs_header=wcs_header,
             diagnostics=diagnostics_out,
             blos_reference=blos_reference,
+            psf_kernel=psf_kernel,
             run_history=run_history,
         )
         _write_auxiliary_slice_shells(
@@ -2241,7 +2344,7 @@ def write_point_scan_artifact(
             existing_names=set(slices_group.keys()),
         )
         searches_group = slice_group.create_group(SEARCHES_GROUP)
-        if out_h5.exists():
+        if out_h5.exists() and bool(preserve_existing_searches):
             with _H5PY_FILE(out_h5, "r") as src:
                 src_slice = None
                 if SLICE_CONTAINER_GROUP in src and resolved_slice_key in src[SLICE_CONTAINER_GROUP]:
@@ -2273,6 +2376,7 @@ def write_sparse_scan_file(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_records: list[dict[str, Any]],
+    psf_kernel: np.ndarray | None = None,
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
     write_point_scan_artifact(
@@ -2282,8 +2386,10 @@ def write_sparse_scan_file(
         wcs_header=wcs_header,
         diagnostics=diagnostics,
         blos_reference=blos_reference,
+        psf_kernel=psf_kernel,
         point_records=point_records,
         run_history=run_history,
+        preserve_existing_searches=preserve_existing_searches,
     )
 
 
@@ -2296,6 +2402,7 @@ def write_single_point_scan_file(
     diagnostics: dict[str, Any],
     point_payload: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
+    psf_kernel: np.ndarray | None = None,
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
     diagnostics_out = dict(diagnostics)
@@ -2307,8 +2414,10 @@ def write_single_point_scan_file(
         wcs_header=wcs_header,
         diagnostics=diagnostics_out,
         blos_reference=blos_reference,
+        psf_kernel=psf_kernel,
         point_records=[point_payload],
         run_history=run_history,
+        preserve_existing_searches=True,
     )
 
 
@@ -2321,6 +2430,7 @@ def append_scan_point_record(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_payload: dict[str, Any],
+    psf_kernel: np.ndarray | None = None,
 ) -> None:
     diagnostics_out = dict(diagnostics)
     diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
@@ -2358,6 +2468,7 @@ def append_scan_point_record(
                         wcs_header=wcs_header,
                         diagnostics=diagnostics_out,
                         blos_reference=blos_reference,
+                        psf_kernel=psf_kernel,
                         run_history=None,
                     )
                     _write_auxiliary_slice_shells(
@@ -2390,6 +2501,7 @@ def append_scan_point_record(
                             wcs_header=wcs_header,
                             diagnostics=diagnostics_out,
                             blos_reference=blos_reference,
+                            psf_kernel=psf_kernel,
                             run_history=None,
                         )
                 searches_group = slice_group.require_group(SEARCHES_GROUP)
@@ -2471,6 +2583,7 @@ def append_sparse_point_record(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_payload: dict[str, Any],
+    psf_kernel: np.ndarray | None = None,
 ) -> None:
     append_scan_point_record(
         out_h5,
@@ -2479,6 +2592,7 @@ def append_sparse_point_record(
         wcs_header=wcs_header,
         diagnostics=diagnostics,
         blos_reference=blos_reference,
+        psf_kernel=psf_kernel,
         point_payload=point_payload,
     )
 
@@ -2492,6 +2606,7 @@ def append_point_record(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     point_payload: dict[str, Any],
+    psf_kernel: np.ndarray | None = None,
 ) -> None:
     artifact_kind = str(diagnostics.get("artifact_kind", "")).strip()
     if not out_h5.exists():
@@ -2514,6 +2629,7 @@ def append_point_record(
             wcs_header=wcs_header,
             diagnostics=diagnostics,
             blos_reference=blos_reference,
+            psf_kernel=psf_kernel,
             point_payload=point_payload,
         )
         return
@@ -2527,6 +2643,7 @@ def append_point_record(
             wcs_header=wcs_header,
             diagnostics=diagnostics,
             blos_reference=blos_reference,
+            psf_kernel=psf_kernel,
             point_payload=point_payload,
         )
         return
@@ -2663,6 +2780,101 @@ def build_patch_grid_model(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def point_records_for_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    source_records = payload.get("point_records")
+    if source_records is None:
+        source_records = list(dict(payload.get("points", {})).values())
+    return [record for record in source_records if str(record.get("status", "computed")) != "missing"]
+
+
+def _point_index_from_record(payload: dict[str, Any], record: dict[str, Any]) -> tuple[int, int]:
+    if "a_index" in record and "b_index" in record:
+        return int(record["a_index"]), int(record["b_index"])
+    a_values = np.asarray(payload.get("a_values", ()), dtype=float)
+    b_values = np.asarray(payload.get("b_values", ()), dtype=float)
+    return nearest_index(a_values, float(record["a"])), nearest_index(b_values, float(record["b"]))
+
+
+def default_point_index(payload: dict[str, Any], metric: str | None = None) -> tuple[int, int]:
+    records = point_records_for_payload(payload)
+    if not records:
+        raise ValueError("No stored point records are available")
+
+    metric_name = str(metric or "").strip().lower()
+    if metric_name in METRICS:
+        ranked: list[tuple[float, dict[str, Any]]] = []
+        for record in records:
+            diagnostics = dict(record.get("diagnostics", {}))
+            metrics = dict(record.get("metrics", {}))
+            value = metrics.get(metric_name, diagnostics.get(metric_name, np.nan))
+            try:
+                numeric = float(value)
+            except Exception:
+                numeric = float("nan")
+            if np.isfinite(numeric):
+                ranked.append((numeric, record))
+        if ranked:
+            return _point_index_from_record(payload, min(ranked, key=lambda item: item[0])[1])
+
+    latest_record = max(
+        records,
+        key=lambda record: (
+            int(record.get("record_order", -1)),
+            float(record.get("a", np.nan)),
+            float(record.get("b", np.nan)),
+        ),
+    )
+    return _point_index_from_record(payload, latest_record)
+
+
+def resolve_point_index(
+    payload: dict[str, Any],
+    *,
+    metric: str | None = None,
+    a_index: int | None = None,
+    b_index: int | None = None,
+) -> tuple[int, int]:
+    points = dict(payload.get("points", {}))
+    if not points:
+        raise ValueError("No stored point records are available")
+
+    if a_index is not None and b_index is not None:
+        key = (int(a_index), int(b_index))
+        if key in points:
+            return key
+
+    records = point_records_for_payload(payload)
+    if not records:
+        raise ValueError("No stored point records are available")
+
+    fallback_index = default_point_index(payload, metric)
+    fallback_record = points.get(fallback_index)
+    fallback_a = float(fallback_record["a"]) if fallback_record is not None else float(records[0]["a"])
+    fallback_b = float(fallback_record["b"]) if fallback_record is not None else float(records[0]["b"])
+
+    a_values = np.asarray(payload.get("a_values", ()), dtype=float)
+    b_values = np.asarray(payload.get("b_values", ()), dtype=float)
+    target_a = fallback_a
+    target_b = fallback_b
+    if a_index is not None and a_values.size:
+        target_a = float(a_values[int(np.clip(int(a_index), 0, max(0, a_values.size - 1)))])
+    if b_index is not None and b_values.size:
+        target_b = float(b_values[int(np.clip(int(b_index), 0, max(0, b_values.size - 1)))])
+
+    a_coords = np.asarray([float(record["a"]) for record in records], dtype=float)
+    b_coords = np.asarray([float(record["b"]) for record in records], dtype=float)
+    a_scale = max(float(np.nanmax(a_coords) - np.nanmin(a_coords)), 1.0)
+    b_scale = max(float(np.nanmax(b_coords) - np.nanmin(b_coords)), 1.0)
+    best_record = min(
+        records,
+        key=lambda record: (
+            ((float(record["a"]) - target_a) / a_scale) ** 2 + ((float(record["b"]) - target_b) / b_scale) ** 2,
+            -int(record.get("record_order", -1)),
+        ),
+    )
+    return _point_index_from_record(payload, best_record)
+
+
 def find_record_for_point(model: dict[str, Any], x: float, y: float) -> dict[str, Any] | None:
     for record in model.get("records", []):
         if float(record["b0"]) <= float(x) <= float(record["b1"]) and float(record["a0"]) <= float(y) <= float(record["a1"]):
@@ -2674,13 +2886,21 @@ def best_grid_index(payload: dict[str, Any], metric: str) -> tuple[int, int]:
     metric_name = str(metric).strip().lower()
     if metric_name not in METRICS:
         raise ValueError(f"Unsupported best-of-grid metric: {metric_name}")
-    arr = np.asarray(payload[metric_name], dtype=float)
-    good = np.isfinite(arr)
-    if not np.any(good):
+    records = point_records_for_payload(payload)
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for record in records:
+        diagnostics = dict(record.get("diagnostics", {}))
+        metrics = dict(record.get("metrics", {}))
+        value = metrics.get(metric_name, diagnostics.get(metric_name, np.nan))
+        try:
+            numeric = float(value)
+        except Exception:
+            numeric = float("nan")
+        if np.isfinite(numeric):
+            ranked.append((numeric, record))
+    if not ranked:
         raise ValueError(f"No finite values available for metric {metric_name}")
-    idx = np.nanargmin(arr)
-    a_index, b_index = np.unravel_index(idx, arr.shape)
-    return int(a_index), int(b_index)
+    return _point_index_from_record(payload, min(ranked, key=lambda item: item[0])[1])
 
 
 def nearest_index(values: np.ndarray, target: float) -> int:

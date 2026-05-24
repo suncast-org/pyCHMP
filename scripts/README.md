@@ -571,6 +571,14 @@ For a fresh adaptive artifact:
 - or set `PYCHMP_TIMESTAMP_ARTIFACTS=1`
 - or force a specific file with `ARTIFACT_H5=/path/to/adaptive.h5`
 
+To rerun the same adaptive search settings as a fresh search while still reusing
+the stored map products in the existing artifact, pass:
+
+- `--start-over`
+
+This creates a new adaptive search instance in the same artifact instead of
+resuming the previous compatible search state.
+
 Adaptive launcher path-resolution notes:
 
 - Prefer explicit launcher flags:

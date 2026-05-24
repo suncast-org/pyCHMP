@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
-from typing import Iterator, MutableMapping, Protocol
+from typing import Callable, Iterator, MutableMapping, Protocol, TypeAlias
 
 import numpy as np
 
@@ -13,6 +13,9 @@ from .ab_scan_tasks import ABPointTask, ABSliceTaskDescriptor, compile_rectangul
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .metrics import MetricValues
 from .optimize import MetricName, ProgressCallback, ProgressStartCallback, Q0OptimizationResult
+
+
+PointLifecycleCallback: TypeAlias = Callable[[float, float], None]
 
 
 class ABRendererFactory(Protocol):
@@ -127,6 +130,8 @@ class ABSearchWorkerPayload:
     sigma: np.ndarray | None
     progress_start_callback: ProgressStartCallback | None = None
     progress_callback: ProgressCallback | None = None
+    point_start_callback: PointLifecycleCallback | None = None
+    point_complete_callback: PointLifecycleCallback | None = None
 
 
 def idl_q0_start_heuristic(a: float, b: float) -> float:
@@ -248,6 +253,8 @@ def _evaluate_ab_search_request(
         f"q0_start={q0_start_text}",
         flush=True,
     )
+    if worker_payload.point_start_callback is not None:
+        worker_payload.point_start_callback(a, b)
     try:
         result = evaluate_ab_point(
             worker_payload.renderer_factory,
@@ -288,6 +295,8 @@ def _evaluate_ab_search_request(
         f"elapsed={float(result.elapsed_seconds):.3f}s",
         flush=True,
     )
+    if worker_payload.point_complete_callback is not None:
+        worker_payload.point_complete_callback(a, b)
     return result
 
 
@@ -340,6 +349,8 @@ def _execute_ab_requests(
     worker_chunksize: int,
     progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
+    point_start_callback: PointLifecycleCallback | None,
+    point_complete_callback: PointLifecycleCallback | None,
 ) -> Iterator[ABPointResult]:
     if not pending_requests:
         return iter(())
@@ -362,6 +373,8 @@ def _execute_ab_requests(
         sigma=None if sigma is None else np.asarray(sigma, dtype=float),
         progress_start_callback=progress_start_callback if execution_plan.policy == "serial" else None,
         progress_callback=progress_callback if execution_plan.policy == "serial" else None,
+        point_start_callback=point_start_callback if execution_plan.policy == "serial" else None,
+        point_complete_callback=point_complete_callback if execution_plan.policy == "serial" else None,
     )
     return iter_execute_tasks(
         pending_requests,
@@ -622,6 +635,8 @@ def _evaluate_adaptive_index_batch(
     worker_chunksize: int,
     progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
+    point_start_callback: PointLifecycleCallback | None,
+    point_complete_callback: PointLifecycleCallback | None,
 ) -> list[ABPointResult]:
     pending_requests: list[ABPointEvaluationRequest] = []
     pending_keys: set[tuple[float, float]] = set()
@@ -689,6 +704,8 @@ def _evaluate_adaptive_index_batch(
                     worker_chunksize=worker_chunksize,
                     progress_start_callback=progress_start_callback,
                     progress_callback=progress_callback,
+                    point_start_callback=point_start_callback,
+                    point_complete_callback=point_complete_callback,
                 ):
                     _persist_adaptive_point(
                         cache_map=cache_map,
@@ -707,6 +724,8 @@ def _evaluate_adaptive_index_batch(
                 worker_chunksize=worker_chunksize,
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
+                point_start_callback=point_start_callback,
+                point_complete_callback=point_complete_callback,
             ):
                 _persist_adaptive_point(
                     cache_map=cache_map,
@@ -753,6 +772,8 @@ def _evaluate_adaptive_neighbor_batch(
     worker_chunksize: int,
     progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
+    point_start_callback: PointLifecycleCallback | None,
+    point_complete_callback: PointLifecycleCallback | None,
 ) -> list[ABPointResult]:
     candidate_points: list[tuple[int, int, float | None]] = []
 
@@ -788,6 +809,8 @@ def _evaluate_adaptive_neighbor_batch(
         worker_chunksize=worker_chunksize,
         progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
+        point_start_callback=point_start_callback,
+        point_complete_callback=point_complete_callback,
     )
 
 
@@ -1094,6 +1117,8 @@ def search_local_minimum_ab(
     no_area: bool = False,
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    point_start_callback: PointLifecycleCallback | None = None,
+    point_complete_callback: PointLifecycleCallback | None = None,
     cache: ABPointCache | None = None,
     execution_policy: ABRequestedExecutionPolicy = "serial",
     max_workers: int | None = None,
@@ -1166,6 +1191,8 @@ def search_local_minimum_ab(
                 worker_chunksize=int(worker_chunksize),
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
+                point_start_callback=point_start_callback,
+                point_complete_callback=point_complete_callback,
             )
             if not point_results:
                 raise RuntimeError("adaptive search failed to evaluate the starting point")
@@ -1218,6 +1245,8 @@ def search_local_minimum_ab(
             worker_chunksize=int(worker_chunksize),
             progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
+            point_start_callback=point_start_callback,
+            point_complete_callback=point_complete_callback,
         )
 
         best_a_index, best_b_index, best_point_after = _current_best_point(
@@ -1315,6 +1344,8 @@ def search_local_minimum_ab(
                 worker_chunksize=int(worker_chunksize),
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
+                point_start_callback=point_start_callback,
+                point_complete_callback=point_complete_callback,
             )
             if not expanded_a and not expanded_b and not evaluated_phase2_points:
                 termination_reason = "frontier_exhausted_without_certification"

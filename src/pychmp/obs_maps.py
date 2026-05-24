@@ -20,6 +20,7 @@ from astropy.io import fits
 
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .map_noise import MapNoiseEstimate, estimate_map_noise
+from .psf import extract_psf_metadata_from_header
 
 
 _MODEL_H5_CACHE: dict[str, Path] = {}
@@ -102,6 +103,23 @@ def estimate_obs_map_noise(
         mask_fraction=1.0,
         diagnostics=diagnostics,
     )
+
+
+def obs_map_noise_unit_label(obs_map: ObservationalMap) -> str:
+    """Return a human-readable unit label for observational-map noise values."""
+
+    domain = str(obs_map.domain or "").strip().lower()
+    if domain == "mw":
+        # MW observation values are brightness temperature in Kelvin.
+        return "K"
+
+    header = obs_map.header if isinstance(obs_map.header, fits.Header) else None
+    if header is not None:
+        bunit = str(header.get("BUNIT", "")).strip()
+        if bunit:
+            return bunit
+
+    return "map units"
 
 
 def _normalize_domain(domain: str | None) -> str:
@@ -473,8 +491,23 @@ def _load_external_obs_map(
     domain: str | None,
     instrument: str | None,
 ) -> ObservationalMap:
-    data_arr, header, hdu_name = load_2d_fits_image(Path(obs_path))
+    resolved_obs_path = Path(obs_path).expanduser().resolve()
+    if not resolved_obs_path.exists():
+        raise ValueError(f"external FITS path not found: {resolved_obs_path}")
+    if resolved_obs_path.is_dir():
+        raise ValueError(
+            "external FITS path must point to a FITS file, but got a directory: "
+            f"{resolved_obs_path}. This often means the shell variable passed to --obs-path is empty."
+        )
+    if not resolved_obs_path.is_file():
+        raise ValueError(f"external FITS path is not a regular file: {resolved_obs_path}")
+
+    try:
+        data_arr, header, hdu_name = load_2d_fits_image(resolved_obs_path)
+    except OSError as exc:
+        raise ValueError(f"failed to read external FITS file: {resolved_obs_path}: {exc}") from exc
     resolved_domain = _normalize_domain(domain)
+    header_psf = extract_psf_metadata_from_header(header)
 
     frequency_ghz = extract_frequency_ghz(header) if resolved_domain == "mw" else _infer_frequency_ghz(header)
     wavelength_angstrom = _extract_wavelength_angstrom(header)
@@ -494,9 +527,9 @@ def _load_external_obs_map(
         wavelength_angstrom=wavelength_angstrom,
         date_obs=_infer_date_obs(header),
         source_mode="external_fits",
-        source_path=str(Path(obs_path).expanduser().resolve()),
+        source_path=str(resolved_obs_path),
         source_map_id=None,
-        psf_metadata=None,
+        psf_metadata=None if header_psf is None else header_psf.as_dict(),
         wcs_metadata={"hdu_name": str(hdu_name)},
     )
 
@@ -531,6 +564,7 @@ def _load_internal_obs_map(
         header_text = _decode_h5_scalar(group["wcs_header"][()])
 
     header = fits.Header.fromstring(header_text, sep="\n")
+    header_psf = extract_psf_metadata_from_header(header)
     frequency_ghz = _infer_frequency_ghz(header)
     wavelength_angstrom = _extract_wavelength_angstrom(header)
     if wavelength_angstrom is None:
@@ -570,7 +604,7 @@ def _load_internal_obs_map(
         source_mode="model_refmap",
         source_path=str(resolved_model_h5),
         source_map_id=resolved_map_id,
-        psf_metadata=None,
+        psf_metadata=None if header_psf is None else header_psf.as_dict(),
         wcs_metadata={
             "group_path": group_path,
             "available_map_ids": available_map_ids,

@@ -29,6 +29,7 @@ import numpy as np
 from astropy.io import fits
 
 from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, validate_obs_map_identity
+from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     SPARSE_ARTIFACT_KIND,
@@ -1129,6 +1130,7 @@ def _save_ab_scan_h5(
     rho2: np.ndarray,
     eta2: np.ndarray,
     success: np.ndarray,
+    psf_kernel: np.ndarray | None,
     point_payloads: dict[tuple[int, int], dict[str, Any]],
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -1147,6 +1149,7 @@ def _save_ab_scan_h5(
         rho2=rho2,
         eta2=eta2,
         success=success,
+        psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         point_payloads=point_payloads,
         slice_key=slice_descriptor_from_diagnostics(diagnostics)["key"],
         run_history=run_history,
@@ -1772,12 +1775,15 @@ def main() -> int:
 
     print("\nEstimating noise from map...")
     noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+        noise_unit = obs_map_noise_unit_label(obs_map)
+                print(f"  Falling back to fixed sigma = {int(noise_result.sigma)} {noise_unit}")
     sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
     noise_diag = noise_result.diagnostics
     if str(noise_result.method_used) == "fallback_std":
         print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} K")
     else:
         print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
+                    print(f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit}")
         print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
 
     sdk = import_module("gxrender.sdk")
@@ -2265,6 +2271,7 @@ def main() -> int:
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 blos_reference=common_blos_reference,
+                psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
                 point_records=[],
                 run_history=current_run_history,
             )
@@ -2541,6 +2548,7 @@ def main() -> int:
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 blos_reference=common_blos_reference,
+                psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
                 point_payload=point_payload,
             )
             _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
@@ -2673,6 +2681,7 @@ def main() -> int:
         rho2=rho2,
         eta2=eta2,
         success=success,
+        psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         point_payloads=point_payloads,
         run_history=current_run_history,
     )
@@ -2990,6 +2999,7 @@ def main() -> int:
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 blos_reference=common_blos_reference,
+                psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
                 point_payload=point_payloads[(int(i), int(j))],
             )
             _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")

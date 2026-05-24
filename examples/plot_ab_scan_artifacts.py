@@ -20,8 +20,10 @@ try:
         METRICS,
         best_grid_index,
         build_patch_grid_model,
+        default_point_index,
         load_scan_file,
         nearest_index,
+        resolve_point_index,
         with_observer_metadata,
     )
 except ModuleNotFoundError:
@@ -30,8 +32,10 @@ except ModuleNotFoundError:
         METRICS,
         best_grid_index,
         build_patch_grid_model,
+        default_point_index,
         load_scan_file,
         nearest_index,
+        resolve_point_index,
         with_observer_metadata,
     )
 
@@ -67,6 +71,7 @@ def _plot_grid_summary(
 
     a_values = np.asarray(payload["a_values"], dtype=float)
     b_values = np.asarray(payload["b_values"], dtype=float)
+    a_index, b_index = resolve_point_index(payload, metric=str(payload.get("target_metric", "chi2")), a_index=a_index, b_index=b_index)
     grid_model = build_patch_grid_model(payload)
     records = list(grid_model["records"])
     record_lookup = {(int(record["a_index"]), int(record["b_index"])): record for record in records}
@@ -204,10 +209,7 @@ def _plot_selected_point(
     show_plot: bool,
     defer_show: bool = False,
 ) -> None:
-    a_values = np.asarray(payload["a_values"], dtype=float)
-    b_values = np.asarray(payload["b_values"], dtype=float)
-    a_index = int(np.clip(int(a_index), 0, max(0, a_values.size - 1)))
-    b_index = int(np.clip(int(b_index), 0, max(0, b_values.size - 1)))
+    a_index, b_index = resolve_point_index(payload, metric=str(payload.get("target_metric", "chi2")), a_index=a_index, b_index=b_index)
     point = payload["points"][(a_index, b_index)]
     diagnostics = dict(payload["diagnostics"])
     diagnostics.update(point["diagnostics"])
@@ -318,8 +320,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     payload = load_scan_file(args.artifact_h5, slice_key=args.slice_key)
-    a_index = int(args.a_index) if args.a_index is not None else 0
-    b_index = int(args.b_index) if args.b_index is not None else 0
+    default_a, default_b = default_point_index(payload, str(payload.get("target_metric", "chi2")))
+    a_index = int(args.a_index) if args.a_index is not None else int(default_a)
+    b_index = int(args.b_index) if args.b_index is not None else int(default_b)
     explicit_point_selection = any(
         [
             args.best_of_grid is not None,
@@ -333,11 +336,17 @@ def main() -> int:
     if args.best_of_grid is not None:
         a_index, b_index = best_grid_index(payload, str(args.best_of_grid))
     elif not explicit_point_selection:
-        a_index, b_index = best_grid_index(payload, str(payload.get("target_metric", "chi2")))
+        a_index, b_index = default_point_index(payload, str(payload.get("target_metric", "chi2")))
     if args.a_value is not None:
         a_index = nearest_index(np.asarray(payload["a_values"], dtype=float), float(args.a_value))
     if args.b_value is not None:
         b_index = nearest_index(np.asarray(payload["b_values"], dtype=float), float(args.b_value))
+    a_index, b_index = resolve_point_index(
+        payload,
+        metric=str(args.best_of_grid or payload.get("target_metric", "chi2")),
+        a_index=a_index,
+        b_index=b_index,
+    )
     show_point = (not bool(args.grid)) or explicit_point_selection
     show_plot = not bool(args.no_plot)
     plot_ab_scan_file(

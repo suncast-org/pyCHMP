@@ -40,12 +40,24 @@ from pychmp import (
     build_tr_region_mask_from_blos,
     fit_q0_to_observation,
     load_obs_map,
+    obs_map_noise_unit_label,
     resolve_render_geometry_via_gxrender,
     resolve_default_testdata_fixture_paths,
     validate_obs_map_identity,
 )
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
 from pychmp.geometry_policy import resolve_geometry_policy
+from pychmp.psf import (
+    KernelConvolvedRenderer as _CoreKernelConvolvedRenderer,
+    build_psf_kernel as _core_build_psf_kernel,
+    default_psf_metadata as _core_default_psf_metadata,
+    effective_psf_parameters as _core_effective_psf_parameters,
+    elliptical_gaussian_kernel as _core_elliptical_gaussian_kernel,
+    extract_psf_metadata_from_header as _core_extract_psf_metadata_from_header,
+    format_psf_report as _core_format_psf_report,
+    PSFMetadata,
+    resolve_psf_metadata as _core_resolve_psf_metadata,
+)
 
 try:
     from q0_artifact_plot import plot_q0_artifact_panel
@@ -60,6 +72,8 @@ DEFAULT_TBASE = 1.0e6
 DEFAULT_NBASE = 1.0e8
 DEFAULT_A = 0.3
 DEFAULT_B = 2.7
+
+
 @dataclass(frozen=True)
 class _ObservationRequest:
     source_mode: str
@@ -162,6 +176,22 @@ def _format_euv_channel(wavelength_angstrom: float) -> str:
     if np.isclose(float(wavelength_angstrom), float(rounded), rtol=0.0, atol=1e-9):
         return str(int(rounded))
     return f"{float(wavelength_angstrom):.6g}"
+
+
+def _normalize_psf_instrument_key(instrument_name: str | None) -> str:
+    return "".join(ch for ch in str(instrument_name or "").strip().lower() if ch.isalnum())
+
+
+def _default_instrument_psf(instrument_name: str | None) -> tuple[dict[str, float] | None, str]:
+    metadata = _core_default_psf_metadata(domain="euv", instrument_name=instrument_name)
+    if metadata is None or metadata.kind != "gaussian":
+        return None, "none"
+    payload = metadata.as_dict()
+    return {
+        "psf_bmaj_arcsec": float(payload["psf_bmaj_arcsec"]),
+        "psf_bmin_arcsec": float(payload["psf_bmin_arcsec"]),
+        "psf_bpa_deg": float(payload["psf_bpa_deg"]),
+    }, str(metadata.source)
 
 
 def _spectral_label_for_obs_map(obs_map: Any) -> str:
@@ -270,37 +300,15 @@ def _first_header_value(header: fits.Header, keys: tuple[str, ...]) -> Any | Non
 
 
 def _extract_psf_from_header(header: fits.Header) -> tuple[dict[str, float] | None, str]:
-    bmaj_raw = _first_header_value(header, ("BMAJ", "BMAJ_DEG", "BMAJDEG", "BEAM_MAJ", "PSF_BMAJ"))
-    bmin_raw = _first_header_value(header, ("BMIN", "BMIN_DEG", "BMINDEG", "BEAM_MIN", "PSF_BMIN"))
-    bpa_raw = _first_header_value(header, ("BPA", "BPA_DEG", "BEAM_PA", "PSF_BPA"))
-
-    if bmaj_raw is None or bmin_raw is None:
+    metadata = _core_extract_psf_metadata_from_header(header)
+    if metadata is None:
         return None, "none"
-
-    try:
-        bmaj = float(bmaj_raw)
-        bmin = float(bmin_raw)
-        bpa = float(bpa_raw) if bpa_raw is not None else 0.0
-    except Exception:
-        return None, "none"
-
-    # Standard FITS BMAJ/BMIN are in degrees; arcsec-style custom keys tend to
-    # say so explicitly and are usually much larger than 1.
-    if abs(bmaj) <= 1.0 and abs(bmin) <= 1.0:
-        bmaj_arcsec = bmaj * 3600.0
-        bmin_arcsec = bmin * 3600.0
-    else:
-        bmaj_arcsec = bmaj
-        bmin_arcsec = bmin
-
-    if not (np.isfinite(bmaj_arcsec) and np.isfinite(bmin_arcsec) and bmaj_arcsec > 0 and bmin_arcsec > 0):
-        return None, "none"
-
+    payload = metadata.as_dict()
     return {
-        "psf_bmaj_arcsec": float(bmaj_arcsec),
-        "psf_bmin_arcsec": float(bmin_arcsec),
-        "psf_bpa_deg": float(bpa),
-    }, "fits_header"
+        "psf_bmaj_arcsec": float(payload["psf_bmaj_arcsec"]),
+        "psf_bmin_arcsec": float(payload["psf_bmin_arcsec"]),
+        "psf_bpa_deg": float(payload["psf_bpa_deg"]),
+    }, str(metadata.source)
 
 
 def _effective_psf_parameters(
@@ -312,25 +320,22 @@ def _effective_psf_parameters(
     ref_frequency_ghz: float | None,
     scale_inverse_frequency: bool,
 ) -> dict[str, float | bool] | None:
-    if bmaj_arcsec is None or bmin_arcsec is None or bpa_deg is None:
-        return None
-    psf_scale = (
-        float(ref_frequency_ghz) / float(active_frequency_ghz)
-        if scale_inverse_frequency and ref_frequency_ghz is not None
-        else 1.0
+    metadata = None
+    if bmaj_arcsec is not None and bmin_arcsec is not None and bpa_deg is not None:
+        metadata = PSFMetadata(
+            source="compatibility_wrapper",
+            kind="gaussian",
+            bmaj_arcsec=float(bmaj_arcsec),
+            bmin_arcsec=float(bmin_arcsec),
+            bpa_deg=float(bpa_deg),
+            allows_frequency_scaling=True,
+        )
+    return _core_effective_psf_parameters(
+        metadata=metadata,
+        active_frequency_ghz=active_frequency_ghz,
+        ref_frequency_ghz=ref_frequency_ghz,
+        scale_inverse_frequency=scale_inverse_frequency,
     )
-    return {
-        "reference_bmaj_arcsec": float(bmaj_arcsec),
-        "reference_bmin_arcsec": float(bmin_arcsec),
-        "reference_bpa_deg": float(bpa_deg),
-        "active_bmaj_arcsec": float(bmaj_arcsec) * float(psf_scale),
-        "active_bmin_arcsec": float(bmin_arcsec) * float(psf_scale),
-        "active_bpa_deg": float(bpa_deg),
-        "reference_frequency_ghz": float(ref_frequency_ghz) if ref_frequency_ghz is not None else float(active_frequency_ghz),
-        "active_frequency_ghz": float(active_frequency_ghz),
-        "scaled": bool(scale_inverse_frequency and ref_frequency_ghz is not None and not np.isclose(psf_scale, 1.0)),
-        "scale_factor": float(psf_scale),
-    }
 
 
 def _format_psf_report(
@@ -343,32 +348,46 @@ def _format_psf_report(
     ref_frequency_ghz: float | None,
     scale_inverse_frequency: bool,
 ) -> str:
-    if source == "none" or bmaj_arcsec is None or bmin_arcsec is None or bpa_deg is None:
-        return "PSF source: none"
-    psf = _effective_psf_parameters(
-        bmaj_arcsec=bmaj_arcsec,
-        bmin_arcsec=bmin_arcsec,
-        bpa_deg=bpa_deg,
+    metadata = None
+    if source != "none" and bmaj_arcsec is not None and bmin_arcsec is not None and bpa_deg is not None:
+        metadata = PSFMetadata(
+            source=source,
+            kind="gaussian",
+            bmaj_arcsec=float(bmaj_arcsec),
+            bmin_arcsec=float(bmin_arcsec),
+            bpa_deg=float(bpa_deg),
+            allows_frequency_scaling=True,
+        )
+    return _core_format_psf_report(
+        metadata=metadata,
         active_frequency_ghz=active_frequency_ghz,
         ref_frequency_ghz=ref_frequency_ghz,
         scale_inverse_frequency=scale_inverse_frequency,
     )
-    assert psf is not None
-    if bool(psf["scaled"]):
-        return (
-            f"PSF source: {source} "
-            f"reference beam: bmaj={float(psf['reference_bmaj_arcsec']):.3f} "
-            f"bmin={float(psf['reference_bmin_arcsec']):.3f} "
-            f"bpa={float(psf['reference_bpa_deg']):.3f} @ {float(psf['reference_frequency_ghz']):.3f} GHz"
-            f"\n    rescaled beam: bmaj={float(psf['active_bmaj_arcsec']):.3f} "
-            f"bmin={float(psf['active_bmin_arcsec']):.3f} "
-            f"bpa={float(psf['active_bpa_deg']):.3f} @ {float(psf['active_frequency_ghz']):.3f} GHz"
+
+
+def _format_static_psf_report(
+    *,
+    source: str,
+    bmaj_arcsec: float | None,
+    bmin_arcsec: float | None,
+    bpa_deg: float | None,
+) -> str:
+    metadata = None
+    if source != "none" and bmaj_arcsec is not None and bmin_arcsec is not None and bpa_deg is not None:
+        metadata = PSFMetadata(
+            source=source,
+            kind="gaussian",
+            bmaj_arcsec=float(bmaj_arcsec),
+            bmin_arcsec=float(bmin_arcsec),
+            bpa_deg=float(bpa_deg),
+            allows_frequency_scaling=False,
         )
-    return (
-        f"PSF source: {source} "
-        f"beam: bmaj={float(psf['active_bmaj_arcsec']):.3f} "
-        f"bmin={float(psf['active_bmin_arcsec']):.3f} "
-        f"bpa={float(psf['active_bpa_deg']):.3f} @ {float(psf['active_frequency_ghz']):.3f} GHz"
+    return _core_format_psf_report(
+        metadata=metadata,
+        active_frequency_ghz=None,
+        ref_frequency_ghz=None,
+        scale_inverse_frequency=False,
     )
 
 
@@ -376,6 +395,10 @@ def _resolve_selected_psf(
     *,
     header_psf: dict[str, float] | None,
     header_psf_source: str,
+    domain: str = "euv",
+    instrument_name: str | None,
+    wavelength_angstrom: float | None = None,
+    date_obs: str | None = None,
     cli_psf_bmaj_arcsec: float | None,
     cli_psf_bmin_arcsec: float | None,
     cli_psf_bpa_deg: float | None,
@@ -384,46 +407,74 @@ def _resolve_selected_psf(
     fallback_psf_bpa_deg: float | None,
     override_header_psf: bool,
 ) -> tuple[float | None, float | None, float | None, str, bool]:
-    has_cli_psf_override = any(
-        value is not None for value in (cli_psf_bmaj_arcsec, cli_psf_bmin_arcsec, cli_psf_bpa_deg)
+    selected_metadata = _resolve_selected_psf_metadata(
+        header_psf=header_psf,
+        header_psf_source=header_psf_source,
+        domain=domain,
+        instrument_name=instrument_name,
+        wavelength_angstrom=wavelength_angstrom,
+        date_obs=date_obs,
+        cli_psf_bmaj_arcsec=cli_psf_bmaj_arcsec,
+        cli_psf_bmin_arcsec=cli_psf_bmin_arcsec,
+        cli_psf_bpa_deg=cli_psf_bpa_deg,
+        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
+        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
+        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
+        override_header_psf=override_header_psf,
     )
-    has_cli_psf_fallback = any(
-        value is not None for value in (fallback_psf_bmaj_arcsec, fallback_psf_bmin_arcsec, fallback_psf_bpa_deg)
+    if selected_metadata is None or selected_metadata.kind != "gaussian":
+        return None, None, None, "none" if selected_metadata is None else str(selected_metadata.source), False
+    return (
+        float(selected_metadata.bmaj_arcsec) if selected_metadata.bmaj_arcsec is not None else None,
+        float(selected_metadata.bmin_arcsec) if selected_metadata.bmin_arcsec is not None else None,
+        float(selected_metadata.bpa_deg) if selected_metadata.bpa_deg is not None else None,
+        str(selected_metadata.source),
+        bool(selected_metadata.allows_frequency_scaling),
     )
 
-    if header_psf is not None and not override_header_psf:
-        return (
-            float(header_psf["psf_bmaj_arcsec"]),
-            float(header_psf["psf_bmin_arcsec"]),
-            float(header_psf["psf_bpa_deg"]),
-            header_psf_source,
-            False,
-        )
-    if has_cli_psf_override:
-        return (
-            cli_psf_bmaj_arcsec,
-            cli_psf_bmin_arcsec,
-            cli_psf_bpa_deg,
-            "cli_override",
-            True,
-        )
+
+def _resolve_selected_psf_metadata(
+    *,
+    header_psf: dict[str, float] | None,
+    header_psf_source: str,
+    domain: str,
+    instrument_name: str | None,
+    wavelength_angstrom: float | None = None,
+    date_obs: str | None = None,
+    cli_psf_bmaj_arcsec: float | None,
+    cli_psf_bmin_arcsec: float | None,
+    cli_psf_bpa_deg: float | None,
+    fallback_psf_bmaj_arcsec: float | None,
+    fallback_psf_bmin_arcsec: float | None,
+    fallback_psf_bpa_deg: float | None,
+    override_header_psf: bool,
+) -> PSFMetadata | None:
+    header_metadata = None
     if header_psf is not None:
-        return (
-            float(header_psf["psf_bmaj_arcsec"]),
-            float(header_psf["psf_bmin_arcsec"]),
-            float(header_psf["psf_bpa_deg"]),
-            header_psf_source,
-            False,
+        header_metadata = PSFMetadata(
+            source=header_psf_source,
+            kind="gaussian",
+            bmaj_arcsec=float(header_psf["psf_bmaj_arcsec"]),
+            bmin_arcsec=float(header_psf["psf_bmin_arcsec"]),
+            bpa_deg=float(header_psf["psf_bpa_deg"]),
+            allows_frequency_scaling=False,
         )
-    if has_cli_psf_fallback:
-        return (
-            fallback_psf_bmaj_arcsec,
-            fallback_psf_bmin_arcsec,
-            fallback_psf_bpa_deg,
-            "cli_fallback",
-            True,
-        )
-    return None, None, None, "none", False
+    selected_metadata = _core_resolve_psf_metadata(
+        header_psf=header_metadata,
+        domain=domain,
+        instrument_name=instrument_name,
+        wavelength_angstrom=wavelength_angstrom,
+        date_obs=date_obs,
+        cli_psf_kernel=None,
+        cli_psf_bmaj_arcsec=cli_psf_bmaj_arcsec,
+        cli_psf_bmin_arcsec=cli_psf_bmin_arcsec,
+        cli_psf_bpa_deg=cli_psf_bpa_deg,
+        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
+        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
+        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
+        override_header_psf=override_header_psf,
+    )
+    return selected_metadata
 
 
 def load_eovsa_map(fits_path: Path) -> tuple[np.ndarray, fits.Header, float]:
@@ -443,37 +494,18 @@ def _elliptical_gaussian_kernel(
     dy_arcsec: float,
     size: int = 41,
 ) -> np.ndarray:
-    fwhm_to_sigma = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    sigma_x = (bmaj_arcsec * fwhm_to_sigma) / dx_arcsec
-    sigma_y = (bmin_arcsec * fwhm_to_sigma) / dy_arcsec
-
-    half = size // 2
-    yy, xx = np.mgrid[-half : half + 1, -half : half + 1]
-
-    theta = np.deg2rad(bpa_deg)
-    ct = np.cos(theta)
-    st = np.sin(theta)
-
-    x_rot = ct * xx + st * yy
-    y_rot = -st * xx + ct * yy
-    kernel = np.exp(-0.5 * ((x_rot / sigma_x) ** 2 + (y_rot / sigma_y) ** 2))
-    kernel /= np.sum(kernel)
-    return kernel
+    return _core_elliptical_gaussian_kernel(
+        bmaj_arcsec=bmaj_arcsec,
+        bmin_arcsec=bmin_arcsec,
+        bpa_deg=bpa_deg,
+        dx_arcsec=dx_arcsec,
+        dy_arcsec=dy_arcsec,
+        size=size,
+    )
 
 
-class PSFConvolvedRenderer:
-    def __init__(self, base_renderer: Any, kernel: np.ndarray) -> None:
-        self._base = base_renderer
-        self._kernel = kernel
-
-    def render_pair(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
-        raw = self._base.render(q0)
-        convolved = fftconvolve(raw, self._kernel, mode="same")
-        return raw, convolved
-
-    def render(self, q0: float) -> np.ndarray:
-        _raw, convolved = self.render_pair(q0)
-        return convolved
+class PSFConvolvedRenderer(_CoreKernelConvolvedRenderer):
+    pass
 
 
 def _lookup_cached_render_pair(
@@ -744,16 +776,20 @@ def _with_observer_wcs_keywords(
     dsun_obs_m: float,
 ) -> fits.Header:
     out = header.copy()
-    out["OBSERVER"] = str(observer_name)
-    out["DSUN_OBS"] = float(dsun_obs_m)
-    out["HGLN_OBS"] = float(hgln_obs_deg)
-    out["HGLT_OBS"] = float(hglt_obs_deg)
-    out["CRLN_OBS"] = float(hgln_obs_deg)
-    out["CRLT_OBS"] = float(hglt_obs_deg)
-    out["HGLN-OBS"] = float(hgln_obs_deg)
-    out["HGLT-OBS"] = float(hglt_obs_deg)
-    out["CRLN-OBS"] = float(hgln_obs_deg)
-    out["CRLT-OBS"] = float(hglt_obs_deg)
+    if observer_name is not None:
+        out["OBSERVER"] = str(observer_name)
+    if dsun_obs_m is not None:
+        out["DSUN_OBS"] = float(dsun_obs_m)
+    if hgln_obs_deg is not None:
+        out["HGLN_OBS"] = float(hgln_obs_deg)
+        out["CRLN_OBS"] = float(hgln_obs_deg)
+        out["HGLN-OBS"] = float(hgln_obs_deg)
+        out["CRLN-OBS"] = float(hgln_obs_deg)
+    if hglt_obs_deg is not None:
+        out["HGLT_OBS"] = float(hglt_obs_deg)
+        out["CRLT_OBS"] = float(hglt_obs_deg)
+        out["HGLT-OBS"] = float(hglt_obs_deg)
+        out["CRLT-OBS"] = float(hglt_obs_deg)
     return out
 
 
@@ -1459,11 +1495,12 @@ Examples:
 
         print(f"\nEstimating noise from map...")
         noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+        noise_unit = obs_map_noise_unit_label(obs_map)
         if str(noise_result.method_used) == "fallback_std":
             print("  ⚠️  Noise estimation failed (map quality issues)")
-            print(f"  Falling back to fixed sigma = {int(noise_result.sigma)}K")
+            print(f"  Falling back to fixed sigma = {int(noise_result.sigma)} {noise_unit}")
         else:
-            print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
+            print(f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit}")
             print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
         sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
         noise_diagnostics = noise_result.diagnostics
@@ -1666,15 +1703,13 @@ Examples:
     fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
     fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
     fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
-    (
-        psf_bmaj_arcsec,
-        psf_bmin_arcsec,
-        psf_bpa_deg,
-        psf_source,
-        psf_allows_frequency_scaling,
-    ) = _resolve_selected_psf(
+    selected_psf_metadata = _resolve_selected_psf_metadata(
         header_psf=header_psf,
         header_psf_source=header_psf_source,
+        domain=render_selection.domain,
+        instrument_name=render_selection.euv_instrument if render_selection.domain != "mw" else None,
+        wavelength_angstrom=None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        date_obs=obs_map.date_obs,
         cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
         cli_psf_bmin_arcsec=psf_bmin_arcsec,
         cli_psf_bpa_deg=psf_bpa_deg,
@@ -1683,45 +1718,39 @@ Examples:
         fallback_psf_bpa_deg=fallback_psf_bpa_deg,
         override_header_psf=bool(args.override_header_psf),
     )
-
-    if render_selection.domain != "mw":
-        if any(
-            value is not None
-            for value in (
-                args.psf_bmaj_arcsec,
-                args.psf_bmin_arcsec,
-                args.psf_bpa_deg,
-                args.fallback_psf_bmaj_arcsec,
-                args.fallback_psf_bmin_arcsec,
-                args.fallback_psf_bpa_deg,
-                args.psf_ref_frequency_ghz,
-            )
-        ) or bool(args.psf_scale_inverse_frequency) or bool(args.override_header_psf):
-            print(
-                "ERROR: MW beam/PSF CLI options are not supported on the one-point EUV/UV path yet."
-            )
-            exit(1)
+    psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
+    psf_allows_frequency_scaling = bool(
+        False if selected_psf_metadata is None else selected_psf_metadata.allows_frequency_scaling
+    )
+    if selected_psf_metadata is not None and selected_psf_metadata.kind == "gaussian":
+        psf_bmaj_arcsec = selected_psf_metadata.bmaj_arcsec
+        psf_bmin_arcsec = selected_psf_metadata.bmin_arcsec
+        psf_bpa_deg = selected_psf_metadata.bpa_deg
+    else:
         psf_bmaj_arcsec = None
         psf_bmin_arcsec = None
         psf_bpa_deg = None
-        psf_source = "none"
-        psf_allows_frequency_scaling = False
 
     if render_selection.domain == "mw":
         print(
             "  "
-            + _format_psf_report(
-                source=str(psf_source),
-                bmaj_arcsec=psf_bmaj_arcsec,
-                bmin_arcsec=psf_bmin_arcsec,
-                bpa_deg=psf_bpa_deg,
+            + _core_format_psf_report(
+                metadata=selected_psf_metadata,
                 active_frequency_ghz=float(freq_ghz),
                 ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
+                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
             )
         )
     else:
-        print("  PSF source: none (one-point EUV/UV path currently compares the direct rendered map)")
+        print(
+            "  "
+            + _core_format_psf_report(
+                metadata=selected_psf_metadata,
+                active_frequency_ghz=None,
+                ref_frequency_ghz=None,
+                scale_inverse_frequency=False,
+            )
+        )
     print(f"  Plasma/heating: a={a_param:.3f} b={b_param:.3f} tbase={tbase:.3e} nbase={nbase:.3e}")
 
 
@@ -1763,24 +1792,17 @@ Examples:
             )
             base_adapter = GXRenderEUVAdapter(**adapter_kwargs)
         renderer = base_adapter
-        if render_selection.domain == "mw" and psf_bmaj_arcsec is not None and psf_bmin_arcsec is not None and psf_bpa_deg is not None:
-            psf_meta = _effective_psf_parameters(
-                bmaj_arcsec=psf_bmaj_arcsec,
-                bmin_arcsec=psf_bmin_arcsec,
-                bpa_deg=psf_bpa_deg,
-                active_frequency_ghz=float(freq_ghz),
-                ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
-            )
-            assert psf_meta is not None
-            kernel = _elliptical_gaussian_kernel(
-                bmaj_arcsec=float(psf_meta["active_bmaj_arcsec"]),
-                bmin_arcsec=float(psf_meta["active_bmin_arcsec"]),
-                bpa_deg=float(psf_bpa_deg),
+        if selected_psf_metadata is not None:
+            psf_kernel, _psf_kernel_meta = _core_build_psf_kernel(
+                metadata=selected_psf_metadata,
                 dx_arcsec=float(geometry.dx),
                 dy_arcsec=float(geometry.dy),
+                active_frequency_ghz=float(freq_ghz) if render_selection.domain == "mw" else None,
+                ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
+                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
             )
-            renderer = PSFConvolvedRenderer(base_adapter, kernel)
+            if psf_kernel is not None:
+                renderer = PSFConvolvedRenderer(base_adapter, psf_kernel)
         print("  ✓ Model loaded successfully")
     except Exception as e:
         print(f"  ✗ Failed to initialize gxrender adapter: {e}")

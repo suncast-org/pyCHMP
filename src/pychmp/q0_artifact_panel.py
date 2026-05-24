@@ -8,6 +8,7 @@ import h5py
 import numpy as np
 from astropy.io import fits
 from astropy.wcs import FITSFixedWarning, WCS
+from matplotlib.patches import Ellipse
 from matplotlib.figure import Figure
 from matplotlib.colors import LogNorm, Normalize, SymLogNorm
 
@@ -82,6 +83,54 @@ def _spectral_label(diagnostics: dict[str, Any] | None, frequency_ghz: float | N
     if channel_label:
         return channel_label
     return "selected slice"
+
+
+def _resolved_psf_summary(diagnostics: dict[str, Any] | None) -> tuple[str, dict[str, float] | None]:
+    diag = diagnostics or {}
+    resolved_psf = dict(diag.get("resolved_psf") or {})
+    source = str(resolved_psf.get("source") or diag.get("psf_source") or "").strip()
+    kind = str(resolved_psf.get("kind") or "").strip().lower()
+
+    def _beam_payload(source_name: str, payload: dict[str, Any]) -> tuple[str, dict[str, float] | None]:
+        bmaj = _optional_float(payload.get("active_bmaj_arcsec"))
+        bmin = _optional_float(payload.get("active_bmin_arcsec"))
+        bpa = _optional_float(payload.get("active_bpa_deg"))
+        if bmaj is None or bmin is None:
+            bmaj = _optional_float(payload.get("psf_bmaj_arcsec"))
+            bmin = _optional_float(payload.get("psf_bmin_arcsec"))
+            bpa = _optional_float(payload.get("psf_bpa_deg")) if bpa is None else bpa
+        if bmaj is None or bmin is None:
+            return "", None
+        source_prefix = f"{source_name} " if source_name else ""
+        bpa_text = f" PA={bpa:.1f}°" if bpa is not None else ""
+        return (
+            f"\nPSF: {source_prefix}{bmaj:.1f}\"x{bmin:.1f}\"{bpa_text}",
+            {
+                "bmaj_arcsec": float(bmaj),
+                "bmin_arcsec": float(bmin),
+                "bpa_deg": 0.0 if bpa is None else float(bpa),
+            },
+        )
+
+    if kind == "kernel":
+        kernel_shape = resolved_psf.get("psf_kernel_shape")
+        kernel_text = ""
+        if isinstance(kernel_shape, (list, tuple)) and len(kernel_shape) == 2:
+            try:
+                kernel_text = f" {int(kernel_shape[0])}x{int(kernel_shape[1])}"
+            except Exception:
+                kernel_text = ""
+        source_prefix = f"{source} " if source else ""
+        return f"\nPSF: {source_prefix}kernel{kernel_text}", None
+    beam_text, beam_payload = _beam_payload(source, resolved_psf)
+    if beam_payload is not None:
+        return beam_text, beam_payload
+    legacy_payload = {
+        "psf_bmaj_arcsec": diag.get("psf_bmaj_arcsec"),
+        "psf_bmin_arcsec": diag.get("psf_bmin_arcsec"),
+        "psf_bpa_deg": diag.get("psf_bpa_deg"),
+    }
+    return _beam_payload(source, legacy_payload)
 
 
 def _load_embedded_blos_reference(f: h5py.File) -> tuple[np.ndarray, fits.Header] | None:
@@ -489,7 +538,7 @@ class Q0ArtifactPanelFigure:
             self._common_images[name] = image
             self._common_colorbars[name] = colorbar
             self._common_notes[name] = note
-            self._common_notes[name] = note
+            axis._psf_overlay = None
 
         self._blos_ax = self.figure.add_subplot(gs[0, 0])
         self._blos_image = None
@@ -541,6 +590,46 @@ class Q0ArtifactPanelFigure:
         self._common_colorbars[name].update_normal(image)
         axis.set_title(title)
         self._common_notes[name].set_text(note)
+
+    def _update_psf_overlay(self, *, name: str, diagnostics: dict[str, Any], header: fits.Header) -> None:
+        axis = self._common_axes.get(name)
+        if axis is None:
+            return
+        previous = getattr(axis, "_psf_overlay", None)
+        if previous is not None:
+            try:
+                previous.remove()
+            except Exception:
+                pass
+            axis._psf_overlay = None
+        if name != "modeled":
+            return
+        _legend, beam_payload = _resolved_psf_summary(diagnostics)
+        if beam_payload is None:
+            return
+        dx_arcsec = abs(_optional_float(header.get("CDELT1")) or 0.0)
+        dy_arcsec = abs(_optional_float(header.get("CDELT2")) or 0.0)
+        if dx_arcsec <= 0.0 or dy_arcsec <= 0.0:
+            return
+        bmaj_px = float(beam_payload["bmaj_arcsec"]) / dx_arcsec
+        bmin_px = float(beam_payload["bmin_arcsec"]) / dy_arcsec
+        if not np.isfinite(bmaj_px) or not np.isfinite(bmin_px) or bmaj_px <= 0.0 or bmin_px <= 0.0:
+            return
+        ny, nx = self._shape
+        center_x = max(0.15 * float(nx), 0.5 * bmaj_px + 4.0)
+        center_y = max(0.15 * float(ny), 0.5 * bmin_px + 4.0)
+        overlay = Ellipse(
+            (center_x, center_y),
+            width=bmaj_px,
+            height=bmin_px,
+            angle=float(beam_payload["bpa_deg"]),
+            facecolor="none",
+            edgecolor="white",
+            linewidth=1.6,
+            alpha=0.95,
+        )
+        axis.add_patch(overlay)
+        axis._psf_overlay = overlay
 
     def _show_blos_placeholder(self, *, a_text: str, b_text: str, message: str) -> None:
         if self._blos_colorbar is not None:
@@ -919,17 +1008,9 @@ class Q0ArtifactPanelFigure:
         # stay layout-identical and simply fall back silently to best-fit maps.
         map_suffix = ""
 
-        psf_bmaj_val = diag.get("psf_bmaj_arcsec")
-        psf_bmin_val = diag.get("psf_bmin_arcsec")
-        psf_bpa_val = diag.get("psf_bpa_deg")
+        psf_legend, _beam_payload = _resolved_psf_summary(diag)
         noise_frac_val = diag.get("noise_frac")
         noise_std_val = diag.get("noise_std")
-
-        if psf_bmaj_val is not None and psf_bmin_val is not None:
-            bpa_part = f"  PA={fmt(psf_bpa_val, '.1f')}°" if psf_bpa_val is not None else ""
-            psf_legend = f"\nPSF: {fmt(psf_bmaj_val, '.1f')}\"×{fmt(psf_bmin_val, '.1f')}\"{bpa_part}"
-        else:
-            psf_legend = ""
 
         if noise_frac_val is not None:
             noise_legend = f"\nnoise: {fmt(float(noise_frac_val) * 100.0, '.1f')}%"
@@ -974,6 +1055,8 @@ class Q0ArtifactPanelFigure:
             vmin=_coerce_axis_limit(residual_map_vmin),
             vmax=_coerce_axis_limit(residual_map_vmax),
         )
+        for panel_name in ("observed", "raw_modeled", "modeled", "residual"):
+            self._update_psf_overlay(name=panel_name, diagnostics=diag, header=header)
 
         self._update_blos_panel(
             model_path=model_path,

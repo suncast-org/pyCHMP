@@ -5,7 +5,7 @@ import numpy as np
 from astropy.io import fits
 import pytest
 
-from pychmp import estimate_obs_map_noise, load_obs_map, validate_obs_map_identity
+from pychmp import estimate_obs_map_noise, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity
 
 
 def test_load_obs_map_mw_external_fits_extracts_frequency(tmp_path) -> None:
@@ -71,6 +71,11 @@ def test_load_obs_map_mw_external_fits_rejects_non_frequency_wcs_axis(tmp_path) 
         load_obs_map(obs_path=fits_path, domain="mw")
 
 
+def test_load_obs_map_external_fits_rejects_directory_path(tmp_path) -> None:
+    with pytest.raises(ValueError, match="must point to a FITS file, but got a directory"):
+        load_obs_map(obs_path=tmp_path, domain="mw", source_mode="external_fits")
+
+
 def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     fits_path = tmp_path / "aia_171.fits"
     data = np.ones((3, 5), dtype=np.float32)
@@ -79,6 +84,9 @@ def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     header["WAVEUNIT"] = "angstrom"
     header["INSTRUME"] = "AIA"
     header["DATE-OBS"] = "2020-11-26T20:00:00"
+    header["BMAJ"] = 2.0 / 3600.0
+    header["BMIN"] = 1.0 / 3600.0
+    header["BPA"] = 12.0
     fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
 
     obs_map = load_obs_map(obs_path=fits_path, domain="euv")
@@ -88,6 +96,12 @@ def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     assert obs_map.frequency_ghz is None
     assert obs_map.wavelength_angstrom == 171.0
     assert obs_map.spectral_label == "171 A"
+    assert obs_map.psf_metadata is not None
+    assert obs_map.psf_metadata["source"] == "fits_header"
+    assert obs_map.psf_metadata["kind"] == "gaussian"
+    assert obs_map.psf_metadata["psf_bmaj_arcsec"] == pytest.approx(2.0)
+    assert obs_map.psf_metadata["psf_bmin_arcsec"] == pytest.approx(1.0)
+    assert obs_map.psf_metadata["psf_bpa_deg"] == pytest.approx(12.0)
     np.testing.assert_allclose(obs_map.data, data)
 
 
@@ -193,3 +207,31 @@ def test_validate_obs_map_identity_rejects_euv_map_with_mw_hint(tmp_path) -> Non
 
     with pytest.raises(ValueError, match="requests MW"):
         validate_obs_map_identity(obs_map, frequency_ghz_hint=5.7)
+
+
+def test_obs_map_noise_unit_label_uses_kelvin_for_mw(tmp_path) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CUNIT3"] = "Hz"
+    header["CRVAL3"] = 2.874e9
+    header["BUNIT"] = "sfu"
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="mw")
+
+    assert obs_map_noise_unit_label(obs_map) == "K"
+
+
+def test_obs_map_noise_unit_label_uses_bunit_for_euv(tmp_path) -> None:
+    fits_path = tmp_path / "aia_171.fits"
+    data = np.ones((3, 5), dtype=np.float32)
+    header = fits.Header()
+    header["WAVELNTH"] = 171
+    header["WAVEUNIT"] = "angstrom"
+    header["BUNIT"] = "DN/s"
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="euv")
+
+    assert obs_map_noise_unit_label(obs_map) == "DN/s"

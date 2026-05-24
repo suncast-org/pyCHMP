@@ -5,13 +5,16 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from astropy.io import fits
 
 from examples.python.adaptive_ab_search_single_observation import (
+    _PersistentPointCache,
     _point_payload_from_result,
     _rescore_auxiliary_map_record,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
+from pychmp.ab_scan_artifacts import COMPATIBILITY_SIGNATURE_KEY, write_point_scan_artifact
 from pychmp.ab_search import ABPointResult
 from pychmp.metrics import MetricValues
 
@@ -238,3 +241,266 @@ def test_rescore_auxiliary_map_record_builds_promoted_point_payload() -> None:
     assert payload["diagnostics"]["map_store_source_slice_key"] == "euv_171"
     np.testing.assert_allclose(payload["modeled_best"], np.ones((2, 2), dtype=float))
     np.testing.assert_allclose(payload["trial_modeled_maps"][1], np.full((2, 2), 3.0, dtype=float))
+
+
+def test_start_over_promotes_same_signature_current_slice_points(tmp_path: Path) -> None:
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["SIMPLE"] = True
+    header["BITPIX"] = -32
+    header["NAXIS"] = 2
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    header["CTYPE1"] = "HPLN-TAN"
+    header["CTYPE2"] = "HPLT-TAN"
+    header["CUNIT1"] = "arcsec"
+    header["CUNIT2"] = "arcsec"
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 2.0
+    header["CDELT2"] = 2.0
+    header["DATE-OBS"] = "2020-11-26T20:00:00"
+
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-123",
+        "target_metric": "chi2",
+        "metrics_mask_threshold": 0.1,
+        "metrics_mask_source": "union_threshold",
+        "mask_type": "union",
+        "model_sha256": "a" * 64,
+        "fits_sha256": "b" * 64,
+        "ebtel_sha256": "c" * 64,
+        "frequency_ghz": 5.7,
+        "map_xc_arcsec": 0.0,
+        "map_yc_arcsec": 0.0,
+        "map_dx_arcsec": 2.0,
+        "map_dy_arcsec": 2.0,
+        "map_nx": 2,
+        "map_ny": 2,
+        "observer_name": "earth",
+        "observer_lonc_deg": 0.0,
+        "observer_b0sun_deg": 0.0,
+        "observer_dsun_cm": 1.495978707e13,
+        "observer_obs_time": "2020-11-26T20:00:00",
+        "target_slice_key": "mw_5p700000ghz",
+        "spectral_domain": "mw",
+        "spectral_label": "5.700 GHz",
+    }
+    point_record = {
+        "a": 0.3,
+        "b": 2.7,
+        "a_index": 0,
+        "b_index": 0,
+        "q0": 1.0,
+        "success": True,
+        "status": "computed",
+        "modeled_best": np.ones((2, 2), dtype=float),
+        "raw_modeled_best": np.ones((2, 2), dtype=float),
+        "residual": np.zeros((2, 2), dtype=float),
+        "fit_q0_trials": (0.5, 1.0),
+        "fit_metric_trials": (0.4, 0.1),
+        "fit_chi2_trials": (0.4, 0.1),
+        "fit_rho2_trials": (0.5, 0.2),
+        "fit_eta2_trials": (0.6, 0.3),
+        "trial_modeled_maps": np.stack(
+            [
+                np.full((2, 2), 0.9, dtype=float),
+                np.full((2, 2), 1.0, dtype=float),
+            ],
+            axis=0,
+        ),
+        "trial_raw_modeled_maps": np.stack(
+            [
+                np.full((2, 2), 0.9, dtype=float),
+                np.full((2, 2), 1.0, dtype=float),
+            ],
+            axis=0,
+        ),
+        "nfev": 2,
+        "nit": 1,
+        "message": "ok",
+        "used_adaptive_bracketing": False,
+        "bracket_found": False,
+        "bracket": None,
+        "target_metric": "chi2",
+        "diagnostics": {
+            COMPATIBILITY_SIGNATURE_KEY: "sig-123",
+            "target_metric": "chi2",
+            "chi2": 0.1,
+            "rho2": 0.2,
+            "eta2": 0.3,
+            "target_metric_value": 0.1,
+        },
+    }
+    artifact_h5 = tmp_path / "adaptive.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_record],
+    )
+
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="chi2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-123",
+        viewer_heartbeat=None,
+    )
+
+    assert cache.promote_current_slice_trial_maps(
+        threshold=0.1,
+        explicit_mask=None,
+        include_matching_signature=False,
+    ) == 0
+    assert cache.promote_current_slice_trial_maps(
+        threshold=0.1,
+        explicit_mask=None,
+        include_matching_signature=True,
+    ) == 1
+    assert len(cache) == 1
+
+
+def test_promote_current_slice_trial_maps_allows_metric_change(tmp_path: Path) -> None:
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["SIMPLE"] = True
+    header["BITPIX"] = -32
+    header["NAXIS"] = 2
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    header["CTYPE1"] = "HPLN-TAN"
+    header["CTYPE2"] = "HPLT-TAN"
+    header["CUNIT1"] = "arcsec"
+    header["CUNIT2"] = "arcsec"
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 2.0
+    header["CDELT2"] = 2.0
+    header["DATE-OBS"] = "2020-11-26T20:00:00"
+
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-123",
+        "target_metric": "chi2",
+        "metrics_mask_threshold": 0.1,
+        "metrics_mask_source": "union_threshold",
+        "mask_type": "union",
+        "model_sha256": "a" * 64,
+        "fits_sha256": "b" * 64,
+        "ebtel_sha256": "c" * 64,
+        "frequency_ghz": 5.7,
+        "map_xc_arcsec": 0.0,
+        "map_yc_arcsec": 0.0,
+        "map_dx_arcsec": 2.0,
+        "map_dy_arcsec": 2.0,
+        "map_nx": 2,
+        "map_ny": 2,
+        "observer_name": "earth",
+        "observer_lonc_deg": 0.0,
+        "observer_b0sun_deg": 0.0,
+        "observer_dsun_cm": 1.495978707e13,
+        "observer_obs_time": "2020-11-26T20:00:00",
+        "target_slice_key": "mw_5p700000ghz",
+        "spectral_domain": "mw",
+        "spectral_label": "5.700 GHz",
+    }
+    point_record = {
+        "a": 0.3,
+        "b": 2.7,
+        "a_index": 0,
+        "b_index": 0,
+        "q0": 1.0,
+        "success": True,
+        "status": "computed",
+        "modeled_best": np.ones((2, 2), dtype=float),
+        "raw_modeled_best": np.ones((2, 2), dtype=float),
+        "residual": np.zeros((2, 2), dtype=float),
+        "fit_q0_trials": (0.5, 1.0),
+        "fit_metric_trials": (0.4, 0.1),
+        "fit_chi2_trials": (0.4, 0.1),
+        "fit_rho2_trials": (0.5, 0.2),
+        "fit_eta2_trials": (0.6, 0.3),
+        "trial_modeled_maps": np.stack(
+            [
+                np.full((2, 2), 0.9, dtype=float),
+                np.full((2, 2), 1.0, dtype=float),
+            ],
+            axis=0,
+        ),
+        "trial_raw_modeled_maps": np.stack(
+            [
+                np.full((2, 2), 0.9, dtype=float),
+                np.full((2, 2), 1.0, dtype=float),
+            ],
+            axis=0,
+        ),
+        "nfev": 2,
+        "nit": 1,
+        "message": "ok",
+        "used_adaptive_bracketing": False,
+        "bracket_found": False,
+        "bracket": None,
+        "target_metric": "chi2",
+        "diagnostics": {
+            COMPATIBILITY_SIGNATURE_KEY: "sig-123",
+            "target_metric": "chi2",
+            "chi2": 0.1,
+            "rho2": 0.2,
+            "eta2": 0.3,
+            "target_metric_value": 0.1,
+        },
+    }
+    artifact_h5 = tmp_path / "adaptive_metric_change.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_record],
+    )
+
+    rescored_diagnostics = {
+        **diagnostics,
+        COMPATIBILITY_SIGNATURE_KEY: "sig-eta2-threshold-0p5",
+        "target_metric": "eta2",
+        "metrics_mask_threshold": 0.5,
+    }
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics=rescored_diagnostics,
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="eta2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-eta2-threshold-0p5",
+        viewer_heartbeat=None,
+    )
+
+    assert cache.promote_current_slice_trial_maps(
+        threshold=0.5,
+        explicit_mask=None,
+        include_matching_signature=False,
+    ) == 1
+    assert len(cache) == 1

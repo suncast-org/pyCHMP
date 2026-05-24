@@ -88,9 +88,12 @@ from pychmp import (
     ABPointResult,
     GXRenderEUVAdapter,
     GXRenderMWAdapter,
+    build_psf_kernel,
     build_tr_region_mask_from_blos,
     estimate_obs_map_noise,
+    format_psf_report,
     load_obs_map,
+    obs_map_noise_unit_label,
     resolve_render_geometry_via_gxrender,
     resolve_default_testdata_fixture_paths,
     search_local_minimum_ab,
@@ -134,11 +137,12 @@ try:
         _elliptical_gaussian_kernel,
         _extract_psf_from_header,
         _format_psf_report,
+        _format_static_psf_report,
         _load_explicit_metric_mask,
         _load_model_identity,
         _make_trial_progress_reporter,
         _resolve_render_selection,
-        _resolve_selected_psf,
+        _resolve_selected_psf_metadata,
         load_blos_reference_for_fov,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
@@ -159,11 +163,12 @@ except ModuleNotFoundError:
         _elliptical_gaussian_kernel,
         _extract_psf_from_header,
         _format_psf_report,
+        _format_static_psf_report,
         _load_explicit_metric_mask,
         _load_model_identity,
         _make_trial_progress_reporter,
         _resolve_render_selection,
-        _resolve_selected_psf,
+        _resolve_selected_psf_metadata,
         load_blos_reference_for_fov,
         _load_model_observer_metadata,
         _load_saved_fov_from_model,
@@ -232,6 +237,8 @@ class _ViewerRefreshHeartbeat:
         self._interval_s = max(0.5, float(interval_s))
         self._phase = ""
         self._pending_points: tuple[tuple[float, float], ...] = ()
+        self._active_point: tuple[float, float] | None = None
+        self._live_trial_payload: dict[str, Any] | None = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -246,6 +253,12 @@ class _ViewerRefreshHeartbeat:
                         {"a": float(a_value), "b": float(b_value)}
                         for a_value, b_value in self._pending_points
                     ],
+                    "active_point": (
+                        None
+                        if self._active_point is None
+                        else {"a": float(self._active_point[0]), "b": float(self._active_point[1])}
+                    ),
+                    "live_trials": None if self._live_trial_payload is None else dict(self._live_trial_payload),
                 }
             self._signal_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
         except Exception:
@@ -274,6 +287,46 @@ class _ViewerRefreshHeartbeat:
             self._pending_points = ()
         self._write_signal()
 
+    def set_active_point(self, a_value: float, b_value: float) -> None:
+        with self._lock:
+            self._active_point = (float(a_value), float(b_value))
+            self._live_trial_payload = None
+        self._write_signal()
+
+    def update_live_trials(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        metric_name: str,
+        q0_trials: list[float],
+        metric_trials: list[float],
+        active_trial_index: int | None = None,
+        active_trial_q0: float | None = None,
+    ) -> None:
+        with self._lock:
+            self._active_point = (float(a_value), float(b_value))
+            self._live_trial_payload = {
+                "a": float(a_value),
+                "b": float(b_value),
+                "metric_name": str(metric_name),
+                "q0_trials": [float(value) for value in q0_trials],
+                "metric_trials": [float(value) for value in metric_trials],
+                "active_trial_index": (
+                    None if active_trial_index is None else int(active_trial_index)
+                ),
+                "active_trial_q0": (
+                    None if active_trial_q0 is None else float(active_trial_q0)
+                ),
+            }
+        self._write_signal()
+
+    def clear_active_trial(self) -> None:
+        with self._lock:
+            self._active_point = None
+            self._live_trial_payload = None
+        self._write_signal()
+
     def start(self, phase: str) -> None:
         self.set_phase(phase)
         if self._thread is not None and self._thread.is_alive():
@@ -286,6 +339,8 @@ class _ViewerRefreshHeartbeat:
         with self._lock:
             self._phase = str(phase).strip()
             self._pending_points = ()
+            self._active_point = None
+            self._live_trial_payload = None
         self._write_signal()
         self._stop_event.set()
         if self._thread is not None:
@@ -841,6 +896,72 @@ def _rescore_auxiliary_map_record(
     return point, payload
 
 
+def _collect_start_over_seed_point_payloads(
+    *,
+    artifact_h5: Path,
+    slice_key: str | None,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+    compatibility_signature: str,
+) -> list[dict[str, Any]]:
+    if not artifact_h5.exists() or not slice_key:
+        return []
+    try:
+        current_payload = load_scan_file(artifact_h5, slice_key=slice_key)
+    except KeyError:
+        return []
+    validate_scan_artifact_compatibility(
+        current_payload,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=wcs_header,
+        diagnostics=diagnostics,
+        artifact_path=artifact_h5,
+    )
+    if bool(dict(current_payload.get("diagnostics") or {}).get("render_only_slice", False)):
+        return []
+
+    payloads_by_key: dict[tuple[float, float], dict[str, Any]] = {}
+    for search in current_payload.get("search_records", []):
+        search_id = str(search.get("search_id", "")).strip()
+        if not search_id:
+            continue
+        try:
+            search_payload = load_scan_file(artifact_h5, slice_key=slice_key, search_id=search_id)
+        except KeyError:
+            continue
+        for record in search_payload.get("point_records", []):
+            key = (float(record["a"]), float(record["b"]))
+            if key in payloads_by_key:
+                continue
+            rescored = _rescore_auxiliary_map_record(
+                {
+                    **dict(record),
+                    "source_slice_key": slice_key,
+                    "source_search_id": search_id,
+                },
+                observed=observed,
+                sigma_map=sigma_map,
+                threshold=float(threshold),
+                explicit_mask=explicit_mask,
+                target_metric=target_metric,
+            )
+            if rescored is None:
+                continue
+            _point, point_payload = rescored
+            point_payload["diagnostics"] = {
+                **dict(point_payload.get("diagnostics") or {}),
+                COMPATIBILITY_SIGNATURE_KEY: compatibility_signature,
+            }
+            payloads_by_key[key] = point_payload
+    return [payloads_by_key[key] for key in sorted(payloads_by_key.keys())]
+
+
 class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
     def __init__(
         self,
@@ -854,6 +975,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         renderer_factory: _AdaptiveRendererFactory,
         target_metric: str,
         psf_source: str,
+        psf_kernel: np.ndarray | None,
         compatibility_signature: str,
         viewer_heartbeat: _ViewerRefreshHeartbeat | None = None,
     ) -> None:
@@ -866,6 +988,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         self._renderer_factory = renderer_factory
         self._target_metric = str(target_metric)
         self._psf_source = str(psf_source)
+        self._psf_kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
         self._compatibility_signature = str(compatibility_signature)
         self._viewer_heartbeat = viewer_heartbeat
         self._point_map: dict[tuple[float, float], ABPointResult] = {}
@@ -924,6 +1047,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 wcs_header=self._target_header,
                 diagnostics=self._diagnostics,
                 blos_reference=self._blos_reference,
+                psf_kernel=self._psf_kernel,
                 point_payload=point_payload,
             )
             self._point_map[key] = point
@@ -966,6 +1090,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         *,
         threshold: float,
         explicit_mask: np.ndarray | None,
+        include_matching_signature: bool = False,
     ) -> int:
         if not self._artifact_h5.exists():
             return 0
@@ -999,7 +1124,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 if point_record_matches_compatibility_signature(
                     record,
                     compatibility_signature=self._compatibility_signature,
-                ):
+                ) and not bool(include_matching_signature):
                     continue
                 rescored = _rescore_auxiliary_map_record(
                     {
@@ -1027,6 +1152,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     wcs_header=self._target_header,
                     diagnostics=self._diagnostics,
                     blos_reference=self._blos_reference,
+                    psf_kernel=self._psf_kernel,
                     point_payload=point_payload,
                 )
                 self._point_map[key] = point
@@ -1044,6 +1170,15 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if existing is not None and np.isclose(existing.q0, value.q0, rtol=0.0, atol=1e-12):
             self._point_map[normalized_key] = value
             return
+        print(
+            f"  Serializing point payload: a={float(value.a):.3f} b={float(value.b):.3f} "
+            f"(trials={len(tuple(value.trial_q0))})"
+        )
+        if self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.set_phase(
+                f"serializing point a={float(value.a):.3f} b={float(value.b):.3f}"
+            )
+        save_started = time.perf_counter()
         payload = _point_payload_from_result(
             value,
             renderer_factory=self._renderer_factory,
@@ -1059,17 +1194,21 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             wcs_header=self._target_header,
             diagnostics=self._diagnostics,
             blos_reference=self._blos_reference,
+            psf_kernel=self._psf_kernel,
             point_payload=payload,
         )
+        save_elapsed = time.perf_counter() - save_started
         self._point_map[normalized_key] = value
         if self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.clear_active_trial()
             self._viewer_heartbeat.set_phase(
                 f"point {len(self._point_map)} saved"
             )
         print(
             f"  Saved point to sparse artifact: a={float(value.a):.3f} b={float(value.b):.3f} "
             f"q0={_format_console_scalar(float(value.q0), fixed_precision=6)} "
-            f"{self._target_metric}={float(value.objective_value):.6e}"
+            f"{self._target_metric}={float(value.objective_value):.6e} "
+            f"save_elapsed={save_elapsed:.3f}s"
         )
 
     def __delitem__(self, key: tuple[float, float]) -> None:
@@ -1156,11 +1295,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--artifact-h5", type=Path, default=None, help="Explicit sparse artifact path to create/update")
     parser.add_argument("--artifacts-dir", type=Path, default=None, help="Directory used when --artifact-h5 is not supplied")
     parser.add_argument("--artifacts-stem", default=None, help="Base filename stem used when --artifact-h5 is not supplied")
-    parser.add_argument(
+    reset_group = parser.add_mutually_exclusive_group()
+    reset_group.add_argument(
         "--recompute-existing",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Reset a compatible sparse artifact at the target path and recompute all points from scratch.",
+    )
+    reset_group.add_argument(
+        "--start-over",
+        action="store_true",
+        help="Start a fresh adaptive search instance in the existing artifact while seeding from the stored maps instead of resuming the previous compatible search state.",
     )
     parser.add_argument("--no-grid-png", action="store_true", help="Skip the summary grid PNG at the end")
     parser.add_argument("--no-point-png", action="store_true", help="Skip the selected-point PNG at the end")
@@ -1314,10 +1459,11 @@ def main() -> int:
     noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
     sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
     noise_diag = noise_result.diagnostics
+    noise_unit = obs_map_noise_unit_label(obs_map)
     if str(noise_result.method_used) == "fallback_std":
-        print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} K")
+        print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} {noise_unit}")
     else:
-        print(f"  Estimated sigma: {float(noise_result.sigma):.2f} K")
+        print(f"  Estimated sigma: {float(noise_result.sigma):.2f} {noise_unit}")
 
     sdk = import_module("gxrender.sdk")
     header_psf, header_psf_source = _extract_psf_from_header(header)
@@ -1327,15 +1473,13 @@ def main() -> int:
     fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
     fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
     fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
-    (
-        psf_bmaj_arcsec,
-        psf_bmin_arcsec,
-        psf_bpa_deg,
-        psf_source,
-        psf_allows_frequency_scaling,
-    ) = _resolve_selected_psf(
+    selected_psf_metadata = _resolve_selected_psf_metadata(
         header_psf=header_psf,
         header_psf_source=header_psf_source,
+        domain=render_selection.domain,
+        instrument_name=render_selection.euv_instrument if render_selection.domain != "mw" else None,
+        wavelength_angstrom=None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        date_obs=obs_map.date_obs,
         cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
         cli_psf_bmin_arcsec=psf_bmin_arcsec,
         cli_psf_bpa_deg=psf_bpa_deg,
@@ -1344,6 +1488,18 @@ def main() -> int:
         fallback_psf_bpa_deg=fallback_psf_bpa_deg,
         override_header_psf=bool(args.override_header_psf),
     )
+    psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
+    psf_allows_frequency_scaling = bool(
+        False if selected_psf_metadata is None else selected_psf_metadata.allows_frequency_scaling
+    )
+    if selected_psf_metadata is not None and selected_psf_metadata.kind == "gaussian":
+        psf_bmaj_arcsec = selected_psf_metadata.bmaj_arcsec
+        psf_bmin_arcsec = selected_psf_metadata.bmin_arcsec
+        psf_bpa_deg = selected_psf_metadata.bpa_deg
+    else:
+        psf_bmaj_arcsec = None
+        psf_bmin_arcsec = None
+        psf_bpa_deg = None
 
     observer_overrides, observer_source = _resolve_observer_overrides(
         sdk,
@@ -1355,49 +1511,38 @@ def main() -> int:
     )
     model_observer_meta = _load_model_observer_metadata(model_h5)
     saved_fov = _load_saved_fov_from_model(model_h5)
-    explicit_observer_requested = any(v is not None for v in (args.observer, args.dsun_cm, args.lonc_deg, args.b0sun_deg))
+    explicit_observer_requested = any(v is not None for v in (args.observer, args.dsun_cm, args.lonc_deg, args.b0sun_deg, args.pixel_scale_arcsec if 'pixel_scale_arcsec' in args else None))
+    # Only pass observer/pixel_scale to gxrender if explicitly requested; otherwise, delegate all geometry/FOV to gxrender
+    gxrender_kwargs = {
+        "model_path": model_h5,
+        "model_format": "auto",
+        "ebtel_path": str(ebtel_path) if ebtel_path is not None else None,
+        "omp_threads": int(getattr(args, "omp_threads", 8)),
+    }
+    if explicit_observer_requested:
+        if args.pixel_scale_arcsec is not None:
+            gxrender_kwargs["pixel_scale_arcsec"] = float(args.pixel_scale_arcsec)
+        if args.observer is not None:
+            gxrender_kwargs["observer_name"] = args.observer
+        # Optionally add observer overrides if any are set
+        observer_override_fields = {k: getattr(args, k) for k in ("dsun_cm", "lonc_deg", "b0sun_deg") if getattr(args, k, None) is not None}
+        if observer_override_fields:
+            sdk = import_module("gxrender.sdk")
+            gxrender_kwargs["observer"] = sdk.ObserverOverrides(**observer_override_fields)
+    resolved_geometry = resolve_render_geometry_via_gxrender(**gxrender_kwargs)
+    geometry = resolved_geometry.geometry
+    # Always resolve geometry policy for diagnostics and artifact metadata
     geometry_policy = resolve_geometry_policy(
         obs_map=obs_map,
         model_observer_meta=model_observer_meta,
         saved_fov=saved_fov,
-        geometry_overrides_requested=False,
+        geometry_overrides_requested=explicit_observer_requested or (args.pixel_scale_arcsec is not None if hasattr(args, "pixel_scale_arcsec") else False),
         explicit_observer_requested=explicit_observer_requested,
     )
-    geometry_observer_name = str(args.observer or geometry_policy.observer_name)
-    geometry_observer = observer_overrides if explicit_observer_requested else None
-    resolved_geometry = resolve_render_geometry_via_gxrender(
-        model_path=model_h5,
-        model_format="auto",
-        ebtel_path=str(ebtel_path) if ebtel_path is not None else None,
-        pixel_scale_arcsec=float(args.pixel_scale_arcsec),
-        observer_name=geometry_observer_name,
-        observer=geometry_observer,
-        omp_threads=int(getattr(args, "omp_threads", 8)),
-    )
-    geometry = resolved_geometry.geometry
-    if not explicit_observer_requested:
-        observer_overrides = sdk.ObserverOverrides(
-            dsun_cm=float(geometry_policy.observer_dsun_cm),
-            lonc_deg=float(geometry_policy.observer_lonc_deg),
-            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
-        )
-        observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
-    effective_observer_name = geometry_observer_name
-    effective_observer_lonc_deg = float(
-        getattr(observer_overrides, "lonc_deg", None)
-        if observer_overrides is not None and getattr(observer_overrides, "lonc_deg", None) is not None
-        else geometry_policy.observer_lonc_deg
-    )
-    effective_observer_b0sun_deg = float(
-        getattr(observer_overrides, "b0sun_deg", None)
-        if observer_overrides is not None and getattr(observer_overrides, "b0sun_deg", None) is not None
-        else geometry_policy.observer_b0sun_deg
-    )
-    effective_observer_dsun_cm = float(
-        getattr(observer_overrides, "dsun_cm", None)
-        if observer_overrides is not None and getattr(observer_overrides, "dsun_cm", None) is not None
-        else geometry_policy.observer_dsun_cm
-    )
+    # For downstream diagnostics, set effective observer values from geometry
+    effective_observer_name = getattr(geometry, "observer_name", None) if hasattr(geometry, "observer_name") else None
+    effective_observer_lonc_deg = getattr(geometry, "lonc_deg", None) if hasattr(geometry, "lonc_deg") else None
+    effective_observer_b0sun_deg = getattr(geometry, "b0sun_deg", None) if hasattr(geometry, "b0sun_deg") else None
 
     target_header = _build_target_header(
         nx=int(geometry.nx),
@@ -1408,12 +1553,13 @@ def main() -> int:
         dy_arcsec=float(geometry.dy),
         template_header=header,
     )
+    # Do not set observer distance in header unless explicitly overridden; delegate to gxrender
     target_header = _with_observer_wcs_keywords(
         target_header,
         observer_name=effective_observer_name,
         hgln_obs_deg=effective_observer_lonc_deg,
         hglt_obs_deg=effective_observer_b0sun_deg,
-        dsun_obs_m=effective_observer_dsun_cm / 100.0,
+        dsun_obs_m=None,
     )
     observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
     sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
@@ -1476,67 +1622,37 @@ def main() -> int:
         f"dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} "
         f"nx={int(geometry.nx)} ny={int(geometry.ny)}"
     )
-    if render_selection.domain != "mw":
-        if any(
-            value is not None
-            for value in (
-                args.psf_bmaj_arcsec,
-                args.psf_bmin_arcsec,
-                args.psf_bpa_deg,
-                args.fallback_psf_bmaj_arcsec,
-                args.fallback_psf_bmin_arcsec,
-                args.fallback_psf_bpa_deg,
-                args.psf_ref_frequency_ghz,
-            )
-        ) or bool(args.psf_scale_inverse_frequency) or bool(args.override_header_psf):
-            raise SystemExit(
-                "MW beam/PSF CLI options are not supported on the adaptive EUV/UV path."
-            )
-        psf_bmaj_arcsec = None
-        psf_bmin_arcsec = None
-        psf_bpa_deg = None
-        psf_source = "none"
-        psf_allows_frequency_scaling = False
-
     if render_selection.domain == "mw":
         print(
             "  "
-            + _format_psf_report(
-                source=str(psf_source),
-                bmaj_arcsec=psf_bmaj_arcsec,
-                bmin_arcsec=psf_bmin_arcsec,
-                bpa_deg=psf_bpa_deg,
+            + format_psf_report(
+                metadata=selected_psf_metadata,
                 active_frequency_ghz=float(freq_ghz),
                 ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
+                scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
             )
         )
     else:
-        print("  PSF source: none (adaptive EUV/UV path currently compares the direct rendered map)")
+        print(
+            "  "
+            + format_psf_report(
+                metadata=selected_psf_metadata,
+                active_frequency_ghz=None,
+                ref_frequency_ghz=None,
+                scale_inverse_frequency=False,
+            )
+        )
 
     psf_kernel = None
     resolved_psf_meta = None
-    if (
-        render_selection.domain == "mw"
-        and psf_bmaj_arcsec is not None
-        and psf_bmin_arcsec is not None
-        and psf_bpa_deg is not None
-    ):
-        resolved_psf_meta = _effective_psf_parameters(
-            bmaj_arcsec=psf_bmaj_arcsec,
-            bmin_arcsec=psf_bmin_arcsec,
-            bpa_deg=psf_bpa_deg,
-            active_frequency_ghz=float(freq_ghz),
-            ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
-            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency and psf_allows_frequency_scaling),
-        )
-        assert resolved_psf_meta is not None
-        psf_kernel = _elliptical_gaussian_kernel(
-            bmaj_arcsec=float(resolved_psf_meta["active_bmaj_arcsec"]),
-            bmin_arcsec=float(resolved_psf_meta["active_bmin_arcsec"]),
-            bpa_deg=float(psf_bpa_deg),
+    if selected_psf_metadata is not None:
+        psf_kernel, resolved_psf_meta = build_psf_kernel(
+            metadata=selected_psf_metadata,
             dx_arcsec=float(geometry.dx),
             dy_arcsec=float(geometry.dy),
+            active_frequency_ghz=float(freq_ghz) if render_selection.domain == "mw" else None,
+            ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
+            scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
         )
 
     model_sha256 = _compute_file_sha256(model_h5)
@@ -1590,9 +1706,9 @@ def main() -> int:
         "observer_name": effective_observer_name,
         "observer_lonc_deg": effective_observer_lonc_deg,
         "observer_b0sun_deg": effective_observer_b0sun_deg,
-        "observer_dsun_cm": effective_observer_dsun_cm,
+        # observer_dsun_cm intentionally omitted unless explicitly overridden
         "observer_obs_time": target_header.get("DATE-OBS", ""),
-        "geometry_policy_mode": geometry_mode,
+        "geometry_policy_mode": geometry_policy.geometry_mode,
         "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
         "geometry_policy_observation_los": geometry_policy.observation_observer,
         "geometry_policy_model_los": geometry_policy.model_observer,
@@ -1642,11 +1758,12 @@ def main() -> int:
             "map_dy_arcsec": root_diag["map_dy_arcsec"],
             "map_nx": root_diag["map_nx"],
             "map_ny": root_diag["map_ny"],
-            "observer_name": root_diag["observer_name"],
-            "observer_lonc_deg": root_diag["observer_lonc_deg"],
-            "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
-            "observer_dsun_cm": root_diag["observer_dsun_cm"],
-            "observer_obs_time": root_diag["observer_obs_time"],
+            # Observer/FOV fields are only included if present (delegated to gxrender otherwise)
+            **({"observer_name": root_diag["observer_name"]} if "observer_name" in root_diag else {}),
+            **({"observer_lonc_deg": root_diag["observer_lonc_deg"]} if "observer_lonc_deg" in root_diag else {}),
+            **({"observer_b0sun_deg": root_diag["observer_b0sun_deg"]} if "observer_b0sun_deg" in root_diag else {}),
+            **({"observer_dsun_cm": root_diag["observer_dsun_cm"]} if "observer_dsun_cm" in root_diag else {}),
+            **({"observer_obs_time": root_diag["observer_obs_time"]} if "observer_obs_time" in root_diag else {}),
             "threshold": root_diag["threshold"],
             "metrics_mask_threshold": root_diag["metrics_mask_threshold"],
             "metrics_mask_fits": root_diag["metrics_mask_fits"],
@@ -1673,7 +1790,22 @@ def main() -> int:
     existing_run_history = load_run_history(artifact_h5) if artifact_preexisting else []
     if bool(args.recompute_existing) and artifact_h5.exists():
         print(f"Recompute existing: resetting sparse artifact at {artifact_h5}")
-    if not artifact_h5.exists() or bool(args.recompute_existing):
+    start_over_seed_payloads: list[dict[str, Any]] = []
+    if bool(args.start_over) and artifact_h5.exists():
+        start_over_seed_payloads = _collect_start_over_seed_point_payloads(
+            artifact_h5=artifact_h5,
+            slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
+            observed=observed_cropped,
+            sigma_map=sigma_cropped,
+            wcs_header=target_header,
+            diagnostics=root_diag,
+            threshold=float(args.metrics_mask_threshold),
+            explicit_mask=explicit_metric_mask,
+            target_metric=str(args.target_metric),
+            compatibility_signature=compatibility_signature,
+        )
+        print(f"Start over: resetting search history in {artifact_h5} while seeding from stored compatible maps")
+    if not artifact_h5.exists() or bool(args.recompute_existing) or bool(args.start_over):
         write_point_scan_artifact(
             artifact_h5,
             observed=observed_cropped,
@@ -1681,8 +1813,10 @@ def main() -> int:
             wcs_header=target_header,
             diagnostics=root_diag,
             blos_reference=common_blos_reference,
-            point_records=[],
-            run_history=existing_run_history,
+            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+            point_records=start_over_seed_payloads if bool(args.start_over) else [],
+            run_history=[] if bool(args.start_over) else existing_run_history,
+            preserve_existing_searches=not bool(args.start_over),
         )
         viewer_heartbeat.set_phase("adaptive sparse artifact initialized")
         print(f"Initialized sparse artifact: {artifact_h5}")
@@ -1731,6 +1865,7 @@ def main() -> int:
         renderer_factory=factory,
         target_metric=str(args.target_metric),
         psf_source=str(psf_source),
+        psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         compatibility_signature=compatibility_signature,
         viewer_heartbeat=viewer_heartbeat,
     )
@@ -1740,6 +1875,7 @@ def main() -> int:
             current_promoted_points = cache.promote_current_slice_trial_maps(
                 threshold=float(args.metrics_mask_threshold),
                 explicit_mask=explicit_metric_mask,
+                include_matching_signature=False,
             )
             if current_promoted_points:
                 reused_points += current_promoted_points
@@ -1766,7 +1902,11 @@ def main() -> int:
             action=(
                 "recompute"
                 if bool(args.recompute_existing) and artifact_preexisting
-                else ("resume" if artifact_preexisting and not bool(args.recompute_existing) else "create")
+                else (
+                    "start_over"
+                    if bool(args.start_over) and artifact_preexisting
+                    else ("resume" if artifact_preexisting and not bool(args.recompute_existing) else "create")
+                )
             ),
             target_metric=str(args.target_metric),
             recompute_existing=bool(args.recompute_existing),
@@ -1774,7 +1914,10 @@ def main() -> int:
             "compatibility_signature": compatibility_signature,
         },
     )
-    print(f"Resume state: {reused_points} compatible point(s) loaded from the existing artifact")
+    if bool(args.start_over):
+        print(f"Start-over seed state: {reused_points} point(s) restored into the reset search")
+    else:
+        print(f"Resume state: {reused_points} compatible point(s) loaded from the existing artifact")
     if auto_viewer_enabled:
         print("Viewer command above is shown for reference; pychmp-view will also be auto-launched unless it is already running.")
     else:
@@ -1787,6 +1930,68 @@ def main() -> int:
     progress_callback = None
     if str(args.execution_policy) == "serial":
         progress_start_callback, progress_callback = _make_trial_progress_reporter(target_metric=str(args.target_metric))
+        if viewer_heartbeat is not None:
+            live_q0_trials: list[float] = []
+            live_metric_trials: list[float] = []
+            active_point: dict[str, tuple[float, float] | None] = {"value": None}
+            console_start_callback = progress_start_callback
+            console_progress_callback = progress_callback
+
+            def _viewer_point_start(a_value: float, b_value: float) -> None:
+                active_point["value"] = (float(a_value), float(b_value))
+                live_q0_trials.clear()
+                live_metric_trials.clear()
+                viewer_heartbeat.set_active_point(float(a_value), float(b_value))
+
+            def _viewer_point_complete(a_value: float, b_value: float) -> None:
+                point = active_point.get("value")
+                if point is not None:
+                    viewer_heartbeat.set_phase("serializing point payload")
+
+            def _viewer_progress_start(trial_index: int, q0: float) -> None:
+                if console_start_callback is not None:
+                    console_start_callback(trial_index, q0)
+                point = active_point.get("value")
+                if point is None:
+                    return
+                viewer_heartbeat.set_phase(f"trial {int(trial_index):02d} rendering")
+                viewer_heartbeat.update_live_trials(
+                    a_value=float(point[0]),
+                    b_value=float(point[1]),
+                    metric_name=str(args.target_metric),
+                    q0_trials=list(live_q0_trials),
+                    metric_trials=list(live_metric_trials),
+                    active_trial_index=int(trial_index),
+                    active_trial_q0=float(q0),
+                )
+
+            def _viewer_progress_report(q0: float, objective_value: float, is_valid: bool, message: str, elapsed_s: float) -> None:
+                if console_progress_callback is not None:
+                    console_progress_callback(q0, objective_value, is_valid, message, elapsed_s)
+                point = active_point.get("value")
+                if point is None:
+                    return
+                live_q0_trials.append(float(q0))
+                live_metric_trials.append(float(objective_value))
+                viewer_heartbeat.set_phase(f"trial {len(live_q0_trials):02d} complete")
+                viewer_heartbeat.update_live_trials(
+                    a_value=float(point[0]),
+                    b_value=float(point[1]),
+                    metric_name=str(args.target_metric),
+                    q0_trials=list(live_q0_trials),
+                    metric_trials=list(live_metric_trials),
+                    active_trial_index=None,
+                    active_trial_q0=None,
+                )
+
+            progress_start_callback = _viewer_progress_start
+            progress_callback = _viewer_progress_report
+        else:
+            _viewer_point_start = None
+            _viewer_point_complete = None
+    else:
+        _viewer_point_start = None
+        _viewer_point_complete = None
     try:
         result = search_local_minimum_ab(
             factory,
@@ -1818,6 +2023,8 @@ def main() -> int:
             execution_policy=str(args.execution_policy),
             max_workers=args.max_workers,
             worker_chunksize=int(args.worker_chunksize),
+            point_start_callback=_viewer_point_start,
+            point_complete_callback=_viewer_point_complete,
         )
     except Exception:
         viewer_heartbeat.stop("adaptive search failed")

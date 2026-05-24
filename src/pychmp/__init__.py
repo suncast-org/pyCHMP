@@ -13,8 +13,9 @@ from .gxrender_adapter import GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWC
 from .geometry_policy import GeometryPolicyDecision, infer_observation_observer, resolve_geometry_policy
 from .map_noise import MapNoiseEstimate, estimate_map_noise
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
-from .obs_maps import ObservationalMap, estimate_obs_map_noise, load_obs_map, validate_obs_map_identity, find_named_testdata_file, resolve_default_testdata_fixture_paths
+from .obs_maps import ObservationalMap, estimate_obs_map_noise, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity, find_named_testdata_file, resolve_default_testdata_fixture_paths
 from .optimize import Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
+from .psf import PSFMetadata, KernelConvolvedRenderer, build_psf_kernel, default_psf_metadata, effective_psf_parameters, elliptical_gaussian_kernel, extract_psf_metadata_from_header, format_psf_report, resolve_psf_metadata
 from .spectral import RenderSliceRequest, default_euv_channels_for_instrument, parse_csv_floats, parse_csv_tokens
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
   "ObservationalMap",
   "load_obs_map",
   "estimate_obs_map_noise",
+  "obs_map_noise_unit_label",
   "validate_obs_map_identity",
   "find_named_testdata_file",
   "resolve_default_testdata_fixture_paths",
@@ -55,6 +57,15 @@ __all__ = [
   "Q0MetricEvaluation",
   "Q0OptimizationResult",
   "find_best_q0",
+  "PSFMetadata",
+  "KernelConvolvedRenderer",
+  "build_psf_kernel",
+  "default_psf_metadata",
+  "effective_psf_parameters",
+  "elliptical_gaussian_kernel",
+  "extract_psf_metadata_from_header",
+  "format_psf_report",
+  "resolve_psf_metadata",
   "RenderSliceRequest",
   "default_euv_channels_for_instrument",
   "parse_csv_floats",
