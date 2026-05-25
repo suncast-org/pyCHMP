@@ -278,9 +278,11 @@ def scan_artifact_compatibility_issues(
         if key not in existing_diagnostics and key not in diagnostics:
             continue  # treat as optional if missing in both
         if key not in existing_diagnostics:
-            continue  # treat as optional if missing in stored
+            issues.append(f"stored artifact is missing required diagnostic '{key}'")
+            continue
         if key not in diagnostics:
-            continue  # treat as optional if missing in current
+            issues.append(f"current run is missing required diagnostic '{key}'")
+            continue
         if not _diagnostic_values_match(key, existing_diagnostics[key], diagnostics[key]):
             issues.append(
                 f"diagnostic mismatch for '{key}' "
@@ -347,8 +349,10 @@ def scan_artifact_reuse_preflight_issues(
         if key not in existing_diagnostics and key not in diagnostics:
             continue
         if key not in existing_diagnostics:
+            issues.append(f"stored artifact is missing required diagnostic '{key}'")
             continue
         if key not in diagnostics:
+            issues.append(f"current run is missing required diagnostic '{key}'")
             continue
         if not _diagnostic_values_match(key, existing_diagnostics[key], diagnostics[key]):
             issues.append(

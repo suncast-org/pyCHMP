@@ -376,6 +376,52 @@ def test_validate_scan_artifact_compatibility_rejects_required_diagnostic_mismat
         )
 
 
+def test_validate_scan_artifact_compatibility_rejects_missing_required_stored_diagnostic(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "scan.h5"
+    observed, sigma_map, header, diagnostics = _write_rectangular_artifact(out_h5)
+
+    with h5py.File(out_h5, "r+") as handle:
+        common = handle["slices/default/common"]
+        stored_diagnostics = json.loads(common["diagnostics_json"][()].decode("utf-8"))
+        stored_diagnostics.pop("model_sha256", None)
+        del common["diagnostics_json"]
+        common.create_dataset("diagnostics_json", data=np.bytes_(json.dumps(stored_diagnostics)))
+
+    payload = load_scan_file(out_h5)
+
+    issues = scan_artifact_compatibility_issues(
+        payload,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    preflight_issues = scan_artifact_reuse_preflight_issues(
+        payload,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+
+    assert any("missing required diagnostic 'model_sha256'" in issue for issue in issues)
+    assert any("missing required diagnostic 'model_sha256'" in issue for issue in preflight_issues)
+    with pytest.raises(ScanArtifactCompatibilityError, match="missing required diagnostic 'model_sha256'"):
+        validate_scan_artifact_compatibility(
+            payload,
+            observed=observed,
+            sigma_map=sigma_map,
+            wcs_header=header,
+            diagnostics=diagnostics,
+            artifact_path=out_h5,
+        )
+    with pytest.raises(ScanArtifactCompatibilityError, match="missing required diagnostic 'model_sha256'"):
+        validate_scan_artifact_reuse_preflight(
+            payload,
+            wcs_header=header,
+            diagnostics=diagnostics,
+            artifact_path=out_h5,
+        )
+
+
 def test_validate_scan_artifact_compatibility_allows_new_search_signature(tmp_path: Path) -> None:
     out_h5 = tmp_path / "scan.h5"
     observed, sigma_map, header, diagnostics = _write_rectangular_artifact(out_h5)

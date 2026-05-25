@@ -14,6 +14,7 @@ from examples.python.adaptive_ab_search_single_observation import (
     _PersistentPointCache,
     _point_payload_from_result,
     _rescore_auxiliary_map_record,
+    _resolve_geometry_request_flags,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
@@ -148,6 +149,21 @@ def test_resolve_render_slice_requests_rejects_all_channels_for_mw() -> None:
             render_channels_csv=None,
             render_frequencies_csv=None,
         )
+
+
+def test_resolve_geometry_request_flags_does_not_treat_default_pixel_scale_as_explicit_override(tmp_path: Path) -> None:
+    args = Namespace(
+        observer=None,
+        dsun_cm=None,
+        lonc_deg=None,
+        b0sun_deg=None,
+        pixel_scale_arcsec=2.0,
+    )
+
+    geometry_overrides_requested, explicit_observer_requested = _resolve_geometry_request_flags(args)
+
+    assert geometry_overrides_requested is False
+    assert explicit_observer_requested is False
 
 
 class _FakeEUVRenderer:

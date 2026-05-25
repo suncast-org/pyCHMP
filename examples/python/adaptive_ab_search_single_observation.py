@@ -1870,6 +1870,15 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_geometry_request_flags(args: argparse.Namespace) -> tuple[bool, bool]:
+    explicit_observer_requested = any(
+        getattr(args, field_name, None) is not None
+        for field_name in ("observer", "dsun_cm", "lonc_deg", "b0sun_deg")
+    )
+    geometry_overrides_requested = False
+    return geometry_overrides_requested, explicit_observer_requested
+
+
 def main() -> int:
     args = _parse_args()
     _validate_gxrender_runtime()
@@ -2048,38 +2057,49 @@ def main() -> int:
     )
     model_observer_meta = _load_model_observer_metadata(model_h5)
     saved_fov = _load_saved_fov_from_model(model_h5)
-    explicit_observer_requested = any(v is not None for v in (args.observer, args.dsun_cm, args.lonc_deg, args.b0sun_deg, args.pixel_scale_arcsec if 'pixel_scale_arcsec' in args else None))
-    # Only pass observer/pixel_scale to gxrender if explicitly requested; otherwise, delegate all geometry/FOV to gxrender
-    gxrender_kwargs = {
-        "model_path": model_h5,
-        "model_format": "auto",
-        "ebtel_path": str(ebtel_path) if ebtel_path is not None else None,
-        "omp_threads": int(getattr(args, "omp_threads", 8)),
-    }
-    if explicit_observer_requested:
-        if args.pixel_scale_arcsec is not None:
-            gxrender_kwargs["pixel_scale_arcsec"] = float(args.pixel_scale_arcsec)
-        if args.observer is not None:
-            gxrender_kwargs["observer_name"] = args.observer
-        # Optionally add observer overrides if any are set
-        observer_override_fields = {k: getattr(args, k) for k in ("dsun_cm", "lonc_deg", "b0sun_deg") if getattr(args, k, None) is not None}
-        if observer_override_fields:
-            sdk = import_module("gxrender.sdk")
-            gxrender_kwargs["observer"] = sdk.ObserverOverrides(**observer_override_fields)
-    resolved_geometry = resolve_render_geometry_via_gxrender(**gxrender_kwargs)
-    geometry = resolved_geometry.geometry
-    # Always resolve geometry policy for diagnostics and artifact metadata
+    geometry_overrides_requested, explicit_observer_requested = _resolve_geometry_request_flags(args)
     geometry_policy = resolve_geometry_policy(
         obs_map=obs_map,
         model_observer_meta=model_observer_meta,
         saved_fov=saved_fov,
-        geometry_overrides_requested=explicit_observer_requested or (args.pixel_scale_arcsec is not None if hasattr(args, "pixel_scale_arcsec") else False),
+        geometry_overrides_requested=geometry_overrides_requested,
         explicit_observer_requested=explicit_observer_requested,
     )
-    # For downstream diagnostics, set effective observer values from geometry
-    effective_observer_name = getattr(geometry, "observer_name", None) if hasattr(geometry, "observer_name") else None
-    effective_observer_lonc_deg = getattr(geometry, "lonc_deg", None) if hasattr(geometry, "lonc_deg") else None
-    effective_observer_b0sun_deg = getattr(geometry, "b0sun_deg", None) if hasattr(geometry, "b0sun_deg") else None
+    geometry_observer_name = str(args.observer or geometry_policy.observer_name)
+    geometry_observer = observer_overrides if explicit_observer_requested else None
+    resolved_geometry = resolve_render_geometry_via_gxrender(
+        model_path=model_h5,
+        model_format="auto",
+        ebtel_path=str(ebtel_path) if ebtel_path is not None else None,
+        pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+        observer_name=geometry_observer_name,
+        observer=geometry_observer,
+        omp_threads=int(getattr(args, "omp_threads", 8)),
+    )
+    geometry = resolved_geometry.geometry
+    if not explicit_observer_requested:
+        observer_overrides = sdk.ObserverOverrides(
+            dsun_cm=float(geometry_policy.observer_dsun_cm),
+            lonc_deg=float(geometry_policy.observer_lonc_deg),
+            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
+        )
+        observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+    effective_observer_name = str(args.observer or geometry_policy.observer_name)
+    effective_observer_lonc_deg = float(
+        getattr(observer_overrides, "lonc_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "lonc_deg", None) is not None
+        else geometry_policy.observer_lonc_deg
+    )
+    effective_observer_b0sun_deg = float(
+        getattr(observer_overrides, "b0sun_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "b0sun_deg", None) is not None
+        else geometry_policy.observer_b0sun_deg
+    )
+    effective_observer_dsun_cm = float(
+        getattr(observer_overrides, "dsun_cm", None)
+        if observer_overrides is not None and getattr(observer_overrides, "dsun_cm", None) is not None
+        else geometry_policy.observer_dsun_cm
+    )
 
     target_header = _build_target_header(
         nx=int(geometry.nx),
@@ -2096,7 +2116,7 @@ def main() -> int:
         observer_name=effective_observer_name,
         hgln_obs_deg=effective_observer_lonc_deg,
         hglt_obs_deg=effective_observer_b0sun_deg,
-        dsun_obs_m=None,
+        dsun_obs_m=effective_observer_dsun_cm / 100.0,
     )
 
     artifact_preexisting = artifact_h5.exists()
@@ -2140,6 +2160,7 @@ def main() -> int:
         "observer_name": effective_observer_name,
         "observer_lonc_deg": effective_observer_lonc_deg,
         "observer_b0sun_deg": effective_observer_b0sun_deg,
+        "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
     }
     if artifact_preexisting and not bool(args.recompute_existing):
@@ -2301,7 +2322,7 @@ def main() -> int:
         "observer_name": effective_observer_name,
         "observer_lonc_deg": effective_observer_lonc_deg,
         "observer_b0sun_deg": effective_observer_b0sun_deg,
-        # observer_dsun_cm intentionally omitted unless explicitly overridden
+        "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
         "geometry_policy_mode": geometry_policy.geometry_mode,
         "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
@@ -2353,12 +2374,11 @@ def main() -> int:
             "map_dy_arcsec": root_diag["map_dy_arcsec"],
             "map_nx": root_diag["map_nx"],
             "map_ny": root_diag["map_ny"],
-            # Observer/FOV fields are only included if present (delegated to gxrender otherwise)
-            **({"observer_name": root_diag["observer_name"]} if "observer_name" in root_diag else {}),
-            **({"observer_lonc_deg": root_diag["observer_lonc_deg"]} if "observer_lonc_deg" in root_diag else {}),
-            **({"observer_b0sun_deg": root_diag["observer_b0sun_deg"]} if "observer_b0sun_deg" in root_diag else {}),
-            **({"observer_dsun_cm": root_diag["observer_dsun_cm"]} if "observer_dsun_cm" in root_diag else {}),
-            **({"observer_obs_time": root_diag["observer_obs_time"]} if "observer_obs_time" in root_diag else {}),
+            "observer_name": root_diag["observer_name"],
+            "observer_lonc_deg": root_diag["observer_lonc_deg"],
+            "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
+            "observer_dsun_cm": root_diag["observer_dsun_cm"],
+            "observer_obs_time": root_diag["observer_obs_time"],
             "threshold": root_diag["threshold"],
             "metrics_mask_threshold": root_diag["metrics_mask_threshold"],
             "metrics_mask_fits": root_diag["metrics_mask_fits"],
