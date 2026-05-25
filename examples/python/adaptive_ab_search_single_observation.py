@@ -9,6 +9,7 @@ selections for EUV/UV slices.
 from __future__ import annotations
 
 import argparse
+import queue
 import hashlib
 import json
 import os
@@ -46,6 +47,11 @@ def _build_physical_compatibility_signature(payload: dict[str, Any]) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _canonical_json_sha256(payload: dict[str, Any]) -> str:
+    normalized = json.dumps(payload, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 def _build_run_history_entry(
     *,
     artifact_h5: Path,
@@ -79,6 +85,8 @@ def _build_run_history_entry(
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES_ROOT = REPO_ROOT / "examples"
+DEFAULT_Q0_XATOL = 1e-3
+DEFAULT_Q0_MAXITER = 200
 for candidate in (REPO_ROOT, EXAMPLES_ROOT):
     candidate_text = str(candidate)
     if candidate_text not in sys.path:
@@ -119,6 +127,7 @@ from pychmp.ab_scan_artifacts import (
     load_run_history,
     point_record_matches_compatibility_signature,
     validate_scan_artifact_compatibility,
+    validate_scan_artifact_reuse_preflight,
     write_point_scan_artifact,
 )
 from pychmp.geometry_policy import resolve_geometry_policy
@@ -232,9 +241,10 @@ class _TeeStream:
 
 
 class _ViewerRefreshHeartbeat:
-    def __init__(self, signal_path: Path, *, interval_s: float = 2.0) -> None:
+    def __init__(self, signal_path: Path, *, interval_s: float = 2.0, slice_key: str | None = None) -> None:
         self._signal_path = Path(signal_path)
         self._interval_s = max(0.5, float(interval_s))
+        self._slice_key = None if slice_key is None else str(slice_key).strip() or None
         self._phase = ""
         self._pending_points: tuple[tuple[float, float], ...] = ()
         self._active_point: tuple[float, float] | None = None
@@ -249,6 +259,7 @@ class _ViewerRefreshHeartbeat:
                 payload = {
                     "timestamp": float(time.time()),
                     "phase": str(self._phase),
+                    "slice_key": self._slice_key,
                     "pending_points": [
                         {"a": float(a_value), "b": float(b_value)}
                         for a_value, b_value in self._pending_points
@@ -350,6 +361,226 @@ class _ViewerRefreshHeartbeat:
     def _run(self) -> None:
         while not self._stop_event.wait(self._interval_s):
             self._write_signal()
+
+
+class _PointRenderRecord:
+    def __init__(self) -> None:
+        self.raw_modeled_by_q0: dict[str, np.ndarray] = {}
+        self.modeled_by_q0: dict[str, np.ndarray] = {}
+        self.components_by_q0: dict[str, dict[str, Any]] = {}
+        self.cube_by_q0: dict[str, dict[str, Any]] = {}
+
+
+class _PointRenderStream:
+    def __init__(self) -> None:
+        self._records: dict[tuple[float, float], _PointRenderRecord] = {}
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {"_records": self._records}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self._records = dict(state.get("_records", {}))
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _q0_key(q0_value: float) -> str:
+        return f"{float(q0_value):.17g}"
+
+    def _get_or_create(self, a_value: float, b_value: float) -> _PointRenderRecord:
+        point_key = (float(a_value), float(b_value))
+        with self._lock:
+            record = self._records.get(point_key)
+            if record is None:
+                record = _PointRenderRecord()
+                self._records[point_key] = record
+            return record
+
+    def record_render_pair(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_value: float,
+        raw_modeled: np.ndarray,
+        modeled: np.ndarray,
+    ) -> None:
+        record = self._get_or_create(a_value, b_value)
+        key = self._q0_key(q0_value)
+        record.raw_modeled_by_q0[key] = np.asarray(raw_modeled, dtype=np.float32)
+        record.modeled_by_q0[key] = np.asarray(modeled, dtype=np.float32)
+
+    def record_components(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_value: float,
+        components: dict[str, Any],
+    ) -> None:
+        record = self._get_or_create(a_value, b_value)
+        key = self._q0_key(q0_value)
+        record.components_by_q0[key] = dict(components)
+
+    def record_cube(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_value: float,
+        cube_payload: dict[str, Any],
+    ) -> None:
+        record = self._get_or_create(a_value, b_value)
+        key = self._q0_key(q0_value)
+        record.cube_by_q0[key] = dict(cube_payload)
+
+    def pop_record(self, *, a_value: float, b_value: float) -> _PointRenderRecord | None:
+        with self._lock:
+            return self._records.pop((float(a_value), float(b_value)), None)
+
+
+class _TrackedBaseRendererProxy:
+    def __init__(self, base_renderer: Any, *, stream: _PointRenderStream, a_value: float, b_value: float) -> None:
+        self._base = base_renderer
+        self._stream = stream
+        self._a_value = float(a_value)
+        self._b_value = float(b_value)
+
+    def render_components(self, q0: float) -> dict[str, Any]:
+        payload = self._base.render_components(float(q0))
+        self._stream.record_components(
+            a_value=self._a_value,
+            b_value=self._b_value,
+            q0_value=float(q0),
+            components=payload,
+        )
+        return payload
+
+    def render_cube(self, q0: float) -> dict[str, Any]:
+        payload = self._base.render_cube(float(q0))
+        self._stream.record_cube(
+            a_value=self._a_value,
+            b_value=self._b_value,
+            q0_value=float(q0),
+            cube_payload=payload,
+        )
+        return payload
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+class _TrackedRendererProxy:
+    def __init__(
+        self,
+        renderer: Any,
+        *,
+        stream: _PointRenderStream,
+        a_value: float,
+        b_value: float,
+        renderer_factory: _AdaptiveRendererFactory,
+        observed_template: np.ndarray,
+        target_metric: str,
+        psf_source: str,
+        compatibility_signature: str,
+        store_trial_map_cubes: bool,
+    ) -> None:
+        self._renderer = renderer
+        self._stream = stream
+        self._a_value = float(a_value)
+        self._b_value = float(b_value)
+        self._renderer_factory = renderer_factory
+        self._observed_template = np.asarray(observed_template, dtype=float)
+        self._target_metric = str(target_metric)
+        self._psf_source = str(psf_source)
+        self._compatibility_signature = str(compatibility_signature)
+        self._store_trial_map_cubes = bool(store_trial_map_cubes)
+        base = getattr(renderer, "_base", None)
+        self._base = None
+        if base is not None:
+            self._base = _TrackedBaseRendererProxy(
+                base,
+                stream=stream,
+                a_value=float(a_value),
+                b_value=float(b_value),
+            )
+
+    def render_pair(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
+        q0_value = float(q0)
+        if hasattr(self._renderer, "render_pair"):
+            raw_modeled, modeled = self._renderer.render_pair(q0_value)
+        else:
+            modeled = self._renderer.render(q0_value)
+            raw_modeled = modeled
+        raw_arr = np.asarray(raw_modeled, dtype=np.float32)
+        modeled_arr = np.asarray(modeled, dtype=np.float32)
+        self._stream.record_render_pair(
+            a_value=self._a_value,
+            b_value=self._b_value,
+            q0_value=q0_value,
+            raw_modeled=raw_arr,
+            modeled=modeled_arr,
+        )
+        return raw_arr, modeled_arr
+
+    def render(self, q0: float) -> np.ndarray:
+        _raw_modeled, modeled = self.render_pair(float(q0))
+        return modeled
+
+    def build_artifact_payload(self, point: ABPointResult) -> dict[str, Any]:
+        stream_record = self._stream.pop_record(a_value=self._a_value, b_value=self._b_value)
+        return _point_payload_from_result(
+            point,
+            renderer_factory=self._renderer_factory,
+            observed_template=self._observed_template,
+            target_metric=self._target_metric,
+            psf_source=self._psf_source,
+            compatibility_signature=self._compatibility_signature,
+            store_trial_map_cubes=self._store_trial_map_cubes,
+            stream_record=stream_record,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._renderer, name)
+
+
+class _StreamingRendererFactory:
+    def __init__(
+        self,
+        base_factory: _AdaptiveRendererFactory,
+        *,
+        stream: _PointRenderStream,
+        observed_template: np.ndarray,
+        target_metric: str,
+        psf_source: str,
+        compatibility_signature: str,
+        store_trial_map_cubes: bool,
+    ) -> None:
+        self._base_factory = base_factory
+        self._stream = stream
+        self._observed_template = np.asarray(observed_template, dtype=float)
+        self._target_metric = str(target_metric)
+        self._psf_source = str(psf_source)
+        self._compatibility_signature = str(compatibility_signature)
+        self._store_trial_map_cubes = bool(store_trial_map_cubes)
+
+    def __call__(self, a: float, b: float) -> Any:
+        renderer = self._base_factory(float(a), float(b))
+        return _TrackedRendererProxy(
+            renderer,
+            stream=self._stream,
+            a_value=float(a),
+            b_value=float(b),
+            renderer_factory=self._base_factory,
+            observed_template=self._observed_template,
+            target_metric=self._target_metric,
+            psf_source=self._psf_source,
+            compatibility_signature=self._compatibility_signature,
+            store_trial_map_cubes=self._store_trial_map_cubes,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base_factory, name)
 
 
 @dataclass(frozen=True)
@@ -491,22 +722,10 @@ def _resolve_observation_request(args: argparse.Namespace, *, repo_root: Path) -
     obs_map_id = None if args.obs_map_id is None else str(args.obs_map_id).strip() or None
     explicit_source = None if args.obs_source is None else str(args.obs_source).strip().lower() or None
 
-    if positional_fits is not None and explicit_obs_path is not None and positional_fits != explicit_obs_path:
-        raise SystemExit(
-            f"Conflicting observation path selectors: positional fits_file={positional_fits} "
-            f"and --obs-path={explicit_obs_path}"
-        )
     obs_path = explicit_obs_path or positional_fits
 
     if explicit_source is None:
         explicit_source = "model_refmap" if obs_map_id is not None else "external_fits"
-    if explicit_source not in {"external_fits", "model_refmap"}:
-        raise SystemExit(f"Unsupported --obs-source value: {explicit_source}")
-
-    if explicit_source == "external_fits" and obs_map_id is not None:
-        raise SystemExit("Conflicting observation selectors: --obs-map-id requires --obs-source=model_refmap")
-    if explicit_source == "model_refmap" and obs_path is not None:
-        raise SystemExit("Conflicting observation selectors: external FITS paths cannot be used with --obs-source=model_refmap")
 
     _eovsa_root, model_root, ebtel_root = _default_testdata_roots(repo_root, testdata_repo=testdata_repo)
     _default_eovsa_fits, default_model_h5, default_ebtel_path = resolve_default_testdata_fixture_paths(
@@ -514,10 +733,6 @@ def _resolve_observation_request(args: argparse.Namespace, *, repo_root: Path) -
         testdata_repo=testdata_repo,
     )
 
-    if explicit_source == "external_fits" and obs_path is None:
-        raise SystemExit("--obs-path or positional fits_file is required when --obs-source=external_fits")
-    if explicit_source == "model_refmap" and obs_map_id is None:
-        raise SystemExit("--obs-map-id is required when --obs-source=model_refmap")
     if model_h5 is None:
         if default_model_h5 is None:
             raise SystemExit(
@@ -599,6 +814,64 @@ def _resolve_existing_file(path_text: str | None) -> Path | None:
     return resolved if resolved.exists() else None
 
 
+def _build_synthetic_map_identity(
+    *,
+    renderer_factory: _AdaptiveRendererFactory,
+    a_value: float,
+    b_value: float,
+    q0_value: float,
+    domain_label: str,
+    channel_or_frequency_label: str,
+    map_role: str,
+) -> dict[str, Any]:
+    geometry = getattr(renderer_factory, "geometry", None)
+    spectral_domain = getattr(renderer_factory, "spectral_domain", "unknown")
+    spectral_label = getattr(renderer_factory, "spectral_label", str(channel_or_frequency_label))
+    observer_name = getattr(renderer_factory, "observer_name", None)
+    render_frequencies_ghz = tuple(getattr(renderer_factory, "render_frequencies_ghz", ()) or ())
+    render_channels = tuple(getattr(renderer_factory, "render_channels", ()) or ())
+    return {
+        "schema": "pychmp.synthetic_map_db.v1",
+        "spectral_domain": str(spectral_domain),
+        "spectral_label": str(spectral_label),
+        "domain_label": str(domain_label),
+        "channel_or_frequency": str(channel_or_frequency_label),
+        "map_role": str(map_role),
+        "a": float(a_value),
+        "b": float(b_value),
+        "q0": float(q0_value),
+        "geometry": {
+            "xc": float(getattr(geometry, "xc", np.nan)),
+            "yc": float(getattr(geometry, "yc", np.nan)),
+            "dx": float(getattr(geometry, "dx", np.nan)),
+            "dy": float(getattr(geometry, "dy", np.nan)),
+            "nx": int(getattr(geometry, "nx", 0)),
+            "ny": int(getattr(geometry, "ny", 0)),
+        },
+        "observer_name": None if observer_name is None else str(observer_name),
+        "render_frequencies_ghz": [float(v) for v in render_frequencies_ghz],
+        "render_channels": [str(v) for v in render_channels],
+    }
+
+
+def _lookup_stream_value_by_q0(
+    values_by_q0: dict[str, Any],
+    q0_value: float,
+) -> Any | None:
+    exact_key = _PointRenderStream._q0_key(float(q0_value))
+    if exact_key in values_by_q0:
+        return values_by_q0[exact_key]
+    target = float(q0_value)
+    for key_text, value in values_by_q0.items():
+        try:
+            candidate = float(key_text)
+        except Exception:
+            continue
+        if np.isclose(candidate, target, rtol=0.0, atol=1e-12):
+            return value
+    return None
+
+
 def _point_payload_from_result(
     point: ABPointResult,
     *,
@@ -607,13 +880,17 @@ def _point_payload_from_result(
     target_metric: str,
     psf_source: str,
     compatibility_signature: str,
+    store_trial_map_cubes: bool = False,
+    stream_record: _PointRenderRecord,
 ) -> dict[str, Any]:
-    renderer = renderer_factory(float(point.a), float(point.b))
-    if hasattr(renderer, "render_pair"):
-        raw_modeled_best, modeled_best = renderer.render_pair(float(point.q0))
-    else:
-        modeled_best = renderer.render(float(point.q0))
-        raw_modeled_best = modeled_best
+    point_a = float(point.a)
+    point_b = float(point.b)
+    point_q0 = float(point.q0)
+    trial_q0_values = [float(v) for v in point.trial_q0]
+    raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, point_q0)
+    modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, point_q0)
+    if raw_modeled_best is None or modeled_best is None:
+        raise RuntimeError("point payload stream record is missing the best rendered maps")
     modeled_best = np.asarray(modeled_best, dtype=float)
     raw_modeled_best = np.asarray(raw_modeled_best, dtype=float)
     residual = np.asarray(modeled_best - np.asarray(observed_template, dtype=float), dtype=float)
@@ -627,53 +904,148 @@ def _point_payload_from_result(
     trial_euv_coronal_maps = None
     trial_euv_tr_maps = None
     map_store_arrays: dict[str, np.ndarray] = {}
-    base_renderer = getattr(renderer, "_base", renderer)
-    if hasattr(base_renderer, "render_cube"):
-        cube_payload = base_renderer.render_cube(float(point.q0))
+    synthetic_map_keys: list[dict[str, Any]] = []
+
+    def _register_synthetic_map(*, identity: dict[str, Any], array: np.ndarray, label: str) -> None:
+        machine_key = _canonical_json_sha256(identity)
+        map_store_name = f"synthetic/{machine_key}"
+        map_store_arrays[map_store_name] = np.asarray(array, dtype=np.float32)
+        synthetic_map_keys.append(
+            {
+                "label": str(label),
+                "map_store_array": str(map_store_name),
+                "machine_key": str(machine_key),
+                "identity": dict(identity),
+            }
+        )
+
+    cube_payload = None
+    cube_payload = _lookup_stream_value_by_q0(stream_record.cube_by_q0, point_q0)
+    if isinstance(cube_payload, dict):
         for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
-            map_store_arrays[f"mw/{float(freq):.6f}ghz/raw_modeled_best"] = np.asarray(rendered, dtype=np.float32)
-    if hasattr(base_renderer, "render_components"):
-        components = base_renderer.render_components(float(point.q0))
+            freq_label = f"{float(freq):.6f}ghz"
+            _register_synthetic_map(
+                identity=_build_synthetic_map_identity(
+                    renderer_factory=renderer_factory,
+                    a_value=point_a,
+                    b_value=point_b,
+                    q0_value=point_q0,
+                    domain_label="mw",
+                    channel_or_frequency_label=freq_label,
+                    map_role="raw_modeled_best",
+                ),
+                array=np.asarray(rendered, dtype=np.float32),
+                label=f"MW {freq_label} raw modeled",
+            )
+    components = None
+    components = _lookup_stream_value_by_q0(stream_record.components_by_q0, point_q0)
+    if isinstance(components, dict):
         for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
-            map_store_arrays[f"euv/{channel}/rendered_best"] = np.asarray(rendered, dtype=np.float32)
+            _register_synthetic_map(
+                identity=_build_synthetic_map_identity(
+                    renderer_factory=renderer_factory,
+                    a_value=point_a,
+                    b_value=point_b,
+                    q0_value=point_q0,
+                    domain_label="euv",
+                    channel_or_frequency_label=str(channel),
+                    map_role="rendered_best",
+                ),
+                array=np.asarray(rendered, dtype=np.float32),
+                label=f"EUV {channel} rendered",
+            )
         for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
-            map_store_arrays[f"euv/{channel}/flux_corona_best"] = np.asarray(rendered, dtype=np.float32)
+            _register_synthetic_map(
+                identity=_build_synthetic_map_identity(
+                    renderer_factory=renderer_factory,
+                    a_value=point_a,
+                    b_value=point_b,
+                    q0_value=point_q0,
+                    domain_label="euv",
+                    channel_or_frequency_label=str(channel),
+                    map_role="flux_corona_best",
+                ),
+                array=np.asarray(rendered, dtype=np.float32),
+                label=f"EUV {channel} coronal flux",
+            )
         for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
-            map_store_arrays[f"euv/{channel}/flux_tr_best"] = np.asarray(rendered, dtype=np.float32)
-    trial_q0_values = [float(v) for v in point.trial_q0]
-    if trial_q0_values:
+            _register_synthetic_map(
+                identity=_build_synthetic_map_identity(
+                    renderer_factory=renderer_factory,
+                    a_value=point_a,
+                    b_value=point_b,
+                    q0_value=point_q0,
+                    domain_label="euv",
+                    channel_or_frequency_label=str(channel),
+                    map_role="flux_tr_best",
+                ),
+                array=np.asarray(rendered, dtype=np.float32),
+                label=f"EUV {channel} TR flux",
+            )
+
+    trial_raw_by_q0: dict[str, np.ndarray] = {}
+    trial_modeled_by_q0: dict[str, np.ndarray] = {}
+    if stream_record is not None:
+        trial_raw_by_q0 = dict(stream_record.raw_modeled_by_q0)
+        trial_modeled_by_q0 = dict(stream_record.modeled_by_q0)
+
+    if trial_q0_values and bool(store_trial_map_cubes):
         raw_trials: list[np.ndarray] = []
         modeled_trials: list[np.ndarray] = []
         residual_trials: list[np.ndarray] = []
         euv_coronal_trials: list[np.ndarray] = []
         euv_tr_trials: list[np.ndarray] = []
-        for q0_value in trial_q0_values:
-            if hasattr(renderer, "render_pair"):
-                raw_trial, modeled_trial = renderer.render_pair(float(q0_value))
-            else:
-                modeled_trial = renderer.render(float(q0_value))
-                raw_trial = modeled_trial
+        for trial_index, q0_value in enumerate(trial_q0_values):
+            raw_trial = _lookup_stream_value_by_q0(trial_raw_by_q0, q0_value)
+            modeled_trial = _lookup_stream_value_by_q0(trial_modeled_by_q0, q0_value)
+            if raw_trial is None or modeled_trial is None:
+                raise RuntimeError("point payload stream record is missing trial rendered maps")
             raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
             modeled_trial_arr = np.asarray(modeled_trial, dtype=np.float32)
             raw_trials.append(raw_trial_arr)
             modeled_trials.append(modeled_trial_arr)
             residual_trials.append(modeled_trial_arr - np.asarray(observed_template, dtype=np.float32))
 
-            if hasattr(base_renderer, "render_components"):
-                components = base_renderer.render_components(float(q0_value))
+            trial_components = _lookup_stream_value_by_q0(stream_record.components_by_q0, q0_value)
+            if isinstance(trial_components, dict):
+                components = trial_components
                 coronal = components.get("flux_corona")
                 tr_flux = components.get("flux_tr")
                 if coronal is not None and tr_flux is not None:
                     euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
                     euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
-                trial_index = len(raw_trials) - 1
                 for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
-                    map_store_arrays[f"euv/{channel}/trial_{trial_index:03d}/rendered"] = np.asarray(rendered, dtype=np.float32)
-            if hasattr(base_renderer, "render_cube"):
-                cube_payload = base_renderer.render_cube(float(q0_value))
-                trial_index = len(raw_trials) - 1
+                    _register_synthetic_map(
+                        identity=_build_synthetic_map_identity(
+                            renderer_factory=renderer_factory,
+                            a_value=point_a,
+                            b_value=point_b,
+                            q0_value=float(q0_value),
+                            domain_label="euv",
+                            channel_or_frequency_label=str(channel),
+                            map_role=f"trial_{trial_index:03d}_rendered",
+                        ),
+                        array=np.asarray(rendered, dtype=np.float32),
+                        label=f"EUV {channel} trial {trial_index:03d} rendered",
+                    )
+            trial_cube = _lookup_stream_value_by_q0(stream_record.cube_by_q0, q0_value)
+            if isinstance(trial_cube, dict):
+                cube_payload = trial_cube
                 for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
-                    map_store_arrays[f"mw/{float(freq):.6f}ghz/trial_{trial_index:03d}/raw_modeled"] = np.asarray(rendered, dtype=np.float32)
+                    freq_label = f"{float(freq):.6f}ghz"
+                    _register_synthetic_map(
+                        identity=_build_synthetic_map_identity(
+                            renderer_factory=renderer_factory,
+                            a_value=point_a,
+                            b_value=point_b,
+                            q0_value=float(q0_value),
+                            domain_label="mw",
+                            channel_or_frequency_label=freq_label,
+                            map_role=f"trial_{trial_index:03d}_raw_modeled",
+                        ),
+                        array=np.asarray(rendered, dtype=np.float32),
+                        label=f"MW {freq_label} trial {trial_index:03d} raw modeled",
+                    )
         if raw_trials and len(raw_trials) == len(trial_q0_values):
             trial_raw_modeled_maps = np.stack(raw_trials, axis=0)
             trial_modeled_maps = np.stack(modeled_trials, axis=0)
@@ -703,6 +1075,9 @@ def _point_payload_from_result(
         "fit_rho2_trials": [float(v) for v in fit_rho2_trials],
         "fit_eta2_trials": [float(v) for v in fit_eta2_trials],
         "psf_source": str(psf_source),
+        "synthetic_map_db_version": 1,
+        "synthetic_map_keys": synthetic_map_keys,
+        "store_trial_map_cubes": bool(store_trial_map_cubes),
         COMPATIBILITY_SIGNATURE_KEY: str(compatibility_signature),
         "point_status": "computed",
     }
@@ -744,6 +1119,81 @@ class _MetricValues:
         self.chi2 = float(chi2)
         self.rho2 = float(rho2)
         self.eta2 = float(eta2)
+
+
+class _ArtifactWriteDispatcher:
+    def __init__(
+        self,
+        *,
+        artifact_h5: Path,
+        observed: np.ndarray,
+        sigma_map: np.ndarray,
+        target_header: Any,
+        diagnostics: dict[str, Any],
+        blos_reference: tuple[np.ndarray, fits.Header] | None,
+        psf_kernel: np.ndarray | None,
+    ) -> None:
+        self._artifact_h5 = Path(artifact_h5)
+        self._observed = np.asarray(observed, dtype=float)
+        self._sigma_map = np.asarray(sigma_map, dtype=float)
+        self._target_header = target_header
+        self._diagnostics = dict(diagnostics)
+        self._blos_reference = blos_reference
+        self._psf_kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=16)
+        self._closed = False
+        self._failed: BaseException | None = None
+        self._lock = threading.Lock()
+        self._worker = threading.Thread(target=self._run, name="pychmp-artifact-dispatcher", daemon=True)
+        self._worker.start()
+
+    def _raise_if_failed(self) -> None:
+        with self._lock:
+            if self._failed is not None:
+                raise RuntimeError("artifact write dispatcher failed") from self._failed
+
+    def write_point(self, point_payload: dict[str, Any]) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("artifact write dispatcher is closed")
+        self._raise_if_failed()
+        # Bounded queue applies backpressure while still allowing the caller to
+        # continue without waiting for each point write to complete.
+        self._queue.put(dict(point_payload))
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._queue.put(None)
+        self._queue.join()
+        self._worker.join(timeout=5.0)
+        self._raise_if_failed()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                return
+            try:
+                append_point_record(
+                    self._artifact_h5,
+                    observed=self._observed,
+                    sigma_map=self._sigma_map,
+                    wcs_header=self._target_header,
+                    diagnostics=self._diagnostics,
+                    blos_reference=self._blos_reference,
+                    psf_kernel=self._psf_kernel,
+                    point_payload=item,
+                )
+            except BaseException as exc:
+                with self._lock:
+                    if self._failed is None:
+                        self._failed = exc
+            finally:
+                self._queue.task_done()
 
 
 def _point_from_record(record: dict[str, Any], *, target_metric: str) -> ABPointResult:
@@ -796,17 +1246,104 @@ def _rescore_auxiliary_map_record(
     target_metric: str,
 ) -> tuple[ABPointResult, dict[str, Any]] | None:
     trial_q0 = tuple(float(value) for value in record.get("fit_q0_trials", ()))
+    trial_metric_trials = tuple(float(value) for value in record.get("fit_metric_trials", ()))
     trial_maps_raw = record.get("trial_modeled_maps")
-    if not trial_q0 or trial_maps_raw is None:
-        return None
-    trial_maps = np.asarray(trial_maps_raw, dtype=float)
-    if trial_maps.ndim != 3 or int(trial_maps.shape[0]) != len(trial_q0):
-        return None
-
     observed_arr = np.asarray(observed, dtype=float)
     sigma_arr = np.asarray(sigma_map, dtype=float)
     explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
     mask_fn = resolve_threshold_mask("union")
+
+    if trial_maps_raw is None:
+        diagnostics = dict(record.get("diagnostics") or {})
+        source_metric = str(record.get("target_metric", diagnostics.get("target_metric", ""))).strip().lower()
+        if not trial_q0 or source_metric != str(target_metric).strip().lower():
+            return None
+        if len(trial_metric_trials) != len(trial_q0):
+            return None
+        modeled_best_raw = record.get("modeled_best")
+        if modeled_best_raw is None:
+            return None
+        finite_indices = [idx for idx, value in enumerate(trial_metric_trials) if np.isfinite(float(value))]
+        if not finite_indices:
+            return None
+        best_index = min(finite_indices, key=lambda idx: float(trial_metric_trials[idx]))
+        best_q0 = float(trial_q0[best_index])
+        best_objective = float(trial_metric_trials[best_index])
+        best_map = np.asarray(modeled_best_raw, dtype=float)
+        trial_chi2 = tuple(float(value) for value in record.get("fit_chi2_trials", trial_metric_trials))
+        trial_rho2 = tuple(float(value) for value in record.get("fit_rho2_trials", (np.nan,) * len(trial_q0)))
+        trial_eta2 = tuple(float(value) for value in record.get("fit_eta2_trials", (np.nan,) * len(trial_q0)))
+        diagnostics.update(
+            {
+                "target_metric": str(target_metric),
+                "target_metric_value": float(best_objective),
+                "chi2": float(trial_chi2[best_index]) if best_index < len(trial_chi2) else float("nan"),
+                "rho2": float(trial_rho2[best_index]) if best_index < len(trial_rho2) else float("nan"),
+                "eta2": float(trial_eta2[best_index]) if best_index < len(trial_eta2) else float("nan"),
+                "map_store_reused": True,
+                "map_store_reused_without_trial_maps": True,
+                "map_store_source_slice_key": record.get("source_slice_key"),
+                "map_store_source_search_id": record.get("source_search_id"),
+            }
+        )
+        residual = np.asarray(best_map, dtype=float) - observed_arr
+        point = ABPointResult(
+            a=float(record["a"]),
+            b=float(record["b"]),
+            q0=float(best_q0),
+            objective_value=float(best_objective),
+            metrics=_MetricValues(
+                chi2=float(diagnostics.get("chi2", np.nan)),
+                rho2=float(diagnostics.get("rho2", np.nan)),
+                eta2=float(diagnostics.get("eta2", np.nan)),
+            ),
+            target_metric=str(target_metric),
+            success=True,
+            nfev=int(len(trial_q0)),
+            nit=0,
+            message="reused from saved trial metrics",
+            used_adaptive_bracketing=bool(record.get("used_adaptive_bracketing", False)),
+            bracket_found=bool(record.get("bracket_found", False)),
+            bracket=None if record.get("bracket") is None else tuple(float(v) for v in record.get("bracket")),
+            trial_q0=tuple(float(v) for v in trial_q0),
+            trial_objective_values=tuple(float(v) for v in trial_metric_trials),
+            trial_chi2_values=trial_chi2,
+            trial_rho2_values=trial_rho2,
+            trial_eta2_values=trial_eta2,
+            elapsed_seconds=0.0,
+        )
+        payload = build_computed_point_payload(
+            a_value=float(point.a),
+            b_value=float(point.b),
+            a_index=int(record.get("a_index", 0)),
+            b_index=int(record.get("b_index", 0)),
+            q0=float(point.q0),
+            success=True,
+            status="computed",
+            modeled_best=np.asarray(best_map, dtype=float),
+            raw_modeled_best=np.asarray(record.get("raw_modeled_best", best_map), dtype=float),
+            residual=residual,
+            fit_q0_trials=tuple(float(v) for v in trial_q0),
+            fit_metric_trials=tuple(float(v) for v in trial_metric_trials),
+            fit_chi2_trials=trial_chi2,
+            fit_rho2_trials=trial_rho2,
+            fit_eta2_trials=trial_eta2,
+            nfev=int(len(trial_q0)),
+            nit=0,
+            message="reused from saved trial metrics",
+            used_adaptive_bracketing=bool(record.get("used_adaptive_bracketing", False)),
+            bracket_found=bool(record.get("bracket_found", False)),
+            bracket=None if record.get("bracket") is None else tuple(float(v) for v in record.get("bracket")),
+            target_metric=str(target_metric),
+            diagnostics=diagnostics,
+        )
+        return point, payload
+
+    if not trial_q0:
+        return None
+    trial_maps = np.asarray(trial_maps_raw, dtype=float)
+    if trial_maps.ndim != 3 or int(trial_maps.shape[0]) != len(trial_q0):
+        return None
 
     rescored: list[tuple[float, Any, float, np.ndarray]] = []
     for q0_value, modeled in zip(trial_q0, trial_maps, strict=False):
@@ -977,6 +1514,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         psf_source: str,
         psf_kernel: np.ndarray | None,
         compatibility_signature: str,
+        store_trial_map_cubes: bool = False,
         viewer_heartbeat: _ViewerRefreshHeartbeat | None = None,
     ) -> None:
         self._artifact_h5 = Path(artifact_h5)
@@ -990,8 +1528,40 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         self._psf_source = str(psf_source)
         self._psf_kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
         self._compatibility_signature = str(compatibility_signature)
+        self._store_trial_map_cubes = bool(store_trial_map_cubes)
         self._viewer_heartbeat = viewer_heartbeat
+        self._render_stream = _PointRenderStream()
+        self._writer = _ArtifactWriteDispatcher(
+            artifact_h5=self._artifact_h5,
+            observed=self._observed,
+            sigma_map=self._sigma_map,
+            target_header=self._target_header,
+            diagnostics=self._diagnostics,
+            blos_reference=self._blos_reference,
+            psf_kernel=self._psf_kernel,
+        )
         self._point_map: dict[tuple[float, float], ABPointResult] = {}
+
+    @property
+    def streaming_renderer_factory(self) -> Any:
+        return _StreamingRendererFactory(
+            self._renderer_factory,
+            stream=self._render_stream,
+            observed_template=self._observed,
+            target_metric=self._target_metric,
+            psf_source=self._psf_source,
+            compatibility_signature=self._compatibility_signature,
+            store_trial_map_cubes=self._store_trial_map_cubes,
+        )
+
+    def close(self) -> None:
+        self._writer.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def set_pending_points(self, points: list[tuple[float, float]] | tuple[tuple[float, float], ...]) -> None:
         if self._viewer_heartbeat is not None:
@@ -1040,16 +1610,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 **dict(point_payload.get("diagnostics") or {}),
                 COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
             }
-            append_point_record(
-                self._artifact_h5,
-                observed=self._observed,
-                sigma_map=self._sigma_map,
-                wcs_header=self._target_header,
-                diagnostics=self._diagnostics,
-                blos_reference=self._blos_reference,
-                psf_kernel=self._psf_kernel,
-                point_payload=point_payload,
-            )
+            self._writer.write_point(point_payload)
             self._point_map[key] = point
             promoted_count += 1
         if promoted_count and self._viewer_heartbeat is not None:
@@ -1145,16 +1706,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     **dict(point_payload.get("diagnostics") or {}),
                     COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
                 }
-                append_point_record(
-                    self._artifact_h5,
-                    observed=self._observed,
-                    sigma_map=self._sigma_map,
-                    wcs_header=self._target_header,
-                    diagnostics=self._diagnostics,
-                    blos_reference=self._blos_reference,
-                    psf_kernel=self._psf_kernel,
-                    point_payload=point_payload,
-                )
+                self._writer.write_point(point_payload)
                 self._point_map[key] = point
                 promoted_count += 1
         if promoted_count and self._viewer_heartbeat is not None:
@@ -1170,6 +1722,9 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if existing is not None and np.isclose(existing.q0, value.q0, rtol=0.0, atol=1e-12):
             self._point_map[normalized_key] = value
             return
+        payload = value.artifact_payload
+        if payload is None:
+            raise RuntimeError("point result is missing the artifact payload produced by the worker")
         print(
             f"  Serializing point payload: a={float(value.a):.3f} b={float(value.b):.3f} "
             f"(trials={len(tuple(value.trial_q0))})"
@@ -1179,24 +1734,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 f"serializing point a={float(value.a):.3f} b={float(value.b):.3f}"
             )
         save_started = time.perf_counter()
-        payload = _point_payload_from_result(
-            value,
-            renderer_factory=self._renderer_factory,
-            observed_template=self._observed,
-            target_metric=self._target_metric,
-            psf_source=self._psf_source,
-            compatibility_signature=self._compatibility_signature,
-        )
-        append_point_record(
-            self._artifact_h5,
-            observed=self._observed,
-            sigma_map=self._sigma_map,
-            wcs_header=self._target_header,
-            diagnostics=self._diagnostics,
-            blos_reference=self._blos_reference,
-            psf_kernel=self._psf_kernel,
-            point_payload=payload,
-        )
+        self._writer.write_point(payload)
         save_elapsed = time.perf_counter() - save_started
         self._point_map[normalized_key] = value
         if self._viewer_heartbeat is not None:
@@ -1208,7 +1746,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             f"  Saved point to sparse artifact: a={float(value.a):.3f} b={float(value.b):.3f} "
             f"q0={_format_console_scalar(float(value.q0), fixed_precision=6)} "
             f"{self._target_metric}={float(value.objective_value):.6e} "
-            f"save_elapsed={save_elapsed:.3f}s"
+            f"enqueue_elapsed={save_elapsed:.3f}s"
         )
 
     def __delitem__(self, key: tuple[float, float]) -> None:
@@ -1255,6 +1793,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-q0-min", type=float, default=None, help="Optional hard lower q0 bound")
     parser.add_argument("--hard-q0-max", type=float, default=None, help="Optional hard upper q0 bound")
     parser.add_argument("--target-metric", choices=("chi2", "rho2", "eta2"), default="chi2", help="Metric minimized during the search")
+    parser.add_argument(
+        "--store-trial-map-cubes",
+        action="store_true",
+        help="Persist full per-trial rendered map cubes (expensive; disabled by default)",
+    )
     parser.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     parser.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
     parser.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
@@ -1265,7 +1808,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive-bracketing", action=argparse.BooleanOptionalAction, default=True, help="Enable adaptive q0 bracketing")
     parser.add_argument("--q0-start", type=float, default=None, help="Optional explicit q0 start for every point")
     parser.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative q0 step for adaptive bracketing")
-    parser.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive q0 bracket expansions")
+    parser.add_argument("--xatol", type=float, default=DEFAULT_Q0_XATOL, help="Absolute q0 tolerance for bounded minimization")
+    parser.add_argument("--maxiter", type=int, default=DEFAULT_Q0_MAXITER, help="Maximum bounded-minimizer iterations")
+    parser.add_argument(
+        "--max-bracket-steps",
+        type=int,
+        default=12,
+        help="Maximum additional adaptive q0 bracket expansions after the initial q0_min/q0_start/q0_max triplet; not a cap on total trial evaluations",
+    )
     parser.add_argument("--tbase", type=float, default=DEFAULT_TBASE, help="Base temperature in K")
     parser.add_argument("--nbase", type=float, default=DEFAULT_NBASE, help="Base density in cm^-3")
     parser.add_argument("--observer", default=None, help="Observer name override, e.g. earth")
@@ -1280,11 +1830,8 @@ def _parse_args() -> argparse.Namespace:
         "--override-header-psf",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use user-supplied PSF or fallback reference-beam parameters even when the FITS header already contains a PSF beam",
+        help="Use user-supplied PSF parameters even when the FITS header already contains a PSF beam",
     )
-    parser.add_argument("--fallback-psf-bmaj-arcsec", type=float, default=None, help="Fallback PSF major-axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied")
-    parser.add_argument("--fallback-psf-bmin-arcsec", type=float, default=None, help="Fallback PSF minor-axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied")
-    parser.add_argument("--fallback-psf-bpa-deg", type=float, default=None, help="Fallback PSF position angle used only when the FITS header has no beam and no explicit PSF override is supplied")
     parser.add_argument("--psf-ref-frequency-ghz", type=float, default=None, help="Reference frequency for the supplied PSF")
     parser.add_argument(
         "--psf-scale-inverse-frequency",
@@ -1441,6 +1988,12 @@ def main() -> int:
         live_log_handle = log_path.open("a", encoding="utf-8", buffering=1)
         sys.stdout = _TeeStream(sys.stdout, live_log_handle)
         sys.stderr = _TeeStream(sys.stderr, live_log_handle)
+        print("=" * 88)
+        print(
+            "Run start: "
+            f"utc={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+            f"pid={os.getpid()} argv={shlex.join([str(sys.executable), *[str(item) for item in sys.argv]])}"
+        )
         print(f"Live log file: {log_path}")
     except Exception as exc:
         print(f"WARNING: failed to initialize live log sidecar: {exc}")
@@ -1455,24 +2008,11 @@ def main() -> int:
     elif obs_map.wavelength_angstrom is not None:
         print(f"  Wavelength: {float(obs_map.wavelength_angstrom):.3f} A")
 
-    print("Estimating noise from map...")
-    noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
-    sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
-    noise_diag = noise_result.diagnostics
-    noise_unit = obs_map_noise_unit_label(obs_map)
-    if str(noise_result.method_used) == "fallback_std":
-        print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} {noise_unit}")
-    else:
-        print(f"  Estimated sigma: {float(noise_result.sigma):.2f} {noise_unit}")
-
     sdk = import_module("gxrender.sdk")
     header_psf, header_psf_source = _extract_psf_from_header(header)
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
-    fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
-    fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
     selected_psf_metadata = _resolve_selected_psf_metadata(
         header_psf=header_psf,
         header_psf_source=header_psf_source,
@@ -1483,9 +2023,6 @@ def main() -> int:
         cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
         cli_psf_bmin_arcsec=psf_bmin_arcsec,
         cli_psf_bpa_deg=psf_bpa_deg,
-        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
-        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
-        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
         override_header_psf=bool(args.override_header_psf),
     )
     psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
@@ -1561,6 +2098,76 @@ def main() -> int:
         hglt_obs_deg=effective_observer_b0sun_deg,
         dsun_obs_m=None,
     )
+
+    artifact_preexisting = artifact_h5.exists()
+    existing_format = detect_scan_artifact_format(artifact_h5) if artifact_preexisting else None
+    if artifact_preexisting and existing_format not in {None, "sparse", "unified"}:
+        raise SystemExit(
+            f"Existing artifact {artifact_h5} is rectangular; this adaptive example requires a sparse artifact path."
+        )
+
+    model_sha256 = _compute_file_sha256(model_h5)
+    observation_source_path = obs_map.source_path
+    observation_source_file = _resolve_existing_file(observation_source_path)
+    observation_source_sha256 = (
+        _compute_file_sha256(observation_source_file)
+        if observation_source_file is not None and observation_source_file.is_file()
+        else None
+    )
+    ebtel_sha256 = _compute_file_sha256(ebtel_path)
+    target_slice_key = next(
+        (str(item["key"]) for item in slice_descriptors if bool(item.get("is_target"))),
+        str(slice_descriptors[0]["key"]) if slice_descriptors else "default",
+    )
+    preflight_diag = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        "spectral_domain": str(render_selection.domain),
+        "spectral_label": str(render_selection.spectral_label),
+        "target_slice_key": target_slice_key,
+        "model_sha256": str(model_sha256),
+        "fits_sha256": str(observation_source_sha256 or ""),
+        "ebtel_sha256": str(ebtel_sha256),
+        "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
+        "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        "euv_channel": render_selection.euv_channel,
+        "euv_instrument": render_selection.euv_instrument,
+        "map_xc_arcsec": float(geometry.xc),
+        "map_yc_arcsec": float(geometry.yc),
+        "map_dx_arcsec": float(geometry.dx),
+        "map_dy_arcsec": float(geometry.dy),
+        "map_nx": int(geometry.nx),
+        "map_ny": int(geometry.ny),
+        "observer_name": effective_observer_name,
+        "observer_lonc_deg": effective_observer_lonc_deg,
+        "observer_b0sun_deg": effective_observer_b0sun_deg,
+        "observer_obs_time": target_header.get("DATE-OBS", ""),
+    }
+    if artifact_preexisting and not bool(args.recompute_existing):
+        try:
+            current_payload = load_scan_file(artifact_h5, slice_key=target_slice_key)
+        except Exception:
+            current_payload = None
+        if current_payload is not None:
+            try:
+                validate_scan_artifact_reuse_preflight(
+                    current_payload,
+                    wcs_header=target_header,
+                    diagnostics=preflight_diag,
+                    artifact_path=artifact_h5,
+                )
+            except ScanArtifactCompatibilityError as exc:
+                raise SystemExit(str(exc)) from exc
+
+    print("Estimating noise from map...")
+    noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+    sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
+    noise_diag = noise_result.diagnostics
+    noise_unit = obs_map_noise_unit_label(obs_map)
+    print(
+        f"  Estimated sigma: {float(noise_result.sigma):.2f} {noise_unit} "
+        f"(method={str(noise_result.method_used)})"
+    )
+
     observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
     sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
     if np.isnan(observed_cropped).any():
@@ -1655,24 +2262,12 @@ def main() -> int:
             scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
         )
 
-    model_sha256 = _compute_file_sha256(model_h5)
-    observation_source_path = obs_map.source_path
-    observation_source_file = _resolve_existing_file(observation_source_path)
-    observation_source_sha256 = (
-        _compute_file_sha256(observation_source_file)
-        if observation_source_file is not None and observation_source_file.is_file()
-        else None
-    )
-    ebtel_sha256 = _compute_file_sha256(ebtel_path)
     root_diag = {
         "artifact_kind": "pychmp_ab_scan_sparse_points",
         "spectral_domain": str(render_selection.domain),
         "spectral_label": str(render_selection.spectral_label),
         "slice_descriptors": slice_descriptors,
-        "target_slice_key": next(
-            (str(item["key"]) for item in slice_descriptors if bool(item.get("is_target"))),
-            str(slice_descriptors[0]["key"]) if slice_descriptors else "default",
-        ),
+        "target_slice_key": target_slice_key,
         "render_frequencies_ghz": [float(v) for v in render_frequencies_ghz],
         "render_channels": [str(v) for v in render_channels],
         "render_extra_slices": int(max(0, len(slice_descriptors) - 1)),
@@ -1779,14 +2374,11 @@ def main() -> int:
     root_diag[COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
     common_blos_reference = blos_reference_for_fov
 
-    artifact_preexisting = artifact_h5.exists()
-    existing_format = detect_scan_artifact_format(artifact_h5) if artifact_preexisting else None
     viewer_refresh_signal = Path(f"{artifact_h5}.refresh")
-    viewer_heartbeat = _ViewerRefreshHeartbeat(viewer_refresh_signal)
-    if artifact_h5.exists() and existing_format not in {None, "sparse", "unified"}:
-        raise SystemExit(
-            f"Existing artifact {artifact_h5} is rectangular; this adaptive example requires a sparse artifact path."
-        )
+    viewer_heartbeat = _ViewerRefreshHeartbeat(
+        viewer_refresh_signal,
+        slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
+    )
     existing_run_history = load_run_history(artifact_h5) if artifact_preexisting else []
     if bool(args.recompute_existing) and artifact_h5.exists():
         print(f"Recompute existing: resetting sparse artifact at {artifact_h5}")
@@ -1867,8 +2459,10 @@ def main() -> int:
         psf_source=str(psf_source),
         psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         compatibility_signature=compatibility_signature,
+        store_trial_map_cubes=bool(args.store_trial_map_cubes),
         viewer_heartbeat=viewer_heartbeat,
     )
+    search_renderer_factory = cache.streaming_renderer_factory
     try:
         reused_points = 0 if bool(args.recompute_existing) else cache.hydrate_from_existing()
         if not bool(args.recompute_existing):
@@ -1891,6 +2485,7 @@ def main() -> int:
                 reused_points += promoted_points
                 print(f"Map store reuse: promoted {promoted_points} point(s) into slice {root_diag.get('target_slice_key')}")
     except ScanArtifactCompatibilityError as exc:
+        cache.close()
         raise SystemExit(str(exc)) from exc
     append_run_history_entry(
         artifact_h5,
@@ -1994,7 +2589,7 @@ def main() -> int:
         _viewer_point_complete = None
     try:
         result = search_local_minimum_ab(
-            factory,
+            search_renderer_factory,
             observed_cropped,
             sigma_cropped,
             a_start=float(args.a_start),
@@ -2011,6 +2606,8 @@ def main() -> int:
             mask_type="union" if explicit_metric_mask is None else "explicit_fits",
             explicit_mask=explicit_metric_mask,
             target_metric=str(args.target_metric),
+            xatol=float(args.xatol),
+            maxiter=int(args.maxiter),
             adaptive_bracketing=bool(args.adaptive_bracketing),
             q0_start=args.q0_start,
             q0_step=float(args.q0_step),
@@ -2028,9 +2625,12 @@ def main() -> int:
         )
     except Exception:
         viewer_heartbeat.stop("adaptive search failed")
+        cache.close()
         raise
     viewer_heartbeat.stop("scan complete")
     elapsed = time.perf_counter() - started
+
+    cache.close()
 
     payload = load_scan_file(artifact_h5)
     if grid_png is not None or point_png is not None or bool(args.show_plot):

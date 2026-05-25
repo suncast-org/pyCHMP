@@ -28,7 +28,6 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, validate_obs_map_identity
 from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
@@ -97,6 +96,8 @@ try:
         DEFAULT_A,
         DEFAULT_B,
         DEFAULT_NBASE,
+        DEFAULT_Q0_MAXITER,
+        DEFAULT_Q0_XATOL,
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
         _load_explicit_metric_mask,
@@ -119,6 +120,7 @@ try:
         load_blos_reference_for_fov,
         _regrid_full_disk_to_target,
         _resolve_observer_overrides,
+        _resolve_selected_psf_metadata,
         _run_stage,
         save_prepared_observation_bundle,
         save_q0_artifact,
@@ -129,6 +131,8 @@ except ModuleNotFoundError:
         DEFAULT_A,
         DEFAULT_B,
         DEFAULT_NBASE,
+        DEFAULT_Q0_MAXITER,
+        DEFAULT_Q0_XATOL,
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
         _load_explicit_metric_mask,
@@ -151,6 +155,7 @@ except ModuleNotFoundError:
         load_blos_reference_for_fov,
         _regrid_full_disk_to_target,
         _resolve_observer_overrides,
+        _resolve_selected_psf_metadata,
         _run_stage,
         save_prepared_observation_bundle,
         save_q0_artifact,
@@ -510,6 +515,8 @@ def _build_rectangular_pending_requests(
     hard_q0_min: float | None,
     hard_q0_max: float | None,
     target_metric: str,
+    xatol: float = DEFAULT_Q0_XATOL,
+    maxiter: int = DEFAULT_Q0_MAXITER,
     adaptive_bracketing: bool,
     q0_step: float,
     max_bracket_steps: int,
@@ -548,6 +555,8 @@ def _build_rectangular_pending_requests(
                 hard_q0_min=hard_q0_min,
                 hard_q0_max=hard_q0_max,
                 target_metric=str(target_metric),
+                xatol=float(xatol),
+                maxiter=int(maxiter),
                 adaptive_bracketing=bool(adaptive_bracketing),
                 q0_step=float(q0_step),
                 max_bracket_steps=int(max_bracket_steps),
@@ -918,6 +927,8 @@ class _SparsePointEvaluationRequest:
     nx: int | None
     ny: int | None
     pixel_scale_arcsec: float | None
+    xatol: float
+    maxiter: int
 
 
 @dataclass(frozen=True)
@@ -959,6 +970,10 @@ def _evaluate_sparse_point_request(
         str(float(task.q0_max)),
         "--target-metric",
         str(request.target_metric),
+        "--xatol",
+        str(float(request.xatol)),
+        "--maxiter",
+        str(int(request.maxiter)),
         "--q0-step",
         str(float(request.q0_step)),
         "--max-bracket-steps",
@@ -1189,6 +1204,8 @@ class _RectangularPointEvaluationRequest:
     hard_q0_min: float | None
     hard_q0_max: float | None
     target_metric: str
+    xatol: float
+    maxiter: int
     adaptive_bracketing: bool
     q0_step: float
     max_bracket_steps: int
@@ -1389,6 +1406,8 @@ def _evaluate_rectangular_point_request(
             hard_q0_min=request.hard_q0_min,
             hard_q0_max=request.hard_q0_max,
             target_metric=str(request.target_metric),
+            xatol=float(request.xatol),
+            maxiter=int(request.maxiter),
             adaptive_bracketing=bool(request.adaptive_bracketing),
             q0_start=request.q0_start,
             q0_step=float(request.q0_step),
@@ -1547,6 +1566,8 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--use-idl-q0-start-heuristic", action=argparse.BooleanOptionalAction, default=False, help="Use the IDL empirical Q0_start(a,b) heuristic if no scalar start is given.")
     p.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative Q0 step for adaptive bracketing.")
     p.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive bracketing expansion steps.")
+    p.add_argument("--xatol", type=float, default=DEFAULT_Q0_XATOL, help="Absolute q0 tolerance for bounded minimization.")
+    p.add_argument("--maxiter", type=int, default=DEFAULT_Q0_MAXITER, help="Maximum bounded-minimizer iterations.")
     p.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
     p.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     p.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
@@ -1568,9 +1589,6 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--psf-bmaj-arcsec", type=float, default=None, help="PSF major axis FWHM.")
     p.add_argument("--psf-bmin-arcsec", type=float, default=None, help="PSF minor axis FWHM.")
     p.add_argument("--psf-bpa-deg", type=float, default=None, help="PSF position angle in degrees.")
-    p.add_argument("--fallback-psf-bmaj-arcsec", type=float, default=None, help="Fallback PSF major axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied.")
-    p.add_argument("--fallback-psf-bmin-arcsec", type=float, default=None, help="Fallback PSF minor axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied.")
-    p.add_argument("--fallback-psf-bpa-deg", type=float, default=None, help="Fallback PSF position angle used only when the FITS header has no beam and no explicit PSF override is supplied.")
     p.add_argument("--psf-ref-frequency-ghz", type=float, default=None, help="Reference frequency for PSF axes values.")
     p.add_argument("--psf-scale-inverse-frequency", action="store_true", help="Scale PSF axes by (ref_freq / active_freq).")
 
@@ -1656,6 +1674,8 @@ def main() -> int:
             "use_idl_q0_start_heuristic": False,
             "q0_step": 1.61803398875,
             "max_bracket_steps": 12,
+            "xatol": DEFAULT_Q0_XATOL,
+            "maxiter": DEFAULT_Q0_MAXITER,
             "tr_mask_bmin_gauss": 1000.0,
             "metrics_mask_threshold": 0.1,
             "metrics_mask_fits": None,
@@ -1720,8 +1740,6 @@ def main() -> int:
             name="b",
         )
 
-    if obs_request.obs_path is not None and not obs_request.obs_path.exists():
-        parser.error(f"observational FITS file not found: {obs_request.obs_path}")
     if not args.model_h5.exists() or args.ebtel_path is None or not args.ebtel_path.exists():
         parser.error("model_h5 and --ebtel-path must both exist")
 
@@ -1746,9 +1764,6 @@ def main() -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
-
-    if obs_map.domain == "mw" and obs_map.frequency_ghz is None:
-        parser.error("could not extract MW observing frequency from the selected observation")
 
     obs_source_detail = (
         str(obs_request.obs_path)
@@ -1775,15 +1790,14 @@ def main() -> int:
 
     print("\nEstimating noise from map...")
     noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
-        noise_unit = obs_map_noise_unit_label(obs_map)
-                print(f"  Falling back to fixed sigma = {int(noise_result.sigma)} {noise_unit}")
+    noise_unit = obs_map_noise_unit_label(obs_map)
     sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
     noise_diag = noise_result.diagnostics
-    if str(noise_result.method_used) == "fallback_std":
-        print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} K")
-    else:
-        print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
-                    print(f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit}")
+    print(
+        f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit} "
+        f"(method={str(noise_result.method_used)})"
+    )
+    if np.isfinite(float(noise_result.mask_fraction)):
         print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
 
     sdk = import_module("gxrender.sdk")
@@ -1795,27 +1809,27 @@ def main() -> int:
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
-    fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
-    fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
-    has_cli_psf_override = any(value is not None for value in (args.psf_bmaj_arcsec, args.psf_bmin_arcsec, args.psf_bpa_deg))
-    has_cli_psf_fallback = any(
-        value is not None for value in (args.fallback_psf_bmaj_arcsec, args.fallback_psf_bmin_arcsec, args.fallback_psf_bpa_deg)
+    selected_psf_metadata = _resolve_selected_psf_metadata(
+        header_psf=header_psf,
+        header_psf_source=header_psf_source,
+        domain=str(obs_map.domain),
+        instrument_name=str(obs_map.instrument) if obs_map.instrument is not None else None,
+        wavelength_angstrom=None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        date_obs=obs_map.date_obs,
+        cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
+        cli_psf_bmin_arcsec=psf_bmin_arcsec,
+        cli_psf_bpa_deg=psf_bpa_deg,
+        override_header_psf=False,
     )
-    if header_psf is not None and not has_cli_psf_override:
-        psf_bmaj_arcsec = float(header_psf["psf_bmaj_arcsec"])
-        psf_bmin_arcsec = float(header_psf["psf_bmin_arcsec"])
-        psf_bpa_deg = float(header_psf["psf_bpa_deg"])
-        psf_source = header_psf_source
-    elif has_cli_psf_override:
-        psf_source = "cli_override"
-    elif has_cli_psf_fallback:
-        psf_bmaj_arcsec = fallback_psf_bmaj_arcsec
-        psf_bmin_arcsec = fallback_psf_bmin_arcsec
-        psf_bpa_deg = fallback_psf_bpa_deg
-        psf_source = "cli_fallback"
+    psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
+    if selected_psf_metadata is not None and selected_psf_metadata.kind == "gaussian":
+        psf_bmaj_arcsec = selected_psf_metadata.bmaj_arcsec
+        psf_bmin_arcsec = selected_psf_metadata.bmin_arcsec
+        psf_bpa_deg = selected_psf_metadata.bpa_deg
     else:
-        psf_source = "none"
+        psf_bmaj_arcsec = None
+        psf_bmin_arcsec = None
+        psf_bpa_deg = None
 
     observer_overrides, observer_source = _resolve_observer_overrides(
         sdk,
@@ -2448,6 +2462,8 @@ def main() -> int:
                     hard_q0_min=args.hard_q0_min,
                     hard_q0_max=args.hard_q0_max,
                     target_metric=str(args.target_metric),
+                    xatol=float(args.xatol),
+                    maxiter=int(args.maxiter),
                     adaptive_bracketing=bool(args.adaptive_bracketing),
                     q0_step=float(args.q0_step),
                     max_bracket_steps=int(args.max_bracket_steps),
@@ -2726,6 +2742,8 @@ def main() -> int:
         hard_q0_min=args.hard_q0_min,
         hard_q0_max=args.hard_q0_max,
         target_metric=str(args.target_metric),
+        xatol=float(args.xatol),
+        maxiter=int(args.maxiter),
         adaptive_bracketing=bool(args.adaptive_bracketing),
         q0_step=float(args.q0_step),
         max_bracket_steps=int(args.max_bracket_steps),
@@ -2900,6 +2918,8 @@ def main() -> int:
                     "optimizer_message": str(response.message),
                     "nfev": int(response.nfev),
                     "nit": int(response.nit),
+                    "xatol": float(args.xatol),
+                    "maxiter": int(args.maxiter),
                     "used_adaptive_bracketing": bool(response.used_adaptive_bracketing),
                     "bracket_found": bool(response.bracket_found),
                     "bracket": [float(v) for v in response.bracket] if response.bracket is not None else None,

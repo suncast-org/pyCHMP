@@ -47,7 +47,8 @@ Python entry point locations:
 - `unix/adaptive_ab_search_single_observation_options_test.sh`
   - Wraps `examples/python/adaptive_ab_search_single_observation.py`.
   - Runs the adaptive real-data single-slice `(a, b)` search against the
-    matching observation/model/EBTEL inputs and writes a sparse live-update artifact.
+    matching observation/model/EBTEL inputs and writes a live-updated unified
+    slice/search artifact.
 
 - `windows/fit_q0_obs_map_options_test.cmd`
 - `windows/validate_q0_recovery_options_test.cmd`
@@ -152,6 +153,27 @@ portable home for the raw CSV, generated reports, plot, per-run benchmark
 artifacts, and the benchmark-specific report generator:
 
 - `reports/parallel benchmark test/generate_scan_ab_obs_map_benchmark_report.py`
+
+## Adaptive Launcher Interface
+
+The adaptive launcher intentionally supports a small set of convenience aliases
+that differ from the underlying Python workflow:
+
+- `--obs-fits-path` is a launcher alias for selecting an external FITS
+  observation. The Python workflow itself uses positional
+  `fits_file model_h5` or `--obs-source external_fits --obs-path ...`.
+- `--model-h5-path` is a launcher alias for the model H5 path. The Python
+  workflow itself uses the positional `model_h5` argument or `--model-h5`.
+- `--obs-map-id` and `--obs-source model_refmap` are forwarded directly when
+  the observation is an internal model refmap such as `AIA_171`.
+- Search and optimizer controls such as `--artifact-h5`, `--a-min`, `--a-max`,
+  `--xatol`, `--maxiter`, and `--max-bracket-steps` are passed through to the
+  Python workflow unchanged.
+
+For adaptive searches, `--xatol` and `--maxiter` control the final bounded Q0
+minimization stage. `--max-bracket-steps` only limits additional adaptive
+bracket expansion attempts; it does not bound the total number of trial
+evaluations written to the artifact.
 
 ## `fit_q0_obs_map_options_test.sh`
 

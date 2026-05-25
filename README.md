@@ -84,10 +84,12 @@ pytest -q
 User-facing runnable workflows are available in `examples/`.
 
 Consolidated scan artifacts now use one normalized point schema across
-fixed-grid and adaptive search workflows. Each stored point carries the final
-best-fit maps plus per-trial `q0`, `chi2`, `rho2`, and `eta2` histories when
-available, so `pychmp-view` can plot the selected metric history directly from
-the artifact.
+fixed-grid and adaptive search workflows. Each artifact keeps common
+slice-level metadata plus per-search point records under a unified slice/search
+layout, with reusable rendered arrays promoted into the shared `map_store`
+when applicable. Each stored point carries the final best-fit maps plus
+per-trial `q0`, `chi2`, `rho2`, and `eta2` histories when available, so
+`pychmp-view` can plot the selected metric history directly from the artifact.
 
 Real-data gxrender validation workflows live under `examples/python/` rather
 than in the default automated test suite.
@@ -132,6 +134,8 @@ shell launchers (.sh / .cmd)
   -> examples/python/adaptive_ab_search_single_observation.py
      -> pychmp.load_obs_map(...)
      -> pychmp.validate_obs_map_identity(...)
+     -> pychmp.resolve_render_geometry_via_gxrender(...)
+     -> pychmp.validate_scan_artifact_reuse_preflight(...) [when reusing an existing target slice]
      -> pychmp.estimate_obs_map_noise(...)
      -> pychmp.resolve_geometry_policy(...)
      -> pychmp.search_local_minimum_ab(...)
@@ -148,6 +152,7 @@ Contributor notes:
 - `adaptive_ab_search_single_observation.py` is the real observational wrapper around the adaptive search core.
 - `src/pychmp/obs_maps.py` is the shared observation-ingestion layer used by the real observational workflows.
 - `src/pychmp/geometry_policy.py` resolves observation LOS compatibility before workflows reuse model-saved observer/FOV metadata.
+- `src/pychmp/ab_scan_artifacts.py` owns the unified slice/search artifact contract, compatibility validation, and reusable map-store plumbing shared by fixed-grid and adaptive workflows.
 
 When adding new observational workflows, prefer reusing:
 
@@ -157,6 +162,13 @@ When adding new observational workflows, prefer reusing:
 - `resolve_geometry_policy(...)`
 
 instead of introducing new script-local FITS/refmap loaders.
+
+The user-facing `fit_q0_obs_map.py`, `scan_ab_obs_map.py`, and
+`adaptive_ab_search_single_observation.py` workflows all expose the bounded
+Q0 minimizer controls `--xatol` and `--maxiter`. These tune the final bounded
+minimization accuracy and iteration budget; adaptive-search
+`--max-bracket-steps` only limits additional bracket expansion attempts before
+that minimization stage.
 
 ### Version Bumping
 

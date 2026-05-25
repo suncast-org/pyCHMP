@@ -639,6 +639,10 @@ def load_obs_map(
             raise ValueError("load_obs_map requires either obs_path or model_h5/map_id")
 
     if explicit_mode == "external_fits":
+        if map_id is not None:
+            raise ValueError(
+                "conflicting observation selectors: map_id cannot be used when source_mode='external_fits'"
+            )
         if obs_path is None:
             raise ValueError("obs_path is required when source_mode='external_fits'")
         return _load_external_obs_map(
@@ -648,6 +652,10 @@ def load_obs_map(
         )
 
     if explicit_mode == "model_refmap":
+        if obs_path is not None:
+            raise ValueError(
+                "conflicting observation selectors: obs_path cannot be used when source_mode='model_refmap'"
+            )
         if model_h5 is None:
             raise ValueError("model_h5 is required when source_mode='model_refmap'")
         if map_id is None:

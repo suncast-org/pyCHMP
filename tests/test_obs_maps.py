@@ -146,6 +146,28 @@ def test_load_obs_map_model_refmap_requires_map_id(tmp_path) -> None:
         load_obs_map(model_h5=model_h5, source_mode="model_refmap")
 
 
+def test_load_obs_map_rejects_map_id_with_external_source(tmp_path) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CUNIT3"] = "Hz"
+    header["CRVAL3"] = 2.874e9
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    with pytest.raises(ValueError, match="map_id cannot be used"):
+        load_obs_map(obs_path=fits_path, map_id="AIA_171", source_mode="external_fits")
+
+
+def test_load_obs_map_rejects_obs_path_with_model_refmap_source(tmp_path) -> None:
+    with pytest.raises(ValueError, match="obs_path cannot be used"):
+        load_obs_map(
+            obs_path=tmp_path / "obs.fits",
+            model_h5=tmp_path / "model.h5",
+            map_id="AIA_171",
+            source_mode="model_refmap",
+        )
+
+
 def test_estimate_obs_map_noise_falls_back_to_uniform_std_for_invalid_map(tmp_path) -> None:
     fits_path = tmp_path / "invalid_map.fits"
     data = np.full((4, 4), 7.0, dtype=np.float32)

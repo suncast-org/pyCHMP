@@ -61,22 +61,30 @@ def test_fit_observation_request_defaults_to_model_refmap_when_map_id_is_supplie
     assert request.ebtel_path == (tmp_path / "ebtel.sav").resolve()
 
 
-def test_fit_observation_request_rejects_conflicting_path_selectors(tmp_path: Path) -> None:
+def test_fit_observation_request_prefers_explicit_obs_path_over_positional_fits(tmp_path: Path) -> None:
     args = _make_resolution_args(
         tmp_path,
         fits_file=tmp_path / "obs_a.fits",
         obs_path=tmp_path / "obs_b.fits",
     )
 
-    with pytest.raises(SystemExit, match="Conflicting observation path selectors"):
-        fit_q0_obs_map._resolve_observation_request(args, repo_root=tmp_path)
+    request = fit_q0_obs_map._resolve_observation_request(args, repo_root=tmp_path)
+
+    assert request.obs_path == (tmp_path / "obs_b.fits").resolve()
 
 
 def test_fit_observation_request_requires_explicit_external_fits_path(tmp_path: Path) -> None:
     args = _make_resolution_args(tmp_path, obs_source="external_fits", fits_file=None, obs_path=None)
 
-    with pytest.raises(SystemExit, match="fits_file is required"):
-        fit_q0_obs_map._resolve_observation_request(args, repo_root=tmp_path)
+    request = fit_q0_obs_map._resolve_observation_request(args, repo_root=tmp_path)
+
+    with pytest.raises(ValueError, match="obs_path is required"):
+        fit_q0_obs_map.load_obs_map(
+            obs_path=request.obs_path,
+            model_h5=request.model_h5,
+            map_id=request.obs_map_id,
+            source_mode=request.source_mode,
+        )
 
 
 def test_scan_and_fit_observation_request_resolution_stay_aligned(tmp_path: Path) -> None:

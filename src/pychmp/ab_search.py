@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
-from typing import Callable, Iterator, MutableMapping, Protocol, TypeAlias
+from typing import Any, Callable, Iterator, MutableMapping, Protocol, TypeAlias
 
 import numpy as np
 
@@ -48,6 +48,7 @@ class ABPointResult:
     trial_rho2_values: tuple[float, ...] = ()
     trial_eta2_values: tuple[float, ...] = ()
     elapsed_seconds: float = float("nan")
+    artifact_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,7 @@ def evaluate_ab_point(
     observed: np.ndarray,
     sigma: np.ndarray | None,
     *,
+    renderer: Q0MapRenderer | None = None,
     a: float,
     b: float,
     q0_min: float,
@@ -189,8 +191,9 @@ def evaluate_ab_point(
     """Evaluate the best-fit `q0` for one `(a, b)` point."""
 
     started = time.perf_counter()
+    q0_renderer = renderer if renderer is not None else renderer_factory(float(a), float(b))
     result: Q0OptimizationResult = fit_q0_to_observation(
-        renderer_factory(float(a), float(b)),
+        q0_renderer,
         observed,
         sigma,
         q0_min=q0_min,
@@ -250,16 +253,20 @@ def _evaluate_ab_search_request(
         "    Starting point: "
         f"a={a:.3f} b={b:.3f} "
         f"q0_range=({float(request.task.q0_min):.6g}, {float(request.task.q0_max):.6g}) "
-        f"q0_start={q0_start_text}",
+        f"q0_start={q0_start_text} "
+        f"max_bracket_steps={int(request.max_bracket_steps)}"
+        " [caps additional adaptive bracket expansions; total trial count also includes the initial q0 triplet and any later bounded refinement evaluations]",
         flush=True,
     )
     if worker_payload.point_start_callback is not None:
         worker_payload.point_start_callback(a, b)
     try:
+        renderer = worker_payload.renderer_factory(a, b)
         result = evaluate_ab_point(
             worker_payload.renderer_factory,
             worker_payload.observed,
             worker_payload.sigma,
+            renderer=renderer,
             a=a,
             b=b,
             q0_min=float(request.task.q0_min),
@@ -297,6 +304,10 @@ def _evaluate_ab_search_request(
     )
     if worker_payload.point_complete_callback is not None:
         worker_payload.point_complete_callback(a, b)
+    artifact_payload_builder = getattr(renderer, "build_artifact_payload", None)
+    if callable(artifact_payload_builder):
+        artifact_payload = artifact_payload_builder(result)
+        return replace(result, artifact_payload=artifact_payload)
     return result
 
 
@@ -349,8 +360,8 @@ def _execute_ab_requests(
     worker_chunksize: int,
     progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
-    point_start_callback: PointLifecycleCallback | None,
-    point_complete_callback: PointLifecycleCallback | None,
+    point_start_callback: PointLifecycleCallback | None = None,
+    point_complete_callback: PointLifecycleCallback | None = None,
 ) -> Iterator[ABPointResult]:
     if not pending_requests:
         return iter(())

@@ -18,10 +18,11 @@ examples that may be added later by pull requests.
   - No additional dependencies beyond pyCHMP core.
 
 - `fit_q0_obs_map.py`
-  - Fit Q0 to real observational maps (EOVSA).
-  - Requires explicit inputs: observational FITS map and model H5.
-  - Loads full-disk FITS maps, estimates background noise, crops/regrids the
-    observation onto the saved model-aligned FOV, then runs Q0 optimization.
+  - Fit Q0 to one observational target against one model.
+  - Supports MW external FITS inputs and EUV/UV internal model refmaps.
+  - Loads the selected observation through the shared `pychmp.obs_maps`
+    contract, estimates background noise, resolves observer/FOV policy, then
+    runs bounded Q0 optimization.
   - Saves fitting results to H5/PNG artifacts and reports fit diagnostics.
 
 - `validate_synthetic_q0_recovery.py`
@@ -34,10 +35,13 @@ examples that may be added later by pull requests.
   - Useful for validating summary-grid behavior before running real model scans.
 
 - `scan_ab_obs_map.py`
-  - Real observational rectangular `(a, b)` grid scan against an EOVSA FITS map
-    plus matching model H5.
+  - Real observational rectangular or sparse `(a, b)` scan against one
+    observation plus matching model H5.
+  - Supports the same MW external FITS and EUV/UV internal refmap selectors as
+    `fit_q0_obs_map.py`.
   - Produces one consolidated H5 file containing the full scan summary and
-    per-point best-fit products.
+    per-point best-fit products under the unified slice/search artifact
+    layout.
   - The consolidated artifact stores per-point final maps plus per-trial
     `q0`, `chi2`, `rho2`, and `eta2` histories so the viewer can inspect the
     selected metric history directly from the artifact.
@@ -72,11 +76,14 @@ examples that may be added later by pull requests.
   - Generic real-data adaptive local `(a, b)` search for a single observational map.
   - Supports both MW external FITS observations and EUV/UV model-refmap selections.
   - Requires an explicit observation selector: an external FITS path or an internal refmap id.
+  - Resolves render geometry first and performs a same-slice artifact reuse
+    preflight before noise estimation, TR-mask construction, and PSF work when
+    reusing an existing target slice.
   - Resolves observation LOS before reusing model-saved observer/FOV metadata;
     mismatches use an observation-inscribed FOV and are recorded in artifact diagnostics.
-  - Persists each evaluated point into a sparse H5 artifact using the same
-     point schema as the fixed-grid scan path, including full stored metric
-     histories and per-trial map cubes when available.
+  - Persists each evaluated point into a unified sparse/search artifact using
+    the same point schema as the fixed-grid scan path, including full stored
+    metric histories and per-trial map cubes when available.
   - Completed point results are appended as they arrive so the viewer can
     inspect progress while the run is active without waiting for a batch flush.
   - Supports `--dry-run` to resolve inputs and artifact locations without starting the search.
@@ -93,7 +100,18 @@ python examples/estimate_map_noise_cli.py /path/to/eovsa_map.fits --all-methods
 
 ```bash
 python examples/fit_q0_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 \
-  --ebtel-path /path/to/ebtel.sav
+  --ebtel-path /path/to/ebtel.sav \
+  --xatol 1e-3 \
+  --maxiter 200
+```
+
+```bash
+python examples/fit_q0_obs_map.py \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --model-h5 /path/to/model.h5 \
+  --ebtel-path /path/to/ebtel.sav \
+  --tr-mask-bmin-gauss 1000
 ```
 
 ```bash
@@ -106,6 +124,18 @@ python examples/scan_synthetic_ab_grid.py
 
 ```bash
 python examples/scan_ab_obs_map.py /path/to/eovsa_map.fits /path/to/model.h5 \
+  --ebtel-path /path/to/ebtel.sav \
+  --a-values 0.0,0.3,0.6 \
+  --b-values 2.1,2.4,2.7 \
+  --xatol 1e-3 \
+  --maxiter 200
+```
+
+```bash
+python examples/scan_ab_obs_map.py \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --model-h5 /path/to/model.h5 \
   --ebtel-path /path/to/ebtel.sav \
   --a-values 0.0,0.3,0.6 \
   --b-values 2.1,2.4,2.7
@@ -158,22 +188,27 @@ python examples/python/validate_q0_recovery_earth_eovsa_psf.py \
 
 ```bash
 python examples/python/adaptive_ab_search_single_observation.py /path/to/obs.fits /path/to/model.h5 --dry-run
-python examples/python/adaptive_ab_search_single_observation.py /path/to/obs.fits /path/to/model.h5
+python examples/python/adaptive_ab_search_single_observation.py /path/to/obs.fits /path/to/model.h5 \
+  --ebtel-path /path/to/ebtel.sav \
+  --xatol 1e-3 \
+  --maxiter 200
 ```
 
 Using your own data with the adaptive search:
 
-- Prefer the explicit launcher flags:
-  `--obs-fits-path`, `--model-h5-path`, and `--ebtel-path`.
-- `OBS_FITS_PATH`, `MODEL_H5_PATH`, and `EBTEL_PATH` remain supported as
-  fallback environment overrides when that is more convenient.
-- The adaptive launcher does not choose an observation FITS implicitly. Use
-  `--obs-fits-path` for an external FITS map, or `--obs-map-id` for an internal
-  model refmap.
-- Precedence for paths is: explicit launcher flag, then environment variable,
-  then built-in defaults only for the model and EBTEL paths.
-- `--artifact-h5`, `--a-min`, `--a-max`, and similar flags are normal command
-  line options forwarded by the launcher to the Python workflow.
+- The Python workflow accepts either positional `fits_file model_h5` for an
+  external FITS observation, or explicit observation selectors:
+  `--obs-source external_fits --obs-path /path/to/obs.fits` or
+  `--obs-source model_refmap --obs-map-id AIA_171 --model-h5 /path/to/model.h5`.
+- The tracked shell launcher also accepts convenience aliases
+  `--obs-fits-path` and `--model-h5-path` and translates them into the current
+  Python workflow arguments before execution.
+- Use `--xatol` and `--maxiter` to control the bounded minimizer accuracy and
+  iteration budget for each point.
+- `--max-bracket-steps` only limits additional adaptive bracket expansion
+  attempts; it does not cap the total number of Q0 trial evaluations.
+- `--artifact-h5`, `--artifacts-dir`, `--artifacts-stem`, and the search-range
+  flags are forwarded directly to the Python workflow.
 
 Git Bash launcher example with your own files:
 
@@ -189,6 +224,8 @@ bash ./scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --b-max 4.8 \
   --b-start 0.0 \
   --q0-start 0.0001 \
+  --xatol 1e-3 \
+  --maxiter 200 \
   --max-bracket-steps 30 \
   --threshold-metric 1.3
 ```
@@ -207,6 +244,8 @@ bash .\scripts\unix\adaptive_ab_search_single_observation_options_test.sh `
   --b-max 4.8 `
   --b-start 0.0 `
   --q0-start 0.0001 `
+  --xatol 1e-3 `
+  --maxiter 200 `
   --max-bracket-steps 30 `
   --threshold-metric 1.3
 ```
@@ -225,6 +264,8 @@ scripts\windows\adaptive_ab_search_single_observation_options_test.cmd ^
   --b-max 4.8 ^
   --b-start 0.0 ^
   --q0-start 0.0001 ^
+  --xatol 1e-3 ^
+  --maxiter 200 ^
   --max-bracket-steps 30 ^
   --threshold-metric 1.3
 ```
@@ -233,8 +274,9 @@ Direct Python example with your own files:
 
 ```bash
 python examples/python/adaptive_ab_search_single_observation.py \
-  /path/to/your_map.fits \
-  /path/to/your_model.h5 \
+  --obs-source external_fits \
+  --obs-path /path/to/your_map.fits \
+  --model-h5 /path/to/your_model.h5 \
   --ebtel-path /path/to/your_ebtel.sav \
   --artifact-h5 /path/to/output/adaptive_ab_search_single_observation.h5 \
   --a-min -4.5 \
@@ -243,6 +285,8 @@ python examples/python/adaptive_ab_search_single_observation.py \
   --b-max 4.8 \
   --b-start 0.0 \
   --q0-start 0.0001 \
+  --xatol 1e-3 \
+  --maxiter 200 \
   --max-bracket-steps 30 \
   --threshold-metric 1.3
 ```
@@ -261,6 +305,8 @@ bash ./scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --b-max 4.8 \
   --b-start 0.0 \
   --q0-start 0.0001 \
+  --xatol 1e-3 \
+  --maxiter 200 \
   --max-bracket-steps 30 \
   --threshold-metric 1.3
 ```

@@ -32,7 +32,9 @@ SEARCH_REQUEST_DATASET = "request_json"
 SEARCH_LIFECYCLE_DATASET = "lifecycle_json"
 MAP_STORE_GROUP = "map_store"
 MAP_STORE_MAPS_GROUP = "maps"
+MAP_STORE_SYNTHETIC_REGISTRY_GROUP = "synthetic_registry"
 MAP_REFS_DATASET = "map_refs_json"
+POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET = "synthetic_map_machine_keys_json"
 CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-05-21-unified-searches"
 REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "artifact_kind",
@@ -41,6 +43,29 @@ REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "fits_sha256",
     "ebtel_sha256",
     "frequency_ghz",
+    "map_xc_arcsec",
+    "map_yc_arcsec",
+    "map_dx_arcsec",
+    "map_dy_arcsec",
+    "map_nx",
+    "map_ny",
+    "observer_name",
+    "observer_lonc_deg",
+    "observer_b0sun_deg",
+    "observer_dsun_cm",
+    "observer_obs_time",
+)
+PREFLIGHT_COMPATIBILITY_DIAGNOSTIC_KEYS = (
+    "artifact_kind",
+    "model_sha256",
+    "fits_sha256",
+    "ebtel_sha256",
+    "spectral_domain",
+    "spectral_label",
+    "frequency_ghz",
+    "wavelength_angstrom",
+    "euv_channel",
+    "euv_instrument",
     "map_xc_arcsec",
     "map_yc_arcsec",
     "map_dx_arcsec",
@@ -291,6 +316,58 @@ def validate_scan_artifact_compatibility(
         payload,
         observed=observed,
         sigma_map=sigma_map,
+        wcs_header=wcs_header,
+        diagnostics=diagnostics,
+    )
+    if not issues:
+        return
+
+    artifact_label = f"existing artifact {artifact_path}" if artifact_path is not None else "existing artifact"
+    raise ScanArtifactCompatibilityError(
+        f"{artifact_label} is not compatible with the current run: " + "; ".join(issues)
+    )
+
+
+def scan_artifact_reuse_preflight_issues(
+    payload: dict[str, Any],
+    *,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+) -> list[str]:
+    issues: list[str] = []
+
+    existing_header = payload.get("wcs_header")
+    if not isinstance(existing_header, fits.Header):
+        issues.append("stored artifact is missing a valid WCS header")
+    elif _canonical_header_text(existing_header) != _canonical_header_text(wcs_header):
+        issues.append("WCS header differs from the stored artifact")
+
+    existing_diagnostics = dict(payload.get("diagnostics", {}))
+    for key in PREFLIGHT_COMPATIBILITY_DIAGNOSTIC_KEYS:
+        if key not in existing_diagnostics and key not in diagnostics:
+            continue
+        if key not in existing_diagnostics:
+            continue
+        if key not in diagnostics:
+            continue
+        if not _diagnostic_values_match(key, existing_diagnostics[key], diagnostics[key]):
+            issues.append(
+                f"diagnostic mismatch for '{key}' "
+                f"(stored={existing_diagnostics[key]!r}, current={diagnostics[key]!r})"
+            )
+
+    return issues
+
+
+def validate_scan_artifact_reuse_preflight(
+    payload: dict[str, Any],
+    *,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+    artifact_path: Path | None = None,
+) -> None:
+    issues = scan_artifact_reuse_preflight_issues(
+        payload,
         wcs_header=wcs_header,
         diagnostics=diagnostics,
     )
@@ -1225,6 +1302,14 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         except Exception:
             bracket = None
     map_refs = _json_loads_or_empty(grp[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in grp else {}
+    diagnostics = json.loads(decode_scalar(grp["diagnostics_json"][()]))
+    if POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET in grp:
+        try:
+            parsed_keys = json.loads(decode_scalar(grp[POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET][()]))
+            if isinstance(parsed_keys, list):
+                diagnostics["synthetic_map_machine_keys"] = [str(item) for item in parsed_keys if str(item).strip()]
+        except Exception:
+            pass
     return {
         "record_order": int(grp.attrs.get("record_order", 0)),
         "a": float(grp.attrs["a"]),
@@ -1258,7 +1343,7 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         "bracket": bracket,
         "target_metric": target_metric,
         "map_refs": map_refs,
-        "diagnostics": json.loads(decode_scalar(grp["diagnostics_json"][()])),
+        "diagnostics": diagnostics,
     }
 
 
@@ -1733,6 +1818,73 @@ def _write_point_map_ref(
     )
 
 
+def _synthetic_map_entries_from_diagnostics(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_entries = diagnostics.get("synthetic_map_keys")
+    if not isinstance(raw_entries, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_entries:
+        if not isinstance(item, dict):
+            continue
+        machine_key = str(item.get("machine_key", "")).strip()
+        if not machine_key:
+            continue
+        out.append(
+            {
+                "machine_key": machine_key,
+                "map_store_array": str(item.get("map_store_array", "")).strip(),
+                "label": str(item.get("label", "")).strip(),
+                "identity": item.get("identity") if isinstance(item.get("identity"), dict) else None,
+            }
+        )
+    return out
+
+
+def _register_synthetic_map_registry_entries(
+    h5_file: h5py.File,
+    *,
+    map_refs: dict[str, str],
+    diagnostics: dict[str, Any],
+) -> list[str]:
+    entries = _synthetic_map_entries_from_diagnostics(diagnostics)
+    if not entries:
+        return []
+
+    registry_group = h5_file.require_group(MAP_STORE_GROUP).require_group(MAP_STORE_SYNTHETIC_REGISTRY_GROUP)
+    registered: list[str] = []
+    for entry in entries:
+        machine_key = str(entry["machine_key"]).strip()
+        if not machine_key:
+            continue
+        map_store_array = str(entry.get("map_store_array", "")).strip()
+        map_ref_key_candidates = []
+        if map_store_array:
+            map_ref_key_candidates.append(map_store_array)
+            if not str(map_store_array).startswith("extra/"):
+                map_ref_key_candidates.append(f"extra/{map_store_array}")
+
+        resolved_map_ref_path = ""
+        for ref_key in map_ref_key_candidates:
+            ref_path = str(map_refs.get(ref_key, "")).strip()
+            if ref_path:
+                resolved_map_ref_path = ref_path
+                break
+        if not resolved_map_ref_path:
+            continue
+
+        if machine_key not in registry_group:
+            entry_group = registry_group.create_group(machine_key)
+            _create_text_dataset(entry_group, "machine_key", machine_key)
+            _create_text_dataset(entry_group, "map_store_array", str(map_store_array))
+            _create_text_dataset(entry_group, "map_ref_path", str(resolved_map_ref_path))
+            _create_text_dataset(entry_group, "label", str(entry.get("label", "")))
+            identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else None
+            if identity is not None:
+                _create_text_dataset(entry_group, "identity_json", _json_dumps(identity))
+        registered.append(machine_key)
+    return sorted(set(registered))
+
+
 def _read_point_map_array(grp: h5py.Group, name: str, refs: dict[str, Any]) -> np.ndarray | None:
     if name in grp:
         return np.asarray(grp[name], dtype=float)
@@ -1776,11 +1928,121 @@ def _auxiliary_map_ref_prefixes_for_descriptor(descriptor: dict[str, Any]) -> tu
     return tuple()
 
 
+def _auxiliary_channel_token_from_descriptor(descriptor: dict[str, Any]) -> str:
+    channel = str(descriptor.get("channel_label") or "").strip()
+    if channel:
+        return channel.lower()
+    wavelength = _optional_float(descriptor.get("wavelength_angstrom"))
+    if wavelength is not None:
+        rounded = round(float(wavelength))
+        if np.isclose(float(wavelength), float(rounded), rtol=0.0, atol=1e-9):
+            return str(int(rounded)).lower()
+        return f"{float(wavelength):.6g}".lower()
+    label = str(descriptor.get("label", "")).strip()
+    if label:
+        return str(label.split()[0]).strip().lower()
+    return ""
+
+
+def _synthetic_registry_entries_for_descriptor(
+    h5_file: h5py.File,
+    *,
+    descriptor: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    if MAP_STORE_GROUP not in h5_file:
+        return {}
+    map_store = h5_file[MAP_STORE_GROUP]
+    if MAP_STORE_SYNTHETIC_REGISTRY_GROUP not in map_store:
+        return {}
+
+    target_domain = str(descriptor.get("domain", "")).strip().lower()
+    target_freq = _optional_float(descriptor.get("frequency_ghz"))
+    target_channel = _auxiliary_channel_token_from_descriptor(descriptor)
+    out: dict[str, dict[str, Any]] = {}
+    registry_group = map_store[MAP_STORE_SYNTHETIC_REGISTRY_GROUP]
+
+    def _dataset_text(group: h5py.Group, name: str) -> str:
+        if name not in group:
+            return ""
+        try:
+            return str(decode_scalar(group[name][()])).strip()
+        except Exception:
+            return ""
+
+    for machine_key in sorted(str(key) for key in registry_group.keys()):
+        entry_group = registry_group[machine_key]
+        map_ref_path = _dataset_text(entry_group, "map_ref_path")
+        if not map_ref_path:
+            continue
+        identity: dict[str, Any] = {}
+        if "identity_json" in entry_group:
+            try:
+                parsed = json.loads(decode_scalar(entry_group["identity_json"][()]))
+                if isinstance(parsed, dict):
+                    identity = parsed
+            except Exception:
+                identity = {}
+
+        identity_domain = str(identity.get("domain_label") or identity.get("spectral_domain") or "").strip().lower()
+        if identity_domain and target_domain and identity_domain != target_domain:
+            continue
+        channel_or_frequency = str(identity.get("channel_or_frequency") or "").strip().lower()
+        if target_domain == "mw":
+            if target_freq is None:
+                continue
+            expected_token = f"{float(target_freq):.6f}ghz".lower()
+            if channel_or_frequency != expected_token:
+                continue
+        elif target_domain in {"euv", "uv"}:
+            if not target_channel:
+                continue
+            if channel_or_frequency != target_channel:
+                continue
+        else:
+            continue
+
+        out[machine_key] = {
+            "machine_key": machine_key,
+            "map_ref_path": map_ref_path,
+            "map_store_array": _dataset_text(entry_group, "map_store_array"),
+            "label": _dataset_text(entry_group, "label"),
+            "identity": identity,
+            "map_role": str(identity.get("map_role", "")).strip(),
+        }
+    return out
+
+
+def _record_synthetic_machine_keys(base_record: dict[str, Any]) -> list[str]:
+    diagnostics = dict(base_record.get("diagnostics") or {})
+    out: list[str] = []
+    for item in diagnostics.get("synthetic_map_machine_keys", []):
+        key = str(item).strip()
+        if key:
+            out.append(key)
+    if out:
+        return sorted(set(out))
+    for item in diagnostics.get("synthetic_map_keys", []):
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("machine_key", "")).strip()
+        if key:
+            out.append(key)
+    return sorted(set(out))
+
+
+def _trial_index_from_synthetic_map_role(map_role: str) -> int | None:
+    match = re.match(r"^trial_(\d+)_(?:rendered|raw_modeled)$", str(map_role).strip().lower())
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def load_auxiliary_map_store_point_records(
     h5_path: Path,
     *,
     slice_key: str,
     source_search_id: str | None = None,
+    use_synthetic_machine_keys: bool = True,
 ) -> list[dict[str, Any]]:
     """Load point records reconstructed from auxiliary maps stored for a slice.
 
@@ -1802,8 +2064,11 @@ def load_auxiliary_map_store_point_records(
         if descriptor is None:
             return out
         prefixes = _auxiliary_map_ref_prefixes_for_descriptor(descriptor)
-        if not prefixes:
-            return out
+        synthetic_entries = (
+            _synthetic_registry_entries_for_descriptor(h5_file, descriptor=descriptor)
+            if bool(use_synthetic_machine_keys)
+            else {}
+        )
 
         slices_group = h5_file[SLICE_CONTAINER_GROUP]
         for source_slice_key in sorted(str(key) for key in slices_group.keys()):
@@ -1823,39 +2088,61 @@ def load_auxiliary_map_store_point_records(
                     if MAP_REFS_DATASET not in record_group:
                         continue
                     map_refs = _json_loads_or_empty(record_group[MAP_REFS_DATASET][()])
-                    matching_prefix = next(
-                        (
-                            prefix
-                            for prefix in prefixes
-                            if any(str(name).startswith(f"{prefix}/") for name in map_refs.keys())
-                        ),
-                        None,
-                    )
-                    if matching_prefix is None:
-                        continue
-
                     base_record = _read_point_group_sparse(record_group)
                     trial_by_index: dict[int, np.ndarray] = {}
                     best_map: np.ndarray | None = None
-                    best_keys = (
-                        f"{matching_prefix}/rendered_best",
-                        f"{matching_prefix}/raw_modeled_best",
-                    )
-                    for key in best_keys:
-                        if key in map_refs:
-                            best_map = _read_map_store_ref_array(h5_file, map_refs[key])
-                            if best_map is not None:
-                                break
-                    trial_pattern = re.compile(
-                        re.escape(f"{matching_prefix}/") + r"trial_(\d+)/(?:rendered|raw_modeled)$"
-                    )
-                    for key, ref_path in map_refs.items():
-                        match = trial_pattern.match(str(key))
-                        if match is None:
-                            continue
-                        arr = _read_map_store_ref_array(h5_file, ref_path)
-                        if arr is not None:
-                            trial_by_index[int(match.group(1))] = arr
+                    matched_source = ""
+                    matched_machine_keys: list[str] = []
+
+                    if synthetic_entries:
+                        for machine_key in _record_synthetic_machine_keys(base_record):
+                            entry = synthetic_entries.get(machine_key)
+                            if entry is None:
+                                continue
+                            arr = _read_map_store_ref_array(h5_file, entry.get("map_ref_path"))
+                            if arr is None:
+                                continue
+                            map_role = str(entry.get("map_role", "")).strip().lower()
+                            if map_role in {"rendered_best", "raw_modeled_best"} and best_map is None:
+                                best_map = np.asarray(arr, dtype=float)
+                            trial_index = _trial_index_from_synthetic_map_role(map_role)
+                            if trial_index is not None:
+                                trial_by_index[int(trial_index)] = np.asarray(arr, dtype=float)
+                            matched_machine_keys.append(machine_key)
+                        if matched_machine_keys:
+                            matched_source = f"synthetic_registry/{str(slice_key)}"
+
+                    if not matched_source:
+                        matching_prefix = next(
+                            (
+                                prefix
+                                for prefix in prefixes
+                                if any(str(name).startswith(f"{prefix}/") for name in map_refs.keys())
+                            ),
+                            None,
+                        )
+                        if matching_prefix is not None:
+                            best_keys = (
+                                f"{matching_prefix}/rendered_best",
+                                f"{matching_prefix}/raw_modeled_best",
+                            )
+                            for key in best_keys:
+                                if key in map_refs:
+                                    best_map = _read_map_store_ref_array(h5_file, map_refs[key])
+                                    if best_map is not None:
+                                        break
+                            trial_pattern = re.compile(
+                                re.escape(f"{matching_prefix}/") + r"trial_(\d+)/(?:rendered|raw_modeled)$"
+                            )
+                            for key, ref_path in map_refs.items():
+                                match = trial_pattern.match(str(key))
+                                if match is None:
+                                    continue
+                                arr = _read_map_store_ref_array(h5_file, ref_path)
+                                if arr is not None:
+                                    trial_by_index[int(match.group(1))] = arr
+                            matched_source = matching_prefix
+
                     if not trial_by_index and best_map is None:
                         continue
 
@@ -1877,7 +2164,9 @@ def load_auxiliary_map_store_point_records(
                     promoted["source_slice_key"] = source_slice_key
                     promoted["source_search_id"] = search_id
                     promoted["source_record_name"] = record_name
-                    promoted["source_auxiliary_map_prefix"] = matching_prefix
+                    promoted["source_auxiliary_map_prefix"] = matched_source
+                    if matched_machine_keys:
+                        promoted["source_synthetic_machine_keys"] = sorted(set(matched_machine_keys))
                     out.append(promoted)
     return out
 
@@ -2227,6 +2516,7 @@ def save_rectangular_scan_file(
 def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order: int) -> None:
     normalized = _normalize_point_payload(payload, record_order=record_order)
     map_refs: dict[str, str] = {}
+    diagnostics_out = dict(normalized["diagnostics"])
     grp.attrs["record_order"] = int(record_order)
     grp.attrs["a"] = float(normalized["a"])
     grp.attrs["b"] = float(normalized["b"])
@@ -2279,8 +2569,29 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
             data=np.asarray(extra_data, dtype=float),
             map_refs=map_refs,
         )
+    synthetic_machine_keys = _register_synthetic_map_registry_entries(
+        grp.file,
+        map_refs=map_refs,
+        diagnostics=diagnostics_out,
+    )
+    if synthetic_machine_keys:
+        compact_entries: list[dict[str, Any]] = []
+        for item in _synthetic_map_entries_from_diagnostics(diagnostics_out):
+            machine_key = str(item.get("machine_key", "")).strip()
+            if not machine_key or machine_key not in synthetic_machine_keys:
+                continue
+            compact_entry = {
+                "machine_key": machine_key,
+                "map_store_array": str(item.get("map_store_array", "")).strip(),
+            }
+            if str(item.get("label", "")).strip():
+                compact_entry["label"] = str(item.get("label", "")).strip()
+            compact_entries.append(compact_entry)
+        diagnostics_out["synthetic_map_machine_keys"] = list(synthetic_machine_keys)
+        diagnostics_out["synthetic_map_keys"] = compact_entries
+        _create_text_dataset(grp, POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET, _json_dumps(synthetic_machine_keys))
     _create_text_dataset(grp, MAP_REFS_DATASET, _json_dumps(map_refs))
-    _create_text_dataset(grp, "diagnostics_json", _json_dumps(normalized["diagnostics"]))
+    _create_text_dataset(grp, "diagnostics_json", _json_dumps(diagnostics_out))
 
 
 def write_point_scan_artifact(

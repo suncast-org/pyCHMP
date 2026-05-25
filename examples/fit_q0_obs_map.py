@@ -72,6 +72,8 @@ DEFAULT_TBASE = 1.0e6
 DEFAULT_NBASE = 1.0e8
 DEFAULT_A = 0.3
 DEFAULT_B = 2.7
+DEFAULT_Q0_XATOL = 1e-3
+DEFAULT_Q0_MAXITER = 200
 
 
 @dataclass(frozen=True)
@@ -119,22 +121,10 @@ def _resolve_observation_request(args: argparse.Namespace, *, repo_root: Path) -
     obs_map_id = None if args.obs_map_id is None else str(args.obs_map_id).strip() or None
     explicit_source = None if args.obs_source is None else str(args.obs_source).strip().lower() or None
 
-    if positional_fits is not None and explicit_obs_path is not None and positional_fits != explicit_obs_path:
-        raise SystemExit(
-            f"Conflicting observation path selectors: positional fits_file={positional_fits} "
-            f"and --obs-path={explicit_obs_path}"
-        )
     obs_path = explicit_obs_path or positional_fits
 
     if explicit_source is None:
         explicit_source = "model_refmap" if obs_map_id is not None else "external_fits"
-    if explicit_source not in {"external_fits", "model_refmap"}:
-        raise SystemExit(f"Unsupported --obs-source value: {explicit_source}")
-
-    if explicit_source == "external_fits" and obs_map_id is not None:
-        raise SystemExit("Conflicting observation selectors: --obs-map-id requires --obs-source=model_refmap")
-    if explicit_source == "model_refmap" and obs_path is not None:
-        raise SystemExit("Conflicting observation selectors: external FITS paths cannot be used with --obs-source=model_refmap")
 
     _eovsa_root, model_root, ebtel_root = _default_testdata_roots(repo_root, testdata_repo=testdata_repo)
     _default_eovsa_fits, default_model_h5, default_ebtel_path = resolve_default_testdata_fixture_paths(
@@ -142,10 +132,6 @@ def _resolve_observation_request(args: argparse.Namespace, *, repo_root: Path) -
         testdata_repo=testdata_repo,
     )
 
-    if explicit_source == "external_fits" and obs_path is None:
-        raise SystemExit("--obs-path or positional fits_file is required when --obs-source=external_fits")
-    if explicit_source == "model_refmap" and obs_map_id is None:
-        raise SystemExit("--obs-map-id is required when --obs-source=model_refmap")
     if model_h5 is None:
         if default_model_h5 is None:
             raise SystemExit(
@@ -402,9 +388,6 @@ def _resolve_selected_psf(
     cli_psf_bmaj_arcsec: float | None,
     cli_psf_bmin_arcsec: float | None,
     cli_psf_bpa_deg: float | None,
-    fallback_psf_bmaj_arcsec: float | None,
-    fallback_psf_bmin_arcsec: float | None,
-    fallback_psf_bpa_deg: float | None,
     override_header_psf: bool,
 ) -> tuple[float | None, float | None, float | None, str, bool]:
     selected_metadata = _resolve_selected_psf_metadata(
@@ -417,9 +400,6 @@ def _resolve_selected_psf(
         cli_psf_bmaj_arcsec=cli_psf_bmaj_arcsec,
         cli_psf_bmin_arcsec=cli_psf_bmin_arcsec,
         cli_psf_bpa_deg=cli_psf_bpa_deg,
-        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
-        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
-        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
         override_header_psf=override_header_psf,
     )
     if selected_metadata is None or selected_metadata.kind != "gaussian":
@@ -444,9 +424,6 @@ def _resolve_selected_psf_metadata(
     cli_psf_bmaj_arcsec: float | None,
     cli_psf_bmin_arcsec: float | None,
     cli_psf_bpa_deg: float | None,
-    fallback_psf_bmaj_arcsec: float | None,
-    fallback_psf_bmin_arcsec: float | None,
-    fallback_psf_bpa_deg: float | None,
     override_header_psf: bool,
 ) -> PSFMetadata | None:
     header_metadata = None
@@ -469,9 +446,9 @@ def _resolve_selected_psf_metadata(
         cli_psf_bmaj_arcsec=cli_psf_bmaj_arcsec,
         cli_psf_bmin_arcsec=cli_psf_bmin_arcsec,
         cli_psf_bpa_deg=cli_psf_bpa_deg,
-        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
-        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
-        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
+        fallback_psf_bmaj_arcsec=None,
+        fallback_psf_bmin_arcsec=None,
+        fallback_psf_bpa_deg=None,
         override_header_psf=override_header_psf,
     )
     return selected_metadata
@@ -1236,6 +1213,8 @@ Examples:
     parser.add_argument("--q0-start", type=float, default=None, help="Explicit starting Q0 for adaptive bracketing")
     parser.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative Q0 step for adaptive bracketing")
     parser.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive bracketing expansion steps")
+    parser.add_argument("--xatol", type=float, default=DEFAULT_Q0_XATOL, help="Absolute q0 tolerance for bounded minimization (default: 1e-3)")
+    parser.add_argument("--maxiter", type=int, default=DEFAULT_Q0_MAXITER, help="Maximum bounded-minimizer iterations (default: 200)")
     parser.add_argument("--target-metric", choices=["chi2", "rho2", "eta2"], default="chi2", help="Target metric for optimization (default: chi2)")
 
     # Plasma/geometry/observer overrides
@@ -1263,11 +1242,8 @@ Examples:
         "--override-header-psf",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use user-supplied PSF or fallback reference-beam parameters even when the FITS header already contains a PSF beam",
+        help="Use user-supplied PSF parameters even when the FITS header already contains a PSF beam",
     )
-    parser.add_argument("--fallback-psf-bmaj-arcsec", type=float, default=None, help="Fallback PSF major axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied")
-    parser.add_argument("--fallback-psf-bmin-arcsec", type=float, default=None, help="Fallback PSF minor axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied")
-    parser.add_argument("--fallback-psf-bpa-deg", type=float, default=None, help="Fallback PSF position angle used only when the FITS header has no beam and no explicit PSF override is supplied")
     parser.add_argument("--psf-ref-frequency-ghz", type=float, default=None, help="Reference frequency for PSF axes values")
     parser.add_argument("--psf-scale-inverse-frequency", action="store_true", help="Scale PSF axes by (ref_freq / active_freq)")
 
@@ -1324,6 +1300,8 @@ Examples:
             "q0_start": None,
             "q0_step": 1.61803398875,
             "max_bracket_steps": 12,
+            "xatol": DEFAULT_Q0_XATOL,
+            "maxiter": DEFAULT_Q0_MAXITER,
             "target_metric": "chi2",
             "tbase": DEFAULT_TBASE,
             "nbase": DEFAULT_NBASE,
@@ -1343,9 +1321,6 @@ Examples:
             "psf_bmaj_arcsec": None,
             "psf_bmin_arcsec": None,
             "psf_bpa_deg": None,
-            "fallback_psf_bmaj_arcsec": None,
-            "fallback_psf_bmin_arcsec": None,
-            "fallback_psf_bpa_deg": None,
             "psf_ref_frequency_ghz": None,
             "psf_scale_inverse_frequency": False,
             "artifacts_dir": None,
@@ -1369,9 +1344,6 @@ Examples:
     args.model_h5 = obs_request.model_h5
     args.ebtel_path = obs_request.ebtel_path
 
-    if obs_request.obs_path is not None and not obs_request.obs_path.exists():
-        print(f"ERROR: Observational FITS file not found: {obs_request.obs_path}")
-        exit(1)
     if not args.model_h5.exists():
         print(f"ERROR: Model file not found: {args.model_h5}")
         exit(1)
@@ -1400,9 +1372,6 @@ Examples:
         render_selection = _resolve_render_selection(args, obs_map)
     except ValueError as exc:
         print(f"ERROR: {exc}")
-        exit(1)
-    if render_selection.domain == "mw" and render_selection.active_frequency_ghz is None:
-        print("ERROR: Could not extract MW observing frequency from the selected observation")
         exit(1)
     if args.prepared_observation_h5 is not None and render_selection.domain != "mw":
         print(
@@ -1496,11 +1465,11 @@ Examples:
         print(f"\nEstimating noise from map...")
         noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
         noise_unit = obs_map_noise_unit_label(obs_map)
-        if str(noise_result.method_used) == "fallback_std":
-            print("  ⚠️  Noise estimation failed (map quality issues)")
-            print(f"  Falling back to fixed sigma = {int(noise_result.sigma)} {noise_unit}")
-        else:
-            print(f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit}")
+        print(
+            f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit} "
+            f"(method={str(noise_result.method_used)})"
+        )
+        if np.isfinite(float(noise_result.mask_fraction)):
             print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
         sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
         noise_diagnostics = noise_result.diagnostics
@@ -1700,9 +1669,6 @@ Examples:
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
-    fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
-    fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
     selected_psf_metadata = _resolve_selected_psf_metadata(
         header_psf=header_psf,
         header_psf_source=header_psf_source,
@@ -1713,9 +1679,6 @@ Examples:
         cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
         cli_psf_bmin_arcsec=psf_bmin_arcsec,
         cli_psf_bpa_deg=psf_bpa_deg,
-        fallback_psf_bmaj_arcsec=fallback_psf_bmaj_arcsec,
-        fallback_psf_bmin_arcsec=fallback_psf_bmin_arcsec,
-        fallback_psf_bpa_deg=fallback_psf_bpa_deg,
         override_header_psf=bool(args.override_header_psf),
     )
     psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
@@ -1969,6 +1932,8 @@ Examples:
                 threshold=float(args.metrics_mask_threshold),
                 explicit_mask=explicit_metric_mask,
                 target_metric=args.target_metric,
+                xatol=float(args.xatol),
+                maxiter=int(args.maxiter),
                 adaptive_bracketing=bool(args.adaptive_bracketing),
                 q0_start=args.q0_start,
                 q0_step=float(args.q0_step),
@@ -2145,6 +2110,8 @@ Examples:
                 "optimizer_message": str(result.message),
                 "nfev": int(result.nfev),
                 "nit": int(result.nit),
+                "xatol": float(args.xatol),
+                "maxiter": int(args.maxiter),
                 "used_adaptive_bracketing": bool(result.used_adaptive_bracketing),
                 "bracket_found": bool(result.bracket_found),
                 "bracket": [float(v) for v in result.bracket] if result.bracket is not None else None,

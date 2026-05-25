@@ -23,9 +23,11 @@ from pychmp.ab_scan_artifacts import (
     load_scan_file,
     point_record_matches_compatibility_signature,
     resolve_point_index,
+    scan_artifact_reuse_preflight_issues,
     write_grid_scan_artifact,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
+    validate_scan_artifact_reuse_preflight,
     write_single_point_scan_file,
     write_point_scan_artifact,
 )
@@ -422,6 +424,72 @@ def test_validate_scan_artifact_compatibility_rejects_sparse_observation_mismatc
         )
 
 
+def test_validate_scan_artifact_reuse_preflight_rejects_sparse_geometry_mismatch(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+    changed_header = _make_header(crval1=12.0)
+    changed_diagnostics = dict(diagnostics)
+    changed_diagnostics["map_dx_arcsec"] = 3.0
+
+    issues = scan_artifact_reuse_preflight_issues(
+        payload,
+        wcs_header=changed_header,
+        diagnostics=changed_diagnostics,
+    )
+
+    assert any("WCS header differs" in issue for issue in issues)
+    assert any("map_dx_arcsec" in issue for issue in issues)
+    with pytest.raises(ScanArtifactCompatibilityError, match="map_dx_arcsec"):
+        validate_scan_artifact_reuse_preflight(
+            payload,
+            wcs_header=changed_header,
+            diagnostics=changed_diagnostics,
+            artifact_path=out_h5,
+        )
+
+
+def test_validate_scan_artifact_reuse_preflight_allows_sparse_search_specific_changes(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+    changed_diagnostics = dict(diagnostics)
+    changed_diagnostics["target_metric"] = "eta2"
+    changed_diagnostics["metrics_mask_threshold"] = 0.5
+    changed_diagnostics[COMPATIBILITY_SIGNATURE_KEY] = "sig-eta2-threshold-0p5"
+
+    validate_scan_artifact_reuse_preflight(
+        payload,
+        wcs_header=header,
+        diagnostics=changed_diagnostics,
+        artifact_path=out_h5,
+    )
+
+
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:
     out_h5 = tmp_path / "sparse_scan.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
@@ -788,6 +856,503 @@ def test_auxiliary_map_store_records_can_seed_render_only_slice(tmp_path: Path) 
     assert records[0]["fit_q0_trials"] == (2.0, 2.5)
     np.testing.assert_allclose(records[0]["trial_modeled_maps"][0], np.full((2, 2), 2.0, dtype=float))
     np.testing.assert_allclose(records[0]["modeled_best"], np.full((2, 2), 2.5, dtype=float))
+
+
+def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "aux_seed_synthetic_keys.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "wavelength_angstrom": 171.0,
+            "target_slice_key": "euv_171",
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "channel_label": "171",
+                    "wavelength_angstrom": 171.0,
+                    "role": "target",
+                    "is_target": True,
+                },
+                {
+                    "key": "euv_193",
+                    "domain": "euv",
+                    "label": "193 A",
+                    "channel_label": "193",
+                    "wavelength_angstrom": 193.0,
+                    "role": "auxiliary",
+                    "is_target": False,
+                },
+            ],
+        }
+    )
+    synthetic_entries = [
+        {
+            "machine_key": "syn-193-best",
+            "map_store_array": "synthetic/syn-193-best",
+            "label": "EUV 193 best",
+            "identity": {
+                "schema": "pychmp.synthetic_map_db.v1",
+                "domain_label": "euv",
+                "channel_or_frequency": "193",
+                "map_role": "rendered_best",
+            },
+        },
+        {
+            "machine_key": "syn-193-trial0",
+            "map_store_array": "synthetic/syn-193-trial0",
+            "label": "EUV 193 trial 0",
+            "identity": {
+                "schema": "pychmp.synthetic_map_db.v1",
+                "domain_label": "euv",
+                "channel_or_frequency": "193",
+                "map_role": "trial_000_rendered",
+            },
+        },
+        {
+            "machine_key": "syn-193-trial1",
+            "map_store_array": "synthetic/syn-193-trial1",
+            "label": "EUV 193 trial 1",
+            "identity": {
+                "schema": "pychmp.synthetic_map_db.v1",
+                "domain_label": "euv",
+                "channel_or_frequency": "193",
+                "map_role": "trial_001_rendered",
+            },
+        },
+    ]
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.ones((2, 2), dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics={
+            **diagnostics,
+            "synthetic_map_db_version": 1,
+            "synthetic_map_keys": synthetic_entries,
+        },
+        map_store_arrays={
+            "synthetic/syn-193-best": np.full((2, 2), 2.5, dtype=float),
+            "synthetic/syn-193-trial0": np.full((2, 2), 2.0, dtype=float),
+            "synthetic/syn-193-trial1": np.full((2, 2), 2.5, dtype=float),
+        },
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_payload],
+    )
+
+    records = load_auxiliary_map_store_point_records(out_h5, slice_key="euv_193")
+
+    assert len(records) == 1
+    assert records[0]["source_slice_key"] == "euv_171"
+    assert records[0]["source_auxiliary_map_prefix"] == "synthetic_registry/euv_193"
+    assert records[0]["source_synthetic_machine_keys"] == ["syn-193-best", "syn-193-trial0", "syn-193-trial1"]
+    assert records[0]["fit_q0_trials"] == (2.0, 2.5)
+    np.testing.assert_allclose(records[0]["trial_modeled_maps"][0], np.full((2, 2), 2.0, dtype=float))
+    np.testing.assert_allclose(records[0]["modeled_best"], np.full((2, 2), 2.5, dtype=float))
+
+
+def test_auxiliary_map_store_records_disable_synthetic_key_lookup_uses_legacy_prefix(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "aux_seed_disable_synthetic_keys.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "wavelength_angstrom": 171.0,
+            "target_slice_key": "euv_171",
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "channel_label": "171",
+                    "wavelength_angstrom": 171.0,
+                    "role": "target",
+                    "is_target": True,
+                },
+                {
+                    "key": "euv_193",
+                    "domain": "euv",
+                    "label": "193 A",
+                    "channel_label": "193",
+                    "wavelength_angstrom": 193.0,
+                    "role": "auxiliary",
+                    "is_target": False,
+                },
+            ],
+        }
+    )
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.ones((2, 2), dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics={
+            **diagnostics,
+            "synthetic_map_db_version": 1,
+            "synthetic_map_keys": [
+                {
+                    "machine_key": "syn-193-best",
+                    "map_store_array": "synthetic/syn-193-best",
+                    "label": "EUV 193 best",
+                    "identity": {
+                        "schema": "pychmp.synthetic_map_db.v1",
+                        "domain_label": "euv",
+                        "channel_or_frequency": "193",
+                        "map_role": "rendered_best",
+                    },
+                },
+                {
+                    "machine_key": "syn-193-trial0",
+                    "map_store_array": "synthetic/syn-193-trial0",
+                    "label": "EUV 193 trial 0",
+                    "identity": {
+                        "schema": "pychmp.synthetic_map_db.v1",
+                        "domain_label": "euv",
+                        "channel_or_frequency": "193",
+                        "map_role": "trial_000_rendered",
+                    },
+                },
+                {
+                    "machine_key": "syn-193-trial1",
+                    "map_store_array": "synthetic/syn-193-trial1",
+                    "label": "EUV 193 trial 1",
+                    "identity": {
+                        "schema": "pychmp.synthetic_map_db.v1",
+                        "domain_label": "euv",
+                        "channel_or_frequency": "193",
+                        "map_role": "trial_001_rendered",
+                    },
+                },
+            ],
+        },
+        map_store_arrays={
+            # Legacy prefix-based auxiliary maps (expected when synthetic lookup is disabled).
+            "euv/193/trial_000/rendered": np.full((2, 2), 2.0, dtype=float),
+            "euv/193/trial_001/rendered": np.full((2, 2), 2.5, dtype=float),
+            "euv/193/rendered_best": np.full((2, 2), 2.5, dtype=float),
+            # Synthetic-key maps with deliberately different values to catch accidental use.
+            "synthetic/syn-193-best": np.full((2, 2), 8.5, dtype=float),
+            "synthetic/syn-193-trial0": np.full((2, 2), 8.0, dtype=float),
+            "synthetic/syn-193-trial1": np.full((2, 2), 8.5, dtype=float),
+        },
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_payload],
+    )
+
+    records = load_auxiliary_map_store_point_records(
+        out_h5,
+        slice_key="euv_193",
+        use_synthetic_machine_keys=False,
+    )
+
+    assert len(records) == 1
+    assert records[0]["source_slice_key"] == "euv_171"
+    assert records[0]["source_auxiliary_map_prefix"] == "extra/euv/193"
+    assert "source_synthetic_machine_keys" not in records[0]
+    assert records[0]["fit_q0_trials"] == (2.0, 2.5)
+    np.testing.assert_allclose(records[0]["trial_modeled_maps"][0], np.full((2, 2), 2.0, dtype=float))
+    np.testing.assert_allclose(records[0]["modeled_best"], np.full((2, 2), 2.5, dtype=float))
+
+
+def test_auxiliary_map_store_records_disable_synthetic_key_lookup_skips_synthetic_only_records(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "aux_seed_disable_synthetic_keys_only.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "wavelength_angstrom": 171.0,
+            "target_slice_key": "euv_171",
+            "slice_descriptors": [
+                {
+                    "key": "euv_171",
+                    "domain": "euv",
+                    "label": "171 A",
+                    "channel_label": "171",
+                    "wavelength_angstrom": 171.0,
+                    "role": "target",
+                    "is_target": True,
+                },
+                {
+                    "key": "euv_193",
+                    "domain": "euv",
+                    "label": "193 A",
+                    "channel_label": "193",
+                    "wavelength_angstrom": 193.0,
+                    "role": "auxiliary",
+                    "is_target": False,
+                },
+            ],
+        }
+    )
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.ones((2, 2), dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics={
+            **diagnostics,
+            "synthetic_map_db_version": 1,
+            "synthetic_map_keys": [
+                {
+                    "machine_key": "syn-193-best",
+                    "map_store_array": "synthetic/syn-193-best",
+                    "label": "EUV 193 best",
+                    "identity": {
+                        "schema": "pychmp.synthetic_map_db.v1",
+                        "domain_label": "euv",
+                        "channel_or_frequency": "193",
+                        "map_role": "rendered_best",
+                    },
+                },
+                {
+                    "machine_key": "syn-193-trial0",
+                    "map_store_array": "synthetic/syn-193-trial0",
+                    "label": "EUV 193 trial 0",
+                    "identity": {
+                        "schema": "pychmp.synthetic_map_db.v1",
+                        "domain_label": "euv",
+                        "channel_or_frequency": "193",
+                        "map_role": "trial_000_rendered",
+                    },
+                },
+            ],
+        },
+        map_store_arrays={
+            # Synthetic-only maps; no legacy prefix keys present.
+            "synthetic/syn-193-best": np.full((2, 2), 8.5, dtype=float),
+            "synthetic/syn-193-trial0": np.full((2, 2), 8.0, dtype=float),
+        },
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_payload],
+    )
+
+    records = load_auxiliary_map_store_point_records(
+        out_h5,
+        slice_key="euv_193",
+        use_synthetic_machine_keys=False,
+    )
+
+    assert records == []
+
+
+def test_synthetic_map_registry_is_persisted_and_point_diagnostics_are_compact(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "synthetic_registry.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    synthetic_machine_key = "synthetic-key-001"
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.ones((2, 2), dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics={
+            **diagnostics,
+            "synthetic_map_keys": [
+                {
+                    "machine_key": synthetic_machine_key,
+                    "map_store_array": "synthetic/synthetic-key-001",
+                    "label": "Synthetic test map",
+                    "identity": {"schema": "pychmp.synthetic_map_db.v1", "a": 0.3, "b": 2.7, "q0": 2.5},
+                }
+            ],
+        },
+        map_store_arrays={"synthetic/synthetic-key-001": np.full((2, 2), 9.0, dtype=float)},
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[point_payload],
+    )
+
+    with h5py.File(out_h5, "r") as handle:
+        search_id = handle["slices/default/active_search_id"][()].decode()
+        record = handle[f"slices/default/searches/{search_id}/point_records/r000000"]
+        stored_diag = json.loads(record["diagnostics_json"][()].decode())
+        assert stored_diag["synthetic_map_machine_keys"] == [synthetic_machine_key]
+        assert "identity" not in stored_diag["synthetic_map_keys"][0]
+        assert "synthetic_map_machine_keys_json" in record
+
+        registry_entry = handle[f"map_store/synthetic_registry/{synthetic_machine_key}"]
+        assert registry_entry["machine_key"][()].decode() == synthetic_machine_key
+        ref_path = registry_entry["map_ref_path"][()].decode()
+        np.testing.assert_allclose(handle[ref_path]["data"][()], np.full((2, 2), 9.0, dtype=float))
+
+
+def test_synthetic_map_registry_dedupes_entries_across_repeated_writes(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "synthetic_registry_dedupe.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    synthetic_machine_key = "synthetic-key-dedupe"
+
+    def _payload() -> dict[str, object]:
+        return build_computed_point_payload(
+            a_value=0.3,
+            b_value=2.7,
+            a_index=0,
+            b_index=0,
+            q0=2.5,
+            success=True,
+            status="computed",
+            modeled_best=np.ones((2, 2), dtype=float),
+            raw_modeled_best=np.ones((2, 2), dtype=float),
+            residual=np.zeros((2, 2), dtype=float),
+            fit_q0_trials=(2.0, 2.5),
+            fit_metric_trials=(0.4, 0.1),
+            fit_chi2_trials=(0.4, 0.1),
+            fit_rho2_trials=(0.5, 0.2),
+            fit_eta2_trials=(0.6, 0.3),
+            nfev=2,
+            nit=1,
+            message="ok",
+            used_adaptive_bracketing=False,
+            bracket_found=False,
+            bracket=None,
+            target_metric="chi2",
+            diagnostics={
+                **diagnostics,
+                "synthetic_map_keys": [
+                    {
+                        "machine_key": synthetic_machine_key,
+                        "map_store_array": "synthetic/synthetic-key-dedupe",
+                        "label": "Synthetic dedupe map",
+                        "identity": {"schema": "pychmp.synthetic_map_db.v1", "a": 0.3, "b": 2.7, "q0": 2.5},
+                    }
+                ],
+            },
+            map_store_arrays={"synthetic/synthetic-key-dedupe": np.full((2, 2), 7.0, dtype=float)},
+        )
+
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_payload()],
+    )
+    append_point_record(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=_payload(),
+    )
+
+    with h5py.File(out_h5, "r") as handle:
+        registry = handle["map_store/synthetic_registry"]
+        assert sorted(registry.keys()) == [synthetic_machine_key]
 
 
 def test_append_point_record_updates_rectangular_artifact(tmp_path: Path) -> None:

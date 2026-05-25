@@ -72,4 +72,4 @@ __all__ = [
   "parse_csv_tokens",
 ]
 
-__version__ = "0.1.0a2"
+__version__ = "0.1.0"
