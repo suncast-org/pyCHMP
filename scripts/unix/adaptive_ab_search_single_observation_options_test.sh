@@ -315,10 +315,6 @@ RESPONSES_ROOT="$TESTDATA_REPO/raw/responses"
 LATEST_MODEL_DIR="$(named_fixture_dir "$MODELS_ROOT" "hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" || true)"
 OBS_FITS_PATH="${OBS_FITS_PATH:-}"
 MODEL_H5_PATH="${MODEL_H5_PATH:-$LATEST_MODEL_DIR/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5}"
-LATEST_RESPONSE_DIR="$(latest_dated_dir "$RESPONSES_ROOT" "*")"
-if [[ -z "${LATEST_RESPONSE_DIR:-}" || ! -d "$LATEST_RESPONSE_DIR" ]]; then
-  LATEST_RESPONSE_DIR="$(find "$RESPONSES_ROOT" -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)"
-fi
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-/tmp/pychmp_adaptive_ab_runs}"
 ARTIFACTS_STEM="${ARTIFACTS_STEM:-adaptive_ab_search_single_observation}"
 TARGET_METRIC="${TARGET_METRIC:-chi2}"
@@ -326,7 +322,7 @@ A_START="${A_START:-0.3}"
 B_START="${B_START:-2.7}"
 DA="${DA:-0.3}"
 DB="${DB:-0.3}"
-A_MIN="${A_MIN:-0.0}"
+A_MIN="${A_MIN:--1.2}"
 A_MAX="${A_MAX:-1.2}"
 B_MIN="${B_MIN:-2.1}"
 B_MAX="${B_MAX:-3.6}"
@@ -527,9 +523,6 @@ if [[ "$OBS_SOURCE" == "model_refmap" && -n "$OBS_MAP_ID" ]]; then
   echo "Using observation map id: $OBS_MAP_ID"
 fi
 if [[ "$OBS_SOURCE" == "model_refmap" ]]; then
-  if [[ -n "${LATEST_RESPONSE_DIR:-}" ]]; then
-    echo "Using response folder: $LATEST_RESPONSE_DIR"
-  fi
   if [[ -n "$EUV_INSTRUMENT" ]]; then
     echo "Using EUV instrument: $EUV_INSTRUMENT"
   fi

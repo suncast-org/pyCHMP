@@ -12,6 +12,7 @@ from typing import Any
 import h5py
 import numpy as np
 from astropy.io import fits
+from scipy.signal import fftconvolve
 
 
 METRICS = ("chi2", "rho2", "eta2")
@@ -28,20 +29,25 @@ COMMON_PSF_KERNEL_DATASET = "psf_kernel"
 COMMON_PSF_KERNEL_META_DATASET = "psf_kernel_meta_json"
 SEARCHES_GROUP = "searches"
 ACTIVE_SEARCH_ID_DATASET = "active_search_id"
+ACTIVE_POINT_SNAPSHOT_GROUP = "active_point_snapshot"
+LIVE_TRIAL_POINT_GROUP = "live_trial_point"
 SEARCH_REQUEST_DATASET = "request_json"
 SEARCH_LIFECYCLE_DATASET = "lifecycle_json"
 MAP_STORE_GROUP = "map_store"
 MAP_STORE_MAPS_GROUP = "maps"
 MAP_STORE_SYNTHETIC_REGISTRY_GROUP = "synthetic_registry"
 MAP_REFS_DATASET = "map_refs_json"
+TRIAL_HISTORY_DATASET = "trial_history_json"
 POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET = "synthetic_map_machine_keys_json"
-CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-05-21-unified-searches"
+CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-05-26-raw-map-only-searches"
 REQUIRED_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "artifact_kind",
     "target_metric",
     "model_sha256",
     "fits_sha256",
     "ebtel_sha256",
+    "euv_response_identity_version",
+    "euv_response_sha256",
     "frequency_ghz",
     "map_xc_arcsec",
     "map_yc_arcsec",
@@ -60,6 +66,8 @@ PREFLIGHT_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "model_sha256",
     "fits_sha256",
     "ebtel_sha256",
+    "euv_response_identity_version",
+    "euv_response_sha256",
     "spectral_domain",
     "spectral_label",
     "frequency_ghz",
@@ -110,9 +118,28 @@ class ScanArtifactCompatibilityError(ValueError):
     """Raised when an existing scan artifact cannot be safely reused."""
 
 
-_SPARSE_APPEND_RETRY_ATTEMPTS = 12
-_SPARSE_APPEND_RETRY_DELAY_S = 0.20
-_H5PY_FILE = h5py.File
+_SPARSE_APPEND_RETRY_ATTEMPTS = 40
+_SPARSE_APPEND_RETRY_DELAY_S = 0.25
+
+
+def _open_h5_with_lock_tolerance(path: Path | str, mode: str = "r", *args: Any, **kwargs: Any) -> h5py.File:
+    text_mode = str(mode)
+    read_only = (
+        "r" in text_mode
+        and "+" not in text_mode
+        and "w" not in text_mode
+        and "a" not in text_mode
+        and "x" not in text_mode
+    )
+    if read_only and "locking" not in kwargs:
+        try:
+            return h5py.File(path, mode, *args, locking=False, **kwargs)
+        except TypeError:
+            pass
+    return h5py.File(path, mode, *args, **kwargs)
+
+
+_H5PY_FILE = _open_h5_with_lock_tolerance
 
 
 def decode_scalar(value: Any) -> str:
@@ -776,6 +803,33 @@ def _search_request_from_diagnostics(
     return request
 
 
+def _search_request_from_group(search_group: h5py.Group) -> dict[str, Any]:
+    if SEARCH_REQUEST_DATASET in search_group:
+        payload = _json_loads_or_empty(search_group[SEARCH_REQUEST_DATASET][()])
+        if payload:
+            return payload
+    diagnostics = _json_loads_or_empty(search_group["diagnostics_json"][()]) if "diagnostics_json" in search_group else {}
+    layout = _json_loads_or_empty(search_group["layout_json"][()]) if "layout_json" in search_group else {}
+    return _search_request_from_diagnostics(diagnostics, layout=layout)
+
+
+def _matching_search_id_for_request(searches_group: h5py.Group, request: dict[str, Any]) -> str | None:
+    target = _json_dumps(request)
+    matches: list[tuple[int, str]] = []
+    for search_id in searches_group.keys():
+        search_group = searches_group[search_id]
+        existing_request = _search_request_from_group(search_group)
+        if _json_dumps(existing_request) != target:
+            continue
+        point_count = len(search_group["point_records"]) if "point_records" in search_group else 0
+        matches.append((int(point_count), str(search_id)))
+    if not matches:
+        return None
+    # Prefer the most complete existing search when duplicates already exist.
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return matches[0][1]
+
+
 def _search_lifecycle_payload(
     *,
     status: str,
@@ -795,11 +849,27 @@ def _search_lifecycle_payload(
     )
     completed_at = diagnostics.get("search_completed_at", previous.get("completed_at"))
     in_progress = status in {"empty", "in_progress", "partial"}
-    if not in_progress and not completed_at:
+    if "search_active" in diagnostics:
+        active = bool(diagnostics.get("search_active"))
+    elif "active" in previous:
+        # Preserve the existing active state across incremental point appends.
+        # The runner sets search_active=False explicitly when it exits; we must
+        # not infer completion just because all current grid points are computed
+        # (the adaptive search may continue exploring new regions).
+        active = bool(previous["active"])
+    elif existing is not None:
+        # Incremental (append) write, first record: the runner is creating this
+        # search so it is active regardless of in_progress status.
+        active = True
+    else:
+        # Batch write (_write_search_group): infer activity from completion
+        # status.  A fully-computed batch-written search has no live runner.
+        active = bool(in_progress)
+    if not in_progress and not active and not completed_at:
         completed_at = _utc_now_iso()
     return {
         "status": str(status),
-        "active": bool(diagnostics.get("search_active", True)),
+        "active": bool(active),
         "in_progress": bool(in_progress),
         "created_at": created_at,
         "started_at": started_at,
@@ -1089,6 +1159,179 @@ def _coerce_loaded_display_map(
     return array, True
 
 
+def _convolve_raw_map(raw_map: np.ndarray, psf_kernel: np.ndarray | None) -> np.ndarray:
+    raw = np.asarray(raw_map, dtype=float)
+    kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
+    if kernel is None or kernel.ndim != 2 or kernel.size == 0:
+        return raw.copy()
+    return np.asarray(fftconvolve(raw, kernel, mode="same"), dtype=float)
+
+
+def _derive_display_maps_from_raw(
+    raw_map: np.ndarray | None,
+    *,
+    observed_template: np.ndarray,
+    psf_kernel: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    raw, has_raw = _coerce_loaded_display_map(raw_map, observed_template=observed_template)
+    if not has_raw:
+        blank = _blank_map(observed_template)
+        return blank, blank.copy(), blank.copy(), False
+    modeled = _convolve_raw_map(raw, psf_kernel)
+    residual = np.asarray(modeled - np.asarray(observed_template, dtype=float), dtype=float)
+    return raw, modeled, residual, True
+
+
+def _derive_trial_display_maps_from_raw(
+    trial_raw_maps: np.ndarray | None,
+    *,
+    observed_template: np.ndarray,
+    psf_kernel: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    if trial_raw_maps is None:
+        return None, None, None
+    raw = np.asarray(trial_raw_maps, dtype=float)
+    template = np.asarray(observed_template, dtype=float)
+    if raw.ndim != 3 or template.ndim != 2 or raw.shape[1:] != template.shape:
+        return None, None, None
+    modeled = np.stack([_convolve_raw_map(frame, psf_kernel) for frame in raw], axis=0)
+    residual = np.asarray(modeled - template[None, :, :], dtype=float)
+    return raw, modeled, residual
+
+
+def _finite_best_trial_index(
+    *,
+    fit_metric_trials: tuple[float, ...],
+    q0: float,
+    fit_q0_trials: tuple[float, ...],
+) -> int | None:
+    if fit_metric_trials:
+        arr = np.asarray(fit_metric_trials, dtype=float)
+        finite = np.flatnonzero(np.isfinite(arr))
+        if finite.size:
+            return int(finite[np.argmin(arr[finite])])
+    if fit_q0_trials:
+        q0_arr = np.asarray(fit_q0_trials, dtype=float)
+        matches = np.flatnonzero(np.isclose(q0_arr, float(q0), rtol=0.0, atol=1e-12))
+        if matches.size:
+            return int(matches[0])
+    return None
+
+
+def _build_trial_history_entries(
+    grp: h5py.Group,
+    *,
+    normalized: dict[str, Any],
+    map_refs: dict[str, str],
+) -> tuple[list[dict[str, Any]], int | None]:
+    fit_q0_trials = tuple(float(v) for v in normalized.get("fit_q0_trials", ()))
+    fit_metric_trials = tuple(float(v) for v in normalized.get("fit_metric_trials", ()))
+    fit_chi2_trials = tuple(float(v) for v in normalized.get("fit_chi2_trials", ()))
+    fit_rho2_trials = tuple(float(v) for v in normalized.get("fit_rho2_trials", ()))
+    fit_eta2_trials = tuple(float(v) for v in normalized.get("fit_eta2_trials", ()))
+    trial_raw = normalized.get("trial_raw_modeled_maps")
+    trial_raw_arr = None if trial_raw is None else np.asarray(trial_raw, dtype=float)
+    best_trial_index = _finite_best_trial_index(
+        fit_metric_trials=fit_metric_trials,
+        q0=float(normalized.get("q0", np.nan)),
+        fit_q0_trials=fit_q0_trials,
+    )
+
+    entries: list[dict[str, Any]] = []
+    if trial_raw_arr is not None and trial_raw_arr.ndim == 3 and trial_raw_arr.shape[0] == len(fit_q0_trials):
+        for trial_index, raw_map in enumerate(trial_raw_arr):
+            map_ref_key = f"trial_raw_modeled_maps/{trial_index:03d}"
+            _write_point_map_ref(
+                grp,
+                normalized=normalized,
+                name=map_ref_key,
+                data=np.asarray(raw_map, dtype=float),
+                map_refs=map_refs,
+            )
+            entries.append(
+                {
+                    "trial_index": int(trial_index),
+                    "q0": float(fit_q0_trials[trial_index]),
+                    "target_metric_value": float(fit_metric_trials[trial_index]) if trial_index < len(fit_metric_trials) else float("nan"),
+                    "chi2": float(fit_chi2_trials[trial_index]) if trial_index < len(fit_chi2_trials) else float("nan"),
+                    "rho2": float(fit_rho2_trials[trial_index]) if trial_index < len(fit_rho2_trials) else float("nan"),
+                    "eta2": float(fit_eta2_trials[trial_index]) if trial_index < len(fit_eta2_trials) else float("nan"),
+                    "raw_map_ref": str(map_refs.get(map_ref_key, "")),
+                }
+            )
+        return entries, best_trial_index
+
+    raw_best = normalized.get("raw_modeled_best")
+    if fit_q0_trials and raw_best is not None:
+        fallback_index = 0 if best_trial_index is None else int(best_trial_index)
+        map_ref_key = f"trial_raw_modeled_maps/{fallback_index:03d}"
+        _write_point_map_ref(
+            grp,
+            normalized=normalized,
+            name=map_ref_key,
+            data=np.asarray(raw_best, dtype=float),
+            map_refs=map_refs,
+        )
+        entries.append(
+            {
+                "trial_index": int(fallback_index),
+                "q0": float(fit_q0_trials[fallback_index]),
+                "target_metric_value": float(fit_metric_trials[fallback_index]) if fallback_index < len(fit_metric_trials) else float("nan"),
+                "chi2": float(fit_chi2_trials[fallback_index]) if fallback_index < len(fit_chi2_trials) else float("nan"),
+                "rho2": float(fit_rho2_trials[fallback_index]) if fallback_index < len(fit_rho2_trials) else float("nan"),
+                "eta2": float(fit_eta2_trials[fallback_index]) if fallback_index < len(fit_eta2_trials) else float("nan"),
+                "raw_map_ref": str(map_refs.get(map_ref_key, "")),
+            }
+        )
+        return entries, fallback_index
+
+    return entries, best_trial_index
+
+
+def _load_trial_history_entries(
+    grp: h5py.Group,
+    *,
+    map_refs: dict[str, Any],
+    include_maps: bool = True,
+) -> tuple[list[dict[str, Any]], np.ndarray | None, int | None]:
+    if TRIAL_HISTORY_DATASET not in grp:
+        return [], None, None
+    try:
+        parsed = json.loads(decode_scalar(grp[TRIAL_HISTORY_DATASET][()]))
+    except Exception:
+        return [], None, None
+    if not isinstance(parsed, list):
+        return [], None, None
+
+    entries: list[dict[str, Any]] = []
+    trial_maps: list[np.ndarray] = []
+    best_trial_index = None if "best_trial_index" not in grp.attrs else int(grp.attrs.get("best_trial_index"))
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        ref_path = str(entry.get("raw_map_ref") or "").strip()
+        if not ref_path:
+            ref_key = str(entry.get("map_ref_key") or "").strip()
+            ref_path = str(map_refs.get(ref_key, "")).strip()
+        entry["raw_map_ref"] = ref_path
+        entries.append(entry)
+        if not include_maps:
+            continue
+        raw_map = _read_map_store_ref_array(grp.file, ref_path)
+        if raw_map is None:
+            continue
+        trial_maps.append(np.asarray(raw_map, dtype=float))
+
+    if not include_maps or not trial_maps:
+        return entries, None, best_trial_index
+    try:
+        trial_raw_maps = np.stack(trial_maps, axis=0)
+    except Exception:
+        trial_raw_maps = None
+    return entries, trial_raw_maps, best_trial_index
+
+
 def _pending_point_payload(
     *,
     a_value: float,
@@ -1176,6 +1419,11 @@ def build_computed_point_payload(
     a_index: int | None = None,
     b_index: int | None = None,
 ) -> dict[str, Any]:
+    best_trial_index = _finite_best_trial_index(
+        fit_metric_trials=tuple(float(v) for v in fit_metric_trials),
+        q0=float(q0),
+        fit_q0_trials=tuple(float(v) for v in fit_q0_trials),
+    )
     payload = {
         "a": float(a_value),
         "b": float(b_value),
@@ -1210,6 +1458,7 @@ def build_computed_point_payload(
         "bracket": None if bracket is None else tuple(float(v) for v in bracket),
         "target_metric": str(target_metric),
         "diagnostics": dict(diagnostics),
+        "best_trial_index": None if best_trial_index is None else int(best_trial_index),
     }
     if a_index is not None:
         payload["a_index"] = int(a_index)
@@ -1272,10 +1521,11 @@ def _normalize_point_payload(payload: dict[str, Any], *, record_order: int) -> d
         "bracket": payload.get("bracket", None),
         "target_metric": target_metric,
         "diagnostics": diagnostics,
+        "best_trial_index": None if payload.get("best_trial_index") is None else int(payload["best_trial_index"]),
     }
 
 
-def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
+def _read_point_group_rectangular(grp: h5py.Group, *, include_maps: bool = True) -> dict[str, Any]:
     target_metric = decode_scalar(
         grp["fit_metric_trials"].attrs["target_metric"]
         if "fit_metric_trials" in grp and "target_metric" in grp["fit_metric_trials"].attrs
@@ -1314,6 +1564,31 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
                 diagnostics["synthetic_map_machine_keys"] = [str(item) for item in parsed_keys if str(item).strip()]
         except Exception:
             pass
+    trial_history, trial_raw_modeled_maps, best_trial_index = _load_trial_history_entries(
+        grp,
+        map_refs=map_refs,
+        include_maps=include_maps,
+    )
+    raw_modeled_best = None
+    if include_maps:
+        if best_trial_index is not None:
+            matching_entry = next(
+                (
+                    item
+                    for item in trial_history
+                    if int(item.get("trial_index", -1)) == int(best_trial_index)
+                ),
+                None,
+            )
+            if matching_entry is not None:
+                raw_modeled_best = _read_map_store_ref_array(grp.file, matching_entry.get("raw_map_ref"))
+        if raw_modeled_best is None and trial_raw_modeled_maps is not None and trial_raw_modeled_maps.ndim == 3 and trial_raw_modeled_maps.shape[0] > 0:
+            fallback_index = 0
+            if best_trial_index is not None:
+                fallback_index = int(np.clip(int(best_trial_index), 0, int(trial_raw_modeled_maps.shape[0]) - 1))
+            raw_modeled_best = np.asarray(trial_raw_modeled_maps[fallback_index], dtype=float)
+        if raw_modeled_best is None:
+            raw_modeled_best = _read_point_map_array(grp, "raw_modeled_best", map_refs)
     return {
         "record_order": int(grp.attrs.get("record_order", 0)),
         "a": float(grp.attrs["a"]),
@@ -1321,24 +1596,28 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         "q0": float(grp.attrs["q0"]),
         "success": bool(grp.attrs["success"]),
         "status": decode_scalar(grp.attrs.get("status", b"computed")),
-        "modeled_best": np.asarray(_read_point_map_array(grp, "modeled_best", map_refs), dtype=float),
-        "raw_modeled_best": np.asarray(_read_point_map_array(grp, "raw_modeled_best", map_refs), dtype=float),
-        "residual": np.asarray(_read_point_map_array(grp, "residual", map_refs), dtype=float),
+        "modeled_best": _read_point_map_array(grp, "modeled_best", map_refs) if include_maps else None,
+        "raw_modeled_best": raw_modeled_best,
+        "residual": _read_point_map_array(grp, "residual", map_refs) if include_maps else None,
         "fit_q0_trials": tuple(float(v) for v in np.asarray(grp["fit_q0_trials"], dtype=float)),
         "fit_metric_trials": tuple(float(v) for v in fit_metric_trials),
         "fit_chi2_trials": tuple(float(v) for v in fit_chi2_trials),
         "fit_rho2_trials": tuple(float(v) for v in fit_rho2_trials),
         "fit_eta2_trials": tuple(float(v) for v in fit_eta2_trials),
-        "trial_raw_modeled_maps": _read_point_map_array(grp, "trial_raw_modeled_maps", map_refs),
-        "trial_modeled_maps": _read_point_map_array(grp, "trial_modeled_maps", map_refs),
-        "trial_residual_maps": _read_point_map_array(grp, "trial_residual_maps", map_refs),
-        "euv_coronal_best": _read_point_map_array(grp, "euv_coronal_best", map_refs),
-        "euv_tr_best": _read_point_map_array(grp, "euv_tr_best", map_refs),
+        "trial_raw_modeled_maps": (
+            trial_raw_modeled_maps
+            if include_maps and trial_raw_modeled_maps is not None
+            else (_read_point_map_array(grp, "trial_raw_modeled_maps", map_refs) if include_maps else None)
+        ),
+        "trial_modeled_maps": _read_point_map_array(grp, "trial_modeled_maps", map_refs) if include_maps else None,
+        "trial_residual_maps": _read_point_map_array(grp, "trial_residual_maps", map_refs) if include_maps else None,
+        "euv_coronal_best": _read_point_map_array(grp, "euv_coronal_best", map_refs) if include_maps else None,
+        "euv_tr_best": _read_point_map_array(grp, "euv_tr_best", map_refs) if include_maps else None,
         "euv_tr_mask": (
             np.asarray(grp["euv_tr_mask"], dtype=bool) if "euv_tr_mask" in grp else None
         ),
-        "trial_euv_coronal_maps": _read_point_map_array(grp, "trial_euv_coronal_maps", map_refs),
-        "trial_euv_tr_maps": _read_point_map_array(grp, "trial_euv_tr_maps", map_refs),
+        "trial_euv_coronal_maps": _read_point_map_array(grp, "trial_euv_coronal_maps", map_refs) if include_maps else None,
+        "trial_euv_tr_maps": _read_point_map_array(grp, "trial_euv_tr_maps", map_refs) if include_maps else None,
         "nfev": int(grp.attrs.get("nfev", -1)),
         "nit": int(grp.attrs.get("nit", -1)),
         "message": decode_scalar(grp.attrs.get("message", b"")),
@@ -1347,18 +1626,20 @@ def _read_point_group_rectangular(grp: h5py.Group) -> dict[str, Any]:
         "bracket": bracket,
         "target_metric": target_metric,
         "map_refs": map_refs,
+        "trial_history": trial_history,
+        "best_trial_index": best_trial_index,
         "diagnostics": diagnostics,
     }
 
 
-def _read_point_group_sparse(grp: h5py.Group) -> dict[str, Any]:
-    return _read_point_group_rectangular(grp)
+def _read_point_group_sparse(grp: h5py.Group, *, include_maps: bool = True) -> dict[str, Any]:
+    return _read_point_group_rectangular(grp, include_maps=include_maps)
 
 
-def _load_sparse_point_records(records_group: h5py.Group) -> list[dict[str, Any]]:
+def _load_sparse_point_records(records_group: h5py.Group, *, include_maps: bool = True) -> list[dict[str, Any]]:
     latest_by_coord: dict[tuple[float, float], dict[str, Any]] = {}
     for name in sorted(records_group.keys()):
-        record = _read_point_group_sparse(records_group[name])
+        record = _read_point_group_sparse(records_group[name], include_maps=include_maps)
         coord = (float(record["a"]), float(record["b"]))
         existing = latest_by_coord.get(coord)
         if existing is None or int(record["record_order"]) >= int(existing["record_order"]):
@@ -1366,16 +1647,16 @@ def _load_sparse_point_records(records_group: h5py.Group) -> list[dict[str, Any]
     return sorted(latest_by_coord.values(), key=lambda item: (float(item["a"]), float(item["b"])))
 
 
-def _load_rectangular_point_records(points_group: h5py.Group) -> list[dict[str, Any]]:
-    records = [_read_point_group_rectangular(points_group[name]) for name in sorted(points_group.keys())]
+def _load_rectangular_point_records(points_group: h5py.Group, *, include_maps: bool = True) -> list[dict[str, Any]]:
+    records = [_read_point_group_rectangular(points_group[name], include_maps=include_maps) for name in sorted(points_group.keys())]
     return sorted(records, key=lambda item: (float(item["a"]), float(item["b"])))
 
 
-def _load_canonical_point_records(group: h5py.Group) -> list[dict[str, Any]]:
+def _load_canonical_point_records(group: h5py.Group, *, include_maps: bool = True) -> list[dict[str, Any]]:
     if "point_records" in group:
-        return _load_sparse_point_records(group["point_records"])
+        return _load_sparse_point_records(group["point_records"], include_maps=include_maps)
     if "points" in group:
-        return _load_rectangular_point_records(group["points"])
+        return _load_rectangular_point_records(group["points"], include_maps=include_maps)
     return []
 
 
@@ -1387,6 +1668,8 @@ def _payload_from_point_records(
     diagnostics: dict[str, Any],
     point_records: list[dict[str, Any]],
     target_metric: str,
+    psf_kernel: np.ndarray | None,
+    include_maps: bool = True,
 ) -> dict[str, Any]:
     unique_a = np.asarray(sorted({float(record["a"]) for record in point_records}), dtype=float)
     unique_b = np.asarray(sorted({float(record["b"]) for record in point_records}), dtype=float)
@@ -1427,20 +1710,43 @@ def _payload_from_point_records(
         a_index = a_lookup[a_value]
         b_index = b_lookup[b_value]
         diagnostics_json = dict(record.get("diagnostics", {}))
-        raw_modeled_best, has_raw_modeled_best = _coerce_loaded_display_map(
-            record.get("raw_modeled_best"),
-            observed_template=observed,
-        )
-        modeled_best, has_modeled_best = _coerce_loaded_display_map(
-            record.get("modeled_best"),
-            observed_template=observed,
-        )
-        residual_map, has_residual = _coerce_loaded_display_map(
-            record.get("residual"),
-            observed_template=observed,
-        )
-        display_maps_available = bool(has_raw_modeled_best and has_modeled_best and has_residual)
-        diagnostics_json["stored_display_maps_available"] = display_maps_available
+        raw_modeled_best = None
+        modeled_best = None
+        residual_map = None
+        raw_trial_maps = None
+        trial_modeled_maps = None
+        trial_residual_maps = None
+        if include_maps:
+            raw_modeled_best, modeled_best, residual_map, has_raw_modeled_best = _derive_display_maps_from_raw(
+                record.get("raw_modeled_best"),
+                observed_template=observed,
+                psf_kernel=psf_kernel,
+            )
+            legacy_modeled_best, has_modeled_best = _coerce_loaded_display_map(
+                record.get("modeled_best"),
+                observed_template=observed,
+            )
+            legacy_residual_map, has_residual = _coerce_loaded_display_map(
+                record.get("residual"),
+                observed_template=observed,
+            )
+            if has_modeled_best and has_residual and not has_raw_modeled_best:
+                modeled_best = legacy_modeled_best
+                residual_map = legacy_residual_map
+            raw_trial_maps, trial_modeled_maps, trial_residual_maps = _derive_trial_display_maps_from_raw(
+                record.get("trial_raw_modeled_maps"),
+                observed_template=observed,
+                psf_kernel=psf_kernel,
+            )
+            if trial_modeled_maps is None:
+                raw_trial_maps = record.get("trial_raw_modeled_maps")
+                trial_modeled_maps = record.get("trial_modeled_maps")
+                trial_residual_maps = record.get("trial_residual_maps")
+            diagnostics_json["stored_display_maps_available"] = bool(has_raw_modeled_best and has_modeled_best and has_residual)
+            diagnostics_json["display_maps_derived_from_raw"] = bool(has_raw_modeled_best)
+        else:
+            diagnostics_json["stored_display_maps_available"] = False
+            diagnostics_json["display_maps_derived_from_raw"] = False
         metrics = {
             "chi2": float(diagnostics_json.get("chi2", np.nan)),
             "rho2": float(diagnostics_json.get("rho2", np.nan)),
@@ -1451,6 +1757,9 @@ def _payload_from_point_records(
             "raw_modeled_best": raw_modeled_best,
             "modeled_best": modeled_best,
             "residual": residual_map,
+            "trial_raw_modeled_maps": raw_trial_maps,
+            "trial_modeled_maps": trial_modeled_maps,
+            "trial_residual_maps": trial_residual_maps,
             "diagnostics": diagnostics_json,
             "a_index": int(a_index),
             "b_index": int(b_index),
@@ -1467,6 +1776,9 @@ def _payload_from_point_records(
                 "raw_modeled_best": raw_modeled_best,
                 "modeled_best": modeled_best,
                 "residual": residual_map,
+                "trial_raw_modeled_maps": raw_trial_maps,
+                "trial_modeled_maps": trial_modeled_maps,
+                "trial_residual_maps": trial_residual_maps,
                 "diagnostics": diagnostics_json,
                 "a_index": int(a_index),
                 "b_index": int(b_index),
@@ -1498,7 +1810,13 @@ def _payload_from_point_records(
     }
 
 
-def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: str | None = None) -> dict[str, Any]:
+def load_scan_file(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+    include_maps: bool = True,
+) -> dict[str, Any]:
     with _H5PY_FILE(h5_path, "r") as f:
         group, descriptors, selected_key = _resolve_slice_group(
             f,
@@ -1523,7 +1841,7 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: st
         )
         if selected_search_id is not None and SEARCHES_GROUP in group:
             search_group = group[SEARCHES_GROUP][selected_search_id]
-            point_records = _load_sparse_point_records(search_group["point_records"]) if "point_records" in search_group else []
+            point_records = _load_sparse_point_records(search_group["point_records"], include_maps=include_maps) if "point_records" in search_group else []
             search_diagnostics = dict(selected_search_record.get("diagnostics", {}) if selected_search_record else {})
             search_specific_diagnostics = {
                 key: value
@@ -1537,10 +1855,10 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: st
         else:
             kind = _artifact_kind_from_group(group)
             if "point_records" in group:
-                point_records = _load_sparse_point_records(group["point_records"])
+                point_records = _load_sparse_point_records(group["point_records"], include_maps=include_maps)
                 target_metric = str(diagnostics.get("target_metric", "chi2"))
             else:
-                point_records = _load_canonical_point_records(group)
+                point_records = _load_canonical_point_records(group, include_maps=include_maps)
                 if "summary" in group:
                     summary = group["summary"]
                     target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
@@ -1553,6 +1871,8 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: st
             diagnostics=diagnostics,
             point_records=point_records,
             target_metric=target_metric,
+            psf_kernel=common_payload.get("psf_kernel"),
+            include_maps=include_maps,
         )
         selected_descriptor = next((item for item in descriptors if str(item["key"]) == str(selected_key)), None)
         payload["available_slices"] = descriptors
@@ -1585,6 +1905,471 @@ def load_scan_file(h5_path: Path, *, slice_key: str | None = None, search_id: st
         payload["trial_logging_policy"] = common_payload.get("trial_logging_policy", {})
         payload["blos_reference"] = common_payload.get("blos_reference")
         return payload
+
+
+def load_active_point_snapshot(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+    include_maps: bool = True,
+) -> dict[str, Any] | None:
+    with _H5PY_FILE(h5_path, "r") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            raise KeyError(f"slice not found: {slice_key or selected_key}")
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or SEARCHES_GROUP not in group:
+            return None
+        searches_group = group[SEARCHES_GROUP]
+        if selected_search_id not in searches_group:
+            return None
+        search_group = searches_group[selected_search_id]
+        if ACTIVE_POINT_SNAPSHOT_GROUP not in search_group:
+            return None
+        payload = _read_point_group_sparse(search_group[ACTIVE_POINT_SNAPSHOT_GROUP], include_maps=include_maps)
+        common_payload = _read_common_group(group["common"])
+        if include_maps:
+            observed = np.asarray(common_payload.get("observed"), dtype=float)
+            psf_kernel = common_payload.get("psf_kernel")
+            raw_modeled_best, modeled_best, residual, _has_raw = _derive_display_maps_from_raw(
+                payload.get("raw_modeled_best"),
+                observed_template=observed,
+                psf_kernel=psf_kernel,
+            )
+            trial_raw_maps, trial_modeled_maps, trial_residual_maps = _derive_trial_display_maps_from_raw(
+                payload.get("trial_raw_modeled_maps"),
+                observed_template=observed,
+                psf_kernel=psf_kernel,
+            )
+            payload["raw_modeled_best"] = raw_modeled_best
+            payload["modeled_best"] = modeled_best
+            payload["residual"] = residual
+            payload["trial_raw_modeled_maps"] = trial_raw_maps
+            payload["trial_modeled_maps"] = trial_modeled_maps
+            payload["trial_residual_maps"] = trial_residual_maps
+        payload["selected_slice_key"] = str(selected_key)
+        payload["selected_search_id"] = str(selected_search_id)
+        return payload
+
+
+def load_live_trial_point(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> dict[str, Any] | None:
+    with _H5PY_FILE(h5_path, "r") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            raise KeyError(f"slice not found: {slice_key or selected_key}")
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or SEARCHES_GROUP not in group:
+            return None
+        searches_group = group[SEARCHES_GROUP]
+        if selected_search_id not in searches_group:
+            return None
+        search_group = searches_group[selected_search_id]
+        if LIVE_TRIAL_POINT_GROUP not in search_group:
+            return None
+        live_group = search_group[LIVE_TRIAL_POINT_GROUP]
+
+        def _load_optional_float(attr_name: str) -> float | None:
+            if attr_name not in live_group.attrs:
+                return None
+            try:
+                value = float(live_group.attrs[attr_name])
+            except Exception:
+                return None
+            return value if np.isfinite(value) else None
+
+        def _load_optional_int(attr_name: str) -> int | None:
+            if attr_name not in live_group.attrs:
+                return None
+            try:
+                return int(live_group.attrs[attr_name])
+            except Exception:
+                return None
+
+        fit_q0_trials = np.asarray(live_group.get("fit_q0_trials", ()), dtype=float)
+        fit_metric_trials = np.asarray(live_group.get("fit_metric_trials", ()), dtype=float)
+        return {
+            "selected_slice_key": str(selected_key),
+            "selected_search_id": str(selected_search_id),
+            "slice_key": decode_scalar(live_group.attrs.get("slice_key", str(selected_key))),
+            "search_id": decode_scalar(live_group.attrs.get("search_id", str(selected_search_id))),
+            "metric_name": decode_scalar(live_group.attrs.get("metric_name", "chi2")),
+            "updated_utc": decode_scalar(live_group.attrs.get("updated_utc", "")),
+            "sequence": _load_optional_int("sequence"),
+            "a": _load_optional_float("a"),
+            "b": _load_optional_float("b"),
+            "q0": _load_optional_float("q0"),
+            "trial_index": _load_optional_int("trial_index"),
+            "fit_q0_trials": fit_q0_trials,
+            "fit_metric_trials": fit_metric_trials,
+        }
+
+
+def load_selected_trial_plot_payload(
+    h5_path: Path,
+    *,
+    a: float,
+    b: float,
+    trial_index: int | None = None,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> dict[str, Any] | None:
+    with _H5PY_FILE(h5_path, "r") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            raise KeyError(f"slice not found: {slice_key or selected_key}")
+
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        records_group: h5py.Group | None = None
+        if selected_search_id is not None and SEARCHES_GROUP in group:
+            searches_group = group[SEARCHES_GROUP]
+            if selected_search_id in searches_group:
+                search_group = searches_group[selected_search_id]
+                if "point_records" in search_group:
+                    records_group = search_group["point_records"]
+        if records_group is None and "point_records" in group:
+            records_group = group["point_records"]
+        if records_group is None and "points" in group:
+            records_group = group["points"]
+        if records_group is None:
+            return None
+
+        selected_record: h5py.Group | None = None
+        selected_order = -1
+        for name in sorted(records_group.keys()):
+            candidate = records_group[name]
+            try:
+                cand_a = float(candidate.attrs["a"])
+                cand_b = float(candidate.attrs["b"])
+            except Exception:
+                continue
+            if not (np.isclose(cand_a, float(a), rtol=0.0, atol=1e-6) and np.isclose(cand_b, float(b), rtol=0.0, atol=1e-6)):
+                continue
+            order = int(candidate.attrs.get("record_order", 0))
+            if selected_record is None or order >= selected_order:
+                selected_record = candidate
+                selected_order = order
+        if selected_record is None:
+            return None
+
+        point_payload = _read_point_group_sparse(selected_record, include_maps=False)
+        map_refs = dict(point_payload.get("map_refs") or {})
+        trial_history = list(point_payload.get("trial_history") or [])
+        fit_q0_trials = np.asarray(point_payload.get("fit_q0_trials", ()), dtype=float)
+
+        chosen_trial_index = None if trial_index is None else int(trial_index)
+        if fit_q0_trials.size > 0:
+            if chosen_trial_index is None:
+                best_trial_index = point_payload.get("best_trial_index")
+                if best_trial_index is not None:
+                    chosen_trial_index = int(np.clip(int(best_trial_index), 0, int(fit_q0_trials.size) - 1))
+                else:
+                    chosen_trial_index = int(fit_q0_trials.size - 1)
+            else:
+                chosen_trial_index = int(np.clip(chosen_trial_index, 0, int(fit_q0_trials.size) - 1))
+
+        raw_map_ref = ""
+        if chosen_trial_index is not None:
+            matching_entry = next(
+                (
+                    item
+                    for item in trial_history
+                    if int(item.get("trial_index", -1)) == int(chosen_trial_index)
+                ),
+                None,
+            )
+            if matching_entry is not None:
+                raw_map_ref = str(matching_entry.get("raw_map_ref", "")).strip()
+                if not raw_map_ref:
+                    ref_key = str(matching_entry.get("map_ref_key", "")).strip()
+                    raw_map_ref = str(map_refs.get(ref_key, "")).strip()
+            if not raw_map_ref:
+                ref_key = f"trial_raw_modeled_maps/{int(chosen_trial_index):03d}"
+                raw_map_ref = str(map_refs.get(ref_key, "")).strip()
+        if not raw_map_ref:
+            raw_map_ref = str(map_refs.get("raw_modeled_best", "")).strip()
+
+        raw_modeled = _read_map_store_ref_array(f, raw_map_ref)
+        if raw_modeled is None:
+            raw_modeled = _read_point_map_array(selected_record, "raw_modeled_best", map_refs)
+        if raw_modeled is None:
+            return None
+
+        common_payload = _read_common_group(group["common"])
+        observed = np.asarray(common_payload.get("observed"), dtype=float)
+        psf_kernel = common_payload.get("psf_kernel")
+        raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
+            raw_modeled,
+            observed_template=observed,
+            psf_kernel=psf_kernel,
+        )
+        if raw_display is None or modeled is None or residual is None:
+            return None
+        return {
+            "a": float(a),
+            "b": float(b),
+            "trial_index": chosen_trial_index,
+            "fit_q0_trials": fit_q0_trials,
+            "raw_modeled_best": np.asarray(raw_display, dtype=float),
+            "modeled_best": np.asarray(modeled, dtype=float),
+            "residual": np.asarray(residual, dtype=float),
+            "observed": observed,
+            "wcs_header": common_payload["wcs_header"],
+            "psf_kernel": psf_kernel,
+            "selected_slice_key": str(selected_key),
+            "selected_search_id": str(selected_search_id) if selected_search_id is not None else None,
+        }
+
+
+def write_active_point_snapshot(
+    h5_path: Path,
+    *,
+    point_payload: dict[str, Any],
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> None:
+    with _H5PY_FILE(h5_path, "r+") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            raise KeyError(f"slice not found: {slice_key or selected_key}")
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or SEARCHES_GROUP not in group:
+            raise KeyError(f"search not found for slice: {slice_key or selected_key}")
+        searches_group = group[SEARCHES_GROUP]
+        if selected_search_id not in searches_group:
+            raise KeyError(f"search not found: {selected_search_id}")
+        search_group = searches_group[selected_search_id]
+        if ACTIVE_POINT_SNAPSHOT_GROUP in search_group:
+            del search_group[ACTIVE_POINT_SNAPSHOT_GROUP]
+        snapshot_group = search_group.create_group(ACTIVE_POINT_SNAPSHOT_GROUP)
+        snapshot_group.attrs["updated_utc"] = np.bytes_(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        _write_point_group(snapshot_group, point_payload, record_order=-1)
+
+
+def write_live_trial_point(
+    h5_path: Path,
+    *,
+    live_state: dict[str, Any],
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> None:
+    with _H5PY_FILE(h5_path, "r+") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            raise KeyError(f"slice not found: {slice_key or selected_key}")
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or SEARCHES_GROUP not in group:
+            raise KeyError(f"search not found for slice: {slice_key or selected_key}")
+        searches_group = group[SEARCHES_GROUP]
+        if selected_search_id not in searches_group:
+            raise KeyError(f"search not found: {selected_search_id}")
+        search_group = searches_group[selected_search_id]
+        if LIVE_TRIAL_POINT_GROUP in search_group:
+            del search_group[LIVE_TRIAL_POINT_GROUP]
+        live_group = search_group.create_group(LIVE_TRIAL_POINT_GROUP)
+        live_group.attrs["updated_utc"] = np.bytes_(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        live_group.attrs["slice_key"] = np.bytes_(str(live_state.get("slice_key") or selected_key))
+        live_group.attrs["search_id"] = np.bytes_(str(live_state.get("search_id") or selected_search_id))
+        live_group.attrs["metric_name"] = np.bytes_(str(live_state.get("metric_name") or "chi2"))
+        if live_state.get("sequence") is not None:
+            live_group.attrs["sequence"] = int(live_state["sequence"])
+        for attr_name in ("a", "b"):
+            value = live_state.get(attr_name)
+            if value is None:
+                continue
+            numeric = float(value)
+            if np.isfinite(numeric):
+                live_group.attrs[attr_name] = numeric
+        q0_value = live_state.get("q0")
+        if q0_value is not None:
+            q0_numeric = float(q0_value)
+            if np.isfinite(q0_numeric):
+                live_group.attrs["q0"] = q0_numeric
+        trial_index_value = live_state.get("trial_index")
+        if trial_index_value is not None:
+            live_group.attrs["trial_index"] = int(trial_index_value)
+        fit_q0_trials = np.asarray(live_state.get("fit_q0_trials", ()), dtype=float)
+        fit_metric_trials = np.asarray(live_state.get("fit_metric_trials", ()), dtype=float)
+        live_group.create_dataset("fit_q0_trials", data=fit_q0_trials.astype(float, copy=False))
+        live_group.create_dataset("fit_metric_trials", data=fit_metric_trials.astype(float, copy=False))
+
+
+def clear_active_point_snapshot(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> None:
+    with _H5PY_FILE(h5_path, "r+") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            return
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or SEARCHES_GROUP not in group:
+            return
+        searches_group = group[SEARCHES_GROUP]
+        if selected_search_id not in searches_group:
+            return
+        search_group = searches_group[selected_search_id]
+        if ACTIVE_POINT_SNAPSHOT_GROUP in search_group:
+            del search_group[ACTIVE_POINT_SNAPSHOT_GROUP]
+
+
+def clear_live_trial_point(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> None:
+    with _H5PY_FILE(h5_path, "r+") as f:
+        group, _descriptors, selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=slice_key is not None,
+        )
+        if group is None:
+            return
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or SEARCHES_GROUP not in group:
+            return
+        searches_group = group[SEARCHES_GROUP]
+        if selected_search_id not in searches_group:
+            return
+        search_group = searches_group[selected_search_id]
+        if LIVE_TRIAL_POINT_GROUP in search_group:
+            del search_group[LIVE_TRIAL_POINT_GROUP]
+
+
+def extract_artifact_identity_summary(
+    h5_path: str | Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> dict[str, Any]:
+    payload = load_scan_file(Path(h5_path), slice_key=slice_key, search_id=search_id)
+    diagnostics = dict(payload.get("diagnostics") or {})
+    selected_search = payload.get("selected_search") or {}
+    search_diagnostics = dict(selected_search.get("diagnostics") or {})
+    readable_keys = (
+        "artifact_kind",
+        "spectral_domain",
+        "spectral_label",
+        "model_id",
+        "model_sha256",
+        "observation_source_mode",
+        "observation_source_path",
+        "observation_source_map_id",
+        "observation_source_sha256",
+        "observation_instrument",
+        "observation_observer",
+        "ebtel_path",
+        "ebtel_sha256",
+        "frequency_ghz",
+        "wavelength_angstrom",
+        "euv_channel",
+        "euv_instrument",
+        "euv_response_sav",
+        "euv_response_origin",
+        "euv_response_override_path",
+        "euv_response_resolver",
+        "euv_response_identity_version",
+        "euv_response_sha256",
+        "euv_response_source",
+        "euv_response_mode",
+        "euv_response_identity_summary",
+        "map_xc_arcsec",
+        "map_yc_arcsec",
+        "map_dx_arcsec",
+        "map_dy_arcsec",
+        "map_nx",
+        "map_ny",
+        "observer_name",
+        "observer_lonc_deg",
+        "observer_b0sun_deg",
+        "observer_dsun_cm",
+        "observer_obs_time",
+        "geometry_policy_mode",
+        "geometry_policy_observation_los",
+        "geometry_policy_model_los",
+        "geometry_policy_los_aligned",
+        COMPATIBILITY_SIGNATURE_KEY,
+        "psf_source",
+        "resolved_psf",
+        "psf_bmaj_arcsec",
+        "psf_bmin_arcsec",
+        "psf_bpa_deg",
+        "psf_ref_frequency_ghz",
+        "psf_scale_inverse_frequency",
+        "render_channels",
+        "render_frequencies_ghz",
+        "target_metric",
+        "metrics_mask_threshold",
+        "metrics_mask_fits",
+        "metrics_mask_source",
+        "mask_type",
+        "tr_mask_bmin_gauss",
+        "tr_mask_source",
+    )
+    identity = {key: diagnostics.get(key) for key in readable_keys if key in diagnostics}
+    search_identity = {
+        key: search_diagnostics.get(key)
+        for key in (
+            "search_id",
+            "target_metric",
+            "metrics_mask_threshold",
+            "metrics_mask_fits",
+            "metrics_mask_source",
+            "mask_type",
+            "tr_mask_bmin_gauss",
+            "tr_mask_source",
+            COMPATIBILITY_SIGNATURE_KEY,
+        )
+        if key in search_diagnostics
+    }
+    return {
+        "artifact_format": payload.get("artifact_format"),
+        "selected_slice_key": payload.get("selected_slice_key"),
+        "selected_slice": payload.get("selected_slice"),
+        "available_slices": payload.get("available_slices", []),
+        "selected_search_id": payload.get("selected_search_id"),
+        "available_search_ids": [
+            str(record.get("search_id"))
+            for record in payload.get("search_records", [])
+            if record.get("search_id") is not None
+        ],
+        "point_count": len(payload.get("point_records", [])),
+        "identity": identity,
+        "search_identity": search_identity,
+    }
 
 
 def load_run_history(h5_path: Path, *, slice_key: str | None = None) -> list[dict[str, Any]]:
@@ -1744,13 +2529,14 @@ def _map_store_identity(
     physical_keys = (
         "model_sha256",
         "ebtel_sha256",
+        "euv_response_identity_version",
+        "euv_response_sha256",
         "spectral_domain",
         "spectral_label",
         "frequency_ghz",
         "wavelength_angstrom",
         "euv_channel",
         "euv_instrument",
-        "euv_response_sav",
         "map_xc_arcsec",
         "map_yc_arcsec",
         "map_dx_arcsec",
@@ -2459,18 +3245,24 @@ def write_grid_scan_artifact(
                 if src_slice is not None and SEARCHES_GROUP in src_slice:
                     for name in src_slice[SEARCHES_GROUP].keys():
                         src_slice[SEARCHES_GROUP].copy(name, searches_group, name=name)
-        current_search_id = _search_id_from_diagnostics(diagnostics_out)
+        request_payload = _search_request_from_diagnostics(
+            diagnostics_out,
+            layout={
+                "kind": "rectangular_grid",
+                "a_values": [float(v) for v in np.asarray(a_values, dtype=float)],
+                "b_values": [float(v) for v in np.asarray(b_values, dtype=float)],
+            },
+        )
+        current_search_id = _matching_search_id_for_request(searches_group, request_payload)
+        if not current_search_id:
+            current_search_id = _search_id_from_diagnostics(diagnostics_out)
         _write_search_group(
             searches_group,
             search_id=current_search_id,
             diagnostics=diagnostics_out,
             point_records=current_point_records,
             run_history=run_history,
-            layout={
-                "kind": "rectangular_grid",
-                "a_values": [float(v) for v in np.asarray(a_values, dtype=float)],
-                "b_values": [float(v) for v in np.asarray(b_values, dtype=float)],
-            },
+            layout=request_payload.get("layout") if isinstance(request_payload.get("layout"), dict) else None,
         )
         _create_text_dataset(slice_group, ACTIVE_SEARCH_ID_DATASET, current_search_id)
     os.replace(tmp_h5, out_h5)
@@ -2535,21 +3327,16 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
     grp.attrs["bracket_found"] = int(bool(normalized["bracket_found"]))
     if normalized["bracket"] is not None:
         grp.create_dataset("bracket", data=np.asarray(normalized["bracket"], dtype=np.float64))
-    _write_point_map_ref(grp, normalized=normalized, name="modeled_best", data=normalized["modeled_best"], map_refs=map_refs)
-    _write_point_map_ref(grp, normalized=normalized, name="raw_modeled_best", data=normalized["raw_modeled_best"], map_refs=map_refs)
-    _write_point_map_ref(grp, normalized=normalized, name="residual", data=normalized["residual"], map_refs=map_refs)
     grp.create_dataset("fit_q0_trials", data=np.asarray(normalized["fit_q0_trials"], dtype=np.float64))
     fit_metric_ds = grp.create_dataset("fit_metric_trials", data=np.asarray(normalized["fit_metric_trials"], dtype=np.float64))
     fit_metric_ds.attrs["target_metric"] = np.bytes_(str(normalized["target_metric"]))
     grp.create_dataset("fit_chi2_trials", data=np.asarray(normalized["fit_chi2_trials"], dtype=np.float64))
     grp.create_dataset("fit_rho2_trials", data=np.asarray(normalized["fit_rho2_trials"], dtype=np.float64))
     grp.create_dataset("fit_eta2_trials", data=np.asarray(normalized["fit_eta2_trials"], dtype=np.float64))
-    if normalized["trial_raw_modeled_maps"] is not None:
-        _write_point_map_ref(grp, normalized=normalized, name="trial_raw_modeled_maps", data=normalized["trial_raw_modeled_maps"], map_refs=map_refs)
-    if normalized["trial_modeled_maps"] is not None:
-        _write_point_map_ref(grp, normalized=normalized, name="trial_modeled_maps", data=normalized["trial_modeled_maps"], map_refs=map_refs)
-    if normalized["trial_residual_maps"] is not None:
-        _write_point_map_ref(grp, normalized=normalized, name="trial_residual_maps", data=normalized["trial_residual_maps"], map_refs=map_refs)
+    trial_history_entries, best_trial_index = _build_trial_history_entries(grp, normalized=normalized, map_refs=map_refs)
+    if best_trial_index is not None:
+        grp.attrs["best_trial_index"] = int(best_trial_index)
+    _create_text_dataset(grp, TRIAL_HISTORY_DATASET, _json_dumps(trial_history_entries))
     if normalized["euv_coronal_best"] is not None:
         _write_point_map_ref(grp, normalized=normalized, name="euv_coronal_best", data=normalized["euv_coronal_best"], map_refs=map_refs)
     if normalized["euv_tr_best"] is not None:
@@ -2669,14 +3456,18 @@ def write_point_scan_artifact(
                 if src_slice is not None and SEARCHES_GROUP in src_slice:
                     for name in src_slice[SEARCHES_GROUP].keys():
                         src_slice[SEARCHES_GROUP].copy(name, searches_group, name=name)
-        current_search_id = _search_id_from_diagnostics(diagnostics_out)
+        layout_payload = {"kind": "point_list"}
+        request_payload = _search_request_from_diagnostics(diagnostics_out, layout=layout_payload)
+        current_search_id = _matching_search_id_for_request(searches_group, request_payload)
+        if not current_search_id:
+            current_search_id = _search_id_from_diagnostics(diagnostics_out)
         _write_search_group(
             searches_group,
             search_id=current_search_id,
             diagnostics=diagnostics_out,
             point_records=list(point_records),
             run_history=run_history,
-            layout={"kind": "point_list"},
+            layout=layout_payload,
         )
         _create_text_dataset(slice_group, ACTIVE_SEARCH_ID_DATASET, current_search_id)
     os.replace(tmp_h5, out_h5)
@@ -2756,7 +3547,7 @@ def append_scan_point_record(
     last_exc: Exception | None = None
     for attempt in range(1, _SPARSE_APPEND_RETRY_ATTEMPTS + 1):
         try:
-            with h5py.File(out_h5, mode) as f:
+            with _H5PY_FILE(out_h5, mode) as f:
                 descriptor = target_slice_descriptor_from_diagnostics(diagnostics_out, fallback_key="default")
                 resolved_slice_key = str(descriptor["key"] or "default")
                 slices_group = f.require_group(SLICE_CONTAINER_GROUP)
@@ -2820,7 +3611,11 @@ def append_scan_point_record(
                             run_history=None,
                         )
                 searches_group = slice_group.require_group(SEARCHES_GROUP)
-                current_search_id = _search_id_from_diagnostics(diagnostics_out)
+                layout_payload = {"kind": "point_list"}
+                request_payload = _search_request_from_diagnostics(diagnostics_out, layout=layout_payload)
+                current_search_id = _matching_search_id_for_request(searches_group, request_payload)
+                if not current_search_id:
+                    current_search_id = _search_id_from_diagnostics(diagnostics_out)
                 if ACTIVE_SEARCH_ID_DATASET in slice_group:
                     del slice_group[ACTIVE_SEARCH_ID_DATASET]
                 _create_text_dataset(slice_group, ACTIVE_SEARCH_ID_DATASET, current_search_id)
@@ -2829,13 +3624,12 @@ def append_scan_point_record(
                     search_group.attrs["search_id"] = np.bytes_(current_search_id)
                     search_group.attrs["target_metric"] = np.bytes_(str(diagnostics_out.get("target_metric", "chi2")))
                     _create_text_dataset(search_group, "diagnostics_json", _json_dumps(diagnostics_out))
-                    layout_payload = {"kind": "point_list"}
                     _create_text_dataset(search_group, "layout_json", _json_dumps(layout_payload))
                     _create_text_dataset(search_group, "run_history_json", _json_dumps([]))
                     _create_text_dataset(
                         search_group,
                         SEARCH_REQUEST_DATASET,
-                        _json_dumps(_search_request_from_diagnostics(diagnostics_out, layout=layout_payload)),
+                        _json_dumps(request_payload),
                     )
                 search_records = search_group.require_group("point_records")
                 search_orders = [int(search_records[name].attrs.get("record_order", -1)) for name in search_records.keys()]
@@ -3156,7 +3950,12 @@ def resolve_point_index(
     if a_index is not None and b_index is not None:
         key = (int(a_index), int(b_index))
         if key in points:
-            return key
+            status = str(points[key].get("status", "computed")).strip().lower()
+            # The viewer pre-fills the rectangular grid with placeholder
+            # "missing" records. Treat those as unresolved so we can fall back
+            # to the nearest real computed point.
+            if status not in {"missing", "pending"}:
+                return key
 
     records = point_records_for_payload(payload)
     if not records:

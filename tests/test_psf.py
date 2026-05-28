@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 from astropy.io import fits
 import pytest
@@ -118,3 +120,28 @@ def test_default_psf_metadata_uses_response_sampling_fallback(monkeypatch: pytes
     assert metadata.bmaj_arcsec == pytest.approx(1.25)
     assert metadata.bmin_arcsec == pytest.approx(1.25)
     assert metadata.bpa_deg == pytest.approx(0.0)
+
+
+def test_aiapy_psf_kernel_recomputes_without_persistent_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"count": 0}
+
+    def _calculate_psf(_wavelength):
+        calls["count"] += 1
+        return np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+
+    def _fake_import_module(name: str):
+        if name == "astropy.units":
+            return SimpleNamespace(angstrom=1.0)
+        if name == "aiapy.psf":
+            return SimpleNamespace(calculate_psf=_calculate_psf)
+        raise ImportError(name)
+
+    monkeypatch.setattr(psf_module, "import_module", _fake_import_module)
+
+    first = default_psf_metadata(domain="euv", instrument_name="AIA", wavelength_angstrom=171.0)
+    second = default_psf_metadata(domain="euv", instrument_name="AIA", wavelength_angstrom=171.0)
+
+    assert first is not None and second is not None
+    assert first.kernel is not None and second.kernel is not None
+    np.testing.assert_allclose(np.asarray(first.kernel), np.asarray(second.kernel))
+    assert calls["count"] == 2

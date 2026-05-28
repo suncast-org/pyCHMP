@@ -1518,8 +1518,10 @@ Examples:
                 geometry_overrides_requested=False,
                 explicit_observer_requested=explicit_observer_requested,
             )
-            geometry_observer_name = str(args.observer or geometry_policy.observer_name)
-            geometry_observer = observer_overrides if explicit_observer_requested else None
+            geometry_observer_name = (
+                None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+            )
+            geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
             resolved_geometry = resolve_render_geometry_via_gxrender(
                 model_path=args.model_h5,
                 model_format="auto",
@@ -1528,6 +1530,7 @@ Examples:
                 observer_name=geometry_observer_name,
                 observer=geometry_observer,
                 omp_threads=int(getattr(args, "omp_threads", 8)),
+                use_saved_fov=bool(geometry_policy.use_model_saved_fov),
             )
             geometry = resolved_geometry.geometry
             geometry_mode = f"gxrender:{resolved_geometry.center_source}"
@@ -1720,6 +1723,7 @@ Examples:
     # Create gxrender adapter from explicit user-provided model path, passing all relevant overrides
     print(f"\nInitializing gxrender adapter for {render_selection.spectral_label}...")
     print(f"  Model file: {args.model_h5}")
+    euv_response_identity = None
     try:
         if render_selection.domain == "mw":
             adapter_kwargs = dict(
@@ -1754,6 +1758,7 @@ Examples:
                 pixel_scale_arcsec=float(args.pixel_scale_arcsec),
             )
             base_adapter = GXRenderEUVAdapter(**adapter_kwargs)
+            euv_response_identity = base_adapter.response_identity()
         renderer = base_adapter
         if selected_psf_metadata is not None:
             psf_kernel, _psf_kernel_meta = _core_build_psf_kernel(
@@ -2133,6 +2138,19 @@ Examples:
                 "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
                 "euv_channel": render_selection.euv_channel,
                 "euv_instrument": render_selection.euv_instrument,
+                "euv_response_identity_version": (
+                    None if euv_response_identity is None else str(euv_response_identity.version)
+                ),
+                "euv_response_sha256": None if euv_response_identity is None else str(euv_response_identity.sha256),
+                "euv_response_source": (
+                    None if euv_response_identity is None else euv_response_identity.summary.get("source")
+                ),
+                "euv_response_mode": (
+                    None if euv_response_identity is None else euv_response_identity.summary.get("mode")
+                ),
+                "euv_response_identity_summary": (
+                    None if euv_response_identity is None else dict(euv_response_identity.summary)
+                ),
                 "tr_mask_bmin_gauss": (
                     abs(float(args.tr_mask_bmin_gauss)) if render_selection.domain != "mw" else None
                 ),

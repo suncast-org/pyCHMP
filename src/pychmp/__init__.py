@@ -9,7 +9,7 @@ Algorithmic provenance:
 from .ab_search import ABLocalSearchResult, ABPointResult, ABScanResult, ABRendererFactory, evaluate_ab_point, idl_q0_start_heuristic, multi_scan_ab, search_local_minimum_ab
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .fitting import Q0MapRenderer, fit_q0_to_observation
-from .gxrender_adapter import GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWContext, ResolvedRenderGeometry, build_tr_region_mask_from_blos, recombine_euv_components, resolve_render_geometry_via_gxrender
+from .gxrender_adapter import EUVResponseIdentity, EUV_RESPONSE_IDENTITY_VERSION, GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWContext, ResolvedRenderGeometry, build_tr_region_mask_from_blos, compute_euv_response_identity, recombine_euv_components, resolve_euv_response_identity, resolve_render_geometry_via_gxrender
 from .geometry_policy import GeometryPolicyDecision, infer_observation_observer, resolve_geometry_policy
 from .map_noise import MapNoiseEstimate, estimate_map_noise
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
@@ -17,6 +17,7 @@ from .obs_maps import ObservationalMap, estimate_obs_map_noise, load_obs_map, ob
 from .optimize import Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
 from .psf import PSFMetadata, KernelConvolvedRenderer, build_psf_kernel, default_psf_metadata, effective_psf_parameters, elliptical_gaussian_kernel, extract_psf_metadata_from_header, format_psf_report, resolve_psf_metadata
 from .spectral import RenderSliceRequest, default_euv_channels_for_instrument, parse_csv_floats, parse_csv_tokens
+from .ab_scan_artifacts import extract_artifact_identity_summary
 
 __all__ = [
   "__version__",
@@ -45,6 +46,10 @@ __all__ = [
   "GXRenderMWAdapter",
   "GXRenderMWContext",
   "GXRenderEUVAdapter",
+  "EUVResponseIdentity",
+  "EUV_RESPONSE_IDENTITY_VERSION",
+  "compute_euv_response_identity",
+  "resolve_euv_response_identity",
   "ResolvedRenderGeometry",
   "resolve_render_geometry_via_gxrender",
   "GeometryPolicyDecision",
@@ -52,6 +57,7 @@ __all__ = [
   "resolve_geometry_policy",
   "build_tr_region_mask_from_blos",
   "recombine_euv_components",
+  "extract_artifact_identity_summary",
   "MapNoiseEstimate",
   "estimate_map_noise",
   "Q0MetricEvaluation",

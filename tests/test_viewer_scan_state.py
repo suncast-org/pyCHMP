@@ -155,6 +155,19 @@ def test_adaptive_sparse_complete_phase_reports_finished(tmp_path: Path) -> None
     assert "Last phase: scan complete" in info_detail
 
 
+def test_scan_state_reports_loading_during_initial_background_load(tmp_path: Path) -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = tmp_path / "adaptive.h5"
+    app.payload = {}
+    app._initial_reload_in_progress = True
+
+    badge, toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "LOADING"
+    assert toolbar_detail == "Opening artifact"
+    assert "load in progress" in info_detail
+
+
 def test_selected_point_summary_shows_elapsed_seconds_when_available(tmp_path: Path) -> None:
     """Show per-point elapsed time in the Selected Point summary when diagnostics provide it."""
 
@@ -223,6 +236,93 @@ def test_refresh_signal_payload_parses_live_trials_and_active_point(tmp_path: Pa
     assert parsed["live_trials"]["active_trial_q0"] == 1.0e-2
 
 
+def test_heartbeat_requires_payload_reload_for_saved_phase() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._last_payload_reload_at_s = 0.0
+    app._MIN_HEARTBEAT_RELOAD_INTERVAL_S = 0.0
+
+    assert app._heartbeat_requires_payload_reload({"phase": "point 12 saved"}) is True
+
+
+def test_heartbeat_requires_payload_reload_ignores_trial_only_phase() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._last_payload_reload_at_s = 0.0
+    app._MIN_HEARTBEAT_RELOAD_INTERVAL_S = 0.0
+
+    assert app._heartbeat_requires_payload_reload({"phase": "trial 03 complete"}) is False
+
+
+def test_poll_external_refresh_signal_uses_lightweight_refresh_for_trial_phase(tmp_path: Path) -> None:
+    app = object.__new__(PychmpViewApp)
+    app._is_closing = False
+    app.refresh_signal_path = tmp_path / "adaptive.h5.refresh"
+    app.refresh_signal_path.write_text("{}\n", encoding="utf-8")
+    app._refresh_signal_mtime_ns = -1
+    app._refresh_signal_phase = ""
+    app._refresh_signal_slice_key = None
+    app._refresh_signal_pending_points = []
+    app._refresh_signal_active_point = None
+    app._refresh_signal_live_trials = None
+    app._external_refresh_after_id = None
+    app._EXTERNAL_REFRESH_POLL_MS = 1200
+    app._last_payload_reload_at_s = 0.0
+    app._MIN_HEARTBEAT_RELOAD_INTERVAL_S = 0.0
+
+    calls = {"reload": 0, "refresh": 0}
+    app._read_refresh_signal_payload = lambda: {
+        "phase": "trial 03 complete",
+        "slice_key": "euv_171",
+        "pending_points": [(0.0, 2.4)],
+        "active_point": (0.0, 2.4),
+        "live_trials": {"metric_name": "eta2", "q0_trials": [1.0e-5], "metric_trials": [1.0]},
+    }
+    app._reload_payload = lambda: calls.__setitem__("reload", calls["reload"] + 1)
+    app._refresh_all = lambda **_kwargs: calls.__setitem__("refresh", calls["refresh"] + 1)
+
+    class _RootStub:
+        def after(self, *_args, **_kwargs):
+            return "after-id"
+
+    app.root = _RootStub()
+
+    app._poll_external_refresh_signal()
+
+    assert calls["reload"] == 1
+    assert calls["refresh"] == 0
+
+
+def test_grid_summary_prefers_existing_png_over_plot_script(tmp_path: Path) -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = tmp_path / "adaptive.h5"
+    app.status_var = _Var("")
+    expected_png = tmp_path / "adaptive_grid.png"
+    expected_png.write_bytes(b"png")
+    calls = {"open": 0, "plot": 0}
+
+    app._open_external_file = lambda path: calls.__setitem__("open", calls["open"] + 1) or (path == expected_png)
+    app._open_plot_script = lambda *_args: calls.__setitem__("plot", calls["plot"] + 1)
+
+    app._open_grid_summary()
+
+    assert calls["open"] == 1
+    assert calls["plot"] == 0
+    assert "Opened saved grid summary PNG" in str(app.status_var.get())
+
+
+def test_grid_summary_falls_back_to_plot_script_when_png_missing(tmp_path: Path) -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = tmp_path / "adaptive.h5"
+    app.status_var = _Var("")
+    calls = {"plot": 0}
+
+    app._open_plot_script = lambda *_args: calls.__setitem__("plot", calls["plot"] + 1)
+
+    app._open_grid_summary()
+
+    assert calls["plot"] == 1
+    assert "Generating grid summary plot" in str(app.status_var.get())
+
+
 def test_selected_solution_plot_context_uses_live_trials_without_saved_point() -> None:
     app = object.__new__(PychmpViewApp)
     app._has_selected_point = lambda: False
@@ -258,10 +358,19 @@ def test_selected_solution_plot_context_uses_live_trials_without_saved_point() -
     app.trials_xscale_var = _Var("linear scale")
     app.trials_yscale_var = _Var("linear scale")
     app._parse_axis_limit = lambda _text: None
-    app._render_live_selected_trial_maps = lambda **_kwargs: (
-        np.ones((2, 2), dtype=float),
-        np.ones((2, 2), dtype=float) * 2.0,
-        np.ones((2, 2), dtype=float) * -1.0,
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-5, 1.0e-4, 1.0e-3], dtype=float),
+        np.asarray([3.0, 2.0, 1.0], dtype=float),
+        "eta2",
+        {
+            "trial_raw_modeled_maps": np.stack(
+                [
+                    np.ones((2, 2), dtype=float),
+                    np.ones((2, 2), dtype=float) * 2.0,
+                    np.ones((2, 2), dtype=float) * 3.0,
+                ]
+            ),
+        },
     )
 
     context = app._selected_solution_plot_context()
@@ -271,6 +380,82 @@ def test_selected_solution_plot_context_uses_live_trials_without_saved_point() -
     assert diagnostics["selected_trial_index"] == 1
     assert diagnostics["selected_trial_maps_available"] is True
     assert float(diagnostics["q0_recovered"]) == 1.0e-4
+
+
+def test_selected_solution_plot_context_prefers_artifact_snapshot_for_live_trials(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = Path("/tmp/live-artifact.h5")
+    app._has_selected_point = lambda: False
+    app._live_trial_state = lambda: {
+        "active_a": 0.3,
+        "active_b": 2.7,
+        "metric_name": "eta2",
+        "q0_trials": [1.0e-5, 1.0e-4],
+        "metric_trials": [3.0, 2.0],
+    }
+    app._should_use_live_trials = lambda _live_state: True
+    app.trial_index_var = _Var(1)
+    app.run_target_metric = "eta2"
+    app.metric_var = _Var("eta2")
+    app.payload = {
+        "diagnostics": {
+            "model_path": "/tmp/model.h5",
+            "ebtel_path": "/tmp/ebtel.sav",
+            "spectral_domain": "mw",
+            "active_frequency_ghz": 2.874,
+        },
+        "observed": np.zeros((2, 2), dtype=float),
+        "wcs_header": fits.Header(),
+        "selected_slice": {"display_label": "MW: 2.874 GHz"},
+        "selected_slice_key": "mw_2p874000ghz",
+        "selected_search_id": "search-live",
+        "blos_reference": None,
+        "psf_kernel": None,
+    }
+    app._slice_label = lambda _descriptor: "MW: 2.874 GHz"
+    app.trials_xmin_var = _Var("")
+    app.trials_xmax_var = _Var("")
+    app.trials_ymin_var = _Var("")
+    app.trials_ymax_var = _Var("")
+    app.trials_xscale_var = _Var("linear scale")
+    app.trials_yscale_var = _Var("linear scale")
+    app._parse_axis_limit = lambda _text: None
+    app._render_live_selected_trial_maps = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not rerender"))
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-5, 1.0e-4], dtype=float),
+        np.asarray([3.0, 2.0], dtype=float),
+        "eta2",
+        {
+            "trial_raw_modeled_maps": np.stack(
+                [
+                    np.full((2, 2), 1.0, dtype=float),
+                    np.full((2, 2), 2.0, dtype=float),
+                ]
+            ),
+        },
+    )
+
+    monkeypatch.setattr(
+        viewer_mod,
+        "load_active_point_snapshot",
+        lambda *_args, **_kwargs: {
+            "a": 0.3,
+            "b": 2.7,
+            "trial_raw_modeled_maps": np.stack(
+                [
+                    np.full((2, 2), 1.0, dtype=float),
+                    np.full((2, 2), 2.0, dtype=float),
+                ]
+            ),
+        },
+    )
+
+    context = app._selected_solution_plot_context()
+
+    assert context is not None
+    np.testing.assert_allclose(context["modeled_best"], np.full((2, 2), 2.0, dtype=float))
+    diagnostics = dict(context["diagnostics"])
+    assert diagnostics["selected_trial_maps_available"] is True
 
 
 def test_open_selected_maps_uses_live_context_without_saved_point() -> None:
@@ -296,6 +481,45 @@ def test_open_selected_maps_uses_live_context_without_saved_point() -> None:
 
     assert window.present_calls == 1
     assert window.update_calls == 1
+
+
+def test_schedule_selected_solution_update_defers_and_coalesces_refresh() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._is_closing = False
+    scheduled: dict[str, Any] = {"callback": None, "cancelled": []}
+
+    class _RootStub:
+        def after_idle(self, callback):
+            scheduled["callback"] = callback
+            return "after-id-1"
+
+        def after_cancel(self, after_id):
+            scheduled["cancelled"].append(after_id)
+
+    class _WindowStub:
+        def __init__(self) -> None:
+            self.update_calls = 0
+
+        def update_selection(self) -> None:
+            self.update_calls += 1
+
+    app.root = _RootStub()
+    app.selected_solution_window = _WindowStub()
+    app._selected_solution_update_after_id = None
+
+    app._schedule_selected_solution_update()
+    assert app._selected_solution_update_after_id == "after-id-1"
+    assert scheduled["cancelled"] == []
+
+    app._schedule_selected_solution_update()
+    assert scheduled["cancelled"] == ["after-id-1"]
+
+    callback = scheduled["callback"]
+    assert callback is not None
+    callback()
+
+    assert app._selected_solution_update_after_id is None
+    assert app.selected_solution_window.update_calls == 1
 
 
 def test_apply_active_point_selection_keeps_existing_valid_selection() -> None:
@@ -765,6 +989,12 @@ def test_trial_slider_changes_selection_in_live_mode_without_saved_point() -> No
         "q0_trials": [1.0e-5, 1.0e-4, 1.0e-3],
         "metric_trials": [3.0, 2.0, 1.0],
     }
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-5, 1.0e-4, 1.0e-3], dtype=float),
+        np.asarray([3.0, 2.0, 1.0], dtype=float),
+        "eta2",
+        None,
+    )
     app.run_target_metric = "eta2"
     app.metric_var = _Var("eta2")
     app.trial_index_var = _Var(0)
@@ -794,6 +1024,12 @@ def test_jump_to_best_trial_works_in_live_mode_without_saved_point() -> None:
         "q0_trials": [1.0e-5, 1.0e-4, 1.0e-3],
         "metric_trials": [2.0, 0.5, 1.0],
     }
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-5, 1.0e-4, 1.0e-3], dtype=float),
+        np.asarray([2.0, 0.5, 1.0], dtype=float),
+        "eta2",
+        None,
+    )
     app.run_target_metric = "eta2"
     app.metric_var = _Var("eta2")
     app.trial_index_var = _Var(0)
@@ -858,6 +1094,12 @@ def test_trial_slider_uses_force_live_mode_for_unsaved_active_point() -> None:
         "q0_trials": [1.0e-6, 1.0e-5, 1.0e-4],
         "metric_trials": [0.5, 0.6, 0.9],
     }
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
+        np.asarray([0.5, 0.6, 0.9], dtype=float),
+        "eta2",
+        None,
+    )
     app.payload = {"selected_slice_key": "mw_6p929688ghz"}
     app.trial_index_var = _Var(2)
     app.run_target_metric = "eta2"
@@ -877,6 +1119,111 @@ def test_trial_slider_uses_force_live_mode_for_unsaved_active_point() -> None:
     assert calls["refresh"] == 1
 
 
+def test_trial_slider_uses_live_mode_for_saved_active_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._updating_trial_slider = False
+    app._has_selected_point = lambda: True
+    app._should_force_live_trials = lambda _live_state: False
+    app._should_use_live_trials = lambda _live_state: True
+    app._selected_point = lambda: {
+        "fit_q0_trials": np.asarray([1.0e-5, 1.0e-4], dtype=float),
+        "fit_metric_trials": np.asarray([1.0, 2.0], dtype=float),
+        "target_metric": "eta2",
+    }
+    app._trial_series_for_point = lambda _point: (np.asarray([1.0e-5, 1.0e-4]), np.asarray([1.0, 2.0]), "eta2")
+    app._live_trial_state = lambda: {
+        "a_index": 1,
+        "b_index": 2,
+        "metric_name": "eta2",
+        "q0_trials": [1.0e-6, 1.0e-5, 1.0e-4],
+        "metric_trials": [0.5, 0.6, 0.9],
+    }
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
+        np.asarray([0.5, 0.6, 0.9], dtype=float),
+        "eta2",
+        None,
+    )
+    app.trial_index_var = _Var(2)
+    app.run_target_metric = "eta2"
+    app.metric_var = _Var("eta2")
+    app._selected_trial_token = None
+    calls = {"refresh": 0}
+
+    def _refresh() -> None:
+        calls["refresh"] += 1
+
+    app._refresh_all = _refresh
+
+    app._on_trial_slider_changed("0")
+
+    assert app.trial_index_var.get() == 0
+    assert app._selected_trial_token == (1, 2, "eta2", -1)
+    assert calls["refresh"] == 1
+
+
+def test_selected_solution_plot_context_prefers_live_context_for_saved_active_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._live_trial_state = lambda: {"a_index": 1, "b_index": 2, "metric_name": "eta2"}
+    app._has_selected_point = lambda: True
+    app._should_force_live_trials = lambda _live_state: False
+    app._should_use_live_trials = lambda _live_state: True
+    live_context = {"diagnostics": {"source": "live"}}
+    app._live_selected_solution_plot_context = lambda: live_context
+
+    context = app._selected_solution_plot_context()
+
+    assert context is live_context
+
+
+def test_trials_canvas_click_uses_live_mode_for_saved_active_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.ax_trials = object()
+    app._has_selected_point = lambda: True
+    app._should_force_live_trials = lambda _live_state: False
+    app._should_use_live_trials = lambda _live_state: True
+    app._selected_point = lambda: {
+        "fit_q0_trials": np.asarray([1.0e-5, 1.0e-4], dtype=float),
+        "fit_metric_trials": np.asarray([1.0, 2.0], dtype=float),
+        "target_metric": "eta2",
+    }
+    app._trial_series_for_point = lambda _point: (np.asarray([1.0e-5, 1.0e-4]), np.asarray([1.0, 2.0]), "eta2")
+    app._live_trial_state = lambda: {
+        "a_index": 1,
+        "b_index": 2,
+        "metric_name": "eta2",
+        "q0_trials": [1.0e-6, 1.0e-5, 1.0e-4],
+        "metric_trials": [0.7, 0.2, 0.9],
+    }
+    app._live_trial_series_from_state = lambda _live_state: (
+        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
+        np.asarray([0.7, 0.2, 0.9], dtype=float),
+        "eta2",
+        None,
+    )
+    app.run_target_metric = "eta2"
+    app.metric_var = _Var("eta2")
+    app.trial_index_var = _Var(2)
+    app._selected_trial_token = None
+    calls = {"refresh": 0}
+
+    def _refresh() -> None:
+        calls["refresh"] += 1
+
+    app._refresh_all = _refresh
+
+    class _Event:
+        inaxes = app.ax_trials
+        xdata = 1.0e-5
+        ydata = 0.2
+
+    app._on_trials_canvas_click(_Event())
+
+    assert app.trial_index_var.get() == 1
+    assert app._selected_trial_token == (1, 2, "eta2", -1)
+    assert calls["refresh"] == 1
+
+
 def test_trial_token_matches_context_ignores_size_suffix() -> None:
     app = object.__new__(PychmpViewApp)
 
@@ -884,6 +1231,115 @@ def test_trial_token_matches_context_ignores_size_suffix() -> None:
     assert app._trial_token_matches_context((0, 1, "eta2", -1), a_token=0, b_token=1, point_metric="eta2") is True
     assert app._trial_token_matches_context((0, 1, "chi2", 11), a_token=0, b_token=1, point_metric="eta2") is False
     assert app._trial_token_matches_context((0, 2, "eta2", 11), a_token=0, b_token=1, point_metric="eta2") is False
+
+
+def test_trial_token_matches_context_tolerates_small_live_float_drift() -> None:
+    app = object.__new__(PychmpViewApp)
+
+    assert (
+        app._trial_token_matches_context(
+            (0.9, 3.0, "eta2", -1),
+            a_token=0.9000004,
+            b_token=2.9999997,
+            point_metric="eta2",
+        )
+        is True
+    )
+
+
+def test_selected_trial_index_preserves_manual_selection_when_trial_count_changes() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(2)
+    app.trial_index_var = _Var(1)
+    app._selected_trial_token = (1, 2, "eta2", 2)
+
+    selected = app._selected_trial_index_for_point(
+        {},
+        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
+        np.asarray([0.5, 0.3, 0.2], dtype=float),
+        "eta2",
+    )
+
+    assert selected == 1
+    assert app.trial_index_var.get() == 1
+    assert app._selected_trial_token == (1, 2, "eta2", 3)
+
+
+def test_selected_trial_index_resets_to_best_when_context_changes() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(2)
+    app.trial_index_var = _Var(2)
+    app._selected_trial_token = (0, 2, "eta2", 3)
+
+    selected = app._selected_trial_index_for_point(
+        {},
+        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
+        np.asarray([2.0, 0.1, 0.5], dtype=float),
+        "eta2",
+    )
+
+    assert selected == 1
+    assert app.trial_index_var.get() == 1
+    assert app._selected_trial_token == (1, 2, "eta2", 3)
+
+
+def test_slice_change_schedules_deferred_reload() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.slice_menu = type("_Menu", (), {"current": lambda self: 0})()
+    app.available_slices = [{"key": "euv_193"}]
+    app.slice_key_var = _Var("euv_171")
+    app.search_id_var = _Var("search-1")
+    app._last_rendered_metric = "eta2"
+    app._capture_current_slice_view_state = lambda _metric: None
+    calls: list[str] = []
+    app._schedule_payload_reload = lambda *, status_text=None: calls.append(str(status_text))
+
+    app._on_slice_changed()
+
+    assert app.slice_key_var.get() == "euv_193"
+    assert app.search_id_var.get() == ""
+    assert calls == ["Loading selected slice..."]
+
+
+def test_search_change_schedules_deferred_reload() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.search_menu = type("_Menu", (), {"current": lambda self: 0})()
+    app.available_searches = [{"search_id": "search-2"}]
+    app.search_id_var = _Var("search-1")
+    app._last_rendered_metric = "eta2"
+    app._capture_current_slice_view_state = lambda _metric: None
+    app._selected_trial_token = object()
+    calls: list[str] = []
+    app._schedule_payload_reload = lambda *, status_text=None: calls.append(str(status_text))
+
+    app._on_search_changed()
+
+    assert app.search_id_var.get() == "search-2"
+    assert app._selected_trial_token is None
+    assert calls == ["Loading selected search..."]
+
+
+def test_refresh_selector_controls_tolerates_missing_available_lists() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.payload = {}
+    app.slice_key_var = _Var("")
+    app.slice_display_var = _Var("")
+    app.search_id_var = _Var("")
+    app.search_display_var = _Var("")
+    app.slice_menu = None
+    app.slice_display_label = None
+    app.search_menu = None
+    app.search_display_label = None
+    app._selected_slice_key = lambda: ""
+    app._selected_search_id = lambda: ""
+
+    app._refresh_slice_controls()
+    app._refresh_search_controls()
+
+    assert app.slice_key_var.get() == ""
+    assert app.search_id_var.get() == ""
 
 
 def test_center_kernel_to_shape_pads_smaller_kernel() -> None:

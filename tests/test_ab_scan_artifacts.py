@@ -17,18 +17,25 @@ from pychmp.ab_scan_artifacts import (
     append_scan_point_record,
     backfill_artifact_diagnostics,
     build_computed_point_payload,
+    clear_active_point_snapshot,
+    clear_live_trial_point,
     default_point_index,
+    extract_artifact_identity_summary,
+    load_active_point_snapshot,
     load_auxiliary_map_store_point_records,
+    load_live_trial_point,
     list_scan_slices,
     load_scan_file,
     point_record_matches_compatibility_signature,
     resolve_point_index,
     scan_artifact_reuse_preflight_issues,
     write_grid_scan_artifact,
+    write_active_point_snapshot,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
     validate_scan_artifact_reuse_preflight,
     write_single_point_scan_file,
+    write_live_trial_point,
     write_point_scan_artifact,
 )
 from pychmp import ab_scan_artifacts
@@ -125,6 +132,135 @@ def _make_blos_reference() -> tuple[np.ndarray, fits.Header]:
     header = _make_header(crval1=12.0)
     data = np.asarray([[10.0, -10.0], [5.0, -5.0]], dtype=float)
     return data, header
+
+
+def test_active_point_snapshot_round_trip(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "artifact.h5"
+    diagnostics = _make_diagnostics(artifact_kind=UNIFIED_ARTIFACT_KIND)
+    diagnostics.update(
+        {
+            "slice_key": "euv_193",
+            "target_slice_key": "euv_193",
+            "spectral_domain": "euv",
+            "spectral_label": "193 A",
+            "euv_channel": "193",
+            "euv_instrument": "AIA",
+        }
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=np.zeros((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        wcs_header=_make_header(),
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    snapshot_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        q0=1.0e-4,
+        success=False,
+        status="running",
+        modeled_best=np.full((2, 2), 2.0, dtype=float),
+        raw_modeled_best=np.full((2, 2), 1.5, dtype=float),
+        residual=np.full((2, 2), -0.5, dtype=float),
+        fit_q0_trials=(1.0e-5, 1.0e-4),
+        fit_metric_trials=(3.0, 2.0),
+        fit_chi2_trials=(float("nan"), float("nan")),
+        fit_rho2_trials=(float("nan"), float("nan")),
+        fit_eta2_trials=(3.0, 2.0),
+        trial_raw_modeled_maps=np.stack(
+            [
+                np.full((2, 2), 1.0, dtype=float),
+                np.full((2, 2), 1.5, dtype=float),
+            ]
+        ),
+        trial_modeled_maps=np.stack(
+            [
+                np.full((2, 2), 1.2, dtype=float),
+                np.full((2, 2), 2.0, dtype=float),
+            ]
+        ),
+        trial_residual_maps=np.stack(
+            [
+                np.full((2, 2), -0.2, dtype=float),
+                np.full((2, 2), -0.5, dtype=float),
+            ]
+        ),
+        nfev=2,
+        nit=1,
+        message="running",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="eta2",
+        diagnostics={"target_metric": "eta2", "point_status": "running"},
+    )
+
+    write_active_point_snapshot(out_h5, point_payload=snapshot_payload, slice_key="euv_193")
+    loaded = load_active_point_snapshot(out_h5, slice_key="euv_193")
+
+    assert loaded is not None
+    assert float(loaded["a"]) == pytest.approx(0.3)
+    assert float(loaded["b"]) == pytest.approx(2.7)
+    np.testing.assert_allclose(loaded["trial_raw_modeled_maps"][1], np.full((2, 2), 1.5, dtype=float))
+    np.testing.assert_allclose(loaded["trial_modeled_maps"][1], np.full((2, 2), 1.5, dtype=float))
+
+    clear_active_point_snapshot(out_h5, slice_key="euv_193")
+    assert load_active_point_snapshot(out_h5, slice_key="euv_193") is None
+
+
+def test_live_trial_point_round_trip(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "artifact_live_trial.h5"
+    diagnostics = _make_diagnostics(artifact_kind=UNIFIED_ARTIFACT_KIND)
+    diagnostics.update(
+        {
+            "slice_key": "euv_171",
+            "target_slice_key": "euv_171",
+            "spectral_domain": "euv",
+            "spectral_label": "171 A",
+            "euv_channel": "171",
+            "euv_instrument": "AIA",
+        }
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=np.zeros((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        wcs_header=_make_header(),
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+
+    write_live_trial_point(
+        out_h5,
+        slice_key="euv_171",
+        live_state={
+            "slice_key": "euv_171",
+            "search_id": "search-live",
+            "a": -0.9,
+            "b": 2.4,
+            "q0": 1.0e-4,
+            "trial_index": 3,
+            "metric_name": "eta2",
+            "fit_q0_trials": [1.0e-5, 3.0e-5],
+            "fit_metric_trials": [4.0, 2.0],
+        },
+    )
+
+    loaded = load_live_trial_point(out_h5, slice_key="euv_171")
+
+    assert loaded is not None
+    assert float(loaded["a"]) == pytest.approx(-0.9)
+    assert float(loaded["b"]) == pytest.approx(2.4)
+    assert float(loaded["q0"]) == pytest.approx(1.0e-4)
+    assert int(loaded["trial_index"]) == 3
+    assert str(loaded["metric_name"]) == "eta2"
+    np.testing.assert_allclose(np.asarray(loaded["fit_q0_trials"], dtype=float), np.asarray([1.0e-5, 3.0e-5]))
+    np.testing.assert_allclose(np.asarray(loaded["fit_metric_trials"], dtype=float), np.asarray([4.0, 2.0]))
+
+    clear_live_trial_point(out_h5, slice_key="euv_171")
+    assert load_live_trial_point(out_h5, slice_key="euv_171") is None
 
 
 def _write_rectangular_artifact(out_h5: Path) -> tuple[np.ndarray, np.ndarray, fits.Header, dict[str, object]]:
@@ -638,6 +774,42 @@ def test_sparse_artifact_rewrite_preserves_selectable_search_records(tmp_path: P
     assert first_search_payload["chi2"][0, 0] == pytest.approx(0.1)
 
 
+def test_append_reuses_existing_search_for_same_request_even_if_signature_differs(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_request_identity.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    first_payload = load_scan_file(out_h5)
+    first_search_id = str(first_payload["selected_search_id"])
+
+    changed_signature = dict(diagnostics)
+    changed_signature[COMPATIBILITY_SIGNATURE_KEY] = "sig-command-changed-only"
+
+    append_scan_point_record(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=changed_signature,
+        point_payload=_make_point_payload(0.3, 1.3),
+    )
+
+    latest_payload = load_scan_file(out_h5)
+    assert len(latest_payload["search_records"]) == 1
+    assert str(latest_payload["selected_search_id"]) == first_search_id
+    assert len(latest_payload["point_records"]) == 2
+
+
 def test_write_single_point_scan_file_round_trip_is_unified_and_viewer_compatible(tmp_path: Path) -> None:
     out_h5 = tmp_path / "single_point.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
@@ -727,6 +899,80 @@ def test_write_single_point_scan_file_round_trip_is_unified_and_viewer_compatibl
     assert payload["blos_reference"] is not None
 
 
+def test_extract_artifact_identity_summary_returns_readable_identity_fields(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "single_point_identity.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_q0_recovery")
+    diagnostics.update(
+        {
+            "spectral_domain": "euv",
+            "spectral_label": "AIA 171",
+            "euv_channel": "171",
+            "euv_instrument": "AIA",
+            "euv_response_origin": "pyEUVTools",
+            "euv_response_override_path": None,
+            "euv_response_resolver": "pychmp.gxrender_adapter.resolve_euv_response_identity",
+            "euv_response_identity_version": "pychmp.euv_response_identity.v1",
+            "euv_response_sha256": "d" * 64,
+            "euv_response_source": "python-provider",
+            "euv_response_mode": "time-dependent",
+            "euv_response_identity_summary": {
+                "instrument": "AIA",
+                "channels": ["171"],
+                "source": "python-provider",
+                "mode": "time-dependent",
+            },
+        }
+    )
+    point_payload = build_computed_point_payload(
+        a_value=0.3,
+        b_value=2.7,
+        a_index=0,
+        b_index=0,
+        q0=2.5,
+        success=True,
+        status="computed",
+        modeled_best=np.ones((2, 2), dtype=float),
+        raw_modeled_best=np.full((2, 2), 2.0, dtype=float),
+        residual=np.zeros((2, 2), dtype=float),
+        fit_q0_trials=(2.0, 2.5),
+        fit_metric_trials=(0.4, 0.1),
+        fit_chi2_trials=(0.4, 0.1),
+        fit_rho2_trials=(0.5, 0.2),
+        fit_eta2_trials=(0.6, 0.3),
+        nfev=2,
+        nit=1,
+        message="ok",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric="chi2",
+        diagnostics=diagnostics,
+    )
+
+    write_single_point_scan_file(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_payload=point_payload,
+    )
+
+    summary = extract_artifact_identity_summary(out_h5)
+
+    assert summary["artifact_format"] == "unified"
+    assert summary["point_count"] == 1
+    assert summary["identity"]["euv_response_sha256"] == "d" * 64
+    assert summary["identity"]["euv_response_origin"] == "pyEUVTools"
+    assert summary["identity"]["euv_response_override_path"] is None
+    assert summary["identity"]["euv_response_resolver"] == "pychmp.gxrender_adapter.resolve_euv_response_identity"
+    assert summary["identity"]["euv_response_identity_summary"]["channels"] == ["171"]
+    assert summary["identity"][COMPATIBILITY_SIGNATURE_KEY] == "sig-123"
+
+
 def test_single_point_artifact_stores_auxiliary_maps_in_map_store(tmp_path: Path) -> None:
     out_h5 = tmp_path / "single_point_aux_maps.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
@@ -771,7 +1017,8 @@ def test_single_point_artifact_stores_auxiliary_maps_in_map_store(tmp_path: Path
     )
 
     payload = load_scan_file(out_h5)
-    np.testing.assert_allclose(payload["point_records"][0]["modeled_best"], np.ones((2, 2), dtype=float))
+    np.testing.assert_allclose(payload["point_records"][0]["raw_modeled_best"], np.full((2, 2), 2.0, dtype=float))
+    np.testing.assert_allclose(payload["point_records"][0]["modeled_best"], np.full((2, 2), 2.0, dtype=float))
 
     with h5py.File(out_h5, "r") as handle:
         search_id = handle["slices/default/active_search_id"][()].decode()
@@ -804,9 +1051,11 @@ def test_load_scan_file_replaces_missing_display_map_refs_with_blank_maps(tmp_pa
         search_id = handle["slices/default/active_search_id"][()].decode()
         record = handle[f"slices/default/searches/{search_id}/point_records/r000000"]
         refs = json.loads(record["map_refs_json"][()].decode())
-        for key in ("raw_modeled_best", "modeled_best", "residual"):
-            ref_path = refs.pop(key)
-            del handle[ref_path]
+        trial_history = json.loads(record["trial_history_json"][()].decode())
+        for entry in trial_history:
+            ref_path = str(entry.get("raw_map_ref", "")).strip()
+            if ref_path:
+                del handle[ref_path]
         record["map_refs_json"][()] = np.bytes_(json.dumps(refs, sort_keys=True))
 
     payload = load_scan_file(out_h5)
@@ -1651,7 +1900,7 @@ def test_search_records_expose_request_and_lifecycle_metadata(tmp_path: Path) ->
     search = payload["selected_search"]
 
     assert search["status"] == "complete"
-    assert search["active"] is True
+    assert search["active"] is False
     assert search["in_progress"] is False
     assert search["created_at"] == "2026-05-22T00:00:00Z"
     assert search["started_at"] == "2026-05-22T00:00:01Z"
@@ -2070,7 +2319,7 @@ def test_append_scan_point_record_retries_transient_file_lock(monkeypatch: pytes
 
     payload = load_scan_file(out_h5)
 
-    assert state["calls"] == 3
+    assert state["calls"] == 4
     assert len(payload["point_records"]) == 1
 
 

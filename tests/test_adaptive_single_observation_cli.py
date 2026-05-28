@@ -3,15 +3,22 @@ from __future__ import annotations
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from astropy.io import fits
 
 from examples.python.adaptive_ab_search_single_observation import (
+    _ArtifactWriteDispatcher,
     _PointRenderRecord,
     _PointRenderStream,
     _PersistentPointCache,
+    _focus_existing_viewer_pid,
+    _build_live_point_snapshot_payload,
+    _build_physical_compatibility_signature,
+    _find_existing_viewer_pid,
+    _maybe_validate_artifact_preflight,
     _point_payload_from_result,
     _rescore_auxiliary_map_record,
     _resolve_geometry_request_flags,
@@ -164,6 +171,198 @@ def test_resolve_geometry_request_flags_does_not_treat_default_pixel_scale_as_ex
 
     assert geometry_overrides_requested is False
     assert explicit_observer_requested is False
+
+
+def test_find_existing_viewer_pid_matches_same_artifact(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    viewer_script = tmp_path / "pychmp_view.py"
+    artifact_text = str(artifact_h5.resolve())
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.os.getpid",
+        lambda: 4321,
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "1111 /usr/bin/python other_script.py /tmp/elsewhere.h5\n"
+                f"2222 /usr/bin/python {viewer_script.name} {artifact_text}\n"
+                "4321 /usr/bin/python pychmp_view.py current_process.h5\n"
+            ),
+        ),
+    )
+
+    found = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=artifact_h5)
+
+    assert found == 2222
+
+
+def test_find_existing_viewer_pid_ignores_other_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "adaptive.h5"
+    viewer_script = tmp_path / "pychmp_view.py"
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.os.getpid",
+        lambda: 4321,
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                f"2222 /usr/bin/python {viewer_script.name} /tmp/other_artifact.h5\n"
+                "4321 /usr/bin/python pychmp_view.py current_process.h5\n"
+            ),
+        ),
+    )
+
+    found = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=artifact_h5)
+
+    assert found is None
+
+
+def test_focus_existing_viewer_pid_returns_true_when_osascript_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.sys.platform",
+        "darwin",
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
+
+    assert _focus_existing_viewer_pid(1234) is True
+
+
+def test_focus_existing_viewer_pid_returns_false_when_not_darwin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.sys.platform",
+        "linux",
+    )
+
+    assert _focus_existing_viewer_pid(1234) is False
+
+
+def test_adaptive_compatibility_signature_tracks_resolved_euv_response_hash() -> None:
+    base_payload = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        "target_metric": "chi2",
+        "model_sha256": "a" * 64,
+        "fits_sha256": "b" * 64,
+        "observation_source_mode": "model_refmap",
+        "observation_source_map_id": "AIA_171",
+        "spectral_domain": "euv",
+        "spectral_label": "AIA 171",
+        "ebtel_sha256": "c" * 64,
+        "frequency_ghz": None,
+        "wavelength_angstrom": 171.0,
+        "euv_channel": "171",
+        "euv_instrument": "AIA",
+        "euv_response_identity_version": "pychmp.euv_response_identity.v1",
+        "euv_response_sha256": "d" * 64,
+        "map_xc_arcsec": 0.0,
+        "map_yc_arcsec": 0.0,
+        "map_dx_arcsec": 2.0,
+        "map_dy_arcsec": 2.0,
+        "map_nx": 2,
+        "map_ny": 2,
+        "observer_name": "earth",
+        "observer_lonc_deg": 0.0,
+        "observer_b0sun_deg": 0.0,
+        "observer_dsun_cm": 1.495978707e13,
+        "observer_obs_time": "2020-11-26T20:00:00",
+        "threshold": 0.1,
+        "metrics_mask_threshold": 0.1,
+        "metrics_mask_fits": None,
+        "threshold_metric": 0.2,
+        "mask_type": "union",
+        "tr_mask_bmin_gauss": 1000.0,
+        "tr_mask_source": "abs_blos_ge_bmin",
+        "no_area": False,
+        "psf_source": "none",
+        "resolved_psf": None,
+    }
+
+    changed_payload = dict(base_payload)
+    changed_payload["euv_response_sha256"] = "e" * 64
+
+    assert _build_physical_compatibility_signature(base_payload) != _build_physical_compatibility_signature(changed_payload)
+
+
+def test_adaptive_preflight_skips_render_only_auxiliary_slice(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation._load_slice_preflight_payload",
+        lambda *_args, **_kwargs: {"diagnostics": {"render_only_slice": True}},
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.validate_scan_artifact_reuse_preflight",
+        lambda *_args, **_kwargs: calls.append("validated"),
+    )
+
+    _maybe_validate_artifact_preflight(
+        artifact_h5=tmp_path / "artifact.h5",
+        artifact_preexisting=True,
+        recompute_existing=False,
+        target_slice_key="euv_193",
+        target_header=fits.Header({"DATE-OBS": "2020-11-26T19:58:28.840"}),
+        diagnostics={
+            "artifact_kind": "pychmp_ab_scan_sparse_points",
+            "model_sha256": "a" * 64,
+            "fits_sha256": "b" * 64,
+            "ebtel_sha256": "c" * 64,
+            "euv_response_identity_version": "pychmp.euv_response_identity.v1",
+            "euv_response_sha256": "d" * 64,
+            "spectral_domain": "euv",
+            "spectral_label": "193 A",
+            "euv_channel": "193",
+            "euv_instrument": "AIA",
+            "map_xc_arcsec": 0.0,
+            "map_yc_arcsec": 0.0,
+            "map_dx_arcsec": 2.0,
+            "map_dy_arcsec": 2.0,
+            "map_nx": 150,
+            "map_ny": 150,
+            "observer_name": "earth",
+            "observer_lonc_deg": 0.0,
+            "observer_b0sun_deg": 0.0,
+            "observer_dsun_cm": 1.0,
+            "observer_obs_time": "2020-11-26T19:58:28.840",
+        },
+    )
+
+    assert calls == []
+
+
+def test_build_live_point_snapshot_payload_uses_completed_trial_maps() -> None:
+    record = _PointRenderRecord()
+    record.raw_modeled_by_q0 = {
+        "1e-05": np.full((2, 2), 1.0, dtype=np.float32),
+        "0.0001": np.full((2, 2), 2.0, dtype=np.float32),
+    }
+    record.modeled_by_q0 = {
+        "1e-05": np.full((2, 2), 1.5, dtype=np.float32),
+        "0.0001": np.full((2, 2), 2.5, dtype=np.float32),
+    }
+
+    payload = _build_live_point_snapshot_payload(
+        a_value=0.3,
+        b_value=2.7,
+        q0_trials=[1.0e-5, 1.0e-4],
+        metric_trials=[3.0, 2.0],
+        observed_template=np.zeros((2, 2), dtype=float),
+        target_metric="eta2",
+        compatibility_signature="sig-live",
+        stream_record=record,
+    )
+
+    assert payload is not None
+    assert payload["status"] == "running"
+    assert tuple(payload["fit_q0_trials"]) == (1.0e-5, 1.0e-4)
+    np.testing.assert_allclose(payload["trial_modeled_maps"][1], np.full((2, 2), 2.5, dtype=float))
 
 
 class _FakeEUVRenderer:
@@ -942,3 +1141,93 @@ def test_cache_setitem_enqueues_without_waiting_for_writer(monkeypatch: pytest.M
     cache[(0.3, 2.7)] = point
     with pytest.raises(RuntimeError, match="artifact write dispatcher failed"):
         cache.close()
+
+
+def test_dispatcher_live_snapshot_lock_contention_does_not_fail_close(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "dispatcher_snapshot_lock.h5"
+    header = fits.Header()
+    diagnostics = {
+        "target_slice_key": "euv_171",
+        "slice_key": "euv_171",
+    }
+    attempts = {"count": 0}
+
+    def _flaky_snapshot(*args: object, **kwargs: object) -> None:
+        attempts["count"] += 1
+        if attempts["count"] <= 2:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.write_live_trial_point",
+        _flaky_snapshot,
+    )
+
+    dispatcher = _ArtifactWriteDispatcher(
+        artifact_h5=artifact_h5,
+        observed=np.zeros((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        psf_kernel=None,
+    )
+
+    dispatcher.write_live_snapshot({"a": 0.0, "b": 0.0})
+    dispatcher.close()
+
+    assert attempts["count"] >= 3
+
+
+def test_dispatcher_live_snapshot_non_lock_error_remains_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "dispatcher_snapshot_fatal.h5"
+    header = fits.Header()
+    diagnostics = {
+        "target_slice_key": "euv_171",
+        "slice_key": "euv_171",
+    }
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.write_live_trial_point",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("snapshot boom")),
+    )
+
+    dispatcher = _ArtifactWriteDispatcher(
+        artifact_h5=artifact_h5,
+        observed=np.zeros((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        psf_kernel=None,
+    )
+
+    dispatcher.write_live_snapshot({"a": 0.0, "b": 0.0})
+    with pytest.raises(RuntimeError, match="artifact write dispatcher failed"):
+        dispatcher.close()
+
+
+def test_dispatcher_live_snapshot_missing_search_is_non_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "dispatcher_snapshot_missing_search.h5"
+    header = fits.Header()
+    diagnostics = {
+        "target_slice_key": "euv_193",
+        "slice_key": "euv_193",
+    }
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.write_live_trial_point",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyError("search not found for slice: euv_193")),
+    )
+
+    dispatcher = _ArtifactWriteDispatcher(
+        artifact_h5=artifact_h5,
+        observed=np.zeros((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        psf_kernel=None,
+    )
+
+    dispatcher.write_live_snapshot({"a": 0.0, "b": 0.0})
+    dispatcher.close()

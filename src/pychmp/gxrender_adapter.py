@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
+import hashlib
 from importlib import import_module
+import json
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -17,8 +19,17 @@ _EUV_PROJECTION_FLAGS_WARNING = (
     "Current Python EUV workflow uses projection flags off "
     "(parallel=False, exact=False, nthreads=0) for the DLL simbox path."
 )
+EUV_RESPONSE_IDENTITY_VERSION = "pychmp.euv_response_identity.v1"
 _euv_projection_flags_warning_emitted = False
 _euv_projection_flags_warning_lock = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class EUVResponseIdentity:
+    sha256: str
+    version: str
+    payload: dict[str, Any]
+    summary: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -26,6 +37,138 @@ class _CachedEUVResponse:
     response: Any
     response_dt: Any
     response_meta: Any
+    response_identity: EUVResponseIdentity | None = None
+
+
+def _canonical_float64_array(values: Any) -> list[Any]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 0:
+        return [None if not np.isfinite(arr.item()) else float(arr.item())]
+    finite = np.isfinite(arr)
+    normalized = arr.astype(np.float64, copy=True)
+    if not finite.all():
+        normalized[~finite] = np.nan
+    return normalized.tolist()
+
+
+def _normalize_dtype_descriptor(value: Any) -> Any:
+    try:
+        dtype = np.dtype(value)
+    except Exception:
+        return str(value)
+    if dtype.names:
+        return [_normalize_identity_value(item) for item in dtype.descr]
+    return str(dtype)
+
+
+def _normalize_identity_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, str, int)):
+        return value
+    if isinstance(value, float):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    if isinstance(value, np.generic):
+        return _normalize_identity_value(value.item())
+    if isinstance(value, np.dtype):
+        return _normalize_dtype_descriptor(value)
+    if isinstance(value, np.ndarray):
+        if value.dtype.fields:
+            return _normalize_identity_value(value.tolist())
+        if np.issubdtype(value.dtype, np.number):
+            return _canonical_float64_array(value)
+        return [_normalize_identity_value(item) for item in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_normalize_identity_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _normalize_identity_value(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if hasattr(value, "unit") and hasattr(value, "value"):
+        return {
+            "value": _normalize_identity_value(getattr(value, "value")),
+            "unit": str(getattr(value, "unit")),
+        }
+    if is_dataclass(value):
+        return _normalize_identity_value(asdict(value))
+    if hasattr(value, "__dict__"):
+        return _normalize_identity_value(vars(value))
+    return str(value)
+
+
+def _normalize_euv_response_meta_for_identity(response_meta: Any) -> dict[str, Any]:
+    return {
+        "instrument": str(getattr(response_meta, "instrument", "") or ""),
+        "channels": [str(channel) for channel in (getattr(response_meta, "channels", ()) or ())],
+    }
+
+
+def _build_euv_response_identity_payload(*, response: Any, response_dt: Any, response_meta: Any) -> dict[str, Any]:
+    arr = np.asarray(response)
+    payload: dict[str, Any] = {
+        "schema": EUV_RESPONSE_IDENTITY_VERSION,
+        "meta": _normalize_euv_response_meta_for_identity(response_meta),
+        "response_dt": _normalize_dtype_descriptor(response_dt if response_dt is not None else arr.dtype),
+    }
+    if arr.dtype.fields and {"ds", "NT", "Nchannels", "logte", "all"}.issubset(set(arr.dtype.fields)) and arr.size >= 1:
+        flat = arr.reshape(-1)
+        entry = flat[0]
+        ds_value = np.asarray(entry["ds"]).reshape(-1)[0]
+        nt_value = np.asarray(entry["NT"]).reshape(-1)[0]
+        nchannels_value = np.asarray(entry["Nchannels"]).reshape(-1)[0]
+        logte = np.asarray(entry["logte"], dtype=np.float64)
+        response_matrix = np.asarray(entry["all"], dtype=np.float64)
+        payload["response"] = {
+            "layout": "gx_structured_array",
+            "ds": None if not np.isfinite(float(ds_value)) else float(ds_value),
+            "nt": int(nt_value),
+            "nchannels": int(nchannels_value),
+            "logte": _canonical_float64_array(logte),
+            "all": _canonical_float64_array(response_matrix),
+        }
+        return payload
+    payload["response"] = _normalize_identity_value(response)
+    return payload
+
+
+def _serialize_euv_response_identity_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def compute_euv_response_identity(*, response: Any, response_dt: Any, response_meta: Any) -> EUVResponseIdentity:
+    payload = _build_euv_response_identity_payload(
+        response=response,
+        response_dt=response_dt,
+        response_meta=response_meta,
+    )
+    digest = hashlib.sha256(_serialize_euv_response_identity_bytes(payload)).hexdigest()
+    response_payload = dict(payload.get("response", {})) if isinstance(payload.get("response"), dict) else {}
+    logte_values = np.asarray(response_payload.get("logte", []), dtype=float)
+    summary = {
+        "instrument": str(getattr(response_meta, "instrument", "") or ""),
+        "channels": [str(channel) for channel in (getattr(response_meta, "channels", ()) or ())],
+        "source": str(getattr(response_meta, "source", "") or ""),
+        "mode": str(getattr(response_meta, "mode", "") or ""),
+        "layout": str(response_payload.get("layout", "generic")),
+        "ds": response_payload.get("ds"),
+        "nt": response_payload.get("nt"),
+        "nchannels": response_payload.get("nchannels"),
+        "logte_min": (None if logte_values.size == 0 else float(np.nanmin(logte_values))),
+        "logte_max": (None if logte_values.size == 0 else float(np.nanmax(logte_values))),
+    }
+    return EUVResponseIdentity(
+        sha256=digest,
+        version=EUV_RESPONSE_IDENTITY_VERSION,
+        payload=payload,
+        summary=summary,
+    )
+
+
+def resolve_euv_response_identity(**adapter_kwargs: Any) -> EUVResponseIdentity | None:
+    return GXRenderEUVAdapter(**adapter_kwargs).response_identity()
 
 
 def build_tr_region_mask_from_blos(
@@ -132,17 +275,19 @@ def resolve_render_geometry_via_gxrender(
     observer: Any | None = None,
     omp_threads: int = 8,
     prefer_execute_center: bool = True,
+    use_saved_fov: bool = False,
 ) -> ResolvedRenderGeometry:
     """Resolve render geometry by delegating observer/FOV policy to gxrender."""
 
     sdk = _load_gxrender_sdk()
     common_mod = _load_common_workflow_helpers()
+    effective_observer_name = None if bool(use_saved_fov) and geometry is None and observer is None else observer_name
     args = SimpleNamespace(
         omp_threads=int(omp_threads),
         model_path=Path(model_path),
         model_format=str(model_format),
         ebtel_path=ebtel_path,
-        observer=observer_name,
+        observer=effective_observer_name,
         dsun_cm=None if observer is None else getattr(observer, "dsun_cm", None),
         lonc_deg=None if observer is None else getattr(observer, "lonc_deg", None),
         b0sun_deg=None if observer is None else getattr(observer, "b0sun_deg", None),
@@ -156,7 +301,7 @@ def resolve_render_geometry_via_gxrender(
         xrange=None if geometry is None else getattr(geometry, "xrange", None),
         yrange=None if geometry is None else getattr(geometry, "yrange", None),
         auto_fov=False,
-        use_saved_fov=False,
+        use_saved_fov=bool(use_saved_fov),
     )
     common = common_mod.prepare_common_inputs(args, prefer_execute_center=prefer_execute_center)
     resolved_geometry = sdk.MapGeometry(
@@ -170,7 +315,7 @@ def resolve_render_geometry_via_gxrender(
     observer_geometry = common.observer_geometry
     return ResolvedRenderGeometry(
         geometry=resolved_geometry,
-        observer_name=str(getattr(observer_geometry, "observer_name", observer_name or "")),
+        observer_name=str(getattr(observer_geometry, "observer_name", effective_observer_name or "")),
         observer_source=str(getattr(observer_geometry, "observer_source", "")),
         center_source=str(common.center_source),
         fov_x_arcsec=float(common.fov_x),
@@ -648,10 +793,17 @@ class GXRenderEUVAdapter:
             response=resolved.response,
             response_dt=resolved.response_dt,
             response_meta=resolved.response_meta,
+            response_identity=compute_euv_response_identity(
+                response=resolved.response,
+                response_dt=resolved.response_dt,
+                response_meta=resolved.response_meta,
+            ),
         )
 
     def _ensure_euv_response_cache(self) -> _CachedEUVResponse | None:
         if not bool(self.cache_response):
+            return None
+        if self.response_sav is None:
             return None
         cache_key = self._response_cache_key_for_current_request()
         cached = self._response_cache
@@ -669,6 +821,18 @@ class GXRenderEUVAdapter:
                 self._response_cache = cached
                 self._response_cache_attempted = True
             return cached
+
+    def response_identity(self) -> EUVResponseIdentity | None:
+        cached = self._ensure_euv_response_cache()
+        if cached is None:
+            return None
+        if cached.response_identity is None:
+            cached.response_identity = compute_euv_response_identity(
+                response=cached.response,
+                response_dt=cached.response_dt,
+                response_meta=cached.response_meta,
+            )
+        return cached.response_identity
 
     def render_components(self, q0: float) -> dict[str, Any]:
         q0_key = float(q0)
@@ -693,6 +857,7 @@ class GXRenderEUVAdapter:
             shtable=self.shtable,
         )
         cached_response = self._ensure_euv_response_cache()
+        cached_response_identity = None if cached_response is None else self.response_identity()
         options = sdk.EUVRenderOptions(
             model_path=Path(self.model_path),
             model_format=str(self.model_format),
@@ -803,6 +968,7 @@ class GXRenderEUVAdapter:
                 "tr_region_mask": (
                     None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool)
                 ),
+                "response_identity": cached_response_identity,
             }
             self._components_cache[q0_key] = payload
             return payload
@@ -835,6 +1001,7 @@ class GXRenderEUVAdapter:
             "tr_region_mask": (
                 None if self.tr_region_mask is None else np.asarray(self.tr_region_mask, dtype=bool)
             ),
+            "response_identity": cached_response_identity,
         }
         self._components_cache[q0_key] = payload
         return payload

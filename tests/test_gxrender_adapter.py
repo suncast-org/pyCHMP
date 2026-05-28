@@ -13,9 +13,11 @@ import pytest
 
 import pychmp.gxrender_adapter as gxrender_adapter
 from pychmp.gxrender_adapter import (
+    EUV_RESPONSE_IDENTITY_VERSION,
     GXRenderEUVAdapter,
     GXRenderMWAdapter,
     build_tr_region_mask_from_blos,
+    compute_euv_response_identity,
     recombine_euv_components,
 )
 
@@ -99,6 +101,32 @@ class FakeSDKWithEUV(FakeSDK):
             axis=-1,
         )
         return FakeEUVResult(cube, channels=["A94", "A171"])
+
+
+def _make_gx_response_payload(*, scale: float = 1.0) -> tuple[np.ndarray, np.dtype, SimpleNamespace]:
+    response_dt = np.dtype(
+        [
+            ("ds", np.float64),
+            ("NT", np.int32),
+            ("Nchannels", np.int32),
+            ("logte", np.float64, (3,)),
+            ("all", np.float64, (2, 3)),
+        ]
+    )
+    response = np.zeros(1, dtype=response_dt)
+    response["ds"] = 0.36
+    response["NT"] = 3
+    response["Nchannels"] = 2
+    response["logte"] = np.asarray([5.0, 6.0, 7.0], dtype=float)
+    response["all"] = np.asarray(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+        ],
+        dtype=float,
+    ) * float(scale)
+    response_meta = SimpleNamespace(instrument="AIA", channels=["94", "171"], source="unit-test", mode="cached")
+    return response, response_dt, response_meta
 
 
 class WrongCubeGXRender(FakeGXRender):
@@ -294,6 +322,47 @@ def test_gxrender_context_forwards_named_observer_to_workflow_args(monkeypatch) 
     assert FakeWorkflowHelpers.prepared_args.observer == "earth"
 
 
+def test_resolve_render_geometry_via_gxrender_forwards_saved_fov_preference(monkeypatch) -> None:
+    class FakeSDKForGeometry(FakeSDK):
+        pass
+
+    class FakeWorkflowHelpersForGeometry:
+        prepared_args = None
+
+        @staticmethod
+        def prepare_common_inputs(args, prefer_execute_center=True):
+            del prefer_execute_center
+            FakeWorkflowHelpersForGeometry.prepared_args = args
+            return SimpleNamespace(
+                xc=-600.0,
+                yc=-300.0,
+                dx=2.0,
+                dy=2.0,
+                nx=150,
+                ny=150,
+                fov_x=300.0,
+                fov_y=300.0,
+                center_source="saved_fov",
+                observer_geometry=SimpleNamespace(observer_name="earth", observer_source="model_metadata"),
+            )
+
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKForGeometry)
+    monkeypatch.setattr(gxrender_adapter, "_load_common_workflow_helpers", lambda: FakeWorkflowHelpersForGeometry)
+
+    resolved = gxrender_adapter.resolve_render_geometry_via_gxrender(
+        model_path="model.h5",
+        observer_name="earth",
+        use_saved_fov=True,
+    )
+
+    assert FakeWorkflowHelpersForGeometry.prepared_args is not None
+    assert FakeWorkflowHelpersForGeometry.prepared_args.use_saved_fov is True
+    assert FakeWorkflowHelpersForGeometry.prepared_args.observer is None
+    assert resolved.center_source == "saved_fov"
+    assert resolved.geometry.nx == 150
+    assert resolved.geometry.ny == 150
+
+
 def test_gxrender_adapter_uses_sdk_path_when_output_dir_requested(monkeypatch) -> None:
     """Use the SDK workflow path when persistent output is requested."""
     class FakeRenderMWWorkflow:
@@ -442,6 +511,9 @@ def test_gxrender_euv_adapter_leaves_supported_instrument_response_to_sdk(monkey
     assert FakeSDKWithEUVI.last_euv_options is not None
     assert FakeSDKWithEUVI.last_euv_options.kwargs["instrument"] == "EUVI"
     assert FakeSDKWithEUVI.last_euv_options.kwargs["response_sav"] is None
+    assert FakeSDKWithEUVI.last_euv_options.kwargs["response"] is None
+    assert FakeSDKWithEUVI.last_euv_options.kwargs["response_dt"] is None
+    assert FakeSDKWithEUVI.last_euv_options.kwargs["response_meta"] is None
 
 
 def test_gxrender_euv_adapter_reports_projection_flags_warning_once(monkeypatch) -> None:
@@ -611,6 +683,7 @@ def test_gxrender_euv_adapter_response_cache_is_thread_safe(monkeypatch) -> None
         model_path="model.h5",
         channel="171",
         instrument="AIA",
+        response_sav=Path("response.sav"),
         ebtel_path="ebtel.sav",
         tbase=1e6,
         nbase=1e8,
@@ -622,6 +695,86 @@ def test_gxrender_euv_adapter_response_cache_is_thread_safe(monkeypatch) -> None
         results = list(executor.map(adapter.render, [0.0217, 0.0218]))
 
     assert len(results) == 2
+    assert resolve_calls == 1
+
+
+def test_compute_euv_response_identity_ignores_provenance_only_meta_fields() -> None:
+    response, response_dt, response_meta = _make_gx_response_payload(scale=1.0)
+    alt_meta = SimpleNamespace(instrument="AIA", channels=["94", "171"], source="other-source", mode="other-mode")
+
+    identity = compute_euv_response_identity(
+        response=response,
+        response_dt=response_dt,
+        response_meta=response_meta,
+    )
+    alt_identity = compute_euv_response_identity(
+        response=response,
+        response_dt=response_dt,
+        response_meta=alt_meta,
+    )
+
+    assert identity.version == EUV_RESPONSE_IDENTITY_VERSION
+    assert identity.sha256 == alt_identity.sha256
+    assert identity.summary["source"] == "unit-test"
+    assert alt_identity.summary["source"] == "other-source"
+
+
+def test_compute_euv_response_identity_changes_when_resolved_payload_changes() -> None:
+    response, response_dt, response_meta = _make_gx_response_payload(scale=1.0)
+    scaled_response, scaled_response_dt, scaled_response_meta = _make_gx_response_payload(scale=2.0)
+
+    identity = compute_euv_response_identity(
+        response=response,
+        response_dt=response_dt,
+        response_meta=response_meta,
+    )
+    scaled_identity = compute_euv_response_identity(
+        response=scaled_response,
+        response_dt=scaled_response_dt,
+        response_meta=scaled_response_meta,
+    )
+
+    assert identity.sha256 != scaled_identity.sha256
+
+
+def test_gxrender_euv_adapter_response_identity_uses_cached_resolution(monkeypatch) -> None:
+    response, response_dt, response_meta = _make_gx_response_payload(scale=1.0)
+    resolve_calls = 0
+
+    def fake_resolve(self):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return gxrender_adapter._CachedEUVResponse(
+            response=response,
+            response_dt=response_dt,
+            response_meta=response_meta,
+            response_identity=compute_euv_response_identity(
+                response=response,
+                response_dt=response_dt,
+                response_meta=response_meta,
+            ),
+        )
+
+    monkeypatch.setattr(GXRenderEUVAdapter, "_resolve_euv_response_cache", fake_resolve)
+
+    adapter = GXRenderEUVAdapter(
+        model_path="model.h5",
+        channel="171",
+        instrument="AIA",
+        response_sav=Path("response.sav"),
+        ebtel_path="ebtel.sav",
+        tbase=1e6,
+        nbase=1e8,
+        a=0.3,
+        b=2.7,
+    )
+
+    identity_a = adapter.response_identity()
+    identity_b = adapter.response_identity()
+
+    assert identity_a is not None
+    assert identity_b is identity_a
+    assert identity_a.summary["channels"] == ["94", "171"]
     assert resolve_calls == 1
 
 

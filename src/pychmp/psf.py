@@ -19,8 +19,6 @@ _RESPONSE_SAMPLING_FWHM_FACTORS: dict[str, float] = {
     "aia": 2.5,
     "sdoaia": 2.5,
 }
-
-
 @dataclass(frozen=True)
 class PSFMetadata:
     source: str

@@ -28,7 +28,7 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity
+from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, obs_map_noise_unit_label, resolve_euv_response_identity, validate_obs_map_identity
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     SPARSE_ARTIFACT_KIND,
@@ -1863,8 +1863,10 @@ def main() -> int:
             geometry_overrides_requested=False,
             explicit_observer_requested=explicit_observer_requested,
         )
-        geometry_observer_name = str(args.observer or geometry_policy.observer_name)
-        geometry_observer = observer_overrides if explicit_observer_requested else None
+        geometry_observer_name = (
+            None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+        )
+        geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
         resolved_geometry = resolve_render_geometry_via_gxrender(
             model_path=args.model_h5,
             model_format="auto",
@@ -1873,6 +1875,7 @@ def main() -> int:
             observer_name=geometry_observer_name,
             observer=geometry_observer,
             omp_threads=int(getattr(args, "omp_threads", 8)),
+            use_saved_fov=bool(geometry_policy.use_model_saved_fov),
         )
         geometry = resolved_geometry.geometry
         geometry_mode = f"gxrender:{resolved_geometry.center_source}"
@@ -2174,6 +2177,32 @@ def main() -> int:
         else None
     )
     ebtel_sha256 = _compute_file_sha256(args.ebtel_path)
+    euv_response_identity = None
+    resolved_euv_channel = None
+    if str(obs_map.domain).lower() in {"euv", "uv"} and obs_map.wavelength_angstrom is not None:
+        wavelength_value = float(obs_map.wavelength_angstrom)
+        rounded_wavelength = round(wavelength_value)
+        resolved_euv_channel = (
+            str(int(rounded_wavelength))
+            if np.isclose(wavelength_value, float(rounded_wavelength), rtol=0.0, atol=1e-9)
+            else f"{wavelength_value:g}"
+        )
+        euv_response_identity = resolve_euv_response_identity(
+            model_path=str(args.model_h5),
+            channel=str(resolved_euv_channel),
+            instrument=str(obs_map.instrument),
+            response_sav=args.euv_response_sav,
+            ebtel_path=str(args.ebtel_path),
+            tbase=float(args.tbase),
+            nbase=float(args.nbase),
+            a=float(a_values[0]),
+            b=float(b_values[0]),
+            geometry=geometry,
+            observer=observer_overrides,
+            observer_name=effective_observer_name,
+            tr_region_mask=euv_tr_mask,
+            pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+        )
     root_diag = {
         "artifact_kind": UNIFIED_ARTIFACT_KIND,
         "spectral_domain": str(obs_map.domain),
@@ -2194,8 +2223,18 @@ def main() -> int:
         "target_metric": str(args.target_metric),
         "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
         "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        "euv_channel": resolved_euv_channel,
         "euv_instrument": obs_map.instrument,
         "euv_response_sav": None if args.euv_response_sav is None else str(args.euv_response_sav),
+        "euv_response_identity_version": None if euv_response_identity is None else str(euv_response_identity.version),
+        "euv_response_sha256": None if euv_response_identity is None else str(euv_response_identity.sha256),
+        "euv_response_source": (
+            None if euv_response_identity is None else euv_response_identity.summary.get("source")
+        ),
+        "euv_response_mode": None if euv_response_identity is None else euv_response_identity.summary.get("mode"),
+        "euv_response_identity_summary": (
+            None if euv_response_identity is None else dict(euv_response_identity.summary)
+        ),
         "tr_mask_bmin_gauss": abs(float(args.tr_mask_bmin_gauss)) if str(obs_map.domain).lower() in {"euv", "uv"} else None,
         "tr_mask_source": ("abs_blos_ge_bmin" if str(obs_map.domain).lower() in {"euv", "uv"} else None),
         "metrics_mask_threshold": float(args.metrics_mask_threshold),
@@ -2241,6 +2280,11 @@ def main() -> int:
             "spectral_label": root_diag["spectral_label"],
             "ebtel_sha256": root_diag["ebtel_sha256"],
             "frequency_ghz": root_diag["frequency_ghz"],
+            "wavelength_angstrom": root_diag["wavelength_angstrom"],
+            "euv_channel": root_diag["euv_channel"],
+            "euv_instrument": root_diag["euv_instrument"],
+            "euv_response_identity_version": root_diag["euv_response_identity_version"],
+            "euv_response_sha256": root_diag["euv_response_sha256"],
             "map_xc_arcsec": root_diag["map_xc_arcsec"],
             "map_yc_arcsec": root_diag["map_yc_arcsec"],
             "map_dx_arcsec": root_diag["map_dx_arcsec"],

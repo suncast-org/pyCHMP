@@ -7,14 +7,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import textwrap
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 from types import SimpleNamespace
-from typing import Any
-
 import numpy as np
 from astropy.io import fits
 from matplotlib.collections import PatchCollection
@@ -23,6 +22,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from scipy.signal import fftconvolve
 
 from .ab_scan_artifacts import (
     METRICS,
@@ -30,6 +30,9 @@ from .ab_scan_artifacts import (
     build_patch_grid_model,
     default_point_index,
     find_record_for_point,
+    load_active_point_snapshot,
+    load_live_trial_point,
+    load_selected_trial_plot_payload,
     load_scan_file,
     resolve_point_index,
     with_observer_metadata,
@@ -133,6 +136,14 @@ def _center_kernel_to_shape(kernel: np.ndarray, shape: tuple[int, int]) -> tuple
     displayed_sum = float(np.nansum(out))
     fraction = displayed_sum / source_sum if np.isfinite(source_sum) and source_sum > 0.0 else 0.0
     return out, float(np.clip(fraction, 0.0, 1.0))
+
+
+def _convolve_raw_map(raw_map: np.ndarray, psf_kernel: np.ndarray | None) -> np.ndarray:
+    raw = np.asarray(raw_map, dtype=float)
+    kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
+    if kernel is None or kernel.ndim != 2 or kernel.size == 0:
+        return raw.copy()
+    return np.asarray(fftconvolve(raw, kernel, mode="same"), dtype=float)
 
 
 def _make_reset_icon_image(master: tk.Misc, *, size: int = 14, color: str = "#4a4a4a") -> tk.PhotoImage:
@@ -753,6 +764,7 @@ class PychmpViewApp:
     _LOAD_RETRY_ATTEMPTS = 8
     _LOAD_RETRY_DELAY_S = 0.35
     _EXTERNAL_REFRESH_POLL_MS = 1200
+    _MIN_HEARTBEAT_RELOAD_INTERVAL_S = 2.0
     _MAX_LOG_LINES = 3000
     _INITIAL_LOG_READ_BYTES = 262_144
     _HEATMAP_FOOTER_HEIGHT = 82
@@ -769,7 +781,13 @@ class PychmpViewApp:
 
     def __init__(self, root: tk.Tk, artifact_h5: Path | None, *, initial_metric: str | None = None) -> None:
         self.root = root
-        self.artifact_h5 = artifact_h5
+        if artifact_h5 is None:
+            self.artifact_h5 = None
+        else:
+            try:
+                self.artifact_h5 = artifact_h5.expanduser().resolve()
+            except Exception:
+                self.artifact_h5 = Path(artifact_h5).expanduser()
         self.payload = {}
         self.a_values = np.asarray([], dtype=float)
         self.b_values = np.asarray([], dtype=float)
@@ -802,6 +820,8 @@ class PychmpViewApp:
         self.status_var = tk.StringVar(value="")
         self.summary_var = tk.StringVar(value="")
         self.slice_display_state: dict[str, dict[str, Any]] = {}
+        self.available_slices: list[dict[str, Any]] = []
+        self.available_searches: list[dict[str, Any]] = []
         self.last_artifact_dir = _load_last_directory()
         self.refresh_signal_path: Path | None = None
         self._refresh_signal_mtime_ns = -1
@@ -811,11 +831,24 @@ class PychmpViewApp:
         self._refresh_signal_active_point: tuple[float, float] | None = None
         self._refresh_signal_live_trials: dict[str, Any] | None = None
         self._external_refresh_after_id: str | None = None
+        self._last_payload_reload_at_s = 0.0
+        self._payload_cache_artifact_path = ""
+        self._payload_cache_artifact_mtime_ns = -1
+        self._payload_cache_by_selection: dict[tuple[str, str], dict[str, Any]] = {}
+        self._scheduled_reload_after_id: str | None = None
+        self._initial_reload_after_id: str | None = None
+        self._initial_reload_in_progress = False
+        self._initial_reload_token = 0
         self._present_window_after_id: str | None = None
+        self._selected_solution_update_after_id: str | None = None
         self._psf_metadata_cache: dict[str, PSFMetadata | None] = {}
         self._psf_kernel_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self._live_trial_render_cache_key: tuple[Any, ...] | None = None
         self._live_trial_render_cache_value: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        self._live_snapshot_cache_key: tuple[Any, ...] | None = None
+        self._live_snapshot_cache_value: dict[str, Any] | None = None
+        self._selected_trial_map_cache_key: tuple[Any, ...] | None = None
+        self._selected_trial_map_cache_value: dict[str, Any] | None = None
         self.refresh_button: ttk.Button | None = None
         self.active_point_button: ttk.Button | None = None
         self.scan_state_badge: tk.Label | None = None
@@ -1107,13 +1140,106 @@ class PychmpViewApp:
         self.root.bind("<Configure>", self._on_resize)
 
         if self.artifact_h5 is not None:
-            self._reload_payload()
+            self.status_var.set("Loading artifact; controls will populate shortly...")
+            self.summary_var.set("Loading artifact...")
+            self._refresh_all()
+            # Let the window realize first so startup remains responsive.
+            self._initial_reload_after_id = self.root.after(150, self._run_initial_payload_reload)
         else:
             self.status_var.set("No artifact loaded. Use Open Artifact to choose a consolidated scan H5 file.")
             self.summary_var.set("No artifact loaded.")
             self._refresh_all()
         self._refresh_selector_values()
         self._apply_fixed_body_geometry()
+
+    def _run_initial_payload_reload(self) -> None:
+        self._initial_reload_after_id = None
+        if self._is_closing or self.artifact_h5 is None:
+            return
+        if self._initial_reload_in_progress:
+            return
+        self._initial_reload_in_progress = True
+        self._initial_reload_token += 1
+        token = int(self._initial_reload_token)
+        requested_slice_key = self._selected_slice_key()
+        requested_search_id = self._selected_search_id()
+        try:
+            artifact_path = Path(self.artifact_h5).expanduser().resolve()
+        except Exception:
+            artifact_path = Path(self.artifact_h5)
+        self.status_var.set("Loading artifact data in background...")
+        self.summary_var.set("Loading artifact...")
+        self._refresh_all()
+
+        def _worker() -> None:
+            payload: dict[str, Any] | None = None
+            error: Exception | None = None
+            try:
+                last_exc: Exception | None = None
+                for attempt in range(1, self._LOAD_RETRY_ATTEMPTS + 1):
+                    try:
+                        payload = load_scan_file(
+                            artifact_path,
+                            slice_key=requested_slice_key,
+                            search_id=requested_search_id,
+                            include_maps=False,
+                        )
+                        break
+                    except (BlockingIOError, PermissionError, OSError) as exc:
+                        last_exc = exc
+                        if attempt >= self._LOAD_RETRY_ATTEMPTS:
+                            break
+                        time.sleep(self._LOAD_RETRY_DELAY_S)
+                if payload is None and last_exc is not None:
+                    raise last_exc
+                if payload is None:
+                    raise RuntimeError("unknown artifact loading failure")
+            except Exception as exc:
+                error = exc
+
+            def _apply_result() -> None:
+                if self._is_closing or int(self._initial_reload_token) != token:
+                    return
+                self._initial_reload_in_progress = False
+                if error is not None:
+                    if isinstance(error, FileNotFoundError):
+                        self.status_var.set(
+                            "Artifact file could not be found at the requested path.\n"
+                            f"Path: {artifact_path}\n"
+                            f"Details: {error}"
+                        )
+                        self.summary_var.set("Artifact path is missing or inaccessible. Use Open Artifact to reselect it.")
+                        self._refresh_action_states()
+                        self._refresh_all()
+                        return
+                    self.status_var.set(
+                        "Artifact is currently being written or is temporarily locked. "
+                        "Please retry in a moment.\n"
+                        f"Details: {error}"
+                    )
+                    self.summary_var.set("Could not refresh artifact right now. Existing view remains unchanged.")
+                    self._refresh_action_states()
+                    self._refresh_all()
+                    return
+                assert payload is not None
+                selected_cache_key = (
+                    str(payload.get("selected_slice_key", "") or ""),
+                    str(payload.get("selected_search_id", "") or ""),
+                )
+                requested_cache_key = (
+                    str(requested_slice_key or ""),
+                    str(requested_search_id or ""),
+                )
+                self._payload_cache_by_selection[requested_cache_key] = payload
+                self._payload_cache_by_selection[selected_cache_key] = payload
+                self._apply_payload(payload)
+
+            try:
+                self.root.after(0, _apply_result)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="pychmp-view-initial-load", daemon=True).start()
 
     def _present_window(self) -> None:
         self._present_window_after_id = None
@@ -1129,9 +1255,33 @@ class PychmpViewApp:
         except Exception:
             pass
 
+    def _schedule_selected_solution_update(self) -> None:
+        if self.selected_solution_window is None or self._is_closing:
+            return
+        if self._selected_solution_update_after_id is not None:
+            try:
+                self.root.after_cancel(self._selected_solution_update_after_id)
+            except Exception:
+                pass
+            self._selected_solution_update_after_id = None
+
+        def _run() -> None:
+            self._selected_solution_update_after_id = None
+            if self.selected_solution_window is None or self._is_closing:
+                return
+            self.selected_solution_window.update_selection()
+
+        self._selected_solution_update_after_id = self.root.after_idle(_run)
+
     def _close_root_window(self) -> None:
         self._is_closing = True
-        for after_id in (self._external_refresh_after_id, self._present_window_after_id):
+        for after_id in (
+            self._external_refresh_after_id,
+            self._scheduled_reload_after_id,
+            self._initial_reload_after_id,
+            self._present_window_after_id,
+            self._selected_solution_update_after_id,
+        ):
             if after_id is None:
                 continue
             try:
@@ -1139,7 +1289,11 @@ class PychmpViewApp:
             except Exception:
                 pass
         self._external_refresh_after_id = None
+        self._scheduled_reload_after_id = None
+        self._initial_reload_after_id = None
+        self._initial_reload_in_progress = False
         self._present_window_after_id = None
+        self._selected_solution_update_after_id = None
         if self.selected_solution_window is not None:
             try:
                 self.selected_solution_window.window.destroy()
@@ -1289,7 +1443,13 @@ class PychmpViewApp:
     def _refresh_action_states(self) -> None:
         has_artifact = self.artifact_h5 is not None
         has_selected_point = has_artifact and self._has_selected_point()
-        has_active_point = has_artifact and self._active_point_indices() is not None
+        has_live_point = has_artifact and self._refresh_signal_active_point is not None
+        live_search_id = str((self._refresh_signal_live_trials or {}).get("search_id", "") or "").strip()
+        selected_search_id = str(self.payload.get("selected_search_id", "") or "").strip()
+        has_active_point = has_live_point and (
+            self._active_point_indices() is not None
+            or (bool(live_search_id) and live_search_id != selected_search_id)
+        )
         if self.open_artifact_button is not None:
             self.open_artifact_button.state(["!disabled"])
         if self.display_selected_button is not None:
@@ -1302,6 +1462,8 @@ class PychmpViewApp:
             self.active_point_button.state(["!disabled"] if has_active_point else ["disabled"])
 
     def _scan_state_snapshot(self) -> tuple[str, str, str, str, str]:
+        if self.artifact_h5 is not None and bool(getattr(self, "_initial_reload_in_progress", False)) and not self.payload:
+            return "LOADING", "Opening artifact", "Artifact load in progress", "#1d6fd6", "white"
         if self.artifact_h5 is None or not self.payload:
             return "NO ARTIFACT", "No artifact", "No artifact loaded", "#6c757d", "white"
 
@@ -1344,6 +1506,22 @@ class PychmpViewApp:
         search_mode = str(diagnostics.get("search_mode", "")).strip().lower()
         adaptive_point_run = search_mode in {"adaptive_local_single_observation", "adaptive_local_single_frequency"}
         if total == 0:
+            refresh_active = False
+            if self.refresh_signal_path is not None and self.refresh_signal_path.exists():
+                try:
+                    refresh_age_s = max(0.0, time.time() - float(self.refresh_signal_path.stat().st_mtime))
+                    refresh_active = refresh_age_s <= float(self._ACTIVE_REFRESH_GRACE_S)
+                except Exception:
+                    refresh_active = False
+            heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
+            heartbeat_matches_selected = not (heartbeat_slice_key and selected_slice_key and heartbeat_slice_key != selected_slice_key)
+            heartbeat_live = bool(getattr(self, "_refresh_signal_live_trials", None)) and heartbeat_matches_selected
+            heartbeat_pending = bool(getattr(self, "_refresh_signal_pending_points", None)) and heartbeat_matches_selected
+            heartbeat_active_point = bool(getattr(self, "_refresh_signal_active_point", None)) and heartbeat_matches_selected
+            heartbeat_running = heartbeat_live or heartbeat_pending or heartbeat_active_point
+
+            badge = "RUNNING" if (heartbeat_running or (adaptive_point_run and refresh_active and heartbeat_matches_selected)) else "EMPTY"
+            color = "#0b7285" if badge == "RUNNING" else "#6c757d"
             toolbar_detail = f"{toolbar_prefix} | 0/{total} computed"
             info_lines_empty = [f"Current slice: {slice_label}"]
             if selected_slice_key:
@@ -1353,8 +1531,11 @@ class PychmpViewApp:
             if selected_search_id:
                 info_lines_empty.append(f"Selected search ID: {selected_search_id}")
             info_lines_empty.extend([f"Grid points: {total}", "Computed: 0", f"Artifact slices: {slice_count}"])
+            phase_display = str(self._refresh_signal_phase or "").strip()
+            if phase_display:
+                info_lines_empty.append(f"Last phase: {phase_display}")
             info_detail = "\n".join(info_lines_empty)
-            return "EMPTY", toolbar_detail, info_detail, "#6c757d", "white"
+            return badge, toolbar_detail, info_detail, color, "white"
 
         statuses = [str(point.get("status", "computed")).strip().lower() for point in points.values()]
         pending = int(sum(status == "pending" for status in statuses))
@@ -1372,27 +1553,40 @@ class PychmpViewApp:
                 refresh_active = False
 
         phase = str(self._refresh_signal_phase or "").strip().lower()
-        phase_running = bool(phase) and phase not in {"scan complete", "complete"}
         phase_complete = phase in {"scan complete", "complete"}
+        phase_aborted = phase in {
+            "scan interrupted",
+            "interrupted",
+            "scan aborted",
+            "aborted",
+            "scan failed",
+            "failed",
+        }
         heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
         heartbeat_matches_selected = not (heartbeat_slice_key and selected_slice_key and heartbeat_slice_key != selected_slice_key)
+        live_state = dict(getattr(self, "_refresh_signal_live_trials", None) or {})
+        heartbeat_search_id = str(live_state.get("search_id", "") or "").strip()
+        heartbeat_matches_selected_search = not (
+            heartbeat_search_id and selected_search_id and heartbeat_search_id != selected_search_id
+        )
         scoped_refresh_active = refresh_active and heartbeat_matches_selected
-        scoped_phase_running = phase_running and heartbeat_matches_selected
         scoped_phase_complete = phase_complete and heartbeat_matches_selected
+        scoped_live_state_active = bool(live_state) and heartbeat_matches_selected and heartbeat_matches_selected_search
+        scoped_pending_points = bool(getattr(self, "_refresh_signal_pending_points", None)) and heartbeat_matches_selected
+        scoped_active_point = bool(getattr(self, "_refresh_signal_active_point", None)) and heartbeat_matches_selected
+        scoped_heartbeat_running = scoped_live_state_active or scoped_pending_points or scoped_active_point
+        search_completed = (search_status == "complete") or bool(completed_at)
 
         if scoped_phase_complete:
             badge = "FINISHED"
             color = "#2b8a3e"
-        elif adaptive_point_run and scoped_refresh_active:
+        elif search_completed:
+            badge = "FINISHED"
+            color = "#2b8a3e"
+        elif scoped_heartbeat_running:
             badge = "RUNNING"
             color = "#0b7285"
-        elif (scoped_refresh_active or scoped_phase_running) and noncomputed > 0:
-            badge = "RUNNING"
-            color = "#0b7285"
-        elif adaptive_point_run and scoped_phase_running:
-            badge = "INCOMPLETE"
-            color = "#b26a00"
-        elif noncomputed > 0:
+        elif not search_completed:
             badge = "INCOMPLETE"
             color = "#b26a00"
         else:
@@ -1459,7 +1653,7 @@ class PychmpViewApp:
         if heartbeat_slice_key:
             info_lines.append(f"Heartbeat slice key: {heartbeat_slice_key}")
         pending_points = list(getattr(self, "_refresh_signal_pending_points", []) or [])
-        if pending_points and heartbeat_matches_selected:
+        if pending_points and heartbeat_matches_selected and heartbeat_matches_selected_search:
             active_points = ", ".join(
                 f"(a={a_value:.3f}, b={b_value:.3f})"
                 for a_value, b_value in pending_points[:4]
@@ -1468,7 +1662,7 @@ class PychmpViewApp:
                 active_points += f", ... (+{len(pending_points) - 4} more)"
             info_lines.append(f"Active point(s): {active_points}")
         elif pending_points:
-            info_lines.append("Active point(s): running on a different slice")
+            info_lines.append("Active point(s): running on a different slice/search")
         active_point = getattr(self, "_refresh_signal_active_point", None)
         if active_point is not None:
             try:
@@ -1477,10 +1671,22 @@ class PychmpViewApp:
             except Exception:
                 pass
             else:
-                if np.isfinite(active_a) and np.isfinite(active_b) and heartbeat_matches_selected:
+                if (
+                    np.isfinite(active_a)
+                    and np.isfinite(active_b)
+                    and heartbeat_matches_selected
+                    and heartbeat_matches_selected_search
+                ):
                     info_lines.append(f"Heartbeat active point: (a={active_a:.3f}, b={active_b:.3f})")
                 elif np.isfinite(active_a) and np.isfinite(active_b):
-                    info_lines.append("Heartbeat active point: running on a different slice")
+                    info_lines.append("Heartbeat active point: running on a different slice/search")
+        live_trials = live_state
+        active_trial_q0 = live_trials.get("active_trial_q0")
+        if active_trial_q0 is not None and heartbeat_matches_selected and heartbeat_matches_selected_search:
+            try:
+                info_lines.append(f"Live trial q0: {float(active_trial_q0):.6e}")
+            except Exception:
+                pass
         return badge, toolbar_detail, "\n".join(info_lines), color, "white"
 
     def _read_refresh_signal_payload(self) -> dict[str, Any]:
@@ -1520,47 +1726,34 @@ class PychmpViewApp:
                 live_trials = None
                 live_payload = payload.get("live_trials")
                 if isinstance(live_payload, dict):
-                    q0_values: list[float] = []
-                    for value in list(live_payload.get("q0_trials", []) or []):
-                        try:
-                            numeric = float(value)
-                        except Exception:
-                            continue
-                        if np.isfinite(numeric):
-                            q0_values.append(numeric)
-                    metric_values: list[float] = []
-                    for value in list(live_payload.get("metric_trials", []) or []):
-                        try:
-                            numeric = float(value)
-                        except Exception:
-                            continue
-                        if np.isfinite(numeric):
-                            metric_values.append(numeric)
-                    if len(q0_values) == len(metric_values):
-                        default_a = active_coords[0] if active_coords is not None else np.nan
-                        default_b = active_coords[1] if active_coords is not None else np.nan
-                        active_trial_index = live_payload.get("active_trial_index")
-                        try:
-                            parsed_active_trial_index = None if active_trial_index is None else int(active_trial_index)
-                        except Exception:
-                            parsed_active_trial_index = None
-                        active_trial_q0 = live_payload.get("active_trial_q0")
-                        try:
-                            parsed_active_trial_q0 = None if active_trial_q0 is None else float(active_trial_q0)
-                        except Exception:
-                            parsed_active_trial_q0 = None
-                        if parsed_active_trial_q0 is not None and not np.isfinite(parsed_active_trial_q0):
-                            parsed_active_trial_q0 = None
-                        live_trials = {
-                            "a": float(live_payload.get("a", default_a)),
-                            "b": float(live_payload.get("b", default_b)),
-                            "metric_name": str(live_payload.get("metric_name", self.run_target_metric or "chi2")),
-                            "slice_key": payload_slice_key,
-                            "q0_trials": q0_values,
-                            "metric_trials": metric_values,
-                            "active_trial_index": parsed_active_trial_index,
-                            "active_trial_q0": parsed_active_trial_q0,
-                        }
+                    default_a = active_coords[0] if active_coords is not None else np.nan
+                    default_b = active_coords[1] if active_coords is not None else np.nan
+                    active_trial_index = live_payload.get("active_trial_index")
+                    try:
+                        parsed_active_trial_index = None if active_trial_index is None else int(active_trial_index)
+                    except Exception:
+                        parsed_active_trial_index = None
+                    active_trial_q0 = live_payload.get("active_trial_q0")
+                    try:
+                        parsed_active_trial_q0 = None if active_trial_q0 is None else float(active_trial_q0)
+                    except Exception:
+                        parsed_active_trial_q0 = None
+                    if parsed_active_trial_q0 is not None and not np.isfinite(parsed_active_trial_q0):
+                        parsed_active_trial_q0 = None
+                    trial_count = live_payload.get("trial_count")
+                    try:
+                        parsed_trial_count = None if trial_count is None else int(trial_count)
+                    except Exception:
+                        parsed_trial_count = None
+                    live_trials = {
+                        "a": float(live_payload.get("a", default_a)),
+                        "b": float(live_payload.get("b", default_b)),
+                        "metric_name": str(live_payload.get("metric_name", self.run_target_metric or "chi2")),
+                        "slice_key": payload_slice_key,
+                        "trial_count": parsed_trial_count,
+                        "active_trial_index": parsed_active_trial_index,
+                        "active_trial_q0": parsed_active_trial_q0,
+                    }
                 return {
                     "phase": phase,
                     "slice_key": payload_slice_key,
@@ -1600,7 +1793,34 @@ class PychmpViewApp:
     def _active_point_indices(self) -> tuple[int, int] | None:
         if self._refresh_signal_active_point is None:
             return None
-        return self._point_indices_for_coordinates(*self._refresh_signal_active_point)
+        if not self.payload:
+            return None
+        active_a, active_b = self._refresh_signal_active_point
+        exact = self._point_indices_for_coordinates(active_a, active_b)
+        if exact is not None:
+            # For Active navigation, prefer the exact live grid cell when it is
+            # representable on the current grid, even if that cell has not been
+            # persisted yet.
+            return exact
+        # Translate live (a, b) to the nearest grid index, then resolve to
+        # the nearest actual *computed* point (handles both the case where the
+        # live point is outside the current grid and the case where it sits on
+        # an uncomputed placeholder position).
+        a_values = self.a_values
+        b_values = self.b_values
+        if a_values.size == 0 or b_values.size == 0:
+            return None
+        nearest_a_idx = int(np.argmin(np.abs(a_values - float(active_a))))
+        nearest_b_idx = int(np.argmin(np.abs(b_values - float(active_b))))
+        try:
+            return resolve_point_index(
+                self.payload,
+                metric=str(self.metric_var.get()),
+                a_index=nearest_a_idx,
+                b_index=nearest_b_idx,
+            )
+        except Exception:
+            return None
 
     def _live_trial_state(self) -> dict[str, Any] | None:
         live_trials = dict(getattr(self, "_refresh_signal_live_trials", None) or {})
@@ -1622,13 +1842,90 @@ class PychmpViewApp:
             live_trials["b_index"] = int(resolved[1])
         return live_trials
 
+    def _sync_live_trial_state_from_artifact(self) -> None:
+        self._refresh_signal_slice_key = None
+        self._refresh_signal_pending_points = []
+        self._refresh_signal_active_point = None
+        self._refresh_signal_live_trials = None
+        artifact_h5 = getattr(self, "artifact_h5", None)
+        if artifact_h5 is None:
+            return
+        slice_key = str(self.payload.get("selected_slice_key", "") or "").strip() or None
+        search_id = str(self.payload.get("selected_search_id", "") or "").strip() or None
+        if slice_key is None:
+            return
+        try:
+            live_state = load_live_trial_point(Path(artifact_h5), slice_key=slice_key, search_id=search_id)
+        except Exception:
+            live_state = None
+        if not isinstance(live_state, dict):
+            newest_state: dict[str, Any] | None = None
+            newest_updated_utc = ""
+            for record in list(self.available_searches or []):
+                candidate_search_id = str(record.get("search_id", "") or "").strip()
+                if not candidate_search_id:
+                    continue
+                try:
+                    candidate_state = load_live_trial_point(
+                        Path(artifact_h5),
+                        slice_key=slice_key,
+                        search_id=candidate_search_id,
+                    )
+                except Exception:
+                    candidate_state = None
+                if not isinstance(candidate_state, dict):
+                    continue
+                updated_utc = str(candidate_state.get("updated_utc", "") or "")
+                if newest_state is None or updated_utc > newest_updated_utc:
+                    newest_state = candidate_state
+                    newest_updated_utc = updated_utc
+            live_state = newest_state
+        if not isinstance(live_state, dict):
+            return
+        self._refresh_signal_slice_key = str(live_state.get("slice_key", "") or slice_key).strip() or slice_key
+        try:
+            active_a = float(live_state.get("a", np.nan))
+            active_b = float(live_state.get("b", np.nan))
+        except Exception:
+            active_a = np.nan
+            active_b = np.nan
+        if np.isfinite(active_a) and np.isfinite(active_b):
+            self._refresh_signal_active_point = (float(active_a), float(active_b))
+        fit_q0_trials = np.asarray(live_state.get("fit_q0_trials", ()), dtype=float)
+        fit_metric_trials = np.asarray(live_state.get("fit_metric_trials", ()), dtype=float)
+        active_trial_q0 = live_state.get("q0")
+        active_trial_index = live_state.get("trial_index")
+        if self._refresh_signal_active_point is not None and active_trial_q0 is not None:
+            self._refresh_signal_pending_points = [self._refresh_signal_active_point]
+        self._refresh_signal_live_trials = {
+            "a": None if self._refresh_signal_active_point is None else float(self._refresh_signal_active_point[0]),
+            "b": None if self._refresh_signal_active_point is None else float(self._refresh_signal_active_point[1]),
+            "metric_name": str(live_state.get("metric_name", self.run_target_metric or "chi2")),
+            "slice_key": self._refresh_signal_slice_key,
+            "search_id": str(live_state.get("search_id", "") or "").strip() or None,
+            "active_trial_index": None if active_trial_index is None else int(active_trial_index),
+            "active_trial_q0": None if active_trial_q0 is None else float(active_trial_q0),
+            "fit_q0_trials": fit_q0_trials,
+            "fit_metric_trials": fit_metric_trials,
+        }
+
     def _should_use_live_trials(self, live_state: dict[str, Any] | None) -> bool:
         if live_state is None:
             return False
         if not self._live_slice_matches_selected(live_state):
             return False
+        if not self._live_search_matches_selected(live_state):
+            return False
         if not self._has_selected_point():
-            return True
+            if "a_index" not in live_state or "b_index" not in live_state:
+                return False
+            return (
+                int(self.a_index_var.get()),
+                int(self.b_index_var.get()),
+            ) == (
+                int(live_state["a_index"]),
+                int(live_state["b_index"]),
+            )
         if "a_index" not in live_state or "b_index" not in live_state:
             # Active point is not yet stored in the artifact grid; do not hijack
             # an explicit user selection.
@@ -1648,10 +1945,19 @@ class PychmpViewApp:
         selected_slice_key = str(self._selected_slice_key() or "").strip()
         return not (live_slice_key and selected_slice_key and live_slice_key != selected_slice_key)
 
+    def _live_search_matches_selected(self, live_state: dict[str, Any] | None) -> bool:
+        if live_state is None:
+            return False
+        live_search_id = str(live_state.get("search_id", "")).strip()
+        selected_search_id = str(self._selected_search_id() or "").strip()
+        return not (live_search_id and selected_search_id and live_search_id != selected_search_id)
+
     def _should_force_live_trials(self, live_state: dict[str, Any] | None) -> bool:
         if live_state is None:
             return False
         if not self._live_slice_matches_selected(live_state):
+            return False
+        if not self._live_search_matches_selected(live_state):
             return False
         # When the active point is not yet saved into the sparse artifact grid,
         # showing the fallback stored point is misleading. Follow the live point.
@@ -2002,12 +2308,23 @@ class PychmpViewApp:
     def _resolved_point_index(self, *, metric_name: str | None = None) -> tuple[int, int] | None:
         if not self.payload:
             return None
+        a_index = int(self.a_index_var.get())
+        b_index = int(self.b_index_var.get())
+        points = dict(self.payload.get("points", {}))
+        key = (a_index, b_index)
+        if key in points:
+            status = str(points[key].get("status", "computed")).strip().lower()
+            if status not in {"missing", "pending"}:
+                return key
+            # Preserve explicit selection on unsaved cells instead of silently
+            # remapping to a different computed point.
+            return None
         try:
             return resolve_point_index(
                 self.payload,
                 metric=metric_name or str(self.metric_var.get()),
-                a_index=int(self.a_index_var.get()),
-                b_index=int(self.b_index_var.get()),
+                a_index=a_index,
+                b_index=b_index,
             )
         except Exception:
             return None
@@ -2124,7 +2441,7 @@ class PychmpViewApp:
         self._restore_trials_controls_for_metric(saved_metric)
 
     def _refresh_slice_controls(self) -> None:
-        descriptors = list(self.available_slices)
+        descriptors = list(getattr(self, "available_slices", []) or [])
         labels = [self._slice_label(item) for item in descriptors]
         keys = [str(item.get("key", "")) for item in descriptors]
         labels = self._unique_menu_labels(labels, keys)
@@ -2158,7 +2475,7 @@ class PychmpViewApp:
         return f"{search_id}{suffix}"
 
     def _refresh_search_controls(self) -> None:
-        records = list(self.available_searches)
+        records = list(getattr(self, "available_searches", []) or [])
         labels = [self._search_label(record) for record in records]
         ids = [str(record.get("search_id", "")) for record in records]
         labels = self._unique_menu_labels(labels, ids)
@@ -2199,7 +2516,10 @@ class PychmpViewApp:
     def _reload_payload(self, artifact_path: Path | None = None) -> None:
         self._capture_current_slice_view_state(self._last_rendered_metric)
         if artifact_path is not None:
-            self.artifact_h5 = artifact_path
+            try:
+                self.artifact_h5 = artifact_path.expanduser().resolve()
+            except Exception:
+                self.artifact_h5 = Path(artifact_path).expanduser()
         if self.artifact_h5 is None:
             self.status_var.set("No artifact loaded. Use Open Artifact to choose a consolidated scan H5 file.")
             self.summary_var.set("No artifact loaded.")
@@ -2219,6 +2539,13 @@ class PychmpViewApp:
             self._refresh_signal_pending_points = []
             self._refresh_signal_active_point = None
             self._refresh_signal_live_trials = None
+            self._payload_cache_artifact_path = ""
+            self._payload_cache_artifact_mtime_ns = -1
+            self._payload_cache_by_selection = {}
+            self._live_snapshot_cache_key = None
+            self._live_snapshot_cache_value = None
+            self._selected_trial_map_cache_key = None
+            self._selected_trial_map_cache_value = None
             self._refresh_action_states()
             self._refresh_all()
             return
@@ -2229,10 +2556,6 @@ class PychmpViewApp:
                 self._refresh_signal_mtime_ns = int(self.refresh_signal_path.stat().st_mtime_ns)
                 refresh_payload = self._read_refresh_signal_payload()
                 self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
-                self._refresh_signal_slice_key = str(refresh_payload.get("slice_key", "")).strip() or None
-                self._refresh_signal_pending_points = list(refresh_payload.get("pending_points", []))
-                self._refresh_signal_active_point = refresh_payload.get("active_point")
-                self._refresh_signal_live_trials = refresh_payload.get("live_trials")
             except Exception:
                 self._refresh_signal_mtime_ns = -1
                 self._refresh_signal_phase = ""
@@ -2245,12 +2568,33 @@ class PychmpViewApp:
         prev_b = int(self.b_index_var.get())
         requested_slice_key = self._selected_slice_key()
         requested_search_id = self._selected_search_id()
+        artifact_signature_path = str(self.artifact_h5.expanduser().resolve())
         try:
-            self.payload = self._load_scan_file_with_retries(
-                self.artifact_h5,
-                slice_key=requested_slice_key,
-                search_id=requested_search_id,
-            )
+            artifact_mtime_ns = int(self.artifact_h5.stat().st_mtime_ns)
+        except Exception:
+            artifact_mtime_ns = -1
+        if (
+            artifact_signature_path != self._payload_cache_artifact_path
+            or int(artifact_mtime_ns) != int(self._payload_cache_artifact_mtime_ns)
+        ):
+            self._payload_cache_artifact_path = artifact_signature_path
+            self._payload_cache_artifact_mtime_ns = int(artifact_mtime_ns)
+            self._payload_cache_by_selection = {}
+            self._live_snapshot_cache_key = None
+            self._live_snapshot_cache_value = None
+            self._selected_trial_map_cache_key = None
+            self._selected_trial_map_cache_value = None
+        cache_key = (str(requested_slice_key or ""), str(requested_search_id or ""))
+        cached_payload = self._payload_cache_by_selection.get(cache_key)
+        try:
+            if cached_payload is not None:
+                self.payload = cached_payload
+            else:
+                self.payload = self._load_scan_file_with_retries(
+                    self.artifact_h5,
+                    slice_key=requested_slice_key,
+                    search_id=requested_search_id,
+                )
         except Exception as exc:
             self.status_var.set(
                 "Artifact is currently being written or is temporarily locked. "
@@ -2259,7 +2603,18 @@ class PychmpViewApp:
             )
             self.summary_var.set("Could not refresh artifact right now. Existing view remains unchanged.")
             return
-        self.root.title(f"pychmp-view: {self.artifact_h5.name}")
+        selected_cache_key = (
+            str(self.payload.get("selected_slice_key", "") or ""),
+            str(self.payload.get("selected_search_id", "") or ""),
+        )
+        self._payload_cache_by_selection[cache_key] = self.payload
+        self._payload_cache_by_selection[selected_cache_key] = self.payload
+        self._apply_payload(self.payload)
+
+    def _apply_payload(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        if self.artifact_h5 is not None:
+            self.root.title(f"pychmp-view: {self.artifact_h5.name}")
         self.available_slices = list(self.payload.get("available_slices", []))
         self.available_searches = list(self.payload.get("search_records", []))
         self.slice_key_var.set(str(self.payload.get("selected_slice_key", "")))
@@ -2269,10 +2624,34 @@ class PychmpViewApp:
         self.display_model = build_patch_grid_model(self.payload)
         self.run_target_metric = str(self.payload.get("target_metric", "chi2"))
         self._restore_slice_view_state()
+        self._sync_live_trial_state_from_artifact()
         self._apply_active_point_selection()
         self._refresh_selector_values()
         self._refresh_action_states()
         self._refresh_all()
+        self._last_payload_reload_at_s = float(time.time())
+        self._live_snapshot_cache_key = None
+        self._live_snapshot_cache_value = None
+        self._selected_trial_map_cache_key = None
+        self._selected_trial_map_cache_value = None
+
+    def _schedule_payload_reload(self, *, status_text: str | None = None) -> None:
+        if self._scheduled_reload_after_id is not None:
+            try:
+                self.root.after_cancel(self._scheduled_reload_after_id)
+            except Exception:
+                pass
+            self._scheduled_reload_after_id = None
+        if status_text:
+            self.status_var.set(str(status_text))
+
+        def _run() -> None:
+            self._scheduled_reload_after_id = None
+            if self._is_closing:
+                return
+            self._reload_payload()
+
+        self._scheduled_reload_after_id = self.root.after_idle(_run)
 
     def _load_scan_file_with_retries(
         self,
@@ -2284,7 +2663,7 @@ class PychmpViewApp:
         last_exc: Exception | None = None
         for attempt in range(1, self._LOAD_RETRY_ATTEMPTS + 1):
             try:
-                return load_scan_file(artifact_h5, slice_key=slice_key, search_id=search_id)
+                return load_scan_file(artifact_h5, slice_key=slice_key, search_id=search_id, include_maps=False)
             except (BlockingIOError, PermissionError, OSError) as exc:
                 last_exc = exc
                 if attempt >= self._LOAD_RETRY_ATTEMPTS:
@@ -2303,6 +2682,8 @@ class PychmpViewApp:
         if self._is_closing:
             return
         try:
+            if bool(getattr(self, "_initial_reload_in_progress", False)):
+                return
             if self.refresh_signal_path is None:
                 return
             if self.refresh_signal_path.exists():
@@ -2311,10 +2692,6 @@ class PychmpViewApp:
                     self._refresh_signal_mtime_ns = mtime_ns
                     refresh_payload = self._read_refresh_signal_payload()
                     self._refresh_signal_phase = str(refresh_payload.get("phase", ""))
-                    self._refresh_signal_slice_key = str(refresh_payload.get("slice_key", "")).strip() or None
-                    self._refresh_signal_pending_points = list(refresh_payload.get("pending_points", []))
-                    self._refresh_signal_active_point = refresh_payload.get("active_point")
-                    self._refresh_signal_live_trials = refresh_payload.get("live_trials")
                     self._reload_payload()
         except Exception:
             pass
@@ -2324,6 +2701,27 @@ class PychmpViewApp:
                     self._external_refresh_after_id = self.root.after(self._EXTERNAL_REFRESH_POLL_MS, self._poll_external_refresh_signal)
                 except Exception:
                     self._external_refresh_after_id = None
+
+    def _heartbeat_requires_payload_reload(self, refresh_payload: dict[str, Any]) -> bool:
+        phase = str(refresh_payload.get("phase", "")).strip().lower()
+        if not phase:
+            return False
+        write_markers = (
+            "saved",
+            "promoted",
+            "initialized",
+            "resume",
+            "loaded",
+            "scan complete",
+            "scan failed",
+            "scan interrupted",
+        )
+        if not any(marker in phase for marker in write_markers):
+            return False
+        now = float(time.time())
+        if now - float(self._last_payload_reload_at_s) < float(self._MIN_HEARTBEAT_RELOAD_INTERVAL_S):
+            return False
+        return True
 
     def _selected_point(self) -> dict[str, Any]:
         resolved = self._resolved_point_index(metric_name=str(self.metric_var.get()))
@@ -2447,9 +2845,11 @@ class PychmpViewApp:
         return int(np.nanargmin(metric_trials))
 
     def _current_trial_token(self, point_metric: str, q0_trials: np.ndarray) -> tuple[int, int, str, int]:
+        a_index_var = getattr(self, "a_index_var", None)
+        b_index_var = getattr(self, "b_index_var", None)
         return (
-            int(self.a_index_var.get()),
-            int(self.b_index_var.get()),
+            int(a_index_var.get()) if a_index_var is not None else 0,
+            int(b_index_var.get()) if b_index_var is not None else 0,
             str(point_metric),
             int(q0_trials.size),
         )
@@ -2465,8 +2865,8 @@ class PychmpViewApp:
         except Exception:
             return False
         return bool(
-            np.isclose(token_a, context_a, rtol=0.0, atol=1e-12)
-            and np.isclose(token_b, context_b, rtol=0.0, atol=1e-12)
+            np.isclose(token_a, context_a, rtol=0.0, atol=1e-6)
+            and np.isclose(token_b, context_b, rtol=0.0, atol=1e-6)
             and str(token[2]) == str(point_metric)
         )
 
@@ -2488,16 +2888,22 @@ class PychmpViewApp:
         token = self._current_trial_token(point_metric, q0_trials)
         best_index = self._best_trial_index_from_metric(metric_trials)
         current_index = int(trial_index_var.get()) if trial_index_var is not None else -1
+        token_matches_context = self._trial_token_matches_context(
+            self._selected_trial_token,
+            a_token=token[0],
+            b_token=token[1],
+            point_metric=point_metric,
+        )
         if (
             force_best
-            or self._selected_trial_token != token
+            or not token_matches_context
             or current_index < 0
             or current_index >= q0_trials.size
         ):
             current_index = 0 if best_index is None else int(best_index)
             if trial_index_var is not None:
                 trial_index_var.set(current_index)
-            self._selected_trial_token = token
+        self._selected_trial_token = token
         return current_index
 
     def _refresh_trial_selector_controls(
@@ -2565,8 +2971,8 @@ class PychmpViewApp:
 
     def _jump_to_best_trial(self) -> None:
         live_state = self._live_trial_state()
-        force_live_trials = self._should_force_live_trials(live_state)
-        if self._has_selected_point() and not force_live_trials:
+        use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
+        if self._has_selected_point() and not use_live_trials:
             point = self._selected_point()
             q0_trials, metric_trials, point_metric = self._trial_series_for_point(point)
             best_index = self._best_trial_index_from_metric(metric_trials)
@@ -2577,16 +2983,14 @@ class PychmpViewApp:
             self._refresh_all()
             return
 
-        if not force_live_trials and not self._should_use_live_trials(live_state):
+        if not use_live_trials:
             return
-        q0_trials = np.asarray(live_state.get("q0_trials", ()), dtype=float)
-        metric_trials = np.asarray(live_state.get("metric_trials", ()), dtype=float)
+        q0_trials, metric_trials, point_metric, _snapshot = self._live_trial_series_from_state(live_state)
         if q0_trials.size == 0 or metric_trials.size != q0_trials.size:
             return
         best_index = self._best_trial_index_from_metric(metric_trials)
         if best_index is None:
             return
-        point_metric = str(live_state.get("metric_name", self.run_target_metric or self.metric_var.get()))
         a_token = int(live_state["a_index"]) if "a_index" in live_state else float(live_state.get("active_a", np.nan))
         b_token = int(live_state["b_index"]) if "b_index" in live_state else float(live_state.get("active_b", np.nan))
         self.trial_index_var.set(int(best_index))
@@ -2597,8 +3001,8 @@ class PychmpViewApp:
         if self._updating_trial_slider:
             return
         live_state = self._live_trial_state()
-        force_live_trials = self._should_force_live_trials(live_state)
-        if self._has_selected_point() and not force_live_trials:
+        use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
+        if self._has_selected_point() and not use_live_trials:
             point = self._selected_point()
             q0_trials, _metric_trials, point_metric = self._trial_series_for_point(point)
             if q0_trials.size == 0:
@@ -2611,16 +3015,14 @@ class PychmpViewApp:
             self._refresh_all()
             return
 
-        if not force_live_trials and not self._should_use_live_trials(live_state):
+        if not use_live_trials:
             return
-        q0_trials = np.asarray(live_state.get("q0_trials", ()), dtype=float)
-        metric_trials = np.asarray(live_state.get("metric_trials", ()), dtype=float)
+        q0_trials, metric_trials, point_metric, _snapshot = self._live_trial_series_from_state(live_state)
         if q0_trials.size == 0 or metric_trials.size != q0_trials.size:
             return
         current = int(np.clip(round(float(value)), 0, max(0, len(q0_trials) - 1)))
         if current == int(self.trial_index_var.get()):
             return
-        point_metric = str(live_state.get("metric_name", self.run_target_metric or self.metric_var.get()))
         a_token = int(live_state["a_index"]) if "a_index" in live_state else float(live_state.get("active_a", np.nan))
         b_token = int(live_state["b_index"]) if "b_index" in live_state else float(live_state.get("active_b", np.nan))
         self.trial_index_var.set(current)
@@ -2629,8 +3031,12 @@ class PychmpViewApp:
 
     def _selected_solution_plot_context(self) -> dict[str, Any] | None:
         live_state = self._live_trial_state()
-        if not self._has_selected_point() or self._should_force_live_trials(live_state):
-            return self._live_selected_solution_plot_context()
+        if not self._has_selected_point() or self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state):
+            live_context = self._live_selected_solution_plot_context()
+            if live_context is not None:
+                return live_context
+            if not self._has_selected_point():
+                return None
         point = self._selected_point()
         diagnostics = self._selected_diagnostics()
         q0_trials, metric_trials, point_metric = self._trial_series_for_point(point)
@@ -2641,9 +3047,9 @@ class PychmpViewApp:
         diagnostics["target_metric"] = str(point_metric)
         diagnostics["best_q0_recovered"] = float(point.get("q0", np.nan))
         diagnostics["best_target_metric_value"] = float(diagnostics.get("target_metric_value", np.nan))
-        raw_modeled = np.asarray(point["raw_modeled_best"], dtype=float)
-        modeled = np.asarray(point["modeled_best"], dtype=float)
-        residual = np.asarray(point["residual"], dtype=float)
+        raw_modeled = None
+        modeled = None
+        residual = None
         if selected_trial_index is not None:
             diagnostics["selected_trial_index"] = int(selected_trial_index)
             diagnostics["selected_trial_count"] = int(q0_trials.size)
@@ -2659,18 +3065,53 @@ class PychmpViewApp:
                 metric_history = self._metric_history_for_point(point, metric_name)
                 if metric_history.size == q0_trials.size:
                     diagnostics[metric_name] = float(metric_history[int(selected_trial_index)])
-            raw_trial_maps = point.get("trial_raw_modeled_maps")
-            modeled_trial_maps = point.get("trial_modeled_maps")
-            residual_trial_maps = point.get("trial_residual_maps")
             diagnostics["selected_trial_maps_available"] = False
-            if raw_trial_maps is not None and modeled_trial_maps is not None and residual_trial_maps is not None:
-                if int(selected_trial_index) < int(np.asarray(raw_trial_maps).shape[0]):
-                    raw_modeled = np.asarray(raw_trial_maps[int(selected_trial_index)], dtype=float)
-                    modeled = np.asarray(modeled_trial_maps[int(selected_trial_index)], dtype=float)
-                    residual = np.asarray(residual_trial_maps[int(selected_trial_index)], dtype=float)
-                    diagnostics["selected_trial_maps_available"] = True
+            loaded_maps = self._load_selected_trial_maps(
+                a_value=float(point.get("a", np.nan)),
+                b_value=float(point.get("b", np.nan)),
+                selected_trial_index=int(selected_trial_index),
+            )
+            if loaded_maps is not None:
+                raw_modeled = np.asarray(loaded_maps.get("raw_modeled_best"), dtype=float)
+                modeled = np.asarray(loaded_maps.get("modeled_best"), dtype=float)
+                residual = np.asarray(loaded_maps.get("residual"), dtype=float)
+                diagnostics["selected_trial_maps_available"] = True
+                diagnostics["selected_trial_index"] = int(loaded_maps.get("trial_index", selected_trial_index))
+            else:
+                raw_trial_maps = point.get("trial_raw_modeled_maps")
+                modeled_trial_maps = point.get("trial_modeled_maps")
+                residual_trial_maps = point.get("trial_residual_maps")
+                if raw_trial_maps is not None and modeled_trial_maps is not None and residual_trial_maps is not None:
+                    if int(selected_trial_index) < int(np.asarray(raw_trial_maps).shape[0]):
+                        raw_modeled = np.asarray(raw_trial_maps[int(selected_trial_index)], dtype=float)
+                        modeled = np.asarray(modeled_trial_maps[int(selected_trial_index)], dtype=float)
+                        residual = np.asarray(residual_trial_maps[int(selected_trial_index)], dtype=float)
+                        diagnostics["selected_trial_maps_available"] = True
         else:
             diagnostics["q0_recovered"] = float(point.get("q0", np.nan))
+            loaded_maps = self._load_selected_trial_maps(
+                a_value=float(point.get("a", np.nan)),
+                b_value=float(point.get("b", np.nan)),
+                selected_trial_index=None,
+            )
+            if loaded_maps is not None:
+                raw_modeled = np.asarray(loaded_maps.get("raw_modeled_best"), dtype=float)
+                modeled = np.asarray(loaded_maps.get("modeled_best"), dtype=float)
+                residual = np.asarray(loaded_maps.get("residual"), dtype=float)
+                diagnostics["selected_trial_maps_available"] = True
+                if loaded_maps.get("trial_index") is not None:
+                    diagnostics["selected_trial_index"] = int(loaded_maps["trial_index"])
+            else:
+                try:
+                    raw_modeled = np.asarray(point["raw_modeled_best"], dtype=float)
+                    modeled = np.asarray(point["modeled_best"], dtype=float)
+                    residual = np.asarray(point["residual"], dtype=float)
+                except Exception:
+                    raw_modeled = None
+                    modeled = None
+                    residual = None
+        if raw_modeled is None or modeled is None or residual is None:
+            return None
         slice_descriptor = dict(self.payload.get("selected_slice") or {})
         slice_label = self._slice_label(slice_descriptor) if slice_descriptor else "single slice"
         frequency_ghz = None
@@ -2687,11 +3128,11 @@ class PychmpViewApp:
                 break
         return {
             "model_path": Path(str(diagnostics.get("model_path", ""))),
-            "observed_noisy": np.asarray(self.payload["observed"], dtype=float),
-            "raw_modeled_best": raw_modeled,
-            "modeled_best": modeled,
-            "residual": residual,
-            "wcs_header": self.payload["wcs_header"],
+            "observed_noisy": np.asarray(self.payload.get("observed"), dtype=float),
+            "raw_modeled_best": np.asarray(raw_modeled, dtype=float),
+            "modeled_best": np.asarray(modeled, dtype=float),
+            "residual": np.asarray(residual, dtype=float),
+            "wcs_header": self.payload.get("wcs_header"),
             "frequency_ghz": frequency_ghz,
             "diagnostics": diagnostics,
             "psf_kernel": self.payload.get("psf_kernel"),
@@ -2846,12 +3287,144 @@ class PychmpViewApp:
         self._live_trial_render_cache_value = payload
         return payload
 
+    def _load_live_active_point_snapshot(self, live_state: dict[str, Any]) -> dict[str, Any] | None:
+        artifact_h5 = getattr(self, "artifact_h5", None)
+        if artifact_h5 is None:
+            return None
+        slice_key = str(self.payload.get("selected_slice_key", "")).strip() or None
+        search_id = str(self.payload.get("selected_search_id", "")).strip() or None
+        if slice_key is None or search_id is None:
+            return None
+        try:
+            active_a = float(live_state.get("active_a", live_state.get("a", np.nan)))
+        except Exception:
+            active_a = float("nan")
+        try:
+            active_b = float(live_state.get("active_b", live_state.get("b", np.nan)))
+        except Exception:
+            active_b = float("nan")
+        if not (np.isfinite(active_a) and np.isfinite(active_b)):
+            return None
+        try:
+            artifact_mtime_ns = int(Path(artifact_h5).stat().st_mtime_ns)
+        except Exception:
+            artifact_mtime_ns = -1
+        cache_key = (
+            str(Path(artifact_h5)),
+            str(slice_key),
+            str(search_id),
+            float(active_a),
+            float(active_b),
+            int(artifact_mtime_ns),
+        )
+        if cache_key == self._live_snapshot_cache_key:
+            return self._live_snapshot_cache_value
+        try:
+            snapshot = load_active_point_snapshot(
+                Path(artifact_h5),
+                slice_key=slice_key,
+                search_id=search_id,
+                include_maps=False,
+            )
+        except Exception:
+            self._live_snapshot_cache_key = cache_key
+            self._live_snapshot_cache_value = None
+            return None
+        self._live_snapshot_cache_key = cache_key
+        self._live_snapshot_cache_value = snapshot
+        return snapshot
+
+    def _load_selected_trial_maps(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        selected_trial_index: int | None,
+    ) -> dict[str, Any] | None:
+        artifact_h5 = getattr(self, "artifact_h5", None)
+        if artifact_h5 is None:
+            return None
+        slice_key = str(self.payload.get("selected_slice_key", "")).strip() or None
+        search_id = str(self.payload.get("selected_search_id", "")).strip() or None
+        if slice_key is None:
+            return None
+        try:
+            artifact_mtime_ns = int(Path(artifact_h5).stat().st_mtime_ns)
+        except Exception:
+            artifact_mtime_ns = -1
+        cache_key = (
+            str(Path(artifact_h5)),
+            str(slice_key),
+            str(search_id or ""),
+            float(a_value),
+            float(b_value),
+            -1 if selected_trial_index is None else int(selected_trial_index),
+            int(artifact_mtime_ns),
+        )
+        if cache_key == getattr(self, "_selected_trial_map_cache_key", None):
+            return getattr(self, "_selected_trial_map_cache_value", None)
+        try:
+            payload = load_selected_trial_plot_payload(
+                Path(artifact_h5),
+                a=float(a_value),
+                b=float(b_value),
+                trial_index=selected_trial_index,
+                slice_key=slice_key,
+                search_id=search_id,
+            )
+        except Exception:
+            payload = None
+        self._selected_trial_map_cache_key = cache_key
+        self._selected_trial_map_cache_value = payload
+        return payload
+
+    def _live_trial_series_from_state(
+        self,
+        live_state: dict[str, Any],
+    ) -> tuple[np.ndarray, np.ndarray, str, dict[str, Any] | None]:
+        point_metric = str(live_state.get("metric_name", self.run_target_metric or self.metric_var.get()))
+        q0_trials = np.asarray(live_state.get("fit_q0_trials", ()), dtype=float)
+        metric_trials = np.asarray(live_state.get("fit_metric_trials", ()), dtype=float)
+        if q0_trials.ndim == 1 and q0_trials.size > 0 and metric_trials.size == q0_trials.size:
+            return q0_trials, metric_trials, point_metric, None
+        snapshot = self._load_live_active_point_snapshot(live_state)
+        if snapshot is not None:
+            try:
+                snapshot_a = float(snapshot.get("a", np.nan))
+                snapshot_b = float(snapshot.get("b", np.nan))
+            except Exception:
+                snapshot_a = float("nan")
+                snapshot_b = float("nan")
+            try:
+                active_a = float(live_state.get("active_a", live_state.get("a", np.nan)))
+                active_b = float(live_state.get("active_b", live_state.get("b", np.nan)))
+            except Exception:
+                active_a = float("nan")
+                active_b = float("nan")
+            coords_match = (
+                np.isfinite(snapshot_a)
+                and np.isfinite(snapshot_b)
+                and np.isfinite(active_a)
+                and np.isfinite(active_b)
+                and np.isclose(snapshot_a, active_a, rtol=0.0, atol=1e-6)
+                and np.isclose(snapshot_b, active_b, rtol=0.0, atol=1e-6)
+            )
+            if coords_match:
+                q0_trials = np.asarray(snapshot.get("fit_q0_trials", ()), dtype=float)
+                metric_trials = np.asarray(snapshot.get(f"fit_{point_metric}_trials", ()), dtype=float)
+                if metric_trials.size != q0_trials.size or metric_trials.size == 0:
+                    metric_trials = np.asarray(snapshot.get("fit_metric_trials", ()), dtype=float)
+                    if metric_trials.size != q0_trials.size:
+                        metric_trials = np.asarray([], dtype=float)
+                if q0_trials.ndim == 1 and q0_trials.size > 0 and metric_trials.size == q0_trials.size:
+                    return q0_trials, metric_trials, point_metric, snapshot
+        return np.asarray([], dtype=float), np.asarray([], dtype=float), point_metric, snapshot
+
     def _live_selected_solution_plot_context(self) -> dict[str, Any] | None:
         live_state = self._live_trial_state()
         if not self._should_use_live_trials(live_state):
             return None
-        q0_trials = np.asarray(live_state.get("q0_trials", ()), dtype=float)
-        metric_trials = np.asarray(live_state.get("metric_trials", ()), dtype=float)
+        q0_trials, metric_trials, point_metric, snapshot = self._live_trial_series_from_state(live_state)
         if q0_trials.ndim != 1 or q0_trials.size == 0 or metric_trials.size != q0_trials.size:
             return None
 
@@ -2860,7 +3433,6 @@ class PychmpViewApp:
         selected_metric = float(metric_trials[current_index])
         best_index = self._best_trial_index_from_metric(metric_trials)
         best_q0 = float(q0_trials[int(best_index)]) if best_index is not None else selected_q0
-        point_metric = str(live_state.get("metric_name", self.run_target_metric or self.metric_var.get()))
 
         diagnostics = dict(self.payload.get("diagnostics") or {})
         diagnostics.update(
@@ -2882,16 +3454,31 @@ class PychmpViewApp:
             }
         )
         diagnostics["selected_trial_maps_available"] = False
-        rendered = self._render_live_selected_trial_maps(
-            diagnostics=diagnostics,
-            a_value=float(diagnostics.get("a", np.nan)),
-            b_value=float(diagnostics.get("b", np.nan)),
-            q0_value=float(selected_q0),
+        loaded_maps = self._load_selected_trial_maps(
+            a_value=float(live_state.get("active_a", np.nan)),
+            b_value=float(live_state.get("active_b", np.nan)),
+            selected_trial_index=int(current_index),
         )
-        if rendered is None:
+        raw_modeled = None
+        modeled = None
+        residual = None
+        if loaded_maps is not None:
+            raw_modeled = np.asarray(loaded_maps.get("raw_modeled_best"), dtype=float)
+            modeled = np.asarray(loaded_maps.get("modeled_best"), dtype=float)
+            residual = np.asarray(loaded_maps.get("residual"), dtype=float)
+            diagnostics["selected_trial_maps_available"] = True
+            diagnostics["selected_trial_index"] = int(loaded_maps.get("trial_index", current_index))
+        elif snapshot is not None:
+            raw_trials = snapshot.get("trial_raw_modeled_maps")
+            if raw_trials is not None:
+                raw_trials_arr = np.asarray(raw_trials, dtype=float)
+                if raw_trials_arr.ndim == 3 and raw_trials_arr.shape[0] == q0_trials.size and current_index < raw_trials_arr.shape[0]:
+                    raw_modeled = np.asarray(raw_trials_arr[current_index], dtype=float)
+                    modeled = _convolve_raw_map(raw_modeled, self.payload.get("psf_kernel"))
+                    residual = np.asarray(modeled - np.asarray(self.payload.get("observed"), dtype=float), dtype=float)
+                    diagnostics["selected_trial_maps_available"] = True
+        if raw_modeled is None or modeled is None or residual is None:
             return None
-        raw_modeled, modeled, residual = rendered
-        diagnostics["selected_trial_maps_available"] = True
         for metric_name in METRICS:
             diagnostics[metric_name] = float(selected_metric) if metric_name == point_metric else float("nan")
 
@@ -2943,6 +3530,11 @@ class PychmpViewApp:
         self._refresh_all()
 
     def _jump_to_active_point(self) -> None:
+        live_search_id = str((self._refresh_signal_live_trials or {}).get("search_id", "") or "").strip()
+        selected_search_id = str(self.payload.get("selected_search_id", "") or "").strip()
+        if live_search_id and selected_search_id and live_search_id != selected_search_id:
+            self.search_id_var.set(live_search_id)
+            self._reload_payload()
         resolved = self._active_point_indices()
         if resolved is None:
             return
@@ -2978,7 +3570,7 @@ class PychmpViewApp:
         self._capture_current_slice_view_state(self._last_rendered_metric)
         self.slice_key_var.set(selected_key)
         self.search_id_var.set("")
-        self._reload_payload()
+        self._schedule_payload_reload(status_text="Loading selected slice...")
 
     def _on_search_changed(self) -> None:
         if self.search_menu is None:
@@ -2992,7 +3584,7 @@ class PychmpViewApp:
         self._capture_current_slice_view_state(self._last_rendered_metric)
         self.search_id_var.set(selected_id)
         self._selected_trial_token = None
-        self._reload_payload()
+        self._schedule_payload_reload(status_text="Loading selected search...")
 
     def _on_b_changed(self) -> None:
         current = int(self.b_menu.current())
@@ -3005,21 +3597,19 @@ class PychmpViewApp:
         if event.inaxes is not self.ax_trials or event.xdata is None:
             return
         live_state = self._live_trial_state()
-        force_live_trials = self._should_force_live_trials(live_state)
-        if self._has_selected_point() and not force_live_trials:
+        use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
+        if self._has_selected_point() and not use_live_trials:
             point = self._selected_point()
             q0_trials, metric_trials, point_metric = self._trial_series_for_point(point)
             if q0_trials.size == 0 or metric_trials.size != q0_trials.size:
                 return
             token = self._current_trial_token(point_metric, q0_trials)
         else:
-            if not force_live_trials and not self._should_use_live_trials(live_state):
+            if not use_live_trials:
                 return
-            q0_trials = np.asarray(live_state.get("q0_trials", ()), dtype=float)
-            metric_trials = np.asarray(live_state.get("metric_trials", ()), dtype=float)
+            q0_trials, metric_trials, point_metric, _snapshot = self._live_trial_series_from_state(live_state)
             if q0_trials.size == 0 or metric_trials.size != q0_trials.size:
                 return
-            point_metric = str(live_state.get("metric_name", self.run_target_metric or self.metric_var.get()))
             a_token = int(live_state["a_index"]) if "a_index" in live_state else float(live_state.get("active_a", np.nan))
             b_token = int(live_state["b_index"]) if "b_index" in live_state else float(live_state.get("active_b", np.nan))
             token = (a_token, b_token, point_metric, -1)
@@ -3088,7 +3678,7 @@ class PychmpViewApp:
             return None
         return resolved
 
-    def _refresh_all(self) -> None:
+    def _refresh_all(self, *, update_selected_solution: bool = True) -> None:
         if not self.payload:
             self._clear_trial_selector_controls()
             self._refresh_action_states()
@@ -3176,8 +3766,8 @@ class PychmpViewApp:
         self._refresh_info_text()
         self.heatmap_canvas.draw_idle()
         self.trials_canvas.draw_idle()
-        if self.selected_solution_window is not None:
-            self.selected_solution_window.update_selection()
+        if update_selected_solution and self.selected_solution_window is not None:
+            self._schedule_selected_solution_update()
 
     def _draw_heatmap(self) -> None:
         metric_name = self.metric_var.get()
@@ -3330,9 +3920,7 @@ class PychmpViewApp:
         active_trial_index = None
         active_trial_q0 = None
         if live_state is not None:
-            q0_trials = np.asarray(live_state.get("q0_trials", ()), dtype=float)
-            metric_trials = np.asarray(live_state.get("metric_trials", ()), dtype=float)
-            point_metric = str(live_state.get("metric_name", self.run_target_metric or selected_metric))
+            q0_trials, metric_trials, point_metric, _snapshot = self._live_trial_series_from_state(live_state)
             live_a_token = (
                 int(live_state["a_index"])
                 if "a_index" in live_state
@@ -3694,7 +4282,32 @@ class PychmpViewApp:
         self.selected_solution_window.present()
         self.selected_solution_window.update_selection()
 
+    def _grid_summary_png_candidate(self) -> Path | None:
+        if self.artifact_h5 is None:
+            return None
+        candidate = self.artifact_h5.with_name(f"{self.artifact_h5.stem}_grid.png")
+        return candidate if candidate.exists() else None
+
+    def _open_external_file(self, path: Path) -> bool:
+        try:
+            resolved = Path(path).expanduser().resolve()
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(resolved)], start_new_session=True)
+                return True
+            if os.name == "nt":
+                os.startfile(str(resolved))
+                return True
+            subprocess.Popen(["xdg-open", str(resolved)], start_new_session=True)
+            return True
+        except Exception:
+            return False
+
     def _open_grid_summary(self) -> None:
+        png_candidate = self._grid_summary_png_candidate()
+        if png_candidate is not None and self._open_external_file(png_candidate):
+            self.status_var.set(f"Opened saved grid summary PNG: {png_candidate}")
+            return
+        self.status_var.set("Generating grid summary plot; this can take a while for large sparse artifacts...")
         self._open_plot_script("--grid")
 
 

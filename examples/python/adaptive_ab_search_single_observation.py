@@ -20,13 +20,14 @@ import sys
 import threading
 import time
 from collections.abc import Iterator, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from astropy.io import fits
+from scipy.signal import fftconvolve
 
 def _format_console_scalar(value: float, *, fixed_precision: int = 6) -> str:
     numeric = float(value)
@@ -83,6 +84,83 @@ def _build_run_history_entry(
     }
 
 
+def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int | None:
+    """Return an existing pychmp-view PID for this artifact, if visible."""
+    try:
+        artifact_text = str(Path(artifact_h5).expanduser().resolve())
+        script_name = Path(viewer_script).name
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    current_pid = os.getpid()
+    for line in proc.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, command = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if script_name in command and artifact_text in command:
+            return pid
+    return None
+
+
+def _focus_existing_viewer_pid(pid: int) -> bool:
+    """Try to bring an existing pychmp-view process to the foreground."""
+    if not sys.platform.startswith("darwin"):
+        return False
+    script = (
+        'tell application "System Events"\n'
+        f"set frontmost of first process whose unix id is {int(pid)} to true\n"
+        "end tell"
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def _is_hdf5_lock_contention_error(exc: BaseException) -> bool:
+    if isinstance(exc, BlockingIOError):
+        return True
+    text = str(exc).strip().lower()
+    return (
+        "unable to lock file" in text
+        or "resource temporarily unavailable" in text
+        or "errno = 35" in text
+    )
+
+
+def _is_snapshot_target_missing_error(exc: BaseException) -> bool:
+    if not isinstance(exc, KeyError):
+        return False
+    text = str(exc).strip().lower()
+    return (
+        "search not found for slice" in text
+        or "search not found" in text
+        or "slice not found" in text
+    )
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES_ROOT = REPO_ROOT / "examples"
 DEFAULT_Q0_XATOL = 1e-3
@@ -96,12 +174,14 @@ from pychmp import (
     ABPointResult,
     GXRenderEUVAdapter,
     GXRenderMWAdapter,
+    PSFMetadata,
     build_psf_kernel,
     build_tr_region_mask_from_blos,
     estimate_obs_map_noise,
     format_psf_report,
     load_obs_map,
     obs_map_noise_unit_label,
+    resolve_euv_response_identity,
     resolve_render_geometry_via_gxrender,
     resolve_default_testdata_fixture_paths,
     search_local_minimum_ab,
@@ -121,6 +201,7 @@ from pychmp.ab_scan_artifacts import (
     append_point_record,
     append_run_history_entry,
     build_computed_point_payload,
+    clear_live_trial_point,
     detect_scan_artifact_format,
     load_auxiliary_map_store_point_records,
     load_scan_file,
@@ -128,6 +209,7 @@ from pychmp.ab_scan_artifacts import (
     point_record_matches_compatibility_signature,
     validate_scan_artifact_compatibility,
     validate_scan_artifact_reuse_preflight,
+    write_live_trial_point,
     write_point_scan_artifact,
 )
 from pychmp.geometry_policy import resolve_geometry_policy
@@ -186,6 +268,117 @@ except ModuleNotFoundError:
         _with_observer_wcs_keywords,
     )
 
+
+def _load_slice_psf_metadata_from_artifact(*, artifact_h5: Path, slice_key: str) -> PSFMetadata | None:
+    try:
+        import h5py  # local import so runtime still works when h5py is unavailable
+    except Exception:
+        return None
+
+    try:
+        with h5py.File(str(artifact_h5), "r", locking=False) as f:
+            common = f["slices"][str(slice_key)]["common"]
+            if "psf_kernel" not in common:
+                return None
+            kernel = np.asarray(common["psf_kernel"], dtype=float)
+            if kernel.ndim != 2 or kernel.size == 0:
+                return None
+            source = "artifact_slice_psf"
+            if "psf_kernel_meta_json" in common:
+                try:
+                    raw_meta = common["psf_kernel_meta_json"][()]
+                    if isinstance(raw_meta, bytes):
+                        raw_meta = raw_meta.decode("utf-8", errors="replace")
+                    parsed = json.loads(str(raw_meta))
+                    origin_source = str(parsed.get("source") or "").strip()
+                    if origin_source:
+                        source = f"artifact_slice_psf:{origin_source}"
+                except Exception:
+                    pass
+            return PSFMetadata(
+                source=source,
+                kind="kernel",
+                kernel=kernel,
+                allows_frequency_scaling=False,
+            )
+    except TypeError:
+        # Older h5py versions may not support the locking kwarg.
+        try:
+            with h5py.File(str(artifact_h5), "r") as f:
+                common = f["slices"][str(slice_key)]["common"]
+                if "psf_kernel" not in common:
+                    return None
+                kernel = np.asarray(common["psf_kernel"], dtype=float)
+                if kernel.ndim != 2 or kernel.size == 0:
+                    return None
+                return PSFMetadata(
+                    source="artifact_slice_psf",
+                    kind="kernel",
+                    kernel=kernel,
+                    allows_frequency_scaling=False,
+                )
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _load_slice_preflight_payload(
+    *,
+    artifact_h5: Path,
+    slice_key: str,
+    include_maps: bool = False,
+) -> dict[str, Any] | None:
+    try:
+        import h5py
+    except Exception:
+        return None
+    try:
+        with h5py.File(str(artifact_h5), "r", locking=False) as f:
+            common = f["slices"][str(slice_key)]["common"]
+            header_text = common["wcs_header"][()]
+            if isinstance(header_text, bytes):
+                header_text = header_text.decode("utf-8", errors="replace")
+            diagnostics_raw = common["diagnostics_json"][()]
+            if isinstance(diagnostics_raw, bytes):
+                diagnostics_raw = diagnostics_raw.decode("utf-8", errors="replace")
+            diagnostics = json.loads(str(diagnostics_raw))
+            if not isinstance(diagnostics, dict):
+                diagnostics = {}
+            observed = np.asarray(common["observed"], dtype=float) if include_maps and "observed" in common else None
+            sigma_map = np.asarray(common["sigma_map"], dtype=float) if include_maps and "sigma_map" in common else None
+            return {
+                "wcs_header": fits.Header.fromstring(str(header_text), sep="\n"),
+                "diagnostics": diagnostics,
+                "observed": observed,
+                "sigma_map": sigma_map,
+            }
+    except TypeError:
+        try:
+            with h5py.File(str(artifact_h5), "r") as f:
+                common = f["slices"][str(slice_key)]["common"]
+                header_text = common["wcs_header"][()]
+                if isinstance(header_text, bytes):
+                    header_text = header_text.decode("utf-8", errors="replace")
+                diagnostics_raw = common["diagnostics_json"][()]
+                if isinstance(diagnostics_raw, bytes):
+                    diagnostics_raw = diagnostics_raw.decode("utf-8", errors="replace")
+                diagnostics = json.loads(str(diagnostics_raw))
+                if not isinstance(diagnostics, dict):
+                    diagnostics = {}
+                observed = np.asarray(common["observed"], dtype=float) if include_maps and "observed" in common else None
+                sigma_map = np.asarray(common["sigma_map"], dtype=float) if include_maps and "sigma_map" in common else None
+                return {
+                    "wcs_header": fits.Header.fromstring(str(header_text), sep="\n"),
+                    "diagnostics": diagnostics,
+                    "observed": observed,
+                    "sigma_map": sigma_map,
+                }
+        except Exception:
+            return None
+    except Exception:
+        return None
+
 try:
     from plot_ab_scan_artifacts import plot_ab_scan_file
 except ModuleNotFoundError:
@@ -218,6 +411,44 @@ def _validate_gxrender_runtime() -> None:
         )
 
 
+def _compact_kernel_for_target_shape(
+    kernel: np.ndarray | None,
+    *,
+    target_ny: int,
+    target_nx: int,
+) -> np.ndarray | None:
+    if kernel is None:
+        return None
+    arr = np.asarray(kernel, dtype=float)
+    if arr.ndim != 2 or arr.size == 0:
+        return arr
+
+    # Keep only the center support needed for target-resolution same-mode convolution.
+    max_ny = max(1, int(target_ny) * 2 + 1)
+    max_nx = max(1, int(target_nx) * 2 + 1)
+    if arr.shape[0] <= max_ny and arr.shape[1] <= max_nx:
+        kernel_sum = float(np.nansum(arr))
+        if np.isfinite(kernel_sum) and kernel_sum != 0.0:
+            return np.asarray(arr / kernel_sum, dtype=float)
+        return arr
+
+    cy = int(arr.shape[0] // 2)
+    cx = int(arr.shape[1] // 2)
+    half_ny = int(max_ny // 2)
+    half_nx = int(max_nx // 2)
+
+    y0 = max(0, cy - half_ny)
+    y1 = min(arr.shape[0], y0 + max_ny)
+    x0 = max(0, cx - half_nx)
+    x1 = min(arr.shape[1], x0 + max_nx)
+
+    compact = np.asarray(arr[y0:y1, x0:x1], dtype=float)
+    compact_sum = float(np.nansum(compact))
+    if np.isfinite(compact_sum) and compact_sum != 0.0:
+        compact = np.asarray(compact / compact_sum, dtype=float)
+    return compact
+
+
 class _TeeStream:
     def __init__(self, *streams: Any) -> None:
         self._streams = [stream for stream in streams if stream is not None]
@@ -243,66 +474,29 @@ class _TeeStream:
 class _ViewerRefreshHeartbeat:
     def __init__(self, signal_path: Path, *, interval_s: float = 2.0, slice_key: str | None = None) -> None:
         self._signal_path = Path(signal_path)
-        self._interval_s = max(0.5, float(interval_s))
         self._slice_key = None if slice_key is None else str(slice_key).strip() or None
-        self._phase = ""
-        self._pending_points: tuple[tuple[float, float], ...] = ()
-        self._active_point: tuple[float, float] | None = None
-        self._live_trial_payload: dict[str, Any] | None = None
-        self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
 
-    def _write_signal(self) -> None:
+    def notify_refresh(self) -> None:
         try:
-            with self._lock:
-                payload = {
-                    "timestamp": float(time.time()),
-                    "phase": str(self._phase),
-                    "slice_key": self._slice_key,
-                    "pending_points": [
-                        {"a": float(a_value), "b": float(b_value)}
-                        for a_value, b_value in self._pending_points
-                    ],
-                    "active_point": (
-                        None
-                        if self._active_point is None
-                        else {"a": float(self._active_point[0]), "b": float(self._active_point[1])}
-                    ),
-                    "live_trials": None if self._live_trial_payload is None else dict(self._live_trial_payload),
-                }
-            self._signal_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+            self._signal_path.write_text("artifact_refreshed\n", encoding="utf-8")
         except Exception:
             pass
 
     @property
     def phase(self) -> str:
-        with self._lock:
-            return str(self._phase)
+        return "artifact_refreshed"
 
     def set_phase(self, phase: str) -> None:
-        with self._lock:
-            self._phase = str(phase).strip()
-        self._write_signal()
+        _ = phase
 
     def set_pending_points(self, points: list[tuple[float, float]] | tuple[tuple[float, float], ...]) -> None:
-        normalized: list[tuple[float, float]] = []
-        for a_value, b_value in points:
-            normalized.append((float(a_value), float(b_value)))
-        with self._lock:
-            self._pending_points = tuple(normalized)
-        self._write_signal()
+        _ = points
 
     def clear_pending_points(self) -> None:
-        with self._lock:
-            self._pending_points = ()
-        self._write_signal()
+        return
 
     def set_active_point(self, a_value: float, b_value: float) -> None:
-        with self._lock:
-            self._active_point = (float(a_value), float(b_value))
-            self._live_trial_payload = None
-        self._write_signal()
+        _ = (a_value, b_value)
 
     def update_live_trials(
         self,
@@ -315,52 +509,16 @@ class _ViewerRefreshHeartbeat:
         active_trial_index: int | None = None,
         active_trial_q0: float | None = None,
     ) -> None:
-        with self._lock:
-            self._active_point = (float(a_value), float(b_value))
-            self._live_trial_payload = {
-                "a": float(a_value),
-                "b": float(b_value),
-                "metric_name": str(metric_name),
-                "q0_trials": [float(value) for value in q0_trials],
-                "metric_trials": [float(value) for value in metric_trials],
-                "active_trial_index": (
-                    None if active_trial_index is None else int(active_trial_index)
-                ),
-                "active_trial_q0": (
-                    None if active_trial_q0 is None else float(active_trial_q0)
-                ),
-            }
-        self._write_signal()
+        _ = (a_value, b_value, metric_name, q0_trials, metric_trials, active_trial_index, active_trial_q0)
 
     def clear_active_trial(self) -> None:
-        with self._lock:
-            self._active_point = None
-            self._live_trial_payload = None
-        self._write_signal()
+        return
 
     def start(self, phase: str) -> None:
-        self.set_phase(phase)
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, name="pychmp-viewer-heartbeat", daemon=True)
-        self._thread.start()
+        _ = phase
 
     def stop(self, phase: str) -> None:
-        with self._lock:
-            self._phase = str(phase).strip()
-            self._pending_points = ()
-            self._active_point = None
-            self._live_trial_payload = None
-        self._write_signal()
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._interval_s + 0.5)
-            self._thread = None
-
-    def _run(self) -> None:
-        while not self._stop_event.wait(self._interval_s):
-            self._write_signal()
+        _ = phase
 
 
 class _PointRenderRecord:
@@ -369,6 +527,26 @@ class _PointRenderRecord:
         self.modeled_by_q0: dict[str, np.ndarray] = {}
         self.components_by_q0: dict[str, dict[str, Any]] = {}
         self.cube_by_q0: dict[str, dict[str, Any]] = {}
+
+    def clone(self) -> _PointRenderRecord:
+        cloned = _PointRenderRecord()
+        cloned.raw_modeled_by_q0 = {
+            str(key): np.asarray(value, dtype=np.float32).copy()
+            for key, value in self.raw_modeled_by_q0.items()
+        }
+        cloned.modeled_by_q0 = {
+            str(key): np.asarray(value, dtype=np.float32).copy()
+            for key, value in self.modeled_by_q0.items()
+        }
+        cloned.components_by_q0 = {
+            str(key): dict(value)
+            for key, value in self.components_by_q0.items()
+        }
+        cloned.cube_by_q0 = {
+            str(key): dict(value)
+            for key, value in self.cube_by_q0.items()
+        }
+        return cloned
 
 
 class _PointRenderStream:
@@ -437,6 +615,11 @@ class _PointRenderStream:
     def pop_record(self, *, a_value: float, b_value: float) -> _PointRenderRecord | None:
         with self._lock:
             return self._records.pop((float(a_value), float(b_value)), None)
+
+    def snapshot_record(self, *, a_value: float, b_value: float) -> _PointRenderRecord | None:
+        with self._lock:
+            record = self._records.get((float(a_value), float(b_value)))
+            return None if record is None else record.clone()
 
 
 class _TrackedBaseRendererProxy:
@@ -872,6 +1055,14 @@ def _lookup_stream_value_by_q0(
     return None
 
 
+def _convolve_with_psf_kernel(raw_map: np.ndarray, psf_kernel: np.ndarray | None) -> np.ndarray:
+    raw = np.asarray(raw_map, dtype=float)
+    kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
+    if kernel is None or kernel.ndim != 2 or kernel.size == 0:
+        return raw.copy()
+    return np.asarray(fftconvolve(raw, kernel, mode="same"), dtype=float)
+
+
 def _point_payload_from_result(
     point: ABPointResult,
     *,
@@ -989,7 +1180,7 @@ def _point_payload_from_result(
         trial_raw_by_q0 = dict(stream_record.raw_modeled_by_q0)
         trial_modeled_by_q0 = dict(stream_record.modeled_by_q0)
 
-    if trial_q0_values and bool(store_trial_map_cubes):
+    if trial_q0_values:
         raw_trials: list[np.ndarray] = []
         modeled_trials: list[np.ndarray] = []
         residual_trials: list[np.ndarray] = []
@@ -997,55 +1188,61 @@ def _point_payload_from_result(
         euv_tr_trials: list[np.ndarray] = []
         for trial_index, q0_value in enumerate(trial_q0_values):
             raw_trial = _lookup_stream_value_by_q0(trial_raw_by_q0, q0_value)
-            modeled_trial = _lookup_stream_value_by_q0(trial_modeled_by_q0, q0_value)
-            if raw_trial is None or modeled_trial is None:
-                raise RuntimeError("point payload stream record is missing trial rendered maps")
+            if raw_trial is None:
+                raw_trials = []
+                modeled_trials = []
+                residual_trials = []
+                euv_coronal_trials = []
+                euv_tr_trials = []
+                break
             raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
-            modeled_trial_arr = np.asarray(modeled_trial, dtype=np.float32)
             raw_trials.append(raw_trial_arr)
+            modeled_trial = _lookup_stream_value_by_q0(trial_modeled_by_q0, q0_value)
+            modeled_trial_arr = raw_trial_arr if modeled_trial is None else np.asarray(modeled_trial, dtype=np.float32)
             modeled_trials.append(modeled_trial_arr)
             residual_trials.append(modeled_trial_arr - np.asarray(observed_template, dtype=np.float32))
 
-            trial_components = _lookup_stream_value_by_q0(stream_record.components_by_q0, q0_value)
-            if isinstance(trial_components, dict):
-                components = trial_components
-                coronal = components.get("flux_corona")
-                tr_flux = components.get("flux_tr")
-                if coronal is not None and tr_flux is not None:
-                    euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
-                    euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
-                for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
-                    _register_synthetic_map(
-                        identity=_build_synthetic_map_identity(
-                            renderer_factory=renderer_factory,
-                            a_value=point_a,
-                            b_value=point_b,
-                            q0_value=float(q0_value),
-                            domain_label="euv",
-                            channel_or_frequency_label=str(channel),
-                            map_role=f"trial_{trial_index:03d}_rendered",
-                        ),
-                        array=np.asarray(rendered, dtype=np.float32),
-                        label=f"EUV {channel} trial {trial_index:03d} rendered",
-                    )
-            trial_cube = _lookup_stream_value_by_q0(stream_record.cube_by_q0, q0_value)
-            if isinstance(trial_cube, dict):
-                cube_payload = trial_cube
-                for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
-                    freq_label = f"{float(freq):.6f}ghz"
-                    _register_synthetic_map(
-                        identity=_build_synthetic_map_identity(
-                            renderer_factory=renderer_factory,
-                            a_value=point_a,
-                            b_value=point_b,
-                            q0_value=float(q0_value),
-                            domain_label="mw",
-                            channel_or_frequency_label=freq_label,
-                            map_role=f"trial_{trial_index:03d}_raw_modeled",
-                        ),
-                        array=np.asarray(rendered, dtype=np.float32),
-                        label=f"MW {freq_label} trial {trial_index:03d} raw modeled",
-                    )
+            if bool(store_trial_map_cubes):
+                trial_components = _lookup_stream_value_by_q0(stream_record.components_by_q0, q0_value)
+                if isinstance(trial_components, dict):
+                    components = trial_components
+                    coronal = components.get("flux_corona")
+                    tr_flux = components.get("flux_tr")
+                    if coronal is not None and tr_flux is not None:
+                        euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
+                        euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
+                    for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                        _register_synthetic_map(
+                            identity=_build_synthetic_map_identity(
+                                renderer_factory=renderer_factory,
+                                a_value=point_a,
+                                b_value=point_b,
+                                q0_value=float(q0_value),
+                                domain_label="euv",
+                                channel_or_frequency_label=str(channel),
+                                map_role=f"trial_{trial_index:03d}_rendered",
+                            ),
+                            array=np.asarray(rendered, dtype=np.float32),
+                            label=f"EUV {channel} trial {trial_index:03d} rendered",
+                        )
+                trial_cube = _lookup_stream_value_by_q0(stream_record.cube_by_q0, q0_value)
+                if isinstance(trial_cube, dict):
+                    cube_payload = trial_cube
+                    for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
+                        freq_label = f"{float(freq):.6f}ghz"
+                        _register_synthetic_map(
+                            identity=_build_synthetic_map_identity(
+                                renderer_factory=renderer_factory,
+                                a_value=point_a,
+                                b_value=point_b,
+                                q0_value=float(q0_value),
+                                domain_label="mw",
+                                channel_or_frequency_label=freq_label,
+                                map_role=f"trial_{trial_index:03d}_raw_modeled",
+                            ),
+                            array=np.asarray(rendered, dtype=np.float32),
+                            label=f"MW {freq_label} trial {trial_index:03d} raw modeled",
+                        )
         if raw_trials and len(raw_trials) == len(trial_q0_values):
             trial_raw_modeled_maps = np.stack(raw_trials, axis=0)
             trial_modeled_maps = np.stack(modeled_trials, axis=0)
@@ -1114,6 +1311,82 @@ def _point_payload_from_result(
     )
 
 
+def _build_live_point_snapshot_payload(
+    *,
+    a_value: float,
+    b_value: float,
+    q0_trials: list[float],
+    metric_trials: list[float],
+    observed_template: np.ndarray,
+    target_metric: str,
+    compatibility_signature: str,
+    stream_record: _PointRenderRecord | None,
+) -> dict[str, Any] | None:
+    if stream_record is None:
+        return None
+    if not q0_trials or len(q0_trials) != len(metric_trials):
+        return None
+
+    raw_trials: list[np.ndarray] = []
+    modeled_trials: list[np.ndarray] = []
+    residual_trials: list[np.ndarray] = []
+    for q0_value in q0_trials:
+        raw_trial = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, float(q0_value))
+        if raw_trial is None:
+            return None
+        raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
+        raw_trials.append(raw_trial_arr)
+        modeled_trial = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, float(q0_value))
+        modeled_trial_arr = raw_trial_arr if modeled_trial is None else np.asarray(modeled_trial, dtype=np.float32)
+        modeled_trials.append(modeled_trial_arr)
+        residual_trials.append(modeled_trial_arr - np.asarray(observed_template, dtype=np.float32))
+
+    metric_name = str(target_metric)
+    fit_metric_trials = tuple(float(v) for v in metric_trials)
+    nan_trials = tuple(float("nan") for _ in metric_trials)
+    fit_chi2_trials = fit_metric_trials if metric_name == "chi2" else nan_trials
+    fit_rho2_trials = fit_metric_trials if metric_name == "rho2" else nan_trials
+    fit_eta2_trials = fit_metric_trials if metric_name == "eta2" else nan_trials
+    best_index = int(np.nanargmin(np.asarray(metric_trials, dtype=float)))
+    diagnostics = {
+        "a": float(a_value),
+        "b": float(b_value),
+        "target_metric": metric_name,
+        "target_metric_value": float(metric_trials[best_index]),
+        "chi2": float(metric_trials[best_index]) if metric_name == "chi2" else float("nan"),
+        "rho2": float(metric_trials[best_index]) if metric_name == "rho2" else float("nan"),
+        "eta2": float(metric_trials[best_index]) if metric_name == "eta2" else float("nan"),
+        "point_status": "running",
+        COMPATIBILITY_SIGNATURE_KEY: str(compatibility_signature),
+    }
+    return build_computed_point_payload(
+        a_value=float(a_value),
+        b_value=float(b_value),
+        q0=float(q0_trials[best_index]),
+        success=False,
+        status="running",
+        modeled_best=np.asarray(raw_trials[best_index], dtype=float),
+        raw_modeled_best=np.asarray(raw_trials[best_index], dtype=float),
+        residual=np.asarray(raw_trials[best_index] - np.asarray(observed_template, dtype=np.float32), dtype=float),
+        fit_q0_trials=tuple(float(v) for v in q0_trials),
+        fit_metric_trials=fit_metric_trials,
+        fit_chi2_trials=fit_chi2_trials,
+        fit_rho2_trials=fit_rho2_trials,
+        fit_eta2_trials=fit_eta2_trials,
+        trial_raw_modeled_maps=np.stack(raw_trials, axis=0),
+        trial_modeled_maps=np.stack(modeled_trials, axis=0),
+        trial_residual_maps=np.stack(residual_trials, axis=0),
+        nfev=int(len(q0_trials)),
+        nit=max(0, int(len(q0_trials) - 1)),
+        message="running",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        target_metric=metric_name,
+        diagnostics=diagnostics,
+    )
+
+
 class _MetricValues:
     def __init__(self, *, chi2: float, rho2: float, eta2: float) -> None:
         self.chi2 = float(chi2)
@@ -1132,6 +1405,7 @@ class _ArtifactWriteDispatcher:
         diagnostics: dict[str, Any],
         blos_reference: tuple[np.ndarray, fits.Header] | None,
         psf_kernel: np.ndarray | None,
+        viewer_heartbeat: _ViewerRefreshHeartbeat | None = None,
     ) -> None:
         self._artifact_h5 = Path(artifact_h5)
         self._observed = np.asarray(observed, dtype=float)
@@ -1140,12 +1414,31 @@ class _ArtifactWriteDispatcher:
         self._diagnostics = dict(diagnostics)
         self._blos_reference = blos_reference
         self._psf_kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
+        self._viewer_heartbeat = viewer_heartbeat
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=16)
         self._closed = False
         self._failed: BaseException | None = None
+        self._snapshot_lock_warning_emitted = False
+        self._snapshot_missing_target_warning_emitted = False
         self._lock = threading.Lock()
         self._worker = threading.Thread(target=self._run, name="pychmp-artifact-dispatcher", daemon=True)
         self._worker.start()
+
+    def _run_h5_write_with_retry(self, fn: Any, *, attempts: int) -> None:
+        last_exc: BaseException | None = None
+        for attempt in range(max(1, int(attempts))):
+            try:
+                fn()
+                return
+            except BaseException as exc:
+                last_exc = exc
+                if not _is_hdf5_lock_contention_error(exc):
+                    raise
+                if attempt >= int(attempts) - 1:
+                    raise
+                time.sleep(min(0.5, 0.05 * (2 ** attempt)))
+        if last_exc is not None:
+            raise last_exc
 
     def _raise_if_failed(self) -> None:
         with self._lock:
@@ -1159,7 +1452,21 @@ class _ArtifactWriteDispatcher:
         self._raise_if_failed()
         # Bounded queue applies backpressure while still allowing the caller to
         # continue without waiting for each point write to complete.
-        self._queue.put(dict(point_payload))
+        self._queue.put(("point", dict(point_payload)))
+
+    def write_live_snapshot(self, point_payload: dict[str, Any]) -> None:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("artifact write dispatcher is closed")
+        self._raise_if_failed()
+        self._queue.put(("live_snapshot", dict(point_payload)))
+
+    def clear_live_snapshot(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+        self._raise_if_failed()
+        self._queue.put(("clear_live_snapshot", None))
 
     def close(self) -> None:
         with self._lock:
@@ -1171,6 +1478,10 @@ class _ArtifactWriteDispatcher:
         self._worker.join(timeout=5.0)
         self._raise_if_failed()
 
+    def drain(self) -> None:
+        self._queue.join()
+        self._raise_if_failed()
+
     def _run(self) -> None:
         while True:
             item = self._queue.get()
@@ -1178,16 +1489,68 @@ class _ArtifactWriteDispatcher:
                 self._queue.task_done()
                 return
             try:
-                append_point_record(
-                    self._artifact_h5,
-                    observed=self._observed,
-                    sigma_map=self._sigma_map,
-                    wcs_header=self._target_header,
-                    diagnostics=self._diagnostics,
-                    blos_reference=self._blos_reference,
-                    psf_kernel=self._psf_kernel,
-                    point_payload=item,
-                )
+                operation, payload = item
+                if operation == "point":
+                    self._run_h5_write_with_retry(
+                        lambda: append_point_record(
+                            self._artifact_h5,
+                            observed=self._observed,
+                            sigma_map=self._sigma_map,
+                            wcs_header=self._target_header,
+                            diagnostics=self._diagnostics,
+                            blos_reference=self._blos_reference,
+                            psf_kernel=self._psf_kernel,
+                            point_payload=payload,
+                        ),
+                        attempts=12,
+                    )
+                    if self._viewer_heartbeat is not None:
+                        self._viewer_heartbeat.notify_refresh()
+                elif operation == "live_snapshot":
+                    try:
+                        self._run_h5_write_with_retry(
+                            lambda: write_live_trial_point(
+                                self._artifact_h5,
+                                live_state=payload,
+                                slice_key=str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip() or None,
+                            ),
+                            attempts=6,
+                        )
+                        if self._viewer_heartbeat is not None:
+                            self._viewer_heartbeat.notify_refresh()
+                    except BaseException as exc:
+                        if _is_snapshot_target_missing_error(exc):
+                            if not self._snapshot_missing_target_warning_emitted:
+                                print(
+                                    "WARNING: live trial point update skipped because target slice/search is not initialized yet; "
+                                    "point writes will continue"
+                                )
+                                self._snapshot_missing_target_warning_emitted = True
+                            continue
+                        if not _is_hdf5_lock_contention_error(exc):
+                            raise
+                        if not self._snapshot_lock_warning_emitted:
+                            print(
+                                "WARNING: active point snapshot update skipped due to transient HDF5 lock contention; "
+                                "point writes will continue"
+                            )
+                            self._snapshot_lock_warning_emitted = True
+                elif operation == "clear_live_snapshot":
+                    try:
+                        self._run_h5_write_with_retry(
+                            lambda: clear_live_trial_point(
+                                self._artifact_h5,
+                                slice_key=str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip() or None,
+                            ),
+                            attempts=4,
+                        )
+                        if self._viewer_heartbeat is not None:
+                            self._viewer_heartbeat.notify_refresh()
+                    except BaseException as exc:
+                        if _is_snapshot_target_missing_error(exc):
+                            continue
+                        if not _is_hdf5_lock_contention_error(exc):
+                            raise
             except BaseException as exc:
                 with self._lock:
                     if self._failed is None:
@@ -1244,10 +1607,13 @@ def _rescore_auxiliary_map_record(
     threshold: float,
     explicit_mask: np.ndarray | None,
     target_metric: str,
+    psf_kernel: np.ndarray | None = None,
 ) -> tuple[ABPointResult, dict[str, Any]] | None:
     trial_q0 = tuple(float(value) for value in record.get("fit_q0_trials", ()))
     trial_metric_trials = tuple(float(value) for value in record.get("fit_metric_trials", ()))
-    trial_maps_raw = record.get("trial_modeled_maps")
+    trial_maps_raw = record.get("trial_raw_modeled_maps")
+    if trial_maps_raw is None:
+        trial_maps_raw = record.get("trial_modeled_maps")
     observed_arr = np.asarray(observed, dtype=float)
     sigma_arr = np.asarray(sigma_map, dtype=float)
     explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
@@ -1260,7 +1626,9 @@ def _rescore_auxiliary_map_record(
             return None
         if len(trial_metric_trials) != len(trial_q0):
             return None
-        modeled_best_raw = record.get("modeled_best")
+        modeled_best_raw = record.get("raw_modeled_best")
+        if modeled_best_raw is None:
+            modeled_best_raw = record.get("modeled_best")
         if modeled_best_raw is None:
             return None
         finite_indices = [idx for idx, value in enumerate(trial_metric_trials) if np.isfinite(float(value))]
@@ -1269,7 +1637,8 @@ def _rescore_auxiliary_map_record(
         best_index = min(finite_indices, key=lambda idx: float(trial_metric_trials[idx]))
         best_q0 = float(trial_q0[best_index])
         best_objective = float(trial_metric_trials[best_index])
-        best_map = np.asarray(modeled_best_raw, dtype=float)
+        best_raw_map = np.asarray(modeled_best_raw, dtype=float)
+        best_map = _convolve_with_psf_kernel(best_raw_map, psf_kernel)
         trial_chi2 = tuple(float(value) for value in record.get("fit_chi2_trials", trial_metric_trials))
         trial_rho2 = tuple(float(value) for value in record.get("fit_rho2_trials", (np.nan,) * len(trial_q0)))
         trial_eta2 = tuple(float(value) for value in record.get("fit_eta2_trials", (np.nan,) * len(trial_q0)))
@@ -1321,7 +1690,7 @@ def _rescore_auxiliary_map_record(
             success=True,
             status="computed",
             modeled_best=np.asarray(best_map, dtype=float),
-            raw_modeled_best=np.asarray(record.get("raw_modeled_best", best_map), dtype=float),
+            raw_modeled_best=np.asarray(best_raw_map, dtype=float),
             residual=residual,
             fit_q0_trials=tuple(float(v) for v in trial_q0),
             fit_metric_trials=tuple(float(v) for v in trial_metric_trials),
@@ -1347,7 +1716,8 @@ def _rescore_auxiliary_map_record(
 
     rescored: list[tuple[float, Any, float, np.ndarray]] = []
     for q0_value, modeled in zip(trial_q0, trial_maps, strict=False):
-        modeled_arr = np.asarray(modeled, dtype=float)
+        raw_arr = np.asarray(modeled, dtype=float)
+        modeled_arr = _convolve_with_psf_kernel(raw_arr, psf_kernel)
         try:
             mask = explicit_mask_arr if explicit_mask_arr is not None else mask_fn(observed_arr, modeled_arr, float(threshold))
             metrics = compute_metrics(observed_arr, modeled_arr, sigma_arr, mask)
@@ -1355,11 +1725,11 @@ def _rescore_auxiliary_map_record(
         except Exception:
             continue
         if np.isfinite(objective):
-            rescored.append((float(q0_value), metrics, float(objective), modeled_arr))
+            rescored.append((float(q0_value), metrics, float(objective), raw_arr, modeled_arr))
     if not rescored:
         return None
 
-    best_q0, best_metrics, best_objective, best_map = min(rescored, key=lambda item: item[2])
+    best_q0, best_metrics, best_objective, best_raw_map, best_map = min(rescored, key=lambda item: item[2])
     diagnostics = dict(record.get("diagnostics") or {})
     diagnostics.update(
         {
@@ -1373,12 +1743,13 @@ def _rescore_auxiliary_map_record(
             "map_store_source_search_id": record.get("source_search_id"),
         }
     )
-    trial_metric_values = tuple(float(objective) for _q0, _metrics, objective, _modeled in rescored)
-    trial_chi2 = tuple(float(metrics.chi2) for _q0, metrics, _objective, _modeled in rescored)
-    trial_rho2 = tuple(float(metrics.rho2) for _q0, metrics, _objective, _modeled in rescored)
-    trial_eta2 = tuple(float(metrics.eta2) for _q0, metrics, _objective, _modeled in rescored)
-    ordered_trial_q0 = tuple(float(q0) for q0, _metrics, _objective, _modeled in rescored)
-    ordered_trial_maps = np.stack([np.asarray(modeled, dtype=float) for _q0, _metrics, _objective, modeled in rescored], axis=0)
+    trial_metric_values = tuple(float(objective) for _q0, _metrics, objective, _raw, _modeled in rescored)
+    trial_chi2 = tuple(float(metrics.chi2) for _q0, metrics, _objective, _raw, _modeled in rescored)
+    trial_rho2 = tuple(float(metrics.rho2) for _q0, metrics, _objective, _raw, _modeled in rescored)
+    trial_eta2 = tuple(float(metrics.eta2) for _q0, metrics, _objective, _raw, _modeled in rescored)
+    ordered_trial_q0 = tuple(float(q0) for q0, _metrics, _objective, _raw, _modeled in rescored)
+    ordered_trial_raw_maps = np.stack([np.asarray(raw, dtype=float) for _q0, _metrics, _objective, raw, _modeled in rescored], axis=0)
+    ordered_trial_maps = np.stack([np.asarray(modeled, dtype=float) for _q0, _metrics, _objective, _raw, modeled in rescored], axis=0)
     residual = np.asarray(best_map, dtype=float) - observed_arr
 
     point = ABPointResult(
@@ -1411,16 +1782,16 @@ def _rescore_auxiliary_map_record(
         success=True,
         status="computed",
         modeled_best=np.asarray(best_map, dtype=float),
-        raw_modeled_best=np.asarray(record.get("raw_modeled_best", best_map), dtype=float),
+        raw_modeled_best=np.asarray(best_raw_map, dtype=float),
         residual=residual,
         fit_q0_trials=ordered_trial_q0,
         fit_metric_trials=trial_metric_values,
         fit_chi2_trials=trial_chi2,
         fit_rho2_trials=trial_rho2,
         fit_eta2_trials=trial_eta2,
-        trial_raw_modeled_maps=np.asarray(record.get("trial_raw_modeled_maps", ordered_trial_maps), dtype=float),
-        trial_modeled_maps=ordered_trial_maps,
-        trial_residual_maps=ordered_trial_maps - observed_arr[None, :, :],
+        trial_raw_modeled_maps=np.asarray(ordered_trial_raw_maps, dtype=float),
+        trial_modeled_maps=np.asarray(ordered_trial_maps, dtype=float),
+        trial_residual_maps=np.asarray(ordered_trial_maps - observed_arr[None, :, :], dtype=float),
         nfev=int(len(rescored)),
         nit=0,
         message="reused from map_store",
@@ -1445,11 +1816,12 @@ def _collect_start_over_seed_point_payloads(
     explicit_mask: np.ndarray | None,
     target_metric: str,
     compatibility_signature: str,
+    psf_kernel: np.ndarray | None,
 ) -> list[dict[str, Any]]:
     if not artifact_h5.exists() or not slice_key:
         return []
     try:
-        current_payload = load_scan_file(artifact_h5, slice_key=slice_key)
+        current_payload = load_scan_file(artifact_h5, slice_key=slice_key, include_maps=False)
     except KeyError:
         return []
     validate_scan_artifact_compatibility(
@@ -1487,6 +1859,7 @@ def _collect_start_over_seed_point_payloads(
                 threshold=float(threshold),
                 explicit_mask=explicit_mask,
                 target_metric=target_metric,
+                psf_kernel=psf_kernel,
             )
             if rescored is None:
                 continue
@@ -1497,6 +1870,36 @@ def _collect_start_over_seed_point_payloads(
             }
             payloads_by_key[key] = point_payload
     return [payloads_by_key[key] for key in sorted(payloads_by_key.keys())]
+    
+def _maybe_validate_artifact_preflight(
+    *,
+    artifact_h5: Path,
+    artifact_preexisting: bool,
+    recompute_existing: bool,
+    target_slice_key: str,
+    target_header: fits.Header,
+    diagnostics: dict[str, Any],
+) -> None:
+    if not artifact_preexisting or bool(recompute_existing):
+        return
+    try:
+        current_payload = _load_slice_preflight_payload(
+            artifact_h5=artifact_h5,
+            slice_key=target_slice_key,
+            include_maps=False,
+        )
+    except Exception:
+        return
+    if current_payload is None:
+        return
+    if bool(dict(current_payload.get("diagnostics") or {}).get("render_only_slice", False)):
+        return
+    validate_scan_artifact_reuse_preflight(
+        current_payload,
+        wcs_header=target_header,
+        diagnostics=diagnostics,
+        artifact_path=artifact_h5,
+    )
 
 
 class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
@@ -1539,6 +1942,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             diagnostics=self._diagnostics,
             blos_reference=self._blos_reference,
             psf_kernel=self._psf_kernel,
+            viewer_heartbeat=self._viewer_heartbeat,
         )
         self._point_map: dict[tuple[float, float], ABPointResult] = {}
 
@@ -1571,6 +1975,36 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if self._viewer_heartbeat is not None:
             self._viewer_heartbeat.clear_pending_points()
 
+    def clear_live_trial_snapshot(self) -> None:
+        self._writer.clear_live_snapshot()
+
+    def write_live_trial_snapshot(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_trials: list[float],
+        metric_trials: list[float],
+        active_trial_index: int | None = None,
+        active_trial_q0: float | None = None,
+    ) -> None:
+        self._writer.write_live_snapshot(
+            {
+                "slice_key": self._target_slice_key(),
+                "search_id": str(self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or "").strip() or None,
+                "a": float(a_value),
+                "b": float(b_value),
+                "q0": None if active_trial_q0 is None else float(active_trial_q0),
+                "trial_index": None if active_trial_index is None else int(active_trial_index),
+                "metric_name": str(self._target_metric),
+                "fit_q0_trials": [float(v) for v in q0_trials],
+                "fit_metric_trials": [float(v) for v in metric_trials],
+            }
+        )
+
+    def flush_pending_writes(self) -> None:
+        self._writer.drain()
+
     def _target_slice_key(self) -> str | None:
         value = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip()
         return value or None
@@ -1599,6 +2033,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 threshold=float(threshold),
                 explicit_mask=explicit_mask,
                 target_metric=self._target_metric,
+                psf_kernel=self._psf_kernel,
             )
             if rescored is None:
                 continue
@@ -1621,7 +2056,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if not self._artifact_h5.exists():
             return 0
         try:
-            payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key())
+            payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key(), include_maps=False)
         except KeyError:
             return 0
         if bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False)) and not payload.get("point_records"):
@@ -1656,7 +2091,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if not self._artifact_h5.exists():
             return 0
         try:
-            current_payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key())
+            current_payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key(), include_maps=False)
         except KeyError:
             return 0
         if bool(dict(current_payload.get("diagnostics") or {}).get("render_only_slice", False)):
@@ -1698,6 +2133,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     threshold=float(threshold),
                     explicit_mask=explicit_mask,
                     target_metric=self._target_metric,
+                    psf_kernel=self._psf_kernel,
                 )
                 if rescored is None:
                     continue
@@ -1735,6 +2171,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             )
         save_started = time.perf_counter()
         self._writer.write_point(payload)
+        self._writer.clear_live_snapshot()
         save_elapsed = time.perf_counter() - save_started
         self._point_map[normalized_key] = value
         if self._viewer_heartbeat is not None:
@@ -1784,7 +2221,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--b-start", type=float, default=DEFAULT_B, help="Adaptive search starting b value")
     parser.add_argument("--da", type=float, default=0.3, help="Adaptive a step size")
     parser.add_argument("--db", type=float, default=0.3, help="Adaptive b step size")
-    parser.add_argument("--a-min", type=float, default=0.0, help="Adaptive search lower a bound")
+    parser.add_argument("--a-min", type=float, default=-1.2, help="Adaptive search lower a bound")
     parser.add_argument("--a-max", type=float, default=1.2, help="Adaptive search upper a bound")
     parser.add_argument("--b-min", type=float, default=2.1, help="Adaptive search lower b bound")
     parser.add_argument("--b-max", type=float, default=3.6, help="Adaptive search upper b bound")
@@ -1924,11 +2361,44 @@ def main() -> int:
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
+    target_slice_key = next(
+        (str(item["key"]) for item in slice_descriptors if bool(item.get("is_target"))),
+        str(slice_descriptors[0]["key"]) if slice_descriptors else "default",
+    )
 
     artifacts_dir = _coerce_path(args.artifacts_dir) or (repo_root / "ab_scan_artifacts")
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     stem = args.artifacts_stem or _default_artifact_stem(obs_request, target_metric=str(args.target_metric))
     artifact_h5 = _coerce_path(args.artifact_h5) or (artifacts_dir / f"{stem}.h5")
+    try:
+        artifact_h5 = artifact_h5.expanduser().resolve()
+    except Exception:
+        artifact_h5 = artifact_h5.expanduser()
+    artifact_preexisting = artifact_h5.exists()
+    resume_slice_payload = (
+        _load_slice_preflight_payload(
+            artifact_h5=artifact_h5,
+            slice_key=target_slice_key,
+            include_maps=True,
+        )
+        if artifact_preexisting and not bool(args.recompute_existing)
+        else None
+    )
+    resume_slice_diagnostics = dict(resume_slice_payload.get("diagnostics") or {}) if resume_slice_payload is not None else {}
+    if (
+        render_selection.domain != "mw"
+        and render_selection.euv_response_sav is None
+        and not bool(args.recompute_existing)
+    ):
+        cached_response_override = str(resume_slice_diagnostics.get("euv_response_override_path") or "").strip()
+        if cached_response_override:
+            override_path = Path(cached_response_override).expanduser()
+            if override_path.exists():
+                render_selection = replace(
+                    render_selection,
+                    euv_response_sav=override_path.resolve(),
+                )
+                print(f"  EUV response preload: restored override from artifact diagnostics ({override_path})")
     grid_png = None if args.no_grid_png else artifact_h5.with_name(f"{artifact_h5.stem}_grid.png")
     point_png = None if args.no_point_png else artifact_h5.with_name(f"{artifact_h5.stem}_point.png")
     log_path = Path(f"{artifact_h5}.log")
@@ -1946,6 +2416,14 @@ def main() -> int:
         if viewer_process is not None and viewer_process.poll() is None:
             print(f"pychmp-view already running ({phase}) pid={viewer_process.pid}")
             return
+        existing_viewer_pid = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=artifact_h5)
+        if existing_viewer_pid is not None:
+            if _focus_existing_viewer_pid(int(existing_viewer_pid)):
+                print(f"Reusing existing pychmp-view ({phase}) pid={existing_viewer_pid} (brought to front)")
+                return
+            print(
+                f"Existing pychmp-view detected ({phase}) pid={existing_viewer_pid} but could not be focused; launching a fresh viewer"
+            )
         try:
             proc = subprocess.Popen(viewer_cmd, start_new_session=True)
             if proc.poll() is not None:
@@ -2007,6 +2485,11 @@ def main() -> int:
     except Exception as exc:
         print(f"WARNING: failed to initialize live log sidecar: {exc}")
 
+    # Launch as early as possible for existing artifacts so long preflight work
+    # (e.g. PSF/model setup) does not look like a stalled run.
+    if artifact_h5.exists():
+        _maybe_launch_viewer("preflight")
+
     print("Using resolved observational map payload")
     observed = np.asarray(obs_map.data, dtype=float)
     header = obs_map.header.copy()
@@ -2022,18 +2505,34 @@ def main() -> int:
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    selected_psf_metadata = _resolve_selected_psf_metadata(
-        header_psf=header_psf,
-        header_psf_source=header_psf_source,
-        domain=render_selection.domain,
-        instrument_name=render_selection.euv_instrument if render_selection.domain != "mw" else None,
-        wavelength_angstrom=None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
-        date_obs=obs_map.date_obs,
-        cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
-        cli_psf_bmin_arcsec=psf_bmin_arcsec,
-        cli_psf_bpa_deg=psf_bpa_deg,
-        override_header_psf=bool(args.override_header_psf),
-    )
+    selected_psf_metadata = None
+    if (
+        artifact_preexisting
+        and not bool(args.override_header_psf)
+        and psf_bmaj_arcsec is None
+        and psf_bmin_arcsec is None
+        and psf_bpa_deg is None
+    ):
+        cached_slice_psf = _load_slice_psf_metadata_from_artifact(
+            artifact_h5=artifact_h5,
+            slice_key=target_slice_key,
+        )
+        if cached_slice_psf is not None:
+            selected_psf_metadata = cached_slice_psf
+            print(f"  PSF preload: restored kernel from artifact slice metadata ({target_slice_key})")
+    if selected_psf_metadata is None:
+        selected_psf_metadata = _resolve_selected_psf_metadata(
+            header_psf=header_psf,
+            header_psf_source=header_psf_source,
+            domain=render_selection.domain,
+            instrument_name=render_selection.euv_instrument if render_selection.domain != "mw" else None,
+            wavelength_angstrom=None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+            date_obs=obs_map.date_obs,
+            cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
+            cli_psf_bmin_arcsec=psf_bmin_arcsec,
+            cli_psf_bpa_deg=psf_bpa_deg,
+            override_header_psf=bool(args.override_header_psf),
+        )
     psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
     psf_allows_frequency_scaling = bool(
         False if selected_psf_metadata is None else selected_psf_metadata.allows_frequency_scaling
@@ -2065,8 +2564,10 @@ def main() -> int:
         geometry_overrides_requested=geometry_overrides_requested,
         explicit_observer_requested=explicit_observer_requested,
     )
-    geometry_observer_name = str(args.observer or geometry_policy.observer_name)
-    geometry_observer = observer_overrides if explicit_observer_requested else None
+    geometry_observer_name = (
+        None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+    )
+    geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
     resolved_geometry = resolve_render_geometry_via_gxrender(
         model_path=model_h5,
         model_format="auto",
@@ -2075,6 +2576,7 @@ def main() -> int:
         observer_name=geometry_observer_name,
         observer=geometry_observer,
         omp_threads=int(getattr(args, "omp_threads", 8)),
+        use_saved_fov=bool(geometry_policy.use_model_saved_fov),
     )
     geometry = resolved_geometry.geometry
     if not explicit_observer_requested:
@@ -2119,7 +2621,6 @@ def main() -> int:
         dsun_obs_m=effective_observer_dsun_cm / 100.0,
     )
 
-    artifact_preexisting = artifact_h5.exists()
     existing_format = detect_scan_artifact_format(artifact_h5) if artifact_preexisting else None
     if artifact_preexisting and existing_format not in {None, "sparse", "unified"}:
         raise SystemExit(
@@ -2135,68 +2636,41 @@ def main() -> int:
         else None
     )
     ebtel_sha256 = _compute_file_sha256(ebtel_path)
-    target_slice_key = next(
-        (str(item["key"]) for item in slice_descriptors if bool(item.get("is_target"))),
-        str(slice_descriptors[0]["key"]) if slice_descriptors else "default",
-    )
-    preflight_diag = {
-        "artifact_kind": "pychmp_ab_scan_sparse_points",
-        "spectral_domain": str(render_selection.domain),
-        "spectral_label": str(render_selection.spectral_label),
-        "target_slice_key": target_slice_key,
-        "model_sha256": str(model_sha256),
-        "fits_sha256": str(observation_source_sha256 or ""),
-        "ebtel_sha256": str(ebtel_sha256),
-        "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
-        "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
-        "euv_channel": render_selection.euv_channel,
-        "euv_instrument": render_selection.euv_instrument,
-        "map_xc_arcsec": float(geometry.xc),
-        "map_yc_arcsec": float(geometry.yc),
-        "map_dx_arcsec": float(geometry.dx),
-        "map_dy_arcsec": float(geometry.dy),
-        "map_nx": int(geometry.nx),
-        "map_ny": int(geometry.ny),
-        "observer_name": effective_observer_name,
-        "observer_lonc_deg": effective_observer_lonc_deg,
-        "observer_b0sun_deg": effective_observer_b0sun_deg,
-        "observer_dsun_cm": effective_observer_dsun_cm,
-        "observer_obs_time": target_header.get("DATE-OBS", ""),
-    }
-    if artifact_preexisting and not bool(args.recompute_existing):
-        try:
-            current_payload = load_scan_file(artifact_h5, slice_key=target_slice_key)
-        except Exception:
-            current_payload = None
-        if current_payload is not None:
-            try:
-                validate_scan_artifact_reuse_preflight(
-                    current_payload,
-                    wcs_header=target_header,
-                    diagnostics=preflight_diag,
-                    artifact_path=artifact_h5,
-                )
-            except ScanArtifactCompatibilityError as exc:
-                raise SystemExit(str(exc)) from exc
-
-    print("Estimating noise from map...")
-    noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
-    sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
-    noise_diag = noise_result.diagnostics
-    noise_unit = obs_map_noise_unit_label(obs_map)
-    print(
-        f"  Estimated sigma: {float(noise_result.sigma):.2f} {noise_unit} "
-        f"(method={str(noise_result.method_used)})"
-    )
-
     observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
-    sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
     if np.isnan(observed_cropped).any():
         observed_cropped = np.nan_to_num(observed_cropped, nan=float(np.nanmedian(observed_cropped)))
+    sigma_cropped = None
+    noise_diag = {}
+    if resume_slice_payload is not None:
+        stored_sigma = resume_slice_payload.get("sigma_map")
+        if stored_sigma is not None:
+            stored_sigma_arr = np.asarray(stored_sigma, dtype=float)
+            if stored_sigma_arr.shape == observed_cropped.shape and stored_sigma_arr.size:
+                sigma_cropped = stored_sigma_arr
+                noise_diag = dict(resume_slice_diagnostics.get("noise_diagnostics") or {})
+                finite_sigma = sigma_cropped[np.isfinite(sigma_cropped)]
+                restored_sigma = float(np.nanmedian(finite_sigma)) if finite_sigma.size else float("nan")
+                noise_unit = obs_map_noise_unit_label(obs_map)
+                print(
+                    f"  Noise preload: restored sigma map from artifact slice metadata "
+                    f"(median sigma={restored_sigma:.2f} {noise_unit})"
+                )
+    if sigma_cropped is None:
+        print("Estimating noise from map...")
+        noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+        sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
+        noise_diag = noise_result.diagnostics
+        noise_unit = obs_map_noise_unit_label(obs_map)
+        print(
+            f"  Estimated sigma: {float(noise_result.sigma):.2f} {noise_unit} "
+            f"(method={str(noise_result.method_used)})"
+        )
+        sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
+
     if np.isnan(sigma_cropped).any():
         fill_sigma = float(np.nanmedian(sigma_cropped))
         if not np.isfinite(fill_sigma) or fill_sigma <= 0:
-            fill_sigma = float(np.nanmedian(sigma_map))
+            fill_sigma = 1.0
         sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
 
     blos_reference_for_fov = load_blos_reference_for_fov(
@@ -2282,6 +2756,113 @@ def main() -> int:
             ref_frequency_ghz=float(args.psf_ref_frequency_ghz) if args.psf_ref_frequency_ghz is not None else None,
             scale_inverse_frequency=bool(args.psf_scale_inverse_frequency),
         )
+        if psf_kernel is not None:
+            original_kernel_shape = tuple(int(v) for v in np.asarray(psf_kernel, dtype=float).shape)
+            psf_kernel = _compact_kernel_for_target_shape(
+                np.asarray(psf_kernel, dtype=float),
+                target_ny=int(geometry.ny),
+                target_nx=int(geometry.nx),
+            )
+            compact_kernel_shape = tuple(int(v) for v in np.asarray(psf_kernel, dtype=float).shape)
+            if compact_kernel_shape != original_kernel_shape:
+                print(
+                    "  PSF compact: "
+                    f"cropped kernel {original_kernel_shape} -> {compact_kernel_shape} "
+                    "for target-grid convolution"
+                )
+                if isinstance(resolved_psf_meta, dict):
+                    resolved_psf_meta = {
+                        **resolved_psf_meta,
+                        "psf_kernel_shape_original": original_kernel_shape,
+                        "psf_kernel_shape": compact_kernel_shape,
+                        "psf_kernel_compacted": True,
+                    }
+
+    euv_response_identity = None
+    euv_response_identity_version = None
+    euv_response_sha256 = None
+    euv_response_identity_summary = None
+    if render_selection.domain != "mw":
+        reused_identity = False
+        if artifact_preexisting and not bool(args.recompute_existing):
+            cached_version = str(resume_slice_diagnostics.get("euv_response_identity_version") or "").strip()
+            cached_sha = str(resume_slice_diagnostics.get("euv_response_sha256") or "").strip()
+            cached_summary = resume_slice_diagnostics.get("euv_response_identity_summary")
+            if cached_version and cached_sha and isinstance(cached_summary, dict):
+                euv_response_identity_version = cached_version
+                euv_response_sha256 = cached_sha
+                euv_response_identity_summary = dict(cached_summary)
+                reused_identity = True
+                print("  EUV response identity: reused cached artifact diagnostics")
+        if not reused_identity:
+            identity_started = time.perf_counter()
+            euv_response_identity = resolve_euv_response_identity(
+                model_path=str(model_h5),
+                channel=str(render_selection.euv_channel),
+                render_channels=render_channels,
+                instrument=str(render_selection.euv_instrument),
+                response_sav=render_selection.euv_response_sav,
+                ebtel_path=str(ebtel_path),
+                tbase=float(args.tbase),
+                nbase=float(args.nbase),
+                a=float(args.a_start),
+                b=float(args.b_start),
+                geometry=geometry,
+                observer=observer_overrides,
+                observer_name=effective_observer_name,
+                tr_region_mask=euv_tr_mask,
+                pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+            )
+            if euv_response_identity is not None:
+                euv_response_identity_version = str(euv_response_identity.version)
+                euv_response_sha256 = str(euv_response_identity.sha256)
+                euv_response_identity_summary = dict(euv_response_identity.summary)
+            identity_elapsed = time.perf_counter() - identity_started
+            print(f"  EUV response identity: computed in {identity_elapsed:.2f}s")
+    euv_response_origin = "pyEUVTools" if render_selection.euv_response_sav is None else "response_sav"
+    euv_response_override_path = None if render_selection.euv_response_sav is None else str(render_selection.euv_response_sav)
+    euv_response_resolver = "pychmp.gxrender_adapter.resolve_euv_response_identity"
+
+    preflight_diag = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        "spectral_domain": str(render_selection.domain),
+        "spectral_label": str(render_selection.spectral_label),
+        "target_slice_key": target_slice_key,
+        "model_sha256": str(model_sha256),
+        "fits_sha256": str(observation_source_sha256 or ""),
+        "ebtel_sha256": str(ebtel_sha256),
+        "euv_response_identity_version": euv_response_identity_version,
+        "euv_response_sha256": euv_response_sha256,
+        "euv_response_origin": euv_response_origin,
+        "euv_response_override_path": euv_response_override_path,
+        "euv_response_resolver": euv_response_resolver,
+        "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
+        "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        "euv_channel": render_selection.euv_channel,
+        "euv_instrument": render_selection.euv_instrument,
+        "map_xc_arcsec": float(geometry.xc),
+        "map_yc_arcsec": float(geometry.yc),
+        "map_dx_arcsec": float(geometry.dx),
+        "map_dy_arcsec": float(geometry.dy),
+        "map_nx": int(geometry.nx),
+        "map_ny": int(geometry.ny),
+        "observer_name": effective_observer_name,
+        "observer_lonc_deg": effective_observer_lonc_deg,
+        "observer_b0sun_deg": effective_observer_b0sun_deg,
+        "observer_dsun_cm": effective_observer_dsun_cm,
+        "observer_obs_time": target_header.get("DATE-OBS", ""),
+    }
+    try:
+        _maybe_validate_artifact_preflight(
+            artifact_h5=artifact_h5,
+            artifact_preexisting=artifact_preexisting,
+            recompute_existing=bool(args.recompute_existing),
+            target_slice_key=target_slice_key,
+            target_header=target_header,
+            diagnostics=preflight_diag,
+        )
+    except ScanArtifactCompatibilityError as exc:
+        raise SystemExit(str(exc)) from exc
 
     root_diag = {
         "artifact_kind": "pychmp_ab_scan_sparse_points",
@@ -2312,6 +2893,18 @@ def main() -> int:
         "euv_channel": render_selection.euv_channel,
         "euv_instrument": render_selection.euv_instrument,
         "euv_response_sav": None if render_selection.euv_response_sav is None else str(render_selection.euv_response_sav),
+        "euv_response_identity_version": euv_response_identity_version,
+        "euv_response_sha256": euv_response_sha256,
+        "euv_response_origin": euv_response_origin,
+        "euv_response_override_path": euv_response_override_path,
+        "euv_response_resolver": euv_response_resolver,
+        "euv_response_source": (
+            None if euv_response_identity_summary is None else euv_response_identity_summary.get("source")
+        ),
+        "euv_response_mode": None if euv_response_identity_summary is None else euv_response_identity_summary.get("mode"),
+        "euv_response_identity_summary": (
+            None if euv_response_identity_summary is None else dict(euv_response_identity_summary)
+        ),
         "map_xc_arcsec": float(geometry.xc),
         "map_yc_arcsec": float(geometry.yc),
         "map_dx_arcsec": float(geometry.dx),
@@ -2367,7 +2960,8 @@ def main() -> int:
             "wavelength_angstrom": root_diag["wavelength_angstrom"],
             "euv_channel": root_diag["euv_channel"],
             "euv_instrument": root_diag["euv_instrument"],
-            "euv_response_sav": root_diag["euv_response_sav"],
+            "euv_response_identity_version": root_diag["euv_response_identity_version"],
+            "euv_response_sha256": root_diag["euv_response_sha256"],
             "map_xc_arcsec": root_diag["map_xc_arcsec"],
             "map_yc_arcsec": root_diag["map_yc_arcsec"],
             "map_dx_arcsec": root_diag["map_dx_arcsec"],
@@ -2399,6 +2993,7 @@ def main() -> int:
         viewer_refresh_signal,
         slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
     )
+    print(f"Viewer heartbeat signal: {viewer_refresh_signal}")
     existing_run_history = load_run_history(artifact_h5) if artifact_preexisting else []
     if bool(args.recompute_existing) and artifact_h5.exists():
         print(f"Recompute existing: resetting sparse artifact at {artifact_h5}")
@@ -2415,6 +3010,7 @@ def main() -> int:
             explicit_mask=explicit_metric_mask,
             target_metric=str(args.target_metric),
             compatibility_signature=compatibility_signature,
+            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         )
         print(f"Start over: resetting search history in {artifact_h5} while seeding from stored compatible maps")
     if not artifact_h5.exists() or bool(args.recompute_existing) or bool(args.start_over):
@@ -2430,7 +3026,7 @@ def main() -> int:
             run_history=[] if bool(args.start_over) else existing_run_history,
             preserve_existing_searches=not bool(args.start_over),
         )
-        viewer_heartbeat.set_phase("adaptive sparse artifact initialized")
+        viewer_heartbeat.notify_refresh()
         print(f"Initialized sparse artifact: {artifact_h5}")
 
     factory = _AdaptiveRendererFactory(
@@ -2484,26 +3080,12 @@ def main() -> int:
     )
     search_renderer_factory = cache.streaming_renderer_factory
     try:
+        if not bool(args.recompute_existing):
+            print("Resume preload: loading compatible points from existing artifact...")
         reused_points = 0 if bool(args.recompute_existing) else cache.hydrate_from_existing()
         if not bool(args.recompute_existing):
-            current_promoted_points = cache.promote_current_slice_trial_maps(
-                threshold=float(args.metrics_mask_threshold),
-                explicit_mask=explicit_metric_mask,
-                include_matching_signature=False,
-            )
-            if current_promoted_points:
-                reused_points += current_promoted_points
-                print(
-                    f"Map store reuse: promoted {current_promoted_points} current-slice point(s) "
-                    f"into search {root_diag.get(COMPATIBILITY_SIGNATURE_KEY)}"
-                )
-            promoted_points = cache.promote_auxiliary_maps_from_store(
-                threshold=float(args.metrics_mask_threshold),
-                explicit_mask=explicit_metric_mask,
-            )
-            if promoted_points:
-                reused_points += promoted_points
-                print(f"Map store reuse: promoted {promoted_points} point(s) into slice {root_diag.get('target_slice_key')}")
+            print(f"Resume preload: loaded {reused_points} compatible point(s) from existing artifact")
+            print("Resume preload: map-store promotion disabled by contract (metadata-only resume)")
     except ScanArtifactCompatibilityError as exc:
         cache.close()
         raise SystemExit(str(exc)) from exc
@@ -2556,12 +3138,11 @@ def main() -> int:
                 active_point["value"] = (float(a_value), float(b_value))
                 live_q0_trials.clear()
                 live_metric_trials.clear()
-                viewer_heartbeat.set_active_point(float(a_value), float(b_value))
+                cache.clear_live_trial_snapshot()
 
             def _viewer_point_complete(a_value: float, b_value: float) -> None:
-                point = active_point.get("value")
-                if point is not None:
-                    viewer_heartbeat.set_phase("serializing point payload")
+                _ = (a_value, b_value)
+                cache.clear_live_trial_snapshot()
 
             def _viewer_progress_start(trial_index: int, q0: float) -> None:
                 if console_start_callback is not None:
@@ -2569,16 +3150,15 @@ def main() -> int:
                 point = active_point.get("value")
                 if point is None:
                     return
-                viewer_heartbeat.set_phase(f"trial {int(trial_index):02d} rendering")
-                viewer_heartbeat.update_live_trials(
+                cache.write_live_trial_snapshot(
                     a_value=float(point[0]),
                     b_value=float(point[1]),
-                    metric_name=str(args.target_metric),
                     q0_trials=list(live_q0_trials),
                     metric_trials=list(live_metric_trials),
                     active_trial_index=int(trial_index),
                     active_trial_q0=float(q0),
                 )
+                cache.flush_pending_writes()
 
             def _viewer_progress_report(q0: float, objective_value: float, is_valid: bool, message: str, elapsed_s: float) -> None:
                 if console_progress_callback is not None:
@@ -2588,16 +3168,15 @@ def main() -> int:
                     return
                 live_q0_trials.append(float(q0))
                 live_metric_trials.append(float(objective_value))
-                viewer_heartbeat.set_phase(f"trial {len(live_q0_trials):02d} complete")
-                viewer_heartbeat.update_live_trials(
+                cache.write_live_trial_snapshot(
                     a_value=float(point[0]),
                     b_value=float(point[1]),
-                    metric_name=str(args.target_metric),
                     q0_trials=list(live_q0_trials),
                     metric_trials=list(live_metric_trials),
                     active_trial_index=None,
                     active_trial_q0=None,
                 )
+                cache.flush_pending_writes()
 
             progress_start_callback = _viewer_progress_start
             progress_callback = _viewer_progress_report

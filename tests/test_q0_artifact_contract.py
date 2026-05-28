@@ -89,8 +89,8 @@ def test_save_q0_artifact_writes_replot_contract_with_embedded_blos(tmp_path: Pa
 
     parsed = _parse_artifact_h5(h5_path)
     np.testing.assert_allclose(parsed["observed"], data)
-    np.testing.assert_allclose(parsed["modeled"], data + 1.0)
-    np.testing.assert_allclose(parsed["raw_modeled"], data + 2.0)
+    np.testing.assert_allclose(parsed["modeled"], data + 3.0)
+    np.testing.assert_allclose(parsed["raw_modeled"], data + 3.0)
     assert parsed["blos_reference"] is not None
 
 
