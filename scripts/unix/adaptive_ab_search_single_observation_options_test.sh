@@ -467,9 +467,9 @@ if [[ "$OBS_SOURCE" == "external_fits" ]]; then
     --adaptive-bracketing
     --metrics-mask-threshold "$METRICS_MASK_THRESHOLD"
     --tr-mask-bmin-gauss "$TR_MASK_BMIN_GAUSS"
-    --fallback-psf-bmaj-arcsec 5.77
-    --fallback-psf-bmin-arcsec 5.77
-    --fallback-psf-bpa-deg -17.5
+    --psf-bmaj-arcsec 5.77
+    --psf-bmin-arcsec 5.77
+    --psf-bpa-deg -17.5
     --psf-ref-frequency-ghz 17.0
     --psf-scale-inverse-frequency
   )

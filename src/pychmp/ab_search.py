@@ -12,6 +12,7 @@ from .ab_scan_execution import ABExecutionSettings, ABRequestedExecutionPolicy, 
 from .ab_scan_tasks import ABPointTask, ABSliceTaskDescriptor, compile_rectangular_point_tasks
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .metrics import MetricValues
+from .obs_preprocessing import SliceObservationReference
 from .optimize import MetricName, ProgressCallback, ProgressStartCallback, Q0OptimizationResult
 
 
@@ -47,6 +48,10 @@ class ABPointResult:
     trial_chi2_values: tuple[float, ...] = ()
     trial_rho2_values: tuple[float, ...] = ()
     trial_eta2_values: tuple[float, ...] = ()
+    trial_shift_x_arcsec: tuple[float, ...] = ()
+    trial_shift_y_arcsec: tuple[float, ...] = ()
+    trial_find_shift_valid: tuple[bool, ...] = ()
+    trial_mask_stages: tuple[str, ...] = ()
     elapsed_seconds: float = float("nan")
     artifact_payload: dict[str, Any] | None = None
 
@@ -120,6 +125,10 @@ class ABPointEvaluationRequest:
     q0_start: float | None
     q0_step: float
     max_bracket_steps: int
+    q0_search_stages: tuple[str, ...] | None = None
+    use_smoothed_obs_max: bool = True
+    use_emthreshold: bool = True
+    emthreshold: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -129,6 +138,7 @@ class ABSearchWorkerPayload:
     renderer_factory: ABRendererFactory
     observed: np.ndarray
     sigma: np.ndarray | None
+    observation_reference: SliceObservationReference | None = None
     progress_start_callback: ProgressStartCallback | None = None
     progress_callback: ProgressCallback | None = None
     point_start_callback: PointLifecycleCallback | None = None
@@ -187,6 +197,11 @@ def evaluate_ab_point(
     max_bracket_steps: int = 12,
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    observation_reference: SliceObservationReference | None = None,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
 ) -> ABPointResult:
     """Evaluate the best-fit `q0` for one `(a, b)` point."""
 
@@ -212,6 +227,11 @@ def evaluate_ab_point(
         max_bracket_steps=max_bracket_steps,
         progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
+        observation_reference=observation_reference,
+        q0_search_stages=q0_search_stages,
+        use_smoothed_obs_max=use_smoothed_obs_max,
+        use_emthreshold=use_emthreshold,
+        emthreshold=emthreshold,
     )
     return ABPointResult(
         a=float(a),
@@ -232,6 +252,10 @@ def evaluate_ab_point(
         trial_chi2_values=tuple(float(v) for v in result.trial_chi2_values),
         trial_rho2_values=tuple(float(v) for v in result.trial_rho2_values),
         trial_eta2_values=tuple(float(v) for v in result.trial_eta2_values),
+        trial_shift_x_arcsec=tuple(float(v) for v in result.trial_shift_x_arcsec),
+        trial_shift_y_arcsec=tuple(float(v) for v in result.trial_shift_y_arcsec),
+        trial_find_shift_valid=tuple(bool(v) for v in result.trial_find_shift_valid),
+        trial_mask_stages=tuple(str(v) for v in result.trial_mask_stages),
         elapsed_seconds=float(time.perf_counter() - started),
     )
 
@@ -285,6 +309,11 @@ def _evaluate_ab_search_request(
             max_bracket_steps=int(request.max_bracket_steps),
             progress_callback=worker_payload.progress_callback,
             progress_start_callback=worker_payload.progress_start_callback,
+            observation_reference=worker_payload.observation_reference,
+            q0_search_stages=request.q0_search_stages,
+            use_smoothed_obs_max=request.use_smoothed_obs_max,
+            use_emthreshold=request.use_emthreshold,
+            emthreshold=float(request.emthreshold),
         )
     except BaseException:
         print(
@@ -302,12 +331,14 @@ def _evaluate_ab_search_request(
         f"elapsed={float(result.elapsed_seconds):.3f}s",
         flush=True,
     )
-    if worker_payload.point_complete_callback is not None:
-        worker_payload.point_complete_callback(a, b)
     artifact_payload_builder = getattr(renderer, "build_artifact_payload", None)
     if callable(artifact_payload_builder):
         artifact_payload = artifact_payload_builder(result)
+        if worker_payload.point_complete_callback is not None:
+            worker_payload.point_complete_callback(a, b)
         return replace(result, artifact_payload=artifact_payload)
+    if worker_payload.point_complete_callback is not None:
+        worker_payload.point_complete_callback(a, b)
     return result
 
 
@@ -362,6 +393,7 @@ def _execute_ab_requests(
     progress_callback: ProgressCallback | None,
     point_start_callback: PointLifecycleCallback | None = None,
     point_complete_callback: PointLifecycleCallback | None = None,
+    observation_reference: SliceObservationReference | None = None,
 ) -> Iterator[ABPointResult]:
     if not pending_requests:
         return iter(())
@@ -382,6 +414,7 @@ def _execute_ab_requests(
         renderer_factory=renderer_factory,
         observed=np.asarray(observed, dtype=float),
         sigma=None if sigma is None else np.asarray(sigma, dtype=float),
+        observation_reference=observation_reference,
         progress_start_callback=progress_start_callback if execution_plan.policy == "serial" else None,
         progress_callback=progress_callback if execution_plan.policy == "serial" else None,
         point_start_callback=point_start_callback if execution_plan.policy == "serial" else None,
@@ -410,8 +443,19 @@ def _cache_set_pending_points(
             [
                 (float(request.task.a), float(request.task.b))
                 for request in pending_requests
-            ]
+            ],
+            q0_starts=[request.q0_start for request in pending_requests],
         )
+    except TypeError:
+        try:
+            setter(
+                [
+                    (float(request.task.a), float(request.task.b))
+                    for request in pending_requests
+                ]
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -576,6 +620,10 @@ def _append_adaptive_request_if_needed(
     max_bracket_steps: int,
     point_results: dict[tuple[float, float], ABPointResult],
     cache_map: ABPointCache,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
 ) -> None:
     key = (float(a_values[a_index]), float(b_values[b_index]))
     cached_point = cache_map.get(key)
@@ -590,6 +638,18 @@ def _append_adaptive_request_if_needed(
         q0_min=float(q0_min),
         q0_max=float(q0_max),
     )
+    resume_lookup = getattr(cache_map, "pending_resume_q0_start", None)
+    if resume_lookup is not None:
+        try:
+            resume_seed = resume_lookup(float(a_values[a_index]), float(b_values[b_index]))
+        except Exception:
+            resume_seed = None
+        if resume_seed is not None:
+            normalized_q0_seed = _normalize_q0_seed(
+                resume_seed,
+                q0_min=float(q0_min),
+                q0_max=float(q0_max),
+            )
     pending_keys.add(key)
     pending_requests.append(
         ABPointEvaluationRequest(
@@ -614,6 +674,10 @@ def _append_adaptive_request_if_needed(
             q0_start=normalized_q0_seed,
             q0_step=float(q0_step),
             max_bracket_steps=int(max_bracket_steps),
+            q0_search_stages=q0_search_stages,
+            use_smoothed_obs_max=use_smoothed_obs_max,
+            use_emthreshold=use_emthreshold,
+            emthreshold=float(emthreshold),
         )
     )
 
@@ -648,6 +712,11 @@ def _evaluate_adaptive_index_batch(
     progress_callback: ProgressCallback | None,
     point_start_callback: PointLifecycleCallback | None,
     point_complete_callback: PointLifecycleCallback | None,
+    observation_reference: SliceObservationReference | None = None,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
 ) -> list[ABPointResult]:
     pending_requests: list[ABPointEvaluationRequest] = []
     pending_keys: set[tuple[float, float]] = set()
@@ -676,6 +745,10 @@ def _evaluate_adaptive_index_batch(
             max_bracket_steps=int(max_bracket_steps),
             point_results=point_results,
             cache_map=cache_map,
+            q0_search_stages=q0_search_stages,
+            use_smoothed_obs_max=use_smoothed_obs_max,
+            use_emthreshold=use_emthreshold,
+            emthreshold=float(emthreshold),
         )
 
     execution_plan = _resolve_execution_plan_for_requests(
@@ -717,6 +790,7 @@ def _evaluate_adaptive_index_batch(
                     progress_callback=progress_callback,
                     point_start_callback=point_start_callback,
                     point_complete_callback=point_complete_callback,
+                    observation_reference=observation_reference,
                 ):
                     _persist_adaptive_point(
                         cache_map=cache_map,
@@ -737,6 +811,7 @@ def _evaluate_adaptive_index_batch(
                 progress_callback=progress_callback,
                 point_start_callback=point_start_callback,
                 point_complete_callback=point_complete_callback,
+                observation_reference=observation_reference,
             ):
                 _persist_adaptive_point(
                     cache_map=cache_map,
@@ -785,6 +860,11 @@ def _evaluate_adaptive_neighbor_batch(
     progress_callback: ProgressCallback | None,
     point_start_callback: PointLifecycleCallback | None,
     point_complete_callback: PointLifecycleCallback | None,
+    observation_reference: SliceObservationReference | None = None,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
 ) -> list[ABPointResult]:
     candidate_points: list[tuple[int, int, float | None]] = []
 
@@ -822,6 +902,11 @@ def _evaluate_adaptive_neighbor_batch(
         progress_callback=progress_callback,
         point_start_callback=point_start_callback,
         point_complete_callback=point_complete_callback,
+        observation_reference=observation_reference,
+        q0_search_stages=q0_search_stages,
+        use_smoothed_obs_max=use_smoothed_obs_max,
+        use_emthreshold=use_emthreshold,
+        emthreshold=float(emthreshold),
     )
 
 
@@ -1134,6 +1219,11 @@ def search_local_minimum_ab(
     execution_policy: ABRequestedExecutionPolicy = "serial",
     max_workers: int | None = None,
     worker_chunksize: int = 1,
+    observation_reference: SliceObservationReference | None = None,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
 ) -> ABLocalSearchResult:
     """Search for a local minimum in `(a, b)` using adaptive Phase 1 and Phase 2 expansion."""
     if float(da) <= 0 or float(db) <= 0:
@@ -1204,6 +1294,11 @@ def search_local_minimum_ab(
                 progress_callback=progress_callback,
                 point_start_callback=point_start_callback,
                 point_complete_callback=point_complete_callback,
+                observation_reference=observation_reference,
+                q0_search_stages=q0_search_stages,
+                use_smoothed_obs_max=use_smoothed_obs_max,
+                use_emthreshold=use_emthreshold,
+                emthreshold=float(emthreshold),
             )
             if not point_results:
                 raise RuntimeError("adaptive search failed to evaluate the starting point")
@@ -1258,6 +1353,11 @@ def search_local_minimum_ab(
             progress_callback=progress_callback,
             point_start_callback=point_start_callback,
             point_complete_callback=point_complete_callback,
+            observation_reference=observation_reference,
+            q0_search_stages=q0_search_stages,
+            use_smoothed_obs_max=use_smoothed_obs_max,
+            use_emthreshold=use_emthreshold,
+            emthreshold=float(emthreshold),
         )
 
         best_a_index, best_b_index, best_point_after = _current_best_point(
@@ -1357,6 +1457,11 @@ def search_local_minimum_ab(
                 progress_callback=progress_callback,
                 point_start_callback=point_start_callback,
                 point_complete_callback=point_complete_callback,
+                observation_reference=observation_reference,
+                q0_search_stages=q0_search_stages,
+                use_smoothed_obs_max=use_smoothed_obs_max,
+                use_emthreshold=use_emthreshold,
+                emthreshold=float(emthreshold),
             )
             if not expanded_a and not expanded_b and not evaluated_phase2_points:
                 termination_reason = "frontier_exhausted_without_certification"
@@ -1453,6 +1558,11 @@ def multi_scan_ab(
     execution_policy: ABRequestedExecutionPolicy = "serial",
     max_workers: int | None = None,
     worker_chunksize: int = 1,
+    observation_reference: SliceObservationReference | None = None,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
 ) -> ABScanResult:
     """Scan a fixed rectangular `(a, b)` grid using nested Q0 fitting.
 
@@ -1517,6 +1627,10 @@ def multi_scan_ab(
                 q0_start=None if q0_start_arr is None else float(q0_start_arr[point_task.a_index, point_task.b_index]),
                 q0_step=float(q0_step),
                 max_bracket_steps=int(max_bracket_steps),
+                q0_search_stages=q0_search_stages,
+                use_smoothed_obs_max=use_smoothed_obs_max,
+                use_emthreshold=use_emthreshold,
+                emthreshold=float(emthreshold),
             )
         )
 
@@ -1531,6 +1645,7 @@ def multi_scan_ab(
             worker_chunksize=int(worker_chunksize),
             progress_start_callback=None,
             progress_callback=progress_callback,
+            observation_reference=observation_reference,
         ):
             key = (float(point.a), float(point.b))
             cache_map[key] = point

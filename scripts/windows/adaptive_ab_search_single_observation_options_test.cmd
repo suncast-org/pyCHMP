@@ -358,7 +358,7 @@ set "BASE_ARGS=--ebtel-path "%EBTEL_PATH%" --a-start %A_START% --b-start %B_STAR
 if defined METRICS_MASK_FITS set "BASE_ARGS=%BASE_ARGS% --metrics-mask-fits "%METRICS_MASK_FITS%""
 
 if /I "%OBS_SOURCE%"=="external_fits" (
-  set "RUN_ARGS="%OBS_FITS_PATH%" "%MODEL_H5_PATH%" %BASE_ARGS% --fallback-psf-bmaj-arcsec 5.77 --fallback-psf-bmin-arcsec 5.77 --fallback-psf-bpa-deg -17.5 --psf-ref-frequency-ghz 17.0 --psf-scale-inverse-frequency"
+  set "RUN_ARGS="%OBS_FITS_PATH%" "%MODEL_H5_PATH%" %BASE_ARGS% --psf-bmaj-arcsec 5.77 --psf-bmin-arcsec 5.77 --psf-bpa-deg -17.5 --psf-ref-frequency-ghz 17.0 --psf-scale-inverse-frequency"
 ) else (
   set "RUN_ARGS=--model-h5 "%MODEL_H5_PATH%" %BASE_ARGS% --obs-source model_refmap --obs-map-id "%OBS_MAP_ID%" --euv-instrument "%EUV_INSTRUMENT%""
   if defined EUV_RESPONSE_SAV set "RUN_ARGS=%RUN_ARGS% --euv-response-sav "%EUV_RESPONSE_SAV%""

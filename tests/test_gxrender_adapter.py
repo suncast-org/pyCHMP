@@ -75,7 +75,14 @@ class FakeGXRender:
                 ],
                 axis=-1,
             )
-            return {"TI": cube}
+            stokes_v = np.stack(
+                [
+                    np.full((int(ny), int(nx)), -(float(q0) + float(index)), dtype=float)
+                    for index, _freq in enumerate(frequencies)
+                ],
+                axis=-1,
+            )
+            return {"TI": cube, "TV": stokes_v}
 
 
 class FakeEUVResult:
@@ -153,7 +160,7 @@ class WrongCubeGXRender(FakeGXRender):
             mode=0,
             warn_defaults=False,
         ):
-            return {"TI": np.ones((int(ny), int(nx)), dtype=float)}
+            return {"TI": np.ones((int(ny), int(nx)), dtype=float), "TV": np.ones((int(ny), int(nx)), dtype=float)}
 
 
 class FakeWorkflowHelpers:
@@ -228,8 +235,11 @@ def test_gxrender_mw_adapter_renders_requested_frequency_cube(monkeypatch) -> No
 
     assert payload["frequencies_ghz"] == [5.8, 8.2]
     assert payload["raw_modeled_cube"].shape == (2, 3, 2)
+    assert payload["raw_stokes_v_cube"].shape == (2, 3, 2)
     np.testing.assert_allclose(payload["raw_modeled_by_frequency"][5.8], np.full((2, 3), 0.02))
     np.testing.assert_allclose(payload["raw_modeled_by_frequency"][8.2], np.full((2, 3), 1.02))
+    np.testing.assert_allclose(payload["stokes_v_by_frequency"][5.8], np.full((2, 3), -0.02))
+    np.testing.assert_allclose(payload["stokes_v_by_frequency"][8.2], np.full((2, 3), -1.02))
 
 
 def test_gxrender_mw_adapter_reuses_cached_frequency_cube(monkeypatch) -> None:
@@ -277,7 +287,7 @@ def test_gxrender_mw_adapter_requires_single_frequency_cube(monkeypatch) -> None
         b=2.7,
     )
 
-    with pytest.raises(ValueError, match="single-frequency TI cube"):
+    with pytest.raises(ValueError, match="expected MW TI cube"):
         adapter.render(0.1)
 
 

@@ -9,11 +9,21 @@ Algorithmic provenance:
 from .ab_search import ABLocalSearchResult, ABPointResult, ABScanResult, ABRendererFactory, evaluate_ab_point, idl_q0_start_heuristic, multi_scan_ab, search_local_minimum_ab
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .fitting import Q0MapRenderer, fit_q0_to_observation
-from .gxrender_adapter import EUVResponseIdentity, EUV_RESPONSE_IDENTITY_VERSION, GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWContext, ResolvedRenderGeometry, build_tr_region_mask_from_blos, compute_euv_response_identity, recombine_euv_components, resolve_euv_response_identity, resolve_render_geometry_via_gxrender
+from .gxrender_adapter import EUVResponseIdentity, EUV_RESPONSE_IDENTITY_VERSION, ForwardModelIdentity, FORWARD_MODEL_IDENTITY_VERSION, GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWContext, ResolvedRenderGeometry, build_tr_region_mask_from_blos, compute_euv_response_identity, compute_forward_model_identity_placeholder, recombine_euv_components, resolve_euv_response_identity, resolve_render_geometry_via_gxrender
 from .geometry_policy import GeometryPolicyDecision, infer_observation_observer, resolve_geometry_policy
 from .map_noise import MapNoiseEstimate, estimate_map_noise
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
 from .obs_maps import ObservationalMap, estimate_obs_map_noise, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity, find_named_testdata_file, resolve_default_testdata_fixture_paths
+from .obs_time_alignment import ObsModelTimeAlignment, align_observation_to_model_time, assess_obs_model_time_alignment, load_model_obs_time_text
+from .obs_preprocessing import (
+    SliceObservationReference,
+    SliceObservationReferenceError,
+    build_slice_observation_identity,
+    prepare_observation_for_metrics,
+    regrid_observation_to_target_fov,
+    resolve_slice_observation_reference,
+    slice_observation_identity_sha256,
+)
 from .optimize import Q0MetricEvaluation, Q0OptimizationResult, find_best_q0
 from .psf import PSFMetadata, KernelConvolvedRenderer, build_psf_kernel, default_psf_metadata, effective_psf_parameters, elliptical_gaussian_kernel, extract_psf_metadata_from_header, format_psf_report, resolve_psf_metadata
 from .spectral import RenderSliceRequest, default_euv_channels_for_instrument, parse_csv_floats, parse_csv_tokens
@@ -55,6 +65,17 @@ __all__ = [
   "GeometryPolicyDecision",
   "infer_observation_observer",
   "resolve_geometry_policy",
+  "ObsModelTimeAlignment",
+  "assess_obs_model_time_alignment",
+  "align_observation_to_model_time",
+  "load_model_obs_time_text",
+  "prepare_observation_for_metrics",
+  "regrid_observation_to_target_fov",
+  "resolve_slice_observation_reference",
+  "SliceObservationReference",
+  "SliceObservationReferenceError",
+  "build_slice_observation_identity",
+  "slice_observation_identity_sha256",
   "build_tr_region_mask_from_blos",
   "recombine_euv_components",
   "extract_artifact_identity_summary",

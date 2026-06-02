@@ -27,12 +27,23 @@ class Q0MetricEvaluation:
     total_modeled_flux: float | None = None
     is_valid: bool = True
     message: str = ""
+    shift_x_arcsec: float = 0.0
+    shift_y_arcsec: float = 0.0
+    find_shift_valid: bool = True
+    mask_obs_fraction: float | None = None
+    mask_mod_fraction: float | None = None
+    find_shift_version: str = ""
+    chmp_eval_policy_version: str = ""
+    mask_stage: str = ""
 
 
 MetricFunctionResult: TypeAlias = MetricValues | Q0MetricEvaluation
 InitialQ0Evaluations: TypeAlias = Mapping[float, MetricFunctionResult]
 ProgressStartCallback: TypeAlias = Callable[[int, float], None]
-ProgressCallback: TypeAlias = Callable[[float, float, bool, str, float], None]
+ProgressCallback: TypeAlias = (
+    Callable[[float, float, bool, str, float, MetricValues, Q0MetricEvaluation], None]
+    | Callable[[float, float, bool, str, float, MetricValues], None]
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +67,11 @@ class Q0OptimizationResult:
     trial_chi2_values: tuple[float, ...] = ()
     trial_rho2_values: tuple[float, ...] = ()
     trial_eta2_values: tuple[float, ...] = ()
+    trial_shift_x_arcsec: tuple[float, ...] = ()
+    trial_shift_y_arcsec: tuple[float, ...] = ()
+    trial_find_shift_valid: tuple[bool, ...] = ()
+    q0_search_stages: tuple[str, ...] = ()
+    trial_mask_stages: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -67,6 +83,10 @@ class _Q0EvaluationRecord:
     total_modeled_flux: float | None
     is_valid: bool
     message: str
+    shift_x_arcsec: float = 0.0
+    shift_y_arcsec: float = 0.0
+    find_shift_valid: bool = True
+    mask_stage: str = ""
 
 
 @dataclass(frozen=True)
@@ -134,11 +154,44 @@ def _evaluate_q0(
         total_modeled_flux=evaluation.total_modeled_flux,
         is_valid=is_valid,
         message=str(evaluation.message or ""),
+        shift_x_arcsec=float(evaluation.shift_x_arcsec),
+        shift_y_arcsec=float(evaluation.shift_y_arcsec),
+        find_shift_valid=bool(evaluation.find_shift_valid),
+        mask_stage=str(evaluation.mask_stage or ""),
     )
     cache[q0] = record
     evaluation_order.append(q0)
     if progress_callback is not None:
-        progress_callback(record.q0, record.objective_value, record.is_valid, record.message, float(elapsed_s))
+        evaluation_payload = Q0MetricEvaluation(
+            metrics=record.metrics,
+            total_observed_flux=record.total_observed_flux,
+            total_modeled_flux=record.total_modeled_flux,
+            is_valid=record.is_valid,
+            message=record.message,
+            shift_x_arcsec=float(record.shift_x_arcsec),
+            shift_y_arcsec=float(record.shift_y_arcsec),
+            find_shift_valid=bool(record.find_shift_valid),
+            mask_stage=str(record.mask_stage or ""),
+        )
+        try:
+            progress_callback(
+                record.q0,
+                record.objective_value,
+                record.is_valid,
+                record.message,
+                float(elapsed_s),
+                record.metrics,
+                evaluation_payload,
+            )
+        except TypeError:
+            progress_callback(
+                record.q0,
+                record.objective_value,
+                record.is_valid,
+                record.message,
+                float(elapsed_s),
+                record.metrics,
+            )
     return record
 
 
@@ -185,6 +238,10 @@ def _seed_initial_evaluations(
             total_modeled_flux=evaluation.total_modeled_flux,
             is_valid=is_valid,
             message=str(evaluation.message or "seeded from saved trial map"),
+            shift_x_arcsec=float(evaluation.shift_x_arcsec),
+            shift_y_arcsec=float(evaluation.shift_y_arcsec),
+            find_shift_valid=bool(evaluation.find_shift_valid),
+            mask_stage=str(evaluation.mask_stage or ""),
         )
         cache[q0] = record
         evaluation_order.append(q0)
@@ -218,6 +275,24 @@ def _trial_metric_histories(
         tuple(float(cache[q0].metrics.rho2) for q0 in evaluation_order),
         tuple(float(cache[q0].metrics.eta2) for q0 in evaluation_order),
     )
+
+
+def _trial_shift_histories(
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+) -> tuple[tuple[float, ...], tuple[float, ...], tuple[bool, ...]]:
+    return (
+        tuple(float(cache[q0].shift_x_arcsec) for q0 in evaluation_order),
+        tuple(float(cache[q0].shift_y_arcsec) for q0 in evaluation_order),
+        tuple(bool(cache[q0].find_shift_valid) for q0 in evaluation_order),
+    )
+
+
+def _trial_mask_stage_histories(
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+) -> tuple[str, ...]:
+    return tuple(str(cache[q0].mask_stage or "") for q0 in evaluation_order)
 
 
 def _valid_records_in_range(
@@ -729,6 +804,8 @@ def find_best_q0(
             trial_q0 = tuple(evaluation_order)
             trial_objective_values = tuple(cache[q0].objective_value for q0 in evaluation_order)
             trial_chi2_values, trial_rho2_values, trial_eta2_values = _trial_metric_histories(cache, evaluation_order)
+            trial_shift_x, trial_shift_y, trial_shift_valid = _trial_shift_histories(cache, evaluation_order)
+            trial_mask_stages = _trial_mask_stage_histories(cache, evaluation_order)
             return Q0OptimizationResult(
                 q0=float(boundary_record.q0),
                 objective_value=boundary_record.objective_value,
@@ -746,6 +823,10 @@ def find_best_q0(
                 trial_chi2_values=trial_chi2_values,
                 trial_rho2_values=trial_rho2_values,
                 trial_eta2_values=trial_eta2_values,
+                trial_shift_x_arcsec=trial_shift_x,
+                trial_shift_y_arcsec=trial_shift_y,
+                trial_find_shift_valid=trial_shift_valid,
+                trial_mask_stages=trial_mask_stages,
             )
         else:
             message_prefix = f"{bracket_result.message}; falling back to bounded refinement"
@@ -799,6 +880,8 @@ def find_best_q0(
     trial_q0 = tuple(evaluation_order)
     trial_objective_values = tuple(cache[q0].objective_value for q0 in evaluation_order)
     trial_chi2_values, trial_rho2_values, trial_eta2_values = _trial_metric_histories(cache, evaluation_order)
+    trial_shift_x, trial_shift_y, trial_shift_valid = _trial_shift_histories(cache, evaluation_order)
+    trial_mask_stages = _trial_mask_stage_histories(cache, evaluation_order)
 
     boundary_tol = max(float(effective_xatol), 1e-12)
     boundary_failure = False
@@ -828,4 +911,8 @@ def find_best_q0(
         trial_chi2_values=trial_chi2_values,
         trial_rho2_values=trial_rho2_values,
         trial_eta2_values=trial_eta2_values,
+        trial_shift_x_arcsec=trial_shift_x,
+        trial_shift_y_arcsec=trial_shift_y,
+        trial_find_shift_valid=trial_shift_valid,
+        trial_mask_stages=trial_mask_stages,
     )

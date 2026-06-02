@@ -11,9 +11,103 @@ from astropy.wcs import FITSFixedWarning, WCS
 from matplotlib.patches import Ellipse
 from matplotlib.figure import Figure
 from matplotlib.colors import LogNorm, Normalize, SymLogNorm
+from .metrics import resolve_metrics_threshold_mask
+from .obs_preprocessing import format_observation_shift_label
+from .viewer_plot_style import (
+    apply_q0_panel_trials_axis_style,
+    apply_q0_solution_panel_layout,
+    autoscale_trials_from_data,
+    limits_frame_finite_data,
+    normalize_axis_scale_choice,
+    resolve_trial_metric_arrays,
+    reserve_q0_trials_subplot,
+)
 
 
 METRIC_CHOICES = ("chi2", "rho2", "eta2")
+_Q0_PANEL_TITLE_KW = {"fontsize": 9, "pad": 8}
+_Q0_PANEL_BOTTOM_ROW_TITLE_KW = {"fontsize": 9, "pad": 10}
+_Q0_PANEL_GRID_KW = {
+    "left": 0.06,
+    "right": 0.99,
+    "top": 0.90,
+    "bottom": 0.12,
+    "hspace": 0.58,
+    "wspace": 0.38,
+    "height_ratios": (1.0, 1.05),
+}
+_Q0_COLORBAR_SHRINK = 0.88
+_Q0_COLORBAR_PAD = 0.04
+_Q0_COLORBAR_ASPECT = 22.0
+
+
+def _attach_panel_colorbar(figure: Figure, axis: Any, mappable: Any) -> Any:
+    colorbar = figure.colorbar(
+        mappable,
+        ax=axis,
+        shrink=_Q0_COLORBAR_SHRINK,
+        pad=_Q0_COLORBAR_PAD,
+        aspect=_Q0_COLORBAR_ASPECT,
+    )
+    colorbar.ax.tick_params(length=2, labelsize=6, pad=1)
+    return colorbar
+
+
+def _compact_map_title(kind: str, spectral_label: str, *, trial_title: str = "") -> str:
+    label = str(spectral_label or "").strip() or "map"
+    title = f"{kind} @ {label}"
+    trial = str(trial_title or "").strip()
+    if trial:
+        return f"{title}\n{trial}"
+    return title
+
+
+def _style_map_axis(axis: Any, *, title: str | None = None, grid_row: int = 0, grid_col: int = 0) -> None:
+    if title is not None:
+        title_kw = _Q0_PANEL_BOTTOM_ROW_TITLE_KW if int(grid_row) == 1 else _Q0_PANEL_TITLE_KW
+        axis.set_title(title, **title_kw)
+    show_x = int(grid_row) == 1
+    show_y = int(grid_col) == 0
+    try:
+        x_coord = axis.coords[0]
+        y_coord = axis.coords[1]
+        x_coord.set_axislabel("Solar X" if show_x else "", minpad=1.2)
+        y_coord.set_axislabel("Solar Y" if show_y else "", minpad=1.2)
+        x_coord.set_ticklabel_visible(show_x)
+        x_coord.set_ticks_visible(show_x)
+        y_coord.set_ticklabel_visible(show_y)
+        y_coord.set_ticks_visible(show_y)
+        if hasattr(x_coord, "set_axislabel_visible"):
+            x_coord.set_axislabel_visible(show_x)
+        if hasattr(y_coord, "set_axislabel_visible"):
+            y_coord.set_axislabel_visible(show_y)
+        if show_x:
+            x_coord.set_ticklabel_position("b")
+            x_coord.set_axislabel_position("b")
+            if hasattr(x_coord, "set_ticks_position"):
+                x_coord.set_ticks_position("b")
+        if show_y:
+            y_coord.set_ticklabel_position("l")
+            y_coord.set_axislabel_position("l")
+            if hasattr(y_coord, "set_ticks_position"):
+                y_coord.set_ticks_position("l")
+        x_coord.set_ticklabel(size=6)
+        y_coord.set_ticklabel(size=6)
+    except Exception:
+        axis.tick_params(
+            labelsize=6,
+            bottom=show_x,
+            labelbottom=show_x,
+            top=False,
+            labeltop=False,
+            left=show_y,
+            labelleft=show_y,
+            right=False,
+            labelright=False,
+        )
+        axis.set_xlabel("Solar X" if show_x else "")
+        axis.set_ylabel("Solar Y" if show_y else "")
+
 
 _REFMAP_CACHE: dict[str, Path | None] = {}
 _BLOS_CACHE: dict[str, tuple[np.ndarray, fits.Header] | None] = {}
@@ -83,6 +177,85 @@ def _spectral_label(diagnostics: dict[str, Any] | None, frequency_ghz: float | N
     if channel_label:
         return channel_label
     return "selected slice"
+
+
+def _euv_channel_token(channel: str) -> str:
+    token = str(channel or "").strip().upper().replace(" ", "")
+    if token.startswith("A") and token[1:].isdigit():
+        return token[1:]
+    return token.lower()
+
+
+def _euv_channel_from_diagnostics(diagnostics: dict[str, Any] | None) -> str:
+    diag = diagnostics or {}
+    channel = str(diag.get("euv_channel", "")).strip()
+    if channel:
+        return channel
+    wavelength_angstrom = _optional_float(diag.get("wavelength_angstrom"))
+    if wavelength_angstrom is not None:
+        rounded = round(float(wavelength_angstrom))
+        if np.isclose(float(wavelength_angstrom), float(rounded), rtol=0.0, atol=1e-9):
+            return str(int(rounded))
+        return f"{float(wavelength_angstrom):.3f}".rstrip("0").rstrip(".")
+    return ""
+
+
+def _sunpy_colormap_registry() -> dict[str, Any]:
+    try:
+        from sunpy.visualization import colormaps as sunpy_colormaps
+    except Exception:
+        return {}
+    return dict(getattr(sunpy_colormaps, "cmlist", {}) or {})
+
+
+def _sunpy_euv_colormap_name(diagnostics: dict[str, Any] | None) -> str | None:
+    diag = diagnostics or {}
+    domain = str(diag.get("spectral_domain", "")).strip().lower()
+    if domain not in {"euv", "uv"}:
+        return None
+    channel = _euv_channel_from_diagnostics(diag)
+    if not channel:
+        return None
+    instrument = str(diag.get("euv_instrument") or diag.get("observation_instrument") or "AIA").strip()
+    instrument_key = instrument.lower()
+    channel_key = _euv_channel_token(channel)
+    cmap_candidates: list[str] = []
+
+    if instrument_key in {"aia", "sdo/aia", "sdoaia"}:
+        cmap_candidates.append(f"sdoaia{channel_key}")
+    elif instrument_key in {"euvia", "euvib", "stereo-a", "stereo-b", "stereo-a/euvi", "stereo-b/euvi"}:
+        cmap_candidates.append(f"euvi{channel_key}")
+    elif instrument_key in {"eui/fsi", "solo-fsi", "solar orbiterfsi", "solar orbiter/fsi"}:
+        cmap_candidates.append(f"solar orbiterfsi{channel_key}")
+    elif instrument_key in {"eui/hri", "solo-hri", "solar orbiterhri", "solar orbiter/hri"}:
+        if channel_key == "1216":
+            cmap_candidates.append("solar orbiterhri_lya1216")
+        else:
+            cmap_candidates.append(f"solar orbiterhri_euv{channel_key}")
+    elif instrument_key in {"trace"}:
+        cmap_candidates.append(f"trace{channel_key}")
+    elif instrument_key in {"eit", "soho/eit", "sohoeit"}:
+        cmap_candidates.append(f"sohoeit{channel_key}")
+    elif instrument_key in {"sxt", "yohkoh/sxt", "yohkohsxt"}:
+        if channel_key in {"a", "al", "openal", "thinal"}:
+            cmap_candidates.append("yohkohsxtal")
+        if channel_key in {"w", "wh", "openwh", "thinwh"}:
+            cmap_candidates.append("yohkohsxtwh")
+
+    available = _sunpy_colormap_registry()
+    for candidate in cmap_candidates:
+        if candidate in available:
+            return candidate
+    return None
+
+
+def _intensity_colormap_for_panel(panel_name: str, diagnostics: dict[str, Any] | None) -> str:
+    if panel_name == "residual":
+        return "coolwarm"
+    sunpy_name = _sunpy_euv_colormap_name(diagnostics)
+    if sunpy_name is not None:
+        return sunpy_name
+    return "inferno"
 
 
 def _resolved_psf_summary(diagnostics: dict[str, Any] | None) -> tuple[str, dict[str, float] | None]:
@@ -451,7 +624,7 @@ def load_blos_reference_for_fov(
 
 class Q0ArtifactPanelFigure:
     def __init__(self, figure: Figure | None = None) -> None:
-        self.figure = figure or Figure(figsize=(14.8, 9.2), constrained_layout=True)
+        self.figure = figure or Figure(figsize=(15.0, 10.5))
         self._gs: Any = None
         self._header_token: str | None = None
         self._shape: tuple[int, int] | None = None
@@ -468,6 +641,7 @@ class Q0ArtifactPanelFigure:
         self._blos_cache_key: str | None = None
         self._blos_loaded = False
         self._show_mask_contours = True
+        self._map_diagnostics: dict[str, Any] | None = None
 
     def set_mask_contours_visible(self, visible: bool) -> None:
         self._show_mask_contours = bool(visible)
@@ -475,55 +649,83 @@ class Q0ArtifactPanelFigure:
     def mask_contours_visible(self) -> bool:
         return bool(self._show_mask_contours)
 
+    def apply_autolayout(self) -> None:
+        """Apply fixed subplot spacing tuned for WCS tick labels and titles."""
+        apply_q0_solution_panel_layout(self.figure)
+        if self._trials_ax is not None:
+            reserve_q0_trials_subplot(self._trials_ax)
+
     def _get_mask(self, observed, modeled, diagnostics):
-        mask_source = str(diagnostics.get("metrics_mask_source", "")).strip().lower()
-        if mask_source == "explicit_fits":
-            return None
-        mask_type = diagnostics.get("mask_type", "union")
-        threshold = float(diagnostics.get("metrics_mask_threshold", diagnostics.get("threshold", 0.1)))
-        from pychmp.metrics import resolve_threshold_mask
-        mask_fn = resolve_threshold_mask(mask_type)
-        return mask_fn(observed, modeled, threshold)
+        header = getattr(self, "_map_wcs_header", None)
+        return resolve_metrics_threshold_mask(
+            observed,
+            modeled,
+            diagnostics,
+            wcs_header=header,
+        )
+
+    def _clear_axis_mask_contours(self, ax: Any) -> None:
+        previous = getattr(ax, "_mask_contours", ())
+        if hasattr(previous, "remove"):
+            previous.remove()
+        else:
+            for coll in previous:
+                coll.remove()
+        ax._mask_contours = ()
+
+    def _draw_mask_contour_on_axis(self, ax: Any, mask: np.ndarray | None, *, show: bool) -> None:
+        self._clear_axis_mask_contours(ax)
+        if show and mask is not None:
+            cs = ax.contour(mask.astype(float), levels=[0.5], colors="lime", linewidths=1.5, alpha=0.8)
+            ax._mask_contours = cs
 
     def _draw_mask_contours(self, show, observed, modeled, diagnostics):
-        # Overlay mask contours on observed, modeled, and residual panels
         mask = self._get_mask(observed, modeled, diagnostics)
-        for name in ("observed", "modeled", "residual"):
+        for name in ("observed", "raw_modeled", "modeled", "residual"):
             ax = self._common_axes.get(name)
             if ax is None:
                 continue
-            # Remove previous contours
-            previous = getattr(ax, "_mask_contours", ())
-            if hasattr(previous, "remove"):
-                previous.remove()
-            else:
-                for coll in previous:
-                    coll.remove()
-            if show and mask is not None:
-                cs = ax.contour(mask.astype(float), levels=[0.5], colors="lime", linewidths=1.5, alpha=0.8)
-                ax._mask_contours = cs
-            else:
-                ax._mask_contours = ()
+            self._draw_mask_contour_on_axis(ax, mask, show=bool(show))
+        blos_ax = self._blos_ax
+        if blos_ax is not None and self._blos_image is not None and mask is not None and self._shape == mask.shape:
+            self._draw_mask_contour_on_axis(blos_ax, mask, show=bool(show))
+        elif blos_ax is not None:
+            self._clear_axis_mask_contours(blos_ax)
     def _build_layout(self, header: fits.Header, shape: tuple[int, int]) -> None:
         self.figure.clear()
-        gs = self.figure.add_gridspec(2, 3)
+        grid_kw = dict(_Q0_PANEL_GRID_KW)
+        height_ratios = grid_kw.pop("height_ratios")
+        gs = self.figure.add_gridspec(
+            2,
+            3,
+            figure=self.figure,
+            height_ratios=height_ratios,
+            hspace=grid_kw.pop("hspace"),
+            wspace=grid_kw.pop("wspace"),
+        )
         self._gs = gs
+        self.figure.subplots_adjust(**grid_kw)
 
         common_specs = [
-            ("observed", gs[0, 1], "inferno"),
-            ("raw_modeled", gs[0, 2], "inferno"),
-            ("modeled", gs[1, 0], "inferno"),
-            ("residual", gs[1, 1], "coolwarm"),
+            ("observed", gs[0, 1], 0, 1),
+            ("raw_modeled", gs[0, 2], 0, 2),
+            ("modeled", gs[1, 0], 1, 0),
+            ("residual", gs[1, 1], 1, 1),
         ]
         self._common_axes = {}
         self._common_images = {}
         self._common_colorbars = {}
         self._common_notes = {}
+        self._common_titles = {}
 
-        for name, slot, cmap in common_specs:
+        for name, slot, grid_row, grid_col in common_specs:
             axis = self.figure.add_subplot(slot, projection=_safe_wcs(header))
+            axis._q0_grid_row = int(grid_row)
+            axis._q0_grid_col = int(grid_col)
+            cmap = _intensity_colormap_for_panel(name, self._map_diagnostics)
             image = axis.imshow(np.zeros(shape, dtype=float), origin="lower", cmap=cmap)
-            colorbar = self.figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04)
+            colorbar = _attach_panel_colorbar(self.figure, axis, image)
+            _style_map_axis(axis, grid_row=grid_row, grid_col=grid_col)
             note = axis.text(
                 0.02,
                 0.02,
@@ -540,7 +742,9 @@ class Q0ArtifactPanelFigure:
             self._common_notes[name] = note
             axis._psf_overlay = None
 
-        self._blos_ax = self.figure.add_subplot(gs[0, 0])
+        self._blos_ax = self.figure.add_subplot(gs[0, 0], projection=_safe_wcs(header))
+        self._blos_ax._q0_grid_row = 0
+        self._blos_ax._q0_grid_col = 0
         self._blos_image = None
         self._blos_colorbar = None
         self._blos_note = self._blos_ax.text(
@@ -554,7 +758,8 @@ class Q0ArtifactPanelFigure:
             bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.85},
         )
         self._trials_ax = self.figure.add_subplot(gs[1, 2])
-        self._trials_ax.set_box_aspect(1)
+        self._trials_ax.set_title("Trials", **_Q0_PANEL_TITLE_KW)
+        self._trials_ax.tick_params(labelsize=7)
         self._header_token = _header_token(header, shape)
         self._shape = shape
         self._blos_cache_key = None
@@ -578,6 +783,7 @@ class Q0ArtifactPanelFigure:
     ) -> None:
         image = self._common_images[name]
         axis = self._common_axes[name]
+        image.set_cmap(_intensity_colormap_for_panel(name, self._map_diagnostics))
         display_data, norm, _limits, _applied_scale = _resolve_image_render_state(
             np.asarray(data, dtype=float),
             scale=scale,
@@ -588,7 +794,10 @@ class Q0ArtifactPanelFigure:
         image.set_data(display_data)
         image.set_norm(norm)
         self._common_colorbars[name].update_normal(image)
-        axis.set_title(title)
+        grid_row = int(getattr(axis, "_q0_grid_row", 0))
+        grid_col = int(getattr(axis, "_q0_grid_col", 0))
+        self._common_titles[name] = title
+        _style_map_axis(axis, title=title, grid_row=grid_row, grid_col=grid_col)
         self._common_notes[name].set_text(note)
 
     def _update_psf_overlay(self, *, name: str, diagnostics: dict[str, Any], header: fits.Header) -> None:
@@ -639,7 +848,7 @@ class Q0ArtifactPanelFigure:
             self._blos_ax.remove()
         self._blos_ax = self.figure.add_subplot(self._gs[0, 0])
         self._blos_image = None
-        self._blos_ax.set_title("B_los Reference")
+        self._blos_ax.set_title("B_los Reference", **_Q0_PANEL_TITLE_KW)
         self._blos_ax.text(0.5, 0.58, message, transform=self._blos_ax.transAxes, ha="center", va="center")
         self._blos_ax.axis("off")
         self._blos_note = self._blos_ax.text(
@@ -695,7 +904,8 @@ class Q0ArtifactPanelFigure:
             self._blos_ax.remove()
             self._blos_ax = self.figure.add_subplot(self._gs[0, 0], projection=_safe_wcs(blos_header))
             self._blos_image = self._blos_ax.imshow(np.asarray(blos_data, dtype=float), origin="lower", cmap="gray")
-            self._blos_colorbar = self.figure.colorbar(self._blos_image, ax=self._blos_ax, fraction=0.046, pad=0.04)
+            self._blos_colorbar = _attach_panel_colorbar(self.figure, self._blos_ax, self._blos_image)
+            _style_map_axis(self._blos_ax, title="B_los Reference", grid_row=0, grid_col=0)
             self._blos_note = self._blos_ax.text(
                 0.02,
                 0.02,
@@ -714,7 +924,7 @@ class Q0ArtifactPanelFigure:
         self._blos_image.set_clim(vmin, vmax)
         if self._blos_colorbar is not None:
             self._blos_colorbar.update_normal(self._blos_image)
-        self._blos_ax.set_title("B_los Reference")
+        _style_map_axis(self._blos_ax, title="B_los Reference", grid_row=0, grid_col=0)
         if self._blos_note is not None:
             self._blos_note.set_text(f"a={a_text}  b={b_text}\nq0=n/a")
         self._blos_loaded = True
@@ -740,12 +950,14 @@ class Q0ArtifactPanelFigure:
         trials_ymax: float | None,
         trials_xscale: str | None,
         trials_yscale: str | None,
+        trials_xlim: tuple[float, float] | None = None,
+        trials_ylim: tuple[float, float] | None = None,
+        trials_match_parent_view: bool = False,
         fmt: Callable[[Any, str], str],
         diagnostics: dict[str, Any],
     ) -> None:
         ax = self._trials_ax
         ax.clear()
-        ax.set_box_aspect(1)
         selected_trial_index = diagnostics.get("selected_trial_index")
         try:
             selected_trial_index = None if selected_trial_index is None else int(selected_trial_index)
@@ -754,9 +966,22 @@ class Q0ArtifactPanelFigure:
 
         plotted_trials = False
         try:
-            q0_arr = np.asarray(q0_trials, dtype=float)
-            metric_arr = np.asarray(metric_trials, dtype=float)
+            q0_arr, metric_arr = resolve_trial_metric_arrays(diagnostics, target_metric)
+            if q0_arr.ndim != 1 or metric_arr.ndim != 1:
+                q0_arr = np.asarray(q0_trials, dtype=float).reshape(-1)
+                metric_arr = np.asarray(metric_trials, dtype=float).reshape(-1)
+            if q0_arr.size and (metric_arr.size != q0_arr.size or not np.any(np.isfinite(metric_arr))):
+                q0_fallback = np.asarray(q0_trials, dtype=float).reshape(-1)
+                metric_fallback = np.asarray(metric_trials, dtype=float).reshape(-1)
+                if metric_fallback.size == q0_fallback.size and np.any(np.isfinite(metric_fallback)):
+                    q0_arr, metric_arr = q0_fallback, metric_fallback
             ok = q0_arr.ndim == 1 and metric_arr.ndim == 1 and q0_arr.size == metric_arr.size and q0_arr.size > 0
+            if ok and not np.any(np.isfinite(metric_arr)):
+                ok = False
+            if ok:
+                finite = np.isfinite(q0_arr) & np.isfinite(metric_arr)
+                if not np.any(finite):
+                    ok = False
             if ok:
                 order = np.argsort(q0_arr)
                 best_trial_index = int(np.nanargmin(metric_arr))
@@ -801,16 +1026,28 @@ class Q0ArtifactPanelFigure:
                     title_parts.append("log y")
                 if zoom2best is not None and zoom2best > 0:
                     title_parts.append(f"zoom±{zoom2best}")
-                title_suffix = f" ({', '.join(title_parts)})" if title_parts else ""
-                ax.set_title(f"{target_metric} vs q0 Trials{title_suffix}")
-                ax.set_xlabel("q0")
-                ax.set_ylabel(target_metric)
                 ax.grid(alpha=0.25)
-                if log_metrics and np.all(np.asarray(metric_arr, dtype=float) > 0.0):
-                    ax.set_yscale("log")
-                if log_q0 and np.all(np.asarray(q0_arr, dtype=float) > 0.0):
+                xscale_choice = normalize_axis_scale_choice(trials_xscale)
+                yscale_choice = normalize_axis_scale_choice(trials_yscale)
+                if xscale_choice == "log" and np.all(np.asarray(q0_arr, dtype=float) > 0.0):
                     ax.set_xscale("log")
-                if zoom2best is not None and zoom2best > 0 and q0_arr.size > 1:
+                else:
+                    ax.set_xscale("linear")
+                if yscale_choice == "log" and np.all(np.asarray(metric_arr, dtype=float) > 0.0):
+                    ax.set_yscale("log")
+                else:
+                    ax.set_yscale("linear")
+                if log_metrics and yscale_choice != "log" and np.all(np.asarray(metric_arr, dtype=float) > 0.0):
+                    ax.set_yscale("log")
+                if log_q0 and xscale_choice != "log" and np.all(np.asarray(q0_arr, dtype=float) > 0.0):
+                    ax.set_xscale("log")
+                limits_locked = False
+                if (
+                    not trials_match_parent_view
+                    and zoom2best is not None
+                    and zoom2best > 0
+                    and q0_arr.size > 1
+                ):
                     q0_sorted = q0_arr[order]
                     best_sorted_pos = int(np.argmin(metric_arr[order]))
                     lo = max(0, best_sorted_pos - zoom2best)
@@ -829,52 +1066,71 @@ class Q0ArtifactPanelFigure:
                         else:
                             ypad = (vy_max - vy_min) * 0.12 if vy_max > vy_min else max(abs(vy_min) * 0.1, 1e-12)
                             ax.set_ylim(vy_min - ypad, vy_max + ypad)
+                    limits_locked = True
 
-                xscale_override = str(trials_xscale or "").strip().lower()
-                if xscale_override in {"linear", "log"}:
-                    if xscale_override != "log" or np.all(np.asarray(q0_arr, dtype=float) > 0.0):
-                        ax.set_xscale(xscale_override)
-                yscale_override = str(trials_yscale or "").strip().lower()
-                if yscale_override in {"linear", "log"}:
-                    if yscale_override != "log" or np.all(np.asarray(metric_arr, dtype=float) > 0.0):
-                        ax.set_yscale(yscale_override)
-
-                xmin = trials_xmin
-                xmax = trials_xmax
-                ymin = trials_ymin
-                ymax = trials_ymax
-                if ax.get_xscale() == "log":
-                    if xmin is not None and xmin <= 0:
-                        xmin = None
-                    if xmax is not None and xmax <= 0:
-                        xmax = None
-                if ax.get_yscale() == "log":
-                    if ymin is not None and ymin <= 0:
-                        ymin = None
-                    if ymax is not None and ymax <= 0:
-                        ymax = None
-                if xmin is not None and xmax is not None and xmin < xmax:
-                    ax.set_xlim(xmin, xmax)
-                elif xmin is not None:
-                    ax.set_xlim(left=xmin)
-                elif xmax is not None:
-                    ax.set_xlim(right=xmax)
-                if ymin is not None and ymax is not None and ymin < ymax:
-                    ax.set_ylim(ymin, ymax)
-                elif ymin is not None:
-                    ax.set_ylim(bottom=ymin)
-                elif ymax is not None:
-                    ax.set_ylim(top=ymax)
-
-                if (
-                    ymin is not None
-                    and ymax is not None
-                    and np.isfinite(float(ymin))
-                    and np.isfinite(float(ymax))
-                    and float(ymin) == float(ymax)
-                ):
-                    pad = max(1.0, abs(ymin) * 0.05)
-                    ax.set_ylim(ymin - pad, ymax + pad)
+                used_parent_limits = False
+                if trials_match_parent_view and trials_xlim is not None and trials_ylim is not None:
+                    x0, x1 = float(trials_xlim[0]), float(trials_xlim[1])
+                    y0, y1 = float(trials_ylim[0]), float(trials_ylim[1])
+                    if limits_frame_finite_data((x0, x1), (y0, y1), q0_arr, metric_arr):
+                        if ax.get_xscale() == "log":
+                            if x0 > 0 and x1 > 0 and x0 < x1:
+                                ax.set_xlim(x0, x1)
+                        elif x0 < x1:
+                            ax.set_xlim(x0, x1)
+                        if ax.get_yscale() == "log":
+                            if y0 > 0 and y1 > 0 and y0 < y1:
+                                ax.set_ylim(y0, y1)
+                        elif y0 < y1:
+                            ax.set_ylim(y0, y1)
+                        used_parent_limits = True
+                        limits_locked = True
+                if not limits_locked:
+                    xmin = trials_xmin
+                    xmax = trials_xmax
+                    ymin = trials_ymin
+                    ymax = trials_ymax
+                    if ax.get_xscale() == "log":
+                        if xmin is not None and xmin <= 0:
+                            xmin = None
+                        if xmax is not None and xmax <= 0:
+                            xmax = None
+                    if ax.get_yscale() == "log":
+                        if ymin is not None and ymin <= 0:
+                            ymin = None
+                        if ymax is not None and ymax <= 0:
+                            ymax = None
+                    if xmin is not None and xmax is not None and xmin < xmax:
+                        ax.set_xlim(xmin, xmax)
+                    elif xmin is not None:
+                        ax.set_xlim(left=xmin)
+                    elif xmax is not None:
+                        ax.set_xlim(right=xmax)
+                    if ymin is not None and ymax is not None and ymin < ymax:
+                        ax.set_ylim(ymin, ymax)
+                    elif ymin is not None:
+                        ax.set_ylim(bottom=ymin)
+                    elif ymax is not None:
+                        ax.set_ylim(top=ymax)
+                    if (
+                        ymin is not None
+                        and ymax is not None
+                        and np.isfinite(float(ymin))
+                        and np.isfinite(float(ymax))
+                        and float(ymin) == float(ymax)
+                    ):
+                        pad = max(1.0, abs(ymin) * 0.05)
+                        ax.set_ylim(ymin - pad, ymax + pad)
+                    manual_limits = (
+                        (trials_xmin is not None and trials_xmax is not None and trials_xmin < trials_xmax)
+                        or trials_xmin is not None
+                        or trials_xmax is not None
+                        or (trials_ymin is not None and trials_ymax is not None and trials_ymin < trials_ymax)
+                        or trials_ymin is not None
+                        or trials_ymax is not None
+                    )
+                    if not manual_limits:
+                        autoscale_trials_from_data(ax, q0_arr, metric_arr)
                 handles, labels = ax.get_legend_handles_labels()
                 if handles:
                     unique_handles: list[Any] = []
@@ -890,12 +1146,14 @@ class Q0ArtifactPanelFigure:
                         ax.legend(
                             unique_handles,
                             unique_labels,
-                            loc="upper left",
-                            fontsize=8,
+                            loc="upper right",
+                            fontsize=7,
                             framealpha=0.9,
-                            handlelength=1.6,
-                            borderpad=0.35,
+                            handlelength=1.4,
+                            borderpad=0.3,
                         )
+                apply_q0_panel_trials_axis_style(ax, metric_name=target_metric)
+                reserve_q0_trials_subplot(ax)
                 plotted_trials = True
         except Exception:
             plotted_trials = False
@@ -954,6 +1212,9 @@ class Q0ArtifactPanelFigure:
         trials_ymax: float | None = None,
         trials_xscale: str | None = None,
         trials_yscale: str | None = None,
+        trials_xlim: tuple[float, float] | None = None,
+        trials_ylim: tuple[float, float] | None = None,
+        trials_match_parent_view: bool = False,
         common_map_scale: str | None = None,
         common_map_vmin: float | None = None,
         common_map_vmax: float | None = None,
@@ -966,9 +1227,11 @@ class Q0ArtifactPanelFigure:
         out_png: Path | None = None,
     ) -> None:
         diag = diagnostics or {}
+        self._map_diagnostics = dict(diag)
         header = wcs_header.copy()
         if wcs_header_transform is not None:
             header = wcs_header_transform(header)
+        self._map_wcs_header = header.copy()
 
         observed_arr = np.asarray(observed_noisy, dtype=float)
         shape = observed_arr.shape
@@ -982,7 +1245,7 @@ class Q0ArtifactPanelFigure:
         display_q0 = diag.get("selected_trial_q0", diag.get("q0_recovered"))
         a_text = fmt(diag.get("a"), ".3f")
         b_text = fmt(diag.get("b"), ".3f")
-        target_metric = str(diag.get("target_metric", "chi2"))
+        target_metric = str(diag.get("trials_display_metric") or diag.get("target_metric", "chi2"))
         target_metric_val = diag.get("target_metric_value", diag.get(target_metric))
         spectral_label = _spectral_label(diag, frequency_ghz)
         selected_trial_index = diag.get("selected_trial_index")
@@ -1019,11 +1282,27 @@ class Q0ArtifactPanelFigure:
         else:
             noise_legend = ""
 
+        try:
+            selected_trial_idx = None if selected_trial_index is None else int(selected_trial_index)
+        except Exception:
+            selected_trial_idx = None
+        shift_label = format_observation_shift_label(
+            diagnostics=diag,
+            trial_index=selected_trial_idx,
+            fit_shift_x_trials=diag.get("fit_shift_x_trials"),
+            fit_shift_y_trials=diag.get("fit_shift_y_trials"),
+            fit_find_shift_valid_trials=diag.get("fit_find_shift_valid_trials"),
+        )
+        observed_title = _compact_map_title("Observed", spectral_label)
+        observed_note = f"a={a_text}  b={b_text}\nq0={fmt(q0_true, '.6f')}{psf_legend}{noise_legend}"
+        if shift_label:
+            observed_note = f"{observed_note}\n{shift_label}"
+
         self._update_common_panel(
             "observed",
             observed_arr,
-            title=f"Observed (Noisy) @ {spectral_label}",
-            note=f"a={a_text}  b={b_text}\nq0={fmt(q0_true, '.6f')}{psf_legend}{noise_legend}",
+            title=observed_title,
+            note=observed_note,
             scale=common_map_scale,
             vmin=_coerce_axis_limit(common_map_vmin),
             vmax=_coerce_axis_limit(common_map_vmax),
@@ -1031,7 +1310,7 @@ class Q0ArtifactPanelFigure:
         self._update_common_panel(
             "raw_modeled",
             np.asarray(raw_modeled_best, dtype=float),
-            title=f"Modeled Raw ({trial_title}) @ {spectral_label}",
+            title=_compact_map_title("Modeled Raw", spectral_label, trial_title=trial_title),
             note=f"a={a_text}  b={b_text}\nq0={fmt(display_q0, '.6f')}{map_suffix}",
             scale=common_map_scale,
             vmin=_coerce_axis_limit(common_map_vmin),
@@ -1040,7 +1319,7 @@ class Q0ArtifactPanelFigure:
         self._update_common_panel(
             "modeled",
             np.asarray(modeled_best, dtype=float),
-            title=f"Modeled ({trial_title}) @ {spectral_label}",
+            title=_compact_map_title("Modeled", spectral_label, trial_title=trial_title),
             note=f"a={a_text}  b={b_text}\nq0={fmt(display_q0, '.6f')}{psf_legend}{map_suffix}",
             scale=common_map_scale,
             vmin=_coerce_axis_limit(common_map_vmin),
@@ -1049,7 +1328,7 @@ class Q0ArtifactPanelFigure:
         self._update_common_panel(
             "residual",
             np.asarray(residual, dtype=float),
-            title=f"Residual ({trial_title}-Obs) @ {spectral_label}",
+            title=_compact_map_title("Residual", spectral_label, trial_title=trial_title),
             note=f"a={a_text}  b={b_text}\nq0=true:{fmt(q0_true, '.6f')} selected:{fmt(display_q0, '.6f')} best:{fmt(q0_best, '.6f')}{psf_legend}{map_suffix}",
             scale=residual_map_scale,
             vmin=_coerce_axis_limit(residual_map_vmin),
@@ -1069,12 +1348,10 @@ class Q0ArtifactPanelFigure:
             blos_reference=blos_reference,
         )
 
+        trials_q0, trials_metric = resolve_trial_metric_arrays(diag, target_metric)
         self._update_trials(
-            q0_trials=diag.get("fit_q0_trials", ()),
-            metric_trials=diag.get(
-                f"fit_{target_metric}_trials",
-                diag.get("fit_metric_trials", diag.get("fit_chi2_trials", ())),
-            ),
+            q0_trials=trials_q0,
+            metric_trials=trials_metric,
             target_metric=target_metric,
             target_metric_val=target_metric_val,
             q0_best=q0_best,
@@ -1091,6 +1368,9 @@ class Q0ArtifactPanelFigure:
             trials_ymax=_coerce_axis_limit(trials_ymax),
             trials_xscale=trials_xscale,
             trials_yscale=trials_yscale,
+            trials_xlim=trials_xlim,
+            trials_ylim=trials_ylim,
+            trials_match_parent_view=trials_match_parent_view,
             fmt=fmt,
             diagnostics=diag,
         )
@@ -1098,6 +1378,7 @@ class Q0ArtifactPanelFigure:
         observed_arr = np.asarray(observed_noisy, dtype=float)
         modeled_arr = np.asarray(modeled_best, dtype=float)
         self._draw_mask_contours(self._show_mask_contours, observed_arr, modeled_arr, diag)
+        self.apply_autolayout()
 
         if out_png is not None:
             self.figure.savefig(str(out_png), dpi=180)
@@ -1147,9 +1428,7 @@ def plot_q0_artifact_panel(
 
         # Interactive display needs a pyplot-managed figure so attributes such
         # as ``number`` and the GUI canvas exist consistently across backends.
-        panel = Q0ArtifactPanelFigure(
-            figure=plt.figure(figsize=(14.8, 9.2), constrained_layout=True)
-        )
+        panel = Q0ArtifactPanelFigure(figure=plt.figure(figsize=(14.8, 9.2)))
     else:
         panel = Q0ArtifactPanelFigure()
     output_path = None if out_png is None else Path(out_png)

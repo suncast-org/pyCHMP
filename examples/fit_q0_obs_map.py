@@ -39,13 +39,18 @@ from pychmp import (
     GXRenderMWAdapter,
     build_tr_region_mask_from_blos,
     fit_q0_to_observation,
+    load_model_obs_time_text,
     load_obs_map,
     obs_map_noise_unit_label,
+    prepare_observation_for_metrics,
+    resolve_slice_observation_reference,
+    SliceObservationReferenceError,
     resolve_render_geometry_via_gxrender,
     resolve_default_testdata_fixture_paths,
     validate_obs_map_identity,
 )
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
+from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
 from pychmp.geometry_policy import resolve_geometry_policy
 from pychmp.psf import (
     KernelConvolvedRenderer as _CoreKernelConvolvedRenderer,
@@ -65,7 +70,7 @@ except ModuleNotFoundError:
     from examples.q0_artifact_plot import plot_q0_artifact_panel
 
 from pychmp.q0_artifact_panel import load_blos_reference_for_fov
-from pychmp.ab_scan_artifacts import build_computed_point_payload, load_scan_file, write_single_point_scan_file
+from pychmp.ab_scan_artifacts import build_computed_point_payload, load_scan_file, write_single_point_scan_file, artifact_geometry_sha256, build_artifact_geometry_block
 
 
 DEFAULT_TBASE = 1.0e6
@@ -806,37 +811,9 @@ def _regrid_full_disk_to_target(
     source_header: fits.Header,
     target_header: fits.Header,
 ) -> np.ndarray:
-    ny = int(target_header["NAXIS2"])
-    nx = int(target_header["NAXIS1"])
+    from pychmp.obs_preprocessing import regrid_observation_to_target_fov
 
-    target_x = (
-        (np.arange(nx, dtype=float) + 1.0 - float(target_header["CRPIX1"])) * float(target_header["CDELT1"])
-        + float(target_header["CRVAL1"])
-    )
-    target_y = (
-        (np.arange(ny, dtype=float) + 1.0 - float(target_header["CRPIX2"])) * float(target_header["CDELT2"])
-        + float(target_header["CRVAL2"])
-    )
-    world_x, world_y = np.meshgrid(target_x, target_y)
-
-    src_x = (
-        (world_x - float(source_header["CRVAL1"])) / float(source_header["CDELT1"])
-        + float(source_header["CRPIX1"])
-        - 1.0
-    )
-    src_y = (
-        (world_y - float(source_header["CRVAL2"])) / float(source_header["CDELT2"])
-        + float(source_header["CRPIX2"])
-        - 1.0
-    )
-    sampled = map_coordinates(
-        np.asarray(data, dtype=float),
-        [np.asarray(src_y, dtype=float), np.asarray(src_x, dtype=float)],
-        order=1,
-        mode="constant",
-        cval=np.nan,
-    )
-    return np.asarray(sampled, dtype=float)
+    return regrid_observation_to_target_fov(data, source_header, target_header)
 
 
 def create_gxrender_adapter(model_path: Path, frequency_ghz: float) -> GXRenderMWAdapter:
@@ -1108,7 +1085,16 @@ def _make_trial_progress_reporter(*, target_metric: str):
         spinner_thread = threading.Thread(target=_spin, daemon=True)
         spinner_thread.start()
 
-    def _report(q0: float, objective_value: float, is_valid: bool, message: str, elapsed_s: float) -> None:
+    def _report(
+        q0: float,
+        objective_value: float,
+        is_valid: bool,
+        message: str,
+        elapsed_s: float,
+        _metrics: Any = None,
+        _evaluation: Any = None,
+    ) -> None:
+        del _evaluation
         nonlocal active_trial
         trial_index = 1 if active_trial is None else active_trial
         _stop_spinner()
@@ -1270,6 +1256,7 @@ Examples:
 
     # Utility
     parser.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit")
+    add_chmp_search_cli_arguments(parser)
 
     args = parser.parse_args()
 
@@ -1413,6 +1400,7 @@ Examples:
     nbase = float(args.nbase) if args.nbase is not None else DEFAULT_NBASE
     a_param = float(args.a) if args.a is not None else DEFAULT_A
     b_param = float(args.b) if args.b is not None else DEFAULT_B
+    obs_preprocess_diag: dict[str, Any] = {}
     if args.prepared_observation_h5 is not None:
         if not args.prepared_observation_h5.exists():
             print(f"ERROR: Prepared observation bundle not found: {args.prepared_observation_h5}")
@@ -1422,6 +1410,7 @@ Examples:
         prepared_meta = dict(prepared.get("metadata") or {})
         observed_cropped = np.asarray(prepared["observed"], dtype=float)
         sigma_cropped = np.asarray(prepared["sigma_map"], dtype=float)
+        obs_preprocess_diag = {"observation_reference_preprocessed": True}
         target_header = prepared["wcs_header"].copy()
         freq_ghz = (
             None
@@ -1575,20 +1564,67 @@ Examples:
             hglt_obs_deg=effective_observer_b0sun_deg,
             dsun_obs_m=effective_observer_dsun_cm / 100.0,
         )
-        observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
-        sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
-        if np.isnan(observed_cropped).any():
-            nan_fraction = float(np.isnan(observed_cropped).sum()) / float(observed_cropped.size)
-            if nan_fraction > 0.05:
-                print(f"  ✗ Regridded observed submap contains too many NaNs ({nan_fraction:.1%}). Check FITS WCS or requested geometry.")
-                exit(1)
-            fill_value = float(np.nanmedian(observed_cropped))
-            observed_cropped = np.nan_to_num(observed_cropped, nan=fill_value)
-        if np.isnan(sigma_cropped).any():
-            fill_sigma = float(np.nanmedian(sigma_cropped))
-            if not np.isfinite(fill_sigma) or fill_sigma <= 0:
-                fill_sigma = float(np.nanmedian(sigma_map))
-            sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
+        model_obs_time = str(
+            model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(args.model_h5) or ""
+        ).strip()
+        obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
+        observation_source_path = obs_map.source_path
+        observation_source_file = _resolve_existing_file(observation_source_path)
+        observation_source_sha256_value = (
+            _compute_file_sha256(observation_source_file)
+            if observation_source_file is not None and observation_source_file.is_file()
+            else None
+        )
+        artifact_geometry_sha256_value = artifact_geometry_sha256(
+            build_artifact_geometry_block(
+                {
+                    "map_xc_arcsec": float(geometry.xc),
+                    "map_yc_arcsec": float(geometry.yc),
+                    "map_dx_arcsec": float(geometry.dx),
+                    "map_dy_arcsec": float(geometry.dy),
+                    "map_nx": int(geometry.nx),
+                    "map_ny": int(geometry.ny),
+                    "observer_name": effective_observer_name,
+                    "observer_lonc_deg": effective_observer_lonc_deg,
+                    "observer_b0sun_deg": effective_observer_b0sun_deg,
+                    "observer_dsun_cm": effective_observer_dsun_cm,
+                    "observer_obs_time": target_header.get("DATE-OBS", ""),
+                }
+            )
+        )
+        try:
+            shift_policy, max_shift_arcsec, xy_shift_arcsec = resolve_shift_policy_from_args(args)
+            slice_obs_ref = resolve_slice_observation_reference(
+                observed,
+                header,
+                target_header,
+                sigma=sigma_map,
+                observation_source_sha256=observation_source_sha256_value,
+                artifact_geometry_sha256=artifact_geometry_sha256_value,
+                model_time_text=model_obs_time or None,
+                observation_time_text=obs_time_text or None,
+                stored_slice_payload=None,
+                force_recompute=True,
+                shift_policy=shift_policy,
+                max_shift_arcsec=max_shift_arcsec,
+                xy_shift_arcsec=xy_shift_arcsec,
+            )
+        except SliceObservationReferenceError as exc:
+            print(f"  ✗ {exc}")
+            exit(1)
+        observed_cropped = np.asarray(slice_obs_ref.observed, dtype=float)
+        sigma_cropped = np.asarray(slice_obs_ref.sigma, dtype=float)
+        obs_preprocess_diag = dict(slice_obs_ref.diagnostics)
+        for warning_line in obs_preprocess_diag.get("observation_time_warning_lines", ()):
+            print(warning_line)
+        if obs_preprocess_diag.get("observation_time_rotation_applied"):
+            print(f"  {obs_preprocess_diag.get('observation_time_alignment_message', '')}")
+        elif str(obs_preprocess_diag.get("observation_time_alignment", "")) not in {"exact", "unknown"}:
+            print(f"  {obs_preprocess_diag.get('observation_time_alignment_message', '')}")
+        nan_fraction = float(np.isnan(observed_cropped).sum()) / float(observed_cropped.size)
+        if nan_fraction > 0.05:
+            print(f"  ✗ Regridded observed submap contains too many NaNs ({nan_fraction:.1%}). Check FITS WCS or requested geometry.")
+            exit(1)
 
         print(f"\nPreparing model-aligned observational submap...")
         print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
@@ -1668,6 +1704,15 @@ Examples:
         )
     else:
         print(f"  Metrics mask: union threshold={float(args.metrics_mask_threshold):.3f}")
+
+    metrics_mask_type = "explicit_fits" if explicit_metric_mask is not None else "union"
+    chmp_settings = resolve_chmp_search_settings(
+        args,
+        mask_type=metrics_mask_type,
+        explicit_mask=explicit_metric_mask,
+    )
+    if len(chmp_settings.q0_search_stages) > 1:
+        print(f"  Q0 search stages: {', '.join(chmp_settings.q0_search_stages)}")
 
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
@@ -1946,6 +1991,11 @@ Examples:
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
                 initial_evaluations=initial_evaluations,
+                observation_reference=slice_obs_ref,
+                q0_search_stages=chmp_settings.q0_search_stages,
+                use_smoothed_obs_max=chmp_settings.use_smoothed_obs_max,
+                use_emthreshold=chmp_settings.use_emthreshold,
+                emthreshold=chmp_settings.emthreshold,
             ),
             spinner=stage_spinner and not bool(args.progress),
             stage_index=1,
@@ -2175,6 +2225,7 @@ Examples:
                 "psf_source": str(psf_source),
                 "observer_obs_time": target_header.get("DATE-OBS", ""),
                 "point_status": "computed",
+                **obs_preprocess_diag,
             }
 
             def _save_outputs() -> None:

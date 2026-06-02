@@ -10,14 +10,17 @@ import pytest
 from astropy.io import fits
 
 from examples.python.adaptive_ab_search_single_observation import (
+    _AdaptiveRendererFactory,
     _ArtifactWriteDispatcher,
+    _FactoryGeometry,
     _PointRenderRecord,
     _PointRenderStream,
     _PersistentPointCache,
+    _StreamingRendererFactory,
     _focus_existing_viewer_pid,
     _build_live_point_snapshot_payload,
-    _build_physical_compatibility_signature,
     _find_existing_viewer_pid,
+    _is_hdf5_lock_contention_error,
     _maybe_validate_artifact_preflight,
     _point_payload_from_result,
     _rescore_auxiliary_map_record,
@@ -25,6 +28,7 @@ from examples.python.adaptive_ab_search_single_observation import (
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
+from pychmp.search_contract import compatibility_signature_from_diagnostics
 from pychmp.ab_scan_artifacts import COMPATIBILITY_SIGNATURE_KEY, load_scan_file, write_point_scan_artifact
 from pychmp.ab_search import ABPointResult
 from pychmp.metrics import MetricValues
@@ -288,7 +292,10 @@ def test_adaptive_compatibility_signature_tracks_resolved_euv_response_hash() ->
     changed_payload = dict(base_payload)
     changed_payload["euv_response_sha256"] = "e" * 64
 
-    assert _build_physical_compatibility_signature(base_payload) != _build_physical_compatibility_signature(changed_payload)
+    assert compatibility_signature_from_diagnostics(base_payload, layout={"kind": "point_list"}) != compatibility_signature_from_diagnostics(
+        changed_payload,
+        layout={"kind": "point_list"},
+    )
 
 
 def test_adaptive_preflight_skips_render_only_auxiliary_slice(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1076,14 +1083,14 @@ def test_cache_setitem_enqueues_without_waiting_for_writer(monkeypatch: pytest.M
 
     gate = {"release": False}
 
-    def _slow_append(*args: object, **kwargs: object) -> None:
+    def _slow_apply(*args: object, **kwargs: object) -> str | None:
         if gate["release"]:
-            return
+            return "p000000"
         raise RuntimeError("writer intentionally blocked")
 
     monkeypatch.setattr(
-        "examples.python.adaptive_ab_search_single_observation.append_point_record",
-        _slow_append,
+        "examples.python.adaptive_ab_search_single_observation.apply_grid_point_event_with_retry",
+        _slow_apply,
     )
 
     point_template = ABPointResult(
@@ -1138,28 +1145,35 @@ def test_cache_setitem_enqueues_without_waiting_for_writer(monkeypatch: pytest.M
         viewer_heartbeat=None,
     )
 
-    cache[(0.3, 2.7)] = point
     with pytest.raises(RuntimeError, match="artifact write dispatcher failed"):
+        cache[(0.3, 2.7)] = point
+    try:
         cache.close()
+    except RuntimeError:
+        pass
 
 
-def test_dispatcher_live_snapshot_lock_contention_does_not_fail_close(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    artifact_h5 = tmp_path / "dispatcher_snapshot_lock.h5"
+def test_dispatcher_grid_event_lock_contention_does_not_fail_close(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from pychmp.grid_points import GridPointAssignedEvent
+
+    artifact_h5 = tmp_path / "dispatcher_grid_lock.h5"
     header = fits.Header()
     diagnostics = {
         "target_slice_key": "euv_171",
         "slice_key": "euv_171",
+        "target_metric": "chi2",
     }
     attempts = {"count": 0}
 
-    def _flaky_snapshot(*args: object, **kwargs: object) -> None:
+    def _flaky_apply(*args: object, **kwargs: object) -> str:
         attempts["count"] += 1
         if attempts["count"] <= 2:
             raise BlockingIOError(35, "Resource temporarily unavailable")
+        return "p000000"
 
     monkeypatch.setattr(
-        "examples.python.adaptive_ab_search_single_observation.write_live_trial_point",
-        _flaky_snapshot,
+        "examples.python.adaptive_ab_search_single_observation.apply_grid_point_event_with_retry",
+        _flaky_apply,
     )
 
     dispatcher = _ArtifactWriteDispatcher(
@@ -1172,23 +1186,28 @@ def test_dispatcher_live_snapshot_lock_contention_does_not_fail_close(monkeypatc
         psf_kernel=None,
     )
 
-    dispatcher.write_live_snapshot({"a": 0.0, "b": 0.0})
+    dispatcher.write_grid_event(
+        GridPointAssignedEvent(a=0.0, b=0.0, q0_start=1e-4, next_q0=1e-4, metric_name="chi2")
+    )
     dispatcher.close()
 
     assert attempts["count"] >= 3
 
 
-def test_dispatcher_live_snapshot_non_lock_error_remains_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    artifact_h5 = tmp_path / "dispatcher_snapshot_fatal.h5"
+def test_dispatcher_grid_event_non_lock_error_remains_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from pychmp.grid_points import GridPointAssignedEvent
+
+    artifact_h5 = tmp_path / "dispatcher_grid_fatal.h5"
     header = fits.Header()
     diagnostics = {
         "target_slice_key": "euv_171",
         "slice_key": "euv_171",
+        "target_metric": "chi2",
     }
 
     monkeypatch.setattr(
-        "examples.python.adaptive_ab_search_single_observation.write_live_trial_point",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("snapshot boom")),
+        "examples.python.adaptive_ab_search_single_observation.apply_grid_point_event_with_retry",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("grid boom")),
     )
 
     dispatcher = _ArtifactWriteDispatcher(
@@ -1201,21 +1220,26 @@ def test_dispatcher_live_snapshot_non_lock_error_remains_fatal(monkeypatch: pyte
         psf_kernel=None,
     )
 
-    dispatcher.write_live_snapshot({"a": 0.0, "b": 0.0})
+    dispatcher.write_grid_event(
+        GridPointAssignedEvent(a=0.0, b=0.0, q0_start=1e-4, next_q0=1e-4, metric_name="chi2")
+    )
     with pytest.raises(RuntimeError, match="artifact write dispatcher failed"):
         dispatcher.close()
 
 
-def test_dispatcher_live_snapshot_missing_search_is_non_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    artifact_h5 = tmp_path / "dispatcher_snapshot_missing_search.h5"
+def test_dispatcher_grid_event_missing_search_is_non_fatal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from pychmp.grid_points import GridPointAssignedEvent
+
+    artifact_h5 = tmp_path / "dispatcher_grid_missing_search.h5"
     header = fits.Header()
     diagnostics = {
         "target_slice_key": "euv_193",
         "slice_key": "euv_193",
+        "target_metric": "chi2",
     }
 
     monkeypatch.setattr(
-        "examples.python.adaptive_ab_search_single_observation.write_live_trial_point",
+        "examples.python.adaptive_ab_search_single_observation.apply_grid_point_event_with_retry",
         lambda *args, **kwargs: (_ for _ in ()).throw(KeyError("search not found for slice: euv_193")),
     )
 
@@ -1229,5 +1253,253 @@ def test_dispatcher_live_snapshot_missing_search_is_non_fatal(monkeypatch: pytes
         psf_kernel=None,
     )
 
-    dispatcher.write_live_snapshot({"a": 0.0, "b": 0.0})
+    dispatcher.write_grid_event(
+        GridPointAssignedEvent(a=0.0, b=0.0, q0_start=1e-4, next_q0=1e-4, metric_name="chi2")
+    )
+    with pytest.raises(RuntimeError, match="artifact write dispatcher failed"):
+        dispatcher.close()
+
+
+def test_streaming_renderer_factory_pickle_roundtrip() -> None:
+    import pickle
+
+    factory = _AdaptiveRendererFactory(
+        model_path="/tmp/model.h5",
+        ebtel_path="/tmp/ebtel.sav",
+        spectral_domain="euv",
+        spectral_label="193 A",
+        frequency_ghz=None,
+        wavelength_angstrom=193.0,
+        euv_channel="193",
+        euv_instrument="AIA",
+        euv_response_sav=None,
+        render_frequencies_ghz=(),
+        render_channels=("193",),
+        tbase=1e6,
+        nbase=1e8,
+        geometry=_FactoryGeometry(xc=0.0, yc=0.0, dx=2.0, dy=2.0, nx=10, ny=10),
+        observer_overrides=None,
+        observer_name="earth",
+        pixel_scale_arcsec=2.0,
+        psf_kernel=np.ones((3, 3), dtype=float),
+    )
+    wrapper = _StreamingRendererFactory(
+        factory,
+        stream=_PointRenderStream(),
+        observed_template=np.ones((5, 5), dtype=float),
+        target_metric="eta2",
+        psf_source="test",
+        compatibility_signature="sig-123",
+        store_trial_map_cubes=False,
+    )
+
+    roundtrip = pickle.loads(pickle.dumps(wrapper))
+
+    assert roundtrip._base_factory.model_path == "/tmp/model.h5"
+    assert roundtrip.spectral_domain == "euv"
+    assert roundtrip._target_metric == "eta2"
+
+
+def test_viewer_refresh_heartbeat_writes_active_pending_point(tmp_path: Path) -> None:
+    import json
+
+    from examples.python.adaptive_ab_search_single_observation import _ViewerRefreshHeartbeat
+    from pychmp.refresh_signal import REFRESH_V2_VERSION
+
+    signal_path = tmp_path / "scan.h5.refresh"
+    heartbeat = _ViewerRefreshHeartbeat(
+        signal_path,
+        slice_key="euv_193",
+        search_id="search_b",
+    )
+    heartbeat.start("adaptive search running")
+    heartbeat.set_pending_points([(0.3, 2.7)])
+
+    payload = json.loads(signal_path.read_text(encoding="utf-8"))
+    assert payload["version"] == REFRESH_V2_VERSION
+    assert payload["event"] == "search_initialized"
+    assert payload["phase"] == "adaptive search running"
+    assert payload["slice_key"] == "euv_193"
+    assert payload["search_id"] == "search_b"
+    assert heartbeat.pending_points() == [(0.3, 2.7)]
+
+
+def test_viewer_refresh_heartbeat_sets_first_pending_as_active_with_multiple_workers(tmp_path: Path) -> None:
+    import json
+
+    from examples.python.adaptive_ab_search_single_observation import _ViewerRefreshHeartbeat
+
+    signal_path = tmp_path / "scan.h5.refresh"
+    heartbeat = _ViewerRefreshHeartbeat(
+        signal_path,
+        slice_key="euv_193",
+        search_id="search_b",
+    )
+    heartbeat.start("adaptive search running")
+    heartbeat.set_pending_points([(0.0, 2.4), (0.3, 2.7), (0.6, 3.0)])
+    heartbeat.emit_event("point_assigned", point_id="p000000", legacy_phase="active point (batch 3 queued)")
+
+    payload = json.loads(signal_path.read_text(encoding="utf-8"))
+    assert payload["event"] == "point_assigned"
+    assert payload["point_id"] == "p000000"
+    assert payload["phase"] == "active point (batch 3 queued)"
+    assert payload["slice_key"] == "euv_193"
+    assert payload["search_id"] == "search_b"
+    assert heartbeat.pending_points()[0] == (0.0, 2.4)
+
+
+def test_viewer_refresh_heartbeat_advances_active_point_after_pending_removal(tmp_path: Path) -> None:
+    import json
+
+    from examples.python.adaptive_ab_search_single_observation import _ViewerRefreshHeartbeat
+
+    signal_path = tmp_path / "scan.h5.refresh"
+    heartbeat = _ViewerRefreshHeartbeat(
+        signal_path,
+        slice_key="euv_193",
+        search_id="search_b",
+    )
+    heartbeat.set_pending_points([(0.0, 2.4), (0.3, 2.7), (0.6, 3.0)])
+    heartbeat.remove_pending_point(0.0, 2.4)
+    heartbeat.emit_event("point_assigned", point_id="p000001", legacy_phase="active point (batch 2 queued)")
+
+    assert heartbeat.pending_points() == [(0.3, 2.7), (0.6, 3.0)]
+    payload = json.loads(signal_path.read_text(encoding="utf-8"))
+    assert payload["event"] == "point_assigned"
+    assert payload["point_id"] == "p000001"
+    assert payload["phase"] == "active point (batch 2 queued)"
+    assert payload["slice_key"] == "euv_193"
+
+
+def test_persistent_cache_set_pending_points_writes_live_trial_marker(tmp_path: Path) -> None:
+    import h5py
+
+    from pychmp.grid_points import list_grid_point_headers
+
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 1.0
+    header["CDELT2"] = 1.0
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    diagnostics = {
+        "artifact_kind": "unified_ab_scan",
+        "slice_key": "euv_193",
+        "target_slice_key": "euv_193",
+        "target_metric": "eta2",
+        "selected_search_id": "search_b5751ea4cf6c8571",
+    }
+    artifact_h5 = tmp_path / "adaptive.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="eta2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-123",
+        viewer_heartbeat=None,
+    )
+
+    cache.set_pending_points([(-0.6, 2.1), (-0.6, 2.4), (-0.6, 2.7)])
+    cache.flush_pending_writes()
+    cache.close()
+
+    with h5py.File(artifact_h5, "r") as f:
+        search_id = f["slices"]["euv_193"]["active_search_id"][()].decode("utf-8")
+        headers = list_grid_point_headers(f["slices"]["euv_193"]["searches"][search_id])
+    assert len(headers) == 3
+    assert float(headers[0]["a"]) == pytest.approx(-0.6)
+    assert float(headers[0]["b"]) == pytest.approx(2.1)
+    assert str(headers[0]["metric_name"]) == "eta2"
+    assert int(headers[0]["n_trials"]) == 0
+
+
+def test_dispatcher_advances_live_trial_marker_to_next_pending_point(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from examples.python.adaptive_ab_search_single_observation import _ViewerRefreshHeartbeat
+    from pychmp.grid_points import GridPointAssignedEvent, GridPointCompletedEvent, read_grid_point_header
+
+    artifact_h5 = tmp_path / "adaptive.h5"
+    header = fits.Header()
+    diagnostics = {
+        "artifact_kind": "unified_ab_scan",
+        "target_slice_key": "euv_193",
+        "slice_key": "euv_193",
+        "target_metric": "eta2",
+        "selected_search_id": "search_b5751ea4cf6c8571",
+    }
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=np.ones((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    heartbeat = _ViewerRefreshHeartbeat(
+        tmp_path / "adaptive.h5.refresh",
+        slice_key="euv_193",
+        search_id="search_b5751ea4cf6c8571",
+    )
+    heartbeat.set_pending_points([(-0.6, 2.1), (-0.6, 2.4)])
+    dispatcher = _ArtifactWriteDispatcher(
+        artifact_h5=artifact_h5,
+        observed=np.ones((2, 2), dtype=float),
+        sigma_map=np.ones((2, 2), dtype=float),
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        psf_kernel=None,
+        viewer_heartbeat=heartbeat,
+    )
+    dispatcher.write_grid_event(
+        GridPointAssignedEvent(
+            a=-0.6,
+            b=2.1,
+            q0_start=1e-4,
+            next_q0=1e-4,
+            metric_name="eta2",
+        )
+    )
+    dispatcher.write_grid_event(
+        GridPointCompletedEvent(
+            point_id="p000000",
+            best_trial_index=0,
+            best_metric=0.1,
+            best_q0=1e-4,
+        )
+    )
     dispatcher.close()
+
+    import h5py
+
+    with h5py.File(artifact_h5, "r") as f:
+        search_id = f["slices"]["euv_193"]["active_search_id"][()].decode("utf-8")
+        header_state = read_grid_point_header(f["slices"]["euv_193"]["searches"][search_id]["grid_points"]["p000000"])
+    assert header_state["status"] == "COMPLETED"
+    assert len(heartbeat.pending_points()) == 2
+
+
+def test_is_hdf5_lock_contention_error_recognizes_read_only_open_conflict() -> None:
+    exc = OSError("Unable to synchronously open file (file is already open for read-only)")
+    assert _is_hdf5_lock_contention_error(exc) is True

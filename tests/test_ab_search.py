@@ -6,6 +6,20 @@ import pytest
 from pychmp.ab_search import ABPointResult, idl_q0_start_heuristic, multi_scan_ab, search_local_minimum_ab
 
 
+def _localized_peak_observed(*, size: int = 32, peak: float = 100.0) -> np.ndarray:
+    observed = np.zeros((size, size), dtype=float)
+    center = size // 2
+    observed[center - 2 : center + 2, center - 2 : center + 2] = peak
+    return observed
+
+
+def _adaptive_penalty_pattern(shape: tuple[int, ...]) -> np.ndarray:
+    pattern = np.zeros(shape, dtype=float)
+    cy, cx = shape[0] // 2, shape[1] // 2
+    pattern[cy - 1 : cy + 1, cx - 1 : cx + 1] = [[1.0, -1.0], [-1.0, 1.0]]
+    return pattern
+
+
 class SyntheticABRenderer:
     def __init__(self, observed: np.ndarray, true_q0: float, render_log: list[float]) -> None:
         self._observed = observed
@@ -57,7 +71,7 @@ class AdaptiveSyntheticABRenderer:
         self._true_q0 = true_q0
         self._penalty = penalty
         self._render_log = render_log
-        self._pattern = np.asarray([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
+        self._pattern = _adaptive_penalty_pattern(observed.shape)
 
     def render(self, q0: float) -> np.ndarray:
         self._render_log.append(float(q0))
@@ -93,7 +107,7 @@ class PicklableAdaptiveSyntheticABRenderer:
         self._observed = observed
         self._true_q0 = true_q0
         self._penalty = penalty
-        self._pattern = np.asarray([[1.0, -1.0], [-1.0, 1.0]], dtype=float)
+        self._pattern = _adaptive_penalty_pattern(observed.shape)
 
     def render(self, q0: float) -> np.ndarray:
         return self._observed + (float(q0) - self._true_q0) + self._penalty * self._pattern
@@ -167,7 +181,7 @@ def test_idl_q0_start_heuristic_matches_formula() -> None:
 
 def test_multi_scan_ab_recovers_expected_q0_grid() -> None:
     """Recover the expected q0 grid for a full rectangular scan."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = CountingRendererFactory(observed)
 
@@ -202,7 +216,7 @@ def test_multi_scan_ab_recovers_expected_q0_grid() -> None:
 
 def test_multi_scan_ab_points_preserve_all_metric_trial_histories() -> None:
     """Keep chi2/rho2/eta2 trial histories on stored AB point results."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = CountingRendererFactory(observed)
 
@@ -228,7 +242,7 @@ def test_multi_scan_ab_points_preserve_all_metric_trial_histories() -> None:
 
 def test_multi_scan_ab_reuses_cached_points() -> None:
     """Reuse cached rectangular scan points without re-rendering them."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = CountingRendererFactory(observed)
     cache: dict[tuple[float, float], ABPointResult] = {}
@@ -267,7 +281,7 @@ def test_multi_scan_ab_reuses_cached_points() -> None:
 
 def test_multi_scan_ab_validates_q0_start_grid_shape() -> None:
     """Reject q0 start grids whose shape does not match the scan grid."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = CountingRendererFactory(observed)
 
@@ -286,7 +300,7 @@ def test_multi_scan_ab_validates_q0_start_grid_shape() -> None:
 
 def test_multi_scan_ab_supports_process_pool_execution() -> None:
     """Support rectangular scan execution through the process pool."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = PicklableRendererFactory(observed)
 
@@ -317,7 +331,7 @@ def test_multi_scan_ab_supports_process_pool_execution() -> None:
 
 def test_multi_scan_ab_supports_auto_execution_policy() -> None:
     """Support rectangular scan execution through the auto policy."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = PicklableRendererFactory(observed)
 
@@ -348,7 +362,7 @@ def test_multi_scan_ab_supports_auto_execution_policy() -> None:
 
 def test_adaptive_serial_reports_only_one_active_point_at_a_time() -> None:
     """Serial adaptive refresh state should advertise one in-flight point at a time."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=0.0, optimum_b=0.0)
     cache = RecordingAdaptiveCache()
@@ -377,7 +391,7 @@ def test_adaptive_serial_reports_only_one_active_point_at_a_time() -> None:
 
 def test_multi_scan_ab_rejects_progress_callback_in_process_pool_mode() -> None:
     """Reject progress callbacks when scans run in process-pool mode."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = PicklableRendererFactory(observed)
 
@@ -397,7 +411,7 @@ def test_multi_scan_ab_rejects_progress_callback_in_process_pool_mode() -> None:
 
 def test_search_local_minimum_ab_converges_on_known_minimum() -> None:
     """Converge on a known local minimum during phase 1 search."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=1.0, optimum_b=-1.0)
 
@@ -430,7 +444,7 @@ def test_search_local_minimum_ab_converges_on_known_minimum() -> None:
 
 def test_search_local_minimum_ab_expands_when_minimum_is_on_edge() -> None:
     """Expand the sampled domain when the current minimum sits on an edge."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=2.0, optimum_b=0.0)
 
@@ -460,7 +474,7 @@ def test_search_local_minimum_ab_expands_when_minimum_is_on_edge() -> None:
 
 def test_search_local_minimum_ab_reuses_cached_points() -> None:
     """Reuse cached adaptive-search points across repeated runs."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=1.0, optimum_b=-1.0)
     cache: dict[tuple[float, float], ABPointResult] = {}
@@ -508,7 +522,7 @@ def test_search_local_minimum_ab_reuses_cached_points() -> None:
 
 def test_search_local_minimum_ab_supports_process_pool_neighbor_batches() -> None:
     """Evaluate adaptive-search neighbor batches through the process pool."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = PicklableAdaptiveRendererFactory(observed, optimum_a=1.0, optimum_b=-1.0)
 
@@ -537,7 +551,7 @@ def test_search_local_minimum_ab_supports_process_pool_neighbor_batches() -> Non
 
 def test_search_local_minimum_ab_phase2_expands_threshold_region() -> None:
     """Expand phase 2 across the requested threshold region."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=0.5, optimum_b=0.5)
 
@@ -566,7 +580,7 @@ def test_search_local_minimum_ab_phase2_expands_threshold_region() -> None:
 
 def test_search_local_minimum_ab_no_area_stops_after_phase1() -> None:
     """Skip phase 2 completely when no-area mode is enabled."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=0.5, optimum_b=0.5)
 
@@ -594,7 +608,7 @@ def test_search_local_minimum_ab_no_area_stops_after_phase1() -> None:
 
 def test_search_local_minimum_ab_warm_start_does_not_change_recovered_minimum() -> None:
     """Preserve the recovered minimum when a warm-start q0 is supplied."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     default_factory = AdaptiveRendererFactory(observed, optimum_a=1.0, optimum_b=-1.0)
     explicit_factory = AdaptiveRendererFactory(observed, optimum_a=1.0, optimum_b=-1.0)
@@ -639,7 +653,7 @@ def test_search_local_minimum_ab_warm_start_does_not_change_recovered_minimum() 
 
 def test_search_local_minimum_ab_phase2_prefers_connected_threshold_basin() -> None:
     """Expand the connected threshold basin around the current best instead of chasing disconnected islands."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = LookupAdaptiveRendererFactory(
         observed,
@@ -670,20 +684,20 @@ def test_search_local_minimum_ab_phase2_prefers_connected_threshold_basin() -> N
     )
 
     a_index = result.a_values.index(2.0)
-    upper_b_index = result.b_values.index(1.0)
     lower_b_index = result.b_values.index(-1.0)
+    upper_b_index = result.b_values.index(1.0)
 
     assert result.best_a == pytest.approx(1.0)
     assert result.best_b == pytest.approx(-1.0) or result.best_b == pytest.approx(1.0)
-    assert 2.0 in result.b_values
-    assert np.isfinite(result.objective_values[a_index, upper_b_index])
-    assert not np.isfinite(result.objective_values[a_index, lower_b_index])
+    assert 2.0 in result.a_values
+    assert np.isfinite(result.objective_values[a_index, lower_b_index])
+    assert not np.isfinite(result.objective_values[a_index, upper_b_index])
     assert result.minimum_certified is True
 
 
 def test_search_local_minimum_ab_matches_bruteforce_scan_on_small_domain() -> None:
     """Match brute-force scanning on a small discrete a-b domain."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=1.0, optimum_b=-1.0)
     a_values = np.array([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=float)
@@ -729,7 +743,7 @@ def test_search_local_minimum_ab_matches_bruteforce_scan_on_small_domain() -> No
 
 def test_search_local_minimum_ab_resume_expands_cached_frontier_when_bounds_widen() -> None:
     """Resume from cached sparse points and expand further when wider bounds are requested."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]], dtype=float)
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     factory = AdaptiveRendererFactory(observed, optimum_a=2.0, optimum_b=-1.0)
     cache: dict[tuple[float, float], ABPointResult] = {}

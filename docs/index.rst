@@ -11,5 +11,7 @@ Sections
    :maxdepth: 1
 
    artifact_data_contract
+   workflow_architecture
    geometry_policy
    provenance
+   viewer_refresh_workflow

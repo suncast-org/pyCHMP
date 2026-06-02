@@ -147,6 +147,9 @@ def _is_hdf5_lock_contention_error(exc: BaseException) -> bool:
         "unable to lock file" in text
         or "resource temporarily unavailable" in text
         or "errno = 35" in text
+        or "already open for read-only" in text
+        or "already open for read" in text
+        or "unable to synchronously open file" in text
     )
 
 
@@ -159,6 +162,20 @@ def _is_snapshot_target_missing_error(exc: BaseException) -> bool:
         or "search not found" in text
         or "slice not found" in text
     )
+
+
+def _artifact_has_target_slice(artifact_h5: Path, slice_key: str | None) -> bool:
+    key = str(slice_key or "").strip()
+    if not key or not artifact_h5.exists():
+        return False
+    try:
+        import h5py
+
+        with h5py.File(str(artifact_h5), "r", locking=False) as handle:
+            slices_group = handle.get(SLICE_CONTAINER_GROUP)
+            return slices_group is not None and key in slices_group
+    except Exception:
+        return False
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -180,13 +197,20 @@ from pychmp import (
     estimate_obs_map_noise,
     format_psf_report,
     load_obs_map,
+    load_model_obs_time_text,
     obs_map_noise_unit_label,
+    prepare_observation_for_metrics,
+    resolve_geometry_policy,
+    resolve_slice_observation_reference,
+    SliceObservationReferenceError,
     resolve_euv_response_identity,
     resolve_render_geometry_via_gxrender,
+    compute_forward_model_identity_placeholder,
     resolve_default_testdata_fixture_paths,
     search_local_minimum_ab,
     validate_obs_map_identity,
 )
+from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
 from pychmp.spectral import (
     default_euv_channels_for_instrument,
     euv_slice_request,
@@ -195,25 +219,50 @@ from pychmp.spectral import (
     parse_csv_tokens,
     unique_preserve_order,
 )
+from pychmp.search_contract import compatibility_signature_from_diagnostics, search_id_from_evaluation_config
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
+    FORWARD_MODEL_IDENTITY_VERSION,
+    SLICE_CONTAINER_GROUP,
+    SEARCHES_GROUP,
     ScanArtifactCompatibilityError,
     append_point_record,
     append_run_history_entry,
+    artifact_geometry_sha256,
+    build_artifact_geometry_block,
     build_computed_point_payload,
-    clear_live_trial_point,
+    build_map_identity,
+    finalize_search_runner_state,
+    _derive_euv_raw_best_from_components,
+    _derive_euv_trial_raw_from_components,
     detect_scan_artifact_format,
     load_auxiliary_map_store_point_records,
     load_scan_file,
     load_run_history,
+    load_slice_observation_reference_payload,
+    load_search_observation_reference_payload,
     point_record_matches_compatibility_signature,
+    read_slice_active_search_id,
     validate_scan_artifact_compatibility,
     validate_scan_artifact_reuse_preflight,
-    write_live_trial_point,
     write_point_scan_artifact,
 )
-from pychmp.geometry_policy import resolve_geometry_policy
-from pychmp.metrics import compute_metrics, resolve_threshold_mask
+from pychmp.grid_points import (
+    GRID_POINTS_CONTRACT_VERSION,
+    GridPointActiveQ0Event,
+    GridPointAssignedEvent,
+    GridPointCompletedEvent,
+    GridPointFailedEvent,
+    GridTrialCommittedEvent,
+    apply_grid_point_event_with_retry,
+    classify_grid_point_state,
+    find_grid_point_group,
+    list_grid_point_headers,
+    hydrate_render_maps_from_grid_point,
+    resolve_trial_shift_commit_fields,
+)
+from pychmp.refresh_signal import RefreshSignalWriter
+from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
 
 try:
     from fit_q0_obs_map import (
@@ -328,7 +377,18 @@ def _load_slice_preflight_payload(
     artifact_h5: Path,
     slice_key: str,
     include_maps: bool = False,
+    search_id: str | None = None,
 ) -> dict[str, Any] | None:
+    try:
+        payload = load_slice_observation_reference_payload(
+            artifact_h5,
+            slice_key=slice_key,
+            search_id=search_id,
+        )
+    except Exception:
+        payload = None
+    if payload is None:
+        return None
     try:
         import h5py
     except Exception:
@@ -342,17 +402,9 @@ def _load_slice_preflight_payload(
             diagnostics_raw = common["diagnostics_json"][()]
             if isinstance(diagnostics_raw, bytes):
                 diagnostics_raw = diagnostics_raw.decode("utf-8", errors="replace")
-            diagnostics = json.loads(str(diagnostics_raw))
-            if not isinstance(diagnostics, dict):
-                diagnostics = {}
-            observed = np.asarray(common["observed"], dtype=float) if include_maps and "observed" in common else None
-            sigma_map = np.asarray(common["sigma_map"], dtype=float) if include_maps and "sigma_map" in common else None
-            return {
-                "wcs_header": fits.Header.fromstring(str(header_text), sep="\n"),
-                "diagnostics": diagnostics,
-                "observed": observed,
-                "sigma_map": sigma_map,
-            }
+            common_diagnostics = json.loads(str(diagnostics_raw))
+            if not isinstance(common_diagnostics, dict):
+                common_diagnostics = {}
     except TypeError:
         try:
             with h5py.File(str(artifact_h5), "r") as f:
@@ -363,21 +415,29 @@ def _load_slice_preflight_payload(
                 diagnostics_raw = common["diagnostics_json"][()]
                 if isinstance(diagnostics_raw, bytes):
                     diagnostics_raw = diagnostics_raw.decode("utf-8", errors="replace")
-                diagnostics = json.loads(str(diagnostics_raw))
-                if not isinstance(diagnostics, dict):
-                    diagnostics = {}
-                observed = np.asarray(common["observed"], dtype=float) if include_maps and "observed" in common else None
-                sigma_map = np.asarray(common["sigma_map"], dtype=float) if include_maps and "sigma_map" in common else None
-                return {
-                    "wcs_header": fits.Header.fromstring(str(header_text), sep="\n"),
-                    "diagnostics": diagnostics,
-                    "observed": observed,
-                    "sigma_map": sigma_map,
-                }
+                common_diagnostics = json.loads(str(diagnostics_raw))
+                if not isinstance(common_diagnostics, dict):
+                    common_diagnostics = {}
         except Exception:
             return None
     except Exception:
         return None
+    obs_diagnostics = dict(payload.get("diagnostics") or {})
+    merged_diagnostics = {**common_diagnostics, **obs_diagnostics}
+    wcs_header = payload.get("wcs_header")
+    if wcs_header is None:
+        wcs_header = fits.Header.fromstring(str(header_text), sep="\n")
+    observed = np.asarray(payload["observed"], dtype=float) if include_maps and payload.get("observed") is not None else None
+    sigma_map = np.asarray(payload["sigma_map"], dtype=float) if include_maps and payload.get("sigma_map") is not None else None
+    return {
+        "wcs_header": wcs_header,
+        "diagnostics": merged_diagnostics,
+        "observed": observed,
+        "sigma_map": sigma_map,
+        "observation_canvas": payload.get("observation_canvas"),
+        "sigma_canvas": payload.get("sigma_canvas"),
+        "canvas_wcs_header": payload.get("canvas_wcs_header"),
+    }
 
 try:
     from plot_ab_scan_artifacts import plot_ab_scan_file
@@ -472,58 +532,131 @@ class _TeeStream:
 
 
 class _ViewerRefreshHeartbeat:
-    def __init__(self, signal_path: Path, *, interval_s: float = 2.0, slice_key: str | None = None) -> None:
-        self._signal_path = Path(signal_path)
-        self._slice_key = None if slice_key is None else str(slice_key).strip() or None
+    """Refresh v2 routing hints for pychmp-view (HDF5 is authoritative)."""
 
-    def notify_refresh(self) -> None:
-        try:
-            self._signal_path.write_text("artifact_refreshed\n", encoding="utf-8")
-        except Exception:
-            pass
+    def __init__(
+        self,
+        signal_path: Path,
+        *,
+        interval_s: float = 2.0,
+        slice_key: str | None = None,
+        search_id: str | None = None,
+    ) -> None:
+        self._signal_path = Path(signal_path)
+        self._interval_s = max(0.5, float(interval_s))
+        self._writer = RefreshSignalWriter(self._signal_path)
+        self._writer.set_routing(slice_key=slice_key, search_id=search_id)
+        self._phase = ""
+        self._pending_points: list[tuple[float, float]] = []
+        self._active_point: tuple[float, float] | None = None
+        self._last_point_id: str | None = None
+        self._lock = threading.Lock()
 
     @property
     def phase(self) -> str:
-        return "artifact_refreshed"
+        with self._lock:
+            return str(self._phase)
+
+    def set_search_id(self, search_id: str | None) -> None:
+        with self._lock:
+            self._writer.set_routing(search_id=search_id)
+
+    def emit_event(
+        self,
+        event: str,
+        *,
+        point_id: str | None = None,
+        trial_index: int | None = None,
+        legacy_phase: str | None = None,
+    ) -> None:
+        with self._lock:
+            if legacy_phase is not None:
+                self._phase = str(legacy_phase)
+            if point_id is not None and str(point_id).strip():
+                self._last_point_id = str(point_id).strip()
+            self._writer.write_event(
+                str(event),
+                point_id=point_id,
+                trial_index=trial_index,
+                legacy_phase=self._phase or legacy_phase,
+            )
+
+    def notify_refresh(self) -> None:
+        with self._lock:
+            point_id = str(self._last_point_id or "").strip() or None
+            if point_id:
+                self._writer.write_event(
+                    "point_assigned",
+                    point_id=point_id,
+                    legacy_phase=self._phase or None,
+                )
+            else:
+                self._writer.write_event(
+                    "search_initialized",
+                    legacy_phase=self._phase or None,
+                )
 
     def set_phase(self, phase: str) -> None:
-        _ = phase
+        with self._lock:
+            self._phase = str(phase)
 
     def set_pending_points(self, points: list[tuple[float, float]] | tuple[tuple[float, float], ...]) -> None:
-        _ = points
+        with self._lock:
+            self._pending_points = [(float(a), float(b)) for a, b in points]
+            if self._pending_points:
+                self._active_point = self._pending_points[0]
+            else:
+                self._active_point = None
+
+    def pending_points(self) -> list[tuple[float, float]]:
+        with self._lock:
+            return list(self._pending_points)
+
+    def remove_pending_point(self, a_value: float, b_value: float) -> None:
+        key = (float(a_value), float(b_value))
+        with self._lock:
+            self._pending_points = [
+                point for point in self._pending_points if not np.allclose(point, key, rtol=0.0, atol=1e-12)
+            ]
+            if self._active_point is not None and np.allclose(self._active_point, key, rtol=0.0, atol=1e-12):
+                self._active_point = self._pending_points[0] if self._pending_points else None
 
     def clear_pending_points(self) -> None:
-        return
+        with self._lock:
+            self._pending_points = []
+            self._active_point = None
 
     def set_active_point(self, a_value: float, b_value: float) -> None:
-        _ = (a_value, b_value)
+        with self._lock:
+            self._active_point = (float(a_value), float(b_value))
 
-    def update_live_trials(
-        self,
-        *,
-        a_value: float,
-        b_value: float,
-        metric_name: str,
-        q0_trials: list[float],
-        metric_trials: list[float],
-        active_trial_index: int | None = None,
-        active_trial_q0: float | None = None,
-    ) -> None:
-        _ = (a_value, b_value, metric_name, q0_trials, metric_trials, active_trial_index, active_trial_q0)
+    def update_from_live_snapshot(self, live_state: dict[str, Any]) -> None:
+        _ = live_state
 
     def clear_active_trial(self) -> None:
         return
 
     def start(self, phase: str) -> None:
-        _ = phase
+        with self._lock:
+            self._phase = str(phase)
+        self.emit_event("search_initialized", legacy_phase=str(phase))
 
     def stop(self, phase: str) -> None:
-        _ = phase
+        with self._lock:
+            self._phase = str(phase)
+            self._pending_points = []
+            self._active_point = None
+        lowered = str(phase).strip().lower()
+        if "complete" in lowered:
+            self.emit_event("search_completed", legacy_phase=str(phase))
+        elif "fail" in lowered or "interrupt" in lowered:
+            self.emit_event("search_completed", legacy_phase=str(phase))
 
 
 class _PointRenderRecord:
     def __init__(self) -> None:
         self.raw_modeled_by_q0: dict[str, np.ndarray] = {}
+        self.stokes_v_by_q0: dict[str, np.ndarray] = {}
         self.modeled_by_q0: dict[str, np.ndarray] = {}
         self.components_by_q0: dict[str, dict[str, Any]] = {}
         self.cube_by_q0: dict[str, dict[str, Any]] = {}
@@ -533,6 +666,10 @@ class _PointRenderRecord:
         cloned.raw_modeled_by_q0 = {
             str(key): np.asarray(value, dtype=np.float32).copy()
             for key, value in self.raw_modeled_by_q0.items()
+        }
+        cloned.stokes_v_by_q0 = {
+            str(key): np.asarray(value, dtype=np.float32).copy()
+            for key, value in self.stokes_v_by_q0.items()
         }
         cloned.modeled_by_q0 = {
             str(key): np.asarray(value, dtype=np.float32).copy()
@@ -582,11 +719,14 @@ class _PointRenderStream:
         q0_value: float,
         raw_modeled: np.ndarray,
         modeled: np.ndarray,
+        stokes_v: np.ndarray | None = None,
     ) -> None:
         record = self._get_or_create(a_value, b_value)
         key = self._q0_key(q0_value)
         record.raw_modeled_by_q0[key] = np.asarray(raw_modeled, dtype=np.float32)
         record.modeled_by_q0[key] = np.asarray(modeled, dtype=np.float32)
+        if stokes_v is not None:
+            record.stokes_v_by_q0[key] = np.asarray(stokes_v, dtype=np.float32)
 
     def record_components(
         self,
@@ -621,6 +761,19 @@ class _PointRenderStream:
             record = self._records.get((float(a_value), float(b_value)))
             return None if record is None else record.clone()
 
+    def drop_trial_render(self, *, a_value: float, b_value: float, q0_value: float) -> None:
+        point_key = (float(a_value), float(b_value))
+        key = self._q0_key(q0_value)
+        with self._lock:
+            record = self._records.get(point_key)
+            if record is None:
+                return
+            record.raw_modeled_by_q0.pop(key, None)
+            record.modeled_by_q0.pop(key, None)
+            record.stokes_v_by_q0.pop(key, None)
+            record.components_by_q0.pop(key, None)
+            record.cube_by_q0.pop(key, None)
+
 
 class _TrackedBaseRendererProxy:
     def __init__(self, base_renderer: Any, *, stream: _PointRenderStream, a_value: float, b_value: float) -> None:
@@ -650,7 +803,8 @@ class _TrackedBaseRendererProxy:
         return payload
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._base, name)
+        base = object.__getattribute__(self, "_base")
+        return getattr(base, name)
 
 
 class _TrackedRendererProxy:
@@ -678,6 +832,9 @@ class _TrackedRendererProxy:
         self._psf_source = str(psf_source)
         self._compatibility_signature = str(compatibility_signature)
         self._store_trial_map_cubes = bool(store_trial_map_cubes)
+        self._artifact_h5: Path | None = None
+        self._slice_key: str | None = None
+        self._search_id: str | None = None
         base = getattr(renderer, "_base", None)
         self._base = None
         if base is not None:
@@ -695,6 +852,11 @@ class _TrackedRendererProxy:
         else:
             modeled = self._renderer.render(q0_value)
             raw_modeled = modeled
+        stokes_v = getattr(self._renderer, "_last_stokes_v", None)
+        if stokes_v is None and hasattr(self._renderer, "render_stokes_raw"):
+            _stokes_i, stokes_v_raw = self._renderer.render_stokes_raw(q0_value)
+            if stokes_v_raw is not None:
+                stokes_v = stokes_v_raw
         raw_arr = np.asarray(raw_modeled, dtype=np.float32)
         modeled_arr = np.asarray(modeled, dtype=np.float32)
         self._stream.record_render_pair(
@@ -703,6 +865,7 @@ class _TrackedRendererProxy:
             q0_value=q0_value,
             raw_modeled=raw_arr,
             modeled=modeled_arr,
+            stokes_v=None if stokes_v is None else np.asarray(stokes_v, dtype=np.float32),
         )
         return raw_arr, modeled_arr
 
@@ -712,6 +875,18 @@ class _TrackedRendererProxy:
 
     def build_artifact_payload(self, point: ABPointResult) -> dict[str, Any]:
         stream_record = self._stream.pop_record(a_value=self._a_value, b_value=self._b_value)
+        if stream_record is None:
+            stream_record = _PointRenderRecord()
+        artifact_h5 = getattr(self, "_artifact_h5", None)
+        if artifact_h5 is not None:
+            _hydrate_stream_record_from_grid_artifact(
+                stream_record,
+                artifact_h5=Path(artifact_h5),
+                slice_key=getattr(self, "_slice_key", None),
+                search_id=getattr(self, "_search_id", None),
+                a_value=float(self._a_value),
+                b_value=float(self._b_value),
+            )
         return _point_payload_from_result(
             point,
             renderer_factory=self._renderer_factory,
@@ -724,7 +899,8 @@ class _TrackedRendererProxy:
         )
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._renderer, name)
+        renderer = object.__getattribute__(self, "_renderer")
+        return getattr(renderer, name)
 
 
 class _StreamingRendererFactory:
@@ -738,6 +914,9 @@ class _StreamingRendererFactory:
         psf_source: str,
         compatibility_signature: str,
         store_trial_map_cubes: bool,
+        artifact_h5: Path | None = None,
+        slice_key: str | None = None,
+        search_id: str | None = None,
     ) -> None:
         self._base_factory = base_factory
         self._stream = stream
@@ -746,10 +925,13 @@ class _StreamingRendererFactory:
         self._psf_source = str(psf_source)
         self._compatibility_signature = str(compatibility_signature)
         self._store_trial_map_cubes = bool(store_trial_map_cubes)
+        self._artifact_h5 = None if artifact_h5 is None else Path(artifact_h5)
+        self._slice_key = None if slice_key is None else str(slice_key).strip() or None
+        self._search_id = None if search_id is None else str(search_id).strip() or None
 
     def __call__(self, a: float, b: float) -> Any:
         renderer = self._base_factory(float(a), float(b))
-        return _TrackedRendererProxy(
+        proxy = _TrackedRendererProxy(
             renderer,
             stream=self._stream,
             a_value=float(a),
@@ -761,9 +943,31 @@ class _StreamingRendererFactory:
             compatibility_signature=self._compatibility_signature,
             store_trial_map_cubes=self._store_trial_map_cubes,
         )
+        proxy._artifact_h5 = self._artifact_h5
+        proxy._slice_key = self._slice_key
+        proxy._search_id = self._search_id
+        return proxy
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._base_factory, name)
+        base_factory = object.__getattribute__(self, "_base_factory")
+        return getattr(base_factory, name)
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "_base_factory": self._base_factory,
+            "_stream": self._stream,
+            "_observed_template": self._observed_template,
+            "_target_metric": self._target_metric,
+            "_psf_source": self._psf_source,
+            "_compatibility_signature": self._compatibility_signature,
+            "_store_trial_map_cubes": self._store_trial_map_cubes,
+            "_artifact_h5": self._artifact_h5,
+            "_slice_key": self._slice_key,
+            "_search_id": self._search_id,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
 
 
 @dataclass(frozen=True)
@@ -813,6 +1017,12 @@ class _AdaptiveRendererFactory:
     pixel_scale_arcsec: float
     psf_kernel: np.ndarray | None
     tr_region_mask: np.ndarray | None = None
+    forward_model_sha256: str = ""
+    forward_model_identity_version: str = FORWARD_MODEL_IDENTITY_VERSION
+    artifact_geometry_sha256: str = ""
+    ebtel_sha256: str = ""
+    euv_response_sha256: str | None = None
+    euv_response_identity_version: str | None = None
 
     def __call__(self, a: float, b: float) -> Any:
         sdk = import_module("gxrender.sdk")
@@ -1005,36 +1215,22 @@ def _build_synthetic_map_identity(
     q0_value: float,
     domain_label: str,
     channel_or_frequency_label: str,
-    map_role: str,
+    component: str,
 ) -> dict[str, Any]:
-    geometry = getattr(renderer_factory, "geometry", None)
-    spectral_domain = getattr(renderer_factory, "spectral_domain", "unknown")
-    spectral_label = getattr(renderer_factory, "spectral_label", str(channel_or_frequency_label))
-    observer_name = getattr(renderer_factory, "observer_name", None)
-    render_frequencies_ghz = tuple(getattr(renderer_factory, "render_frequencies_ghz", ()) or ())
-    render_channels = tuple(getattr(renderer_factory, "render_channels", ()) or ())
-    return {
-        "schema": "pychmp.synthetic_map_db.v1",
-        "spectral_domain": str(spectral_domain),
-        "spectral_label": str(spectral_label),
-        "domain_label": str(domain_label),
-        "channel_or_frequency": str(channel_or_frequency_label),
-        "map_role": str(map_role),
-        "a": float(a_value),
-        "b": float(b_value),
-        "q0": float(q0_value),
-        "geometry": {
-            "xc": float(getattr(geometry, "xc", np.nan)),
-            "yc": float(getattr(geometry, "yc", np.nan)),
-            "dx": float(getattr(geometry, "dx", np.nan)),
-            "dy": float(getattr(geometry, "dy", np.nan)),
-            "nx": int(getattr(geometry, "nx", 0)),
-            "ny": int(getattr(geometry, "ny", 0)),
-        },
-        "observer_name": None if observer_name is None else str(observer_name),
-        "render_frequencies_ghz": [float(v) for v in render_frequencies_ghz],
-        "render_channels": [str(v) for v in render_channels],
-    }
+    return build_map_identity(
+        a=float(a_value),
+        b=float(b_value),
+        q0=float(q0_value),
+        domain=str(domain_label),
+        channel_or_frequency=str(channel_or_frequency_label),
+        component=str(component),
+        forward_model_sha256=str(renderer_factory.forward_model_sha256),
+        forward_model_identity_version=str(renderer_factory.forward_model_identity_version),
+        ebtel_sha256=str(renderer_factory.ebtel_sha256),
+        artifact_geometry_sha256=str(renderer_factory.artifact_geometry_sha256),
+        euv_response_sha256=renderer_factory.euv_response_sha256,
+        euv_response_identity_version=renderer_factory.euv_response_identity_version,
+    )
 
 
 def _lookup_stream_value_by_q0(
@@ -1063,6 +1259,26 @@ def _convolve_with_psf_kernel(raw_map: np.ndarray, psf_kernel: np.ndarray | None
     return np.asarray(fftconvolve(raw, kernel, mode="same"), dtype=float)
 
 
+def _hydrate_stream_record_from_grid_artifact(
+    record: _PointRenderRecord,
+    *,
+    artifact_h5: Path,
+    slice_key: str | None,
+    search_id: str | None,
+    a_value: float,
+    b_value: float,
+) -> None:
+    hydrate_render_maps_from_grid_point(
+        Path(artifact_h5),
+        slice_key=slice_key,
+        search_id=search_id,
+        a=float(a_value),
+        b=float(b_value),
+        raw_modeled_by_q0=record.raw_modeled_by_q0,
+        modeled_by_q0=record.modeled_by_q0,
+    )
+
+
 def _point_payload_from_result(
     point: ABPointResult,
     *,
@@ -1081,6 +1297,17 @@ def _point_payload_from_result(
     raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, point_q0)
     modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, point_q0)
     if raw_modeled_best is None or modeled_best is None:
+        metric_trials = [float(v) for v in point.trial_objective_values]
+        if len(metric_trials) == len(trial_q0_values) and metric_trials:
+            finite = [(idx, value) for idx, value in enumerate(metric_trials) if np.isfinite(value)]
+            if finite:
+                best_index = min(finite, key=lambda item: item[1])[0]
+                fallback_q0 = float(trial_q0_values[best_index])
+                raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, fallback_q0)
+                modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, fallback_q0)
+                if raw_modeled_best is not None and modeled_best is not None:
+                    point_q0 = float(fallback_q0)
+    if raw_modeled_best is None or modeled_best is None:
         raise RuntimeError("point payload stream record is missing the best rendered maps")
     modeled_best = np.asarray(modeled_best, dtype=float)
     raw_modeled_best = np.asarray(raw_modeled_best, dtype=float)
@@ -1094,10 +1321,18 @@ def _point_payload_from_result(
     trial_residual_maps = None
     trial_euv_coronal_maps = None
     trial_euv_tr_maps = None
+    euv_coronal_best = None
+    euv_tr_best = None
+    stokes_v_best = None
+    trial_stokes_v_maps = None
+    euv_tr_mask = None
+    tr_mask_attr = getattr(renderer_factory, "tr_region_mask", None)
+    if tr_mask_attr is not None:
+        euv_tr_mask = np.asarray(tr_mask_attr, dtype=bool)
     map_store_arrays: dict[str, np.ndarray] = {}
     synthetic_map_keys: list[dict[str, Any]] = []
 
-    def _register_synthetic_map(*, identity: dict[str, Any], array: np.ndarray, label: str) -> None:
+    def _register_synthetic_map(*, identity: dict[str, Any], array: np.ndarray, label: str, map_role: str) -> None:
         machine_key = _canonical_json_sha256(identity)
         map_store_name = f"synthetic/{machine_key}"
         map_store_arrays[map_store_name] = np.asarray(array, dtype=np.float32)
@@ -1106,13 +1341,14 @@ def _point_payload_from_result(
                 "label": str(label),
                 "map_store_array": str(map_store_name),
                 "machine_key": str(machine_key),
-                "identity": dict(identity),
+                "identity": {**dict(identity), "map_role": str(map_role)},
             }
         )
 
     cube_payload = None
     cube_payload = _lookup_stream_value_by_q0(stream_record.cube_by_q0, point_q0)
     if isinstance(cube_payload, dict):
+        stokes_v_by_frequency = dict(cube_payload.get("stokes_v_by_frequency", {}))
         for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
             freq_label = f"{float(freq):.6f}ghz"
             _register_synthetic_map(
@@ -1123,28 +1359,39 @@ def _point_payload_from_result(
                     q0_value=point_q0,
                     domain_label="mw",
                     channel_or_frequency_label=freq_label,
-                    map_role="raw_modeled_best",
+                    component="stokes_i",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"MW {freq_label} raw modeled",
+                label=f"MW {freq_label} Stokes I",
+                map_role="stokes_i",
             )
+            rendered_v = stokes_v_by_frequency.get(freq)
+            if rendered_v is None:
+                rendered_v = stokes_v_by_frequency.get(float(freq))
+            if rendered_v is not None:
+                _register_synthetic_map(
+                    identity=_build_synthetic_map_identity(
+                        renderer_factory=renderer_factory,
+                        a_value=point_a,
+                        b_value=point_b,
+                        q0_value=point_q0,
+                        domain_label="mw",
+                        channel_or_frequency_label=freq_label,
+                        component="stokes_v",
+                    ),
+                    array=np.asarray(rendered_v, dtype=np.float32),
+                    label=f"MW {freq_label} Stokes V",
+                    map_role="stokes_v",
+                )
     components = None
     components = _lookup_stream_value_by_q0(stream_record.components_by_q0, point_q0)
     if isinstance(components, dict):
-        for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
-            _register_synthetic_map(
-                identity=_build_synthetic_map_identity(
-                    renderer_factory=renderer_factory,
-                    a_value=point_a,
-                    b_value=point_b,
-                    q0_value=point_q0,
-                    domain_label="euv",
-                    channel_or_frequency_label=str(channel),
-                    map_role="rendered_best",
-                ),
-                array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} rendered",
-            )
+        corona_target = components.get("flux_corona")
+        tr_target = components.get("flux_tr")
+        if corona_target is not None:
+            euv_coronal_best = np.asarray(corona_target, dtype=np.float32)
+        if tr_target is not None:
+            euv_tr_best = np.asarray(tr_target, dtype=np.float32)
         for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
             _register_synthetic_map(
                 identity=_build_synthetic_map_identity(
@@ -1154,10 +1401,11 @@ def _point_payload_from_result(
                     q0_value=point_q0,
                     domain_label="euv",
                     channel_or_frequency_label=str(channel),
-                    map_role="flux_corona_best",
+                    component="corona",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} coronal flux",
+                label=f"EUV {channel} corona",
+                map_role="corona",
             )
         for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
             _register_synthetic_map(
@@ -1168,17 +1416,23 @@ def _point_payload_from_result(
                     q0_value=point_q0,
                     domain_label="euv",
                     channel_or_frequency_label=str(channel),
-                    map_role="flux_tr_best",
+                    component="tr",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} TR flux",
+                label=f"EUV {channel} TR",
+                map_role="tr",
             )
 
     trial_raw_by_q0: dict[str, np.ndarray] = {}
     trial_modeled_by_q0: dict[str, np.ndarray] = {}
+    trial_stokes_v_by_q0: dict[str, np.ndarray] = {}
     if stream_record is not None:
         trial_raw_by_q0 = dict(stream_record.raw_modeled_by_q0)
         trial_modeled_by_q0 = dict(stream_record.modeled_by_q0)
+        trial_stokes_v_by_q0 = dict(stream_record.stokes_v_by_q0)
+    stokes_v_best_lookup = _lookup_stream_value_by_q0(trial_stokes_v_by_q0, point_q0)
+    if stokes_v_best_lookup is not None:
+        stokes_v_best = np.asarray(stokes_v_best_lookup, dtype=np.float32)
 
     if trial_q0_values:
         raw_trials: list[np.ndarray] = []
@@ -1186,6 +1440,7 @@ def _point_payload_from_result(
         residual_trials: list[np.ndarray] = []
         euv_coronal_trials: list[np.ndarray] = []
         euv_tr_trials: list[np.ndarray] = []
+        stokes_v_trials: list[np.ndarray] = []
         for trial_index, q0_value in enumerate(trial_q0_values):
             raw_trial = _lookup_stream_value_by_q0(trial_raw_by_q0, q0_value)
             if raw_trial is None:
@@ -1194,6 +1449,7 @@ def _point_payload_from_result(
                 residual_trials = []
                 euv_coronal_trials = []
                 euv_tr_trials = []
+                stokes_v_trials = []
                 break
             raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
             raw_trials.append(raw_trial_arr)
@@ -1201,6 +1457,9 @@ def _point_payload_from_result(
             modeled_trial_arr = raw_trial_arr if modeled_trial is None else np.asarray(modeled_trial, dtype=np.float32)
             modeled_trials.append(modeled_trial_arr)
             residual_trials.append(modeled_trial_arr - np.asarray(observed_template, dtype=np.float32))
+            stokes_v_trial = _lookup_stream_value_by_q0(trial_stokes_v_by_q0, q0_value)
+            if stokes_v_trial is not None:
+                stokes_v_trials.append(np.asarray(stokes_v_trial, dtype=np.float32))
 
             if bool(store_trial_map_cubes):
                 trial_components = _lookup_stream_value_by_q0(stream_record.components_by_q0, q0_value)
@@ -1211,7 +1470,7 @@ def _point_payload_from_result(
                     if coronal is not None and tr_flux is not None:
                         euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
                         euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
-                    for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                    for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
                         _register_synthetic_map(
                             identity=_build_synthetic_map_identity(
                                 renderer_factory=renderer_factory,
@@ -1220,14 +1479,31 @@ def _point_payload_from_result(
                                 q0_value=float(q0_value),
                                 domain_label="euv",
                                 channel_or_frequency_label=str(channel),
-                                map_role=f"trial_{trial_index:03d}_rendered",
+                                component="corona",
                             ),
                             array=np.asarray(rendered, dtype=np.float32),
-                            label=f"EUV {channel} trial {trial_index:03d} rendered",
+                            label=f"EUV {channel} trial {trial_index:03d} corona",
+                            map_role=f"trial_{trial_index:03d}_corona",
+                        )
+                    for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+                        _register_synthetic_map(
+                            identity=_build_synthetic_map_identity(
+                                renderer_factory=renderer_factory,
+                                a_value=point_a,
+                                b_value=point_b,
+                                q0_value=float(q0_value),
+                                domain_label="euv",
+                                channel_or_frequency_label=str(channel),
+                                component="tr",
+                            ),
+                            array=np.asarray(rendered, dtype=np.float32),
+                            label=f"EUV {channel} trial {trial_index:03d} TR",
+                            map_role=f"trial_{trial_index:03d}_tr",
                         )
                 trial_cube = _lookup_stream_value_by_q0(stream_record.cube_by_q0, q0_value)
                 if isinstance(trial_cube, dict):
                     cube_payload = trial_cube
+                    stokes_v_by_frequency = dict(cube_payload.get("stokes_v_by_frequency", {}))
                     for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
                         freq_label = f"{float(freq):.6f}ghz"
                         _register_synthetic_map(
@@ -1238,11 +1514,30 @@ def _point_payload_from_result(
                                 q0_value=float(q0_value),
                                 domain_label="mw",
                                 channel_or_frequency_label=freq_label,
-                                map_role=f"trial_{trial_index:03d}_raw_modeled",
+                                component="stokes_i",
                             ),
                             array=np.asarray(rendered, dtype=np.float32),
-                            label=f"MW {freq_label} trial {trial_index:03d} raw modeled",
+                            label=f"MW {freq_label} trial {trial_index:03d} Stokes I",
+                            map_role=f"trial_{trial_index:03d}_stokes_i",
                         )
+                        rendered_v = stokes_v_by_frequency.get(freq)
+                        if rendered_v is None:
+                            rendered_v = stokes_v_by_frequency.get(float(freq))
+                        if rendered_v is not None:
+                            _register_synthetic_map(
+                                identity=_build_synthetic_map_identity(
+                                    renderer_factory=renderer_factory,
+                                    a_value=point_a,
+                                    b_value=point_b,
+                                    q0_value=float(q0_value),
+                                    domain_label="mw",
+                                    channel_or_frequency_label=freq_label,
+                                    component="stokes_v",
+                                ),
+                                array=np.asarray(rendered_v, dtype=np.float32),
+                                label=f"MW {freq_label} trial {trial_index:03d} Stokes V",
+                                map_role=f"trial_{trial_index:03d}_stokes_v",
+                            )
         if raw_trials and len(raw_trials) == len(trial_q0_values):
             trial_raw_modeled_maps = np.stack(raw_trials, axis=0)
             trial_modeled_maps = np.stack(modeled_trials, axis=0)
@@ -1250,6 +1545,8 @@ def _point_payload_from_result(
         if euv_coronal_trials and len(euv_coronal_trials) == len(trial_q0_values):
             trial_euv_coronal_maps = np.stack(euv_coronal_trials, axis=0)
             trial_euv_tr_maps = np.stack(euv_tr_trials, axis=0)
+        if stokes_v_trials and len(stokes_v_trials) == len(trial_q0_values):
+            trial_stokes_v_maps = np.stack(stokes_v_trials, axis=0)
     elapsed_seconds = float(point.elapsed_seconds)
     diagnostics = {
         "a": float(point.a),
@@ -1294,11 +1591,20 @@ def _point_payload_from_result(
         fit_chi2_trials=fit_chi2_trials,
         fit_rho2_trials=fit_rho2_trials,
         fit_eta2_trials=fit_eta2_trials,
+        fit_shift_x_trials=tuple(float(v) for v in point.trial_shift_x_arcsec),
+        fit_shift_y_trials=tuple(float(v) for v in point.trial_shift_y_arcsec),
+        fit_find_shift_valid_trials=tuple(bool(v) for v in point.trial_find_shift_valid),
+        fit_trial_mask_stages=tuple(str(v) for v in point.trial_mask_stages),
         trial_raw_modeled_maps=trial_raw_modeled_maps,
         trial_modeled_maps=trial_modeled_maps,
         trial_residual_maps=trial_residual_maps,
         trial_euv_coronal_maps=trial_euv_coronal_maps,
         trial_euv_tr_maps=trial_euv_tr_maps,
+        euv_coronal_best=euv_coronal_best,
+        euv_tr_best=euv_tr_best,
+        euv_tr_mask=euv_tr_mask,
+        stokes_v_best=stokes_v_best,
+        trial_stokes_v_maps=trial_stokes_v_maps,
         map_store_arrays=map_store_arrays,
         nfev=int(point.nfev),
         nit=int(point.nit),
@@ -1445,28 +1751,12 @@ class _ArtifactWriteDispatcher:
             if self._failed is not None:
                 raise RuntimeError("artifact write dispatcher failed") from self._failed
 
-    def write_point(self, point_payload: dict[str, Any]) -> None:
+    def write_grid_event(self, event: Any) -> None:
         with self._lock:
             if self._closed:
                 raise RuntimeError("artifact write dispatcher is closed")
         self._raise_if_failed()
-        # Bounded queue applies backpressure while still allowing the caller to
-        # continue without waiting for each point write to complete.
-        self._queue.put(("point", dict(point_payload)))
-
-    def write_live_snapshot(self, point_payload: dict[str, Any]) -> None:
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("artifact write dispatcher is closed")
-        self._raise_if_failed()
-        self._queue.put(("live_snapshot", dict(point_payload)))
-
-    def clear_live_snapshot(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-        self._raise_if_failed()
-        self._queue.put(("clear_live_snapshot", None))
+        self._queue.put(("grid_event", event))
 
     def close(self) -> None:
         with self._lock:
@@ -1482,6 +1772,50 @@ class _ArtifactWriteDispatcher:
         self._queue.join()
         self._raise_if_failed()
 
+    def _target_slice_key(self) -> str | None:
+        value = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip()
+        return value or None
+
+    def _target_search_id(self) -> str | None:
+        value = str(self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or "").strip()
+        return value or None
+
+    def _emit_refresh_for_event(self, event: Any, *, point_id: str | None = None) -> None:
+        if self._viewer_heartbeat is None:
+            return
+        if isinstance(event, GridPointAssignedEvent):
+            self._viewer_heartbeat.emit_event(
+                "point_assigned",
+                point_id=str(point_id or event.point_id or ""),
+                legacy_phase=f"point assigned {event.a:.3f},{event.b:.3f}",
+            )
+        elif isinstance(event, GridTrialCommittedEvent):
+            self._viewer_heartbeat.emit_event(
+                "trial_committed",
+                point_id=str(event.point_id),
+                trial_index=int(event.trial_index),
+                legacy_phase=f"trial {int(event.trial_index):02d} complete",
+            )
+        elif isinstance(event, GridPointCompletedEvent):
+            self._viewer_heartbeat.emit_event(
+                "point_completed",
+                point_id=str(event.point_id),
+                legacy_phase="point saved",
+            )
+        elif isinstance(event, GridPointFailedEvent):
+            self._viewer_heartbeat.emit_event(
+                "point_failed",
+                point_id=str(event.point_id),
+                legacy_phase="point failed",
+            )
+        elif isinstance(event, GridPointActiveQ0Event):
+            if point_id is not None:
+                self._viewer_heartbeat.emit_event(
+                    "point_assigned",
+                    point_id=str(point_id),
+                    legacy_phase="trial active",
+                )
+
     def _run(self) -> None:
         while True:
             item = self._queue.get()
@@ -1490,67 +1824,26 @@ class _ArtifactWriteDispatcher:
                 return
             try:
                 operation, payload = item
-                if operation == "point":
-                    self._run_h5_write_with_retry(
-                        lambda: append_point_record(
+                if operation == "grid_event":
+                    assigned_point_id: str | None = None
+
+                    def _apply() -> None:
+                        nonlocal assigned_point_id
+                        assigned_point_id = apply_grid_point_event_with_retry(
                             self._artifact_h5,
+                            payload,
                             observed=self._observed,
                             sigma_map=self._sigma_map,
                             wcs_header=self._target_header,
                             diagnostics=self._diagnostics,
                             blos_reference=self._blos_reference,
                             psf_kernel=self._psf_kernel,
-                            point_payload=payload,
-                        ),
-                        attempts=12,
-                    )
-                    if self._viewer_heartbeat is not None:
-                        self._viewer_heartbeat.notify_refresh()
-                elif operation == "live_snapshot":
-                    try:
-                        self._run_h5_write_with_retry(
-                            lambda: write_live_trial_point(
-                                self._artifact_h5,
-                                live_state=payload,
-                                slice_key=str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip() or None,
-                            ),
-                            attempts=6,
                         )
-                        if self._viewer_heartbeat is not None:
-                            self._viewer_heartbeat.notify_refresh()
-                    except BaseException as exc:
-                        if _is_snapshot_target_missing_error(exc):
-                            if not self._snapshot_missing_target_warning_emitted:
-                                print(
-                                    "WARNING: live trial point update skipped because target slice/search is not initialized yet; "
-                                    "point writes will continue"
-                                )
-                                self._snapshot_missing_target_warning_emitted = True
-                            continue
-                        if not _is_hdf5_lock_contention_error(exc):
-                            raise
-                        if not self._snapshot_lock_warning_emitted:
-                            print(
-                                "WARNING: active point snapshot update skipped due to transient HDF5 lock contention; "
-                                "point writes will continue"
-                            )
-                            self._snapshot_lock_warning_emitted = True
-                elif operation == "clear_live_snapshot":
-                    try:
-                        self._run_h5_write_with_retry(
-                            lambda: clear_live_trial_point(
-                                self._artifact_h5,
-                                slice_key=str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip() or None,
-                            ),
-                            attempts=4,
-                        )
-                        if self._viewer_heartbeat is not None:
-                            self._viewer_heartbeat.notify_refresh()
-                    except BaseException as exc:
-                        if _is_snapshot_target_missing_error(exc):
-                            continue
-                        if not _is_hdf5_lock_contention_error(exc):
-                            raise
+
+                    self._run_h5_write_with_retry(_apply, attempts=12)
+                    self._emit_refresh_for_event(payload, point_id=assigned_point_id)
+                else:
+                    raise RuntimeError(f"unsupported dispatcher operation: {operation}")
             except BaseException as exc:
                 with self._lock:
                     if self._failed is None:
@@ -1608,10 +1901,15 @@ def _rescore_auxiliary_map_record(
     explicit_mask: np.ndarray | None,
     target_metric: str,
     psf_kernel: np.ndarray | None = None,
+    tr_region_mask: np.ndarray | None = None,
 ) -> tuple[ABPointResult, dict[str, Any]] | None:
+    if record.get("euv_tr_mask") is None and tr_region_mask is not None:
+        record = {**dict(record), "euv_tr_mask": np.asarray(tr_region_mask, dtype=bool)}
     trial_q0 = tuple(float(value) for value in record.get("fit_q0_trials", ()))
     trial_metric_trials = tuple(float(value) for value in record.get("fit_metric_trials", ()))
     trial_maps_raw = record.get("trial_raw_modeled_maps")
+    if trial_maps_raw is None:
+        trial_maps_raw = _derive_euv_trial_raw_from_components(record)
     if trial_maps_raw is None:
         trial_maps_raw = record.get("trial_modeled_maps")
     observed_arr = np.asarray(observed, dtype=float)
@@ -1627,6 +1925,8 @@ def _rescore_auxiliary_map_record(
         if len(trial_metric_trials) != len(trial_q0):
             return None
         modeled_best_raw = record.get("raw_modeled_best")
+        if modeled_best_raw is None:
+            modeled_best_raw = _derive_euv_raw_best_from_components(record)
         if modeled_best_raw is None:
             modeled_best_raw = record.get("modeled_best")
         if modeled_best_raw is None:
@@ -1902,6 +2202,48 @@ def _maybe_validate_artifact_preflight(
     )
 
 
+def _grid_trial_shift_commit_kwargs(
+    *,
+    trial_index: int,
+    payload: dict[str, Any] | None = None,
+    result: ABPointResult | None = None,
+    shift_x_trials: Any = None,
+    shift_y_trials: Any = None,
+    shift_valid_trials: Any = None,
+) -> dict[str, Any]:
+    stages: tuple[str, ...] = ()
+    if payload is not None:
+        stages = tuple(str(v) for v in payload.get("fit_trial_mask_stages", ()) or ())
+    if not stages and result is not None:
+        stages = tuple(str(v) for v in result.trial_mask_stages or ())
+    stage = str(stages[trial_index]) if trial_index < len(stages) else ""
+    if shift_x_trials is None:
+        shift_x_trials = payload.get("fit_shift_x_trials") if payload is not None else None
+        if shift_x_trials is None and result is not None:
+            shift_x_trials = result.trial_shift_x_arcsec
+    if shift_y_trials is None:
+        shift_y_trials = payload.get("fit_shift_y_trials") if payload is not None else None
+        if shift_y_trials is None and result is not None:
+            shift_y_trials = result.trial_shift_y_arcsec
+    if shift_valid_trials is None:
+        shift_valid_trials = payload.get("fit_find_shift_valid_trials") if payload is not None else None
+        if shift_valid_trials is None and result is not None:
+            shift_valid_trials = result.trial_find_shift_valid
+    trial_metadata, shift_x, shift_y, shift_valid = resolve_trial_shift_commit_fields(
+        trial_index=int(trial_index),
+        shift_x_trials=shift_x_trials,
+        shift_y_trials=shift_y_trials,
+        shift_valid_trials=shift_valid_trials,
+        stage=stage,
+    )
+    return {
+        "trial_metadata": trial_metadata,
+        "shift_x": shift_x,
+        "shift_y": shift_y,
+        "shift_valid": shift_valid,
+    }
+
+
 class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
     def __init__(
         self,
@@ -1945,9 +2287,359 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             viewer_heartbeat=self._viewer_heartbeat,
         )
         self._point_map: dict[tuple[float, float], ABPointResult] = {}
+        self._point_ids: dict[tuple[float, float], str] = {}
+        self._trials_committed: dict[tuple[float, float], int] = {}
+        self._resume_q0: dict[tuple[float, float], float] = {}
+        self._retry_failed = False
+        self._resume_incomplete_from = "next_q0"
+        self._recompute_existing = False
+
+    def set_resume_policy(
+        self,
+        *,
+        retry_failed: bool = False,
+        resume_incomplete_from: str = "next_q0",
+    ) -> None:
+        self._retry_failed = bool(retry_failed)
+        resume_from = str(resume_incomplete_from or "next_q0").strip().lower()
+        self._resume_incomplete_from = resume_from if resume_from in {"next_q0", "q0_start"} else "next_q0"
+
+    def pending_resume_q0_start(self, a_value: float, b_value: float) -> float | None:
+        return self._resume_q0.get((float(a_value), float(b_value)))
+
+    def _resolve_search_id_from_artifact(self) -> str | None:
+        configured = str(
+            self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or ""
+        ).strip()
+        slice_key = self._target_slice_key()
+        if not slice_key or not self._artifact_h5.exists():
+            return configured or None
+        import h5py
+
+        from pychmp.ab_scan_artifacts import ACTIVE_SEARCH_ID_DATASET
+
+        try:
+            with h5py.File(str(self._artifact_h5), "r") as f:
+                if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
+                    return configured or None
+                slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+                if ACTIVE_SEARCH_ID_DATASET in slice_group:
+                    active = str(slice_group[ACTIVE_SEARCH_ID_DATASET][()].decode("utf-8")).strip()
+                    if active:
+                        return active
+        except Exception:
+            pass
+        return configured or None
+
+    def _sync_point_id_from_artifact(self, a_value: float, b_value: float) -> str | None:
+        import h5py
+
+        slice_key = self._target_slice_key()
+        search_id = self._resolve_search_id_from_artifact()
+        if not slice_key or not search_id or not self._artifact_h5.exists():
+            return None
+        with h5py.File(str(self._artifact_h5), "r") as f:
+            if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
+                return None
+            slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+            if SEARCHES_GROUP not in slice_group or search_id not in slice_group[SEARCHES_GROUP]:
+                return None
+            found = find_grid_point_group(
+                slice_group[SEARCHES_GROUP][search_id],
+                a=float(a_value),
+                b=float(b_value),
+            )
+            if found is None:
+                return None
+            point_id = str(found[0])
+        self._point_ids[(float(a_value), float(b_value))] = point_id
+        return point_id
+
+    def set_recompute_existing(self, enabled: bool) -> None:
+        self._recompute_existing = bool(enabled)
+
+    def point_id_for(self, a_value: float, b_value: float) -> str | None:
+        return self._point_ids.get((float(a_value), float(b_value)))
+
+    def assign_grid_points(
+        self,
+        assignments: list[tuple[float, float, float | None]],
+        *,
+        force_new: bool | None = None,
+    ) -> None:
+        force = self._recompute_existing if force_new is None else bool(force_new)
+        for a_value, b_value, q0_start in assignments:
+            q0_seed = float(q0_start) if q0_start is not None else float(np.sqrt(float(self._diagnostics.get("q0_min", 1e-5)) * float(self._diagnostics.get("q0_max", 1e-3))))
+            event = GridPointAssignedEvent(
+                a=float(a_value),
+                b=float(b_value),
+                q0_start=float(q0_seed),
+                next_q0=float(q0_seed),
+                metric_name=str(self._target_metric),
+                force_new_point_id=bool(force),
+            )
+            self._writer.write_grid_event(event)
+            self._writer.drain()
+            point_key = (float(a_value), float(b_value))
+            point_id = self._sync_point_id_from_artifact(float(a_value), float(b_value))
+            if point_id is not None and (force or point_key not in self._trials_committed):
+                self._trials_committed[point_key] = 0
+
+    def set_pending_points(
+        self,
+        points: list[tuple[float, float]] | tuple[tuple[float, float], ...],
+        *,
+        q0_starts: list[float | None] | None = None,
+    ) -> None:
+        normalized = [(float(a), float(b)) for a, b in points]
+        if self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.set_pending_points(normalized)
+        assignments: list[tuple[float, float, float | None]] = []
+        for index, (a_value, b_value) in enumerate(normalized):
+            q0_start = None
+            if q0_starts is not None and index < len(q0_starts):
+                q0_start = q0_starts[index]
+            assignments.append((float(a_value), float(b_value), q0_start))
+        if assignments:
+            self.assign_grid_points(assignments)
+
+    def clear_pending_points(self) -> None:
+        if self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.clear_pending_points()
+
+    def clear_live_trial_snapshot(self) -> None:
+        return
+
+    def update_active_q0(self, *, a_value: float, b_value: float, q0_value: float) -> None:
+        point_id = self.point_id_for(a_value, b_value)
+        if point_id is None:
+            return
+        self._writer.write_grid_event(
+            GridPointActiveQ0Event(point_id=str(point_id), next_q0=float(q0_value))
+        )
+
+    def commit_trial(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        trial_index: int,
+        q0_value: float,
+        metric_value: float,
+        raw_modeled_map: np.ndarray | None,
+        next_q0: float | None = None,
+        trial_metadata: dict[str, Any] | None = None,
+        chi2: float | None = None,
+        rho2: float | None = None,
+        eta2: float | None = None,
+        shift_x: float | None = None,
+        shift_y: float | None = None,
+        shift_valid: bool | None = None,
+    ) -> None:
+        point_key = (float(a_value), float(b_value))
+        point_id = self.point_id_for(a_value, b_value)
+        if point_id is None:
+            return
+        q0_trials = [float(q0_value)]
+        metric_trials = [float(metric_value)]
+        best_index = 0
+        if trial_index > 0:
+            best_index = int(trial_index)
+        shift_kwargs = _grid_trial_shift_commit_kwargs(trial_index=int(trial_index))
+        if shift_x is not None:
+            shift_kwargs["shift_x"] = float(shift_x)
+        if shift_y is not None:
+            shift_kwargs["shift_y"] = float(shift_y)
+        if shift_valid is not None:
+            shift_kwargs["shift_valid"] = bool(shift_valid)
+        merged_metadata = {**dict(shift_kwargs.get("trial_metadata") or {}), **dict(trial_metadata or {})}
+        event = GridTrialCommittedEvent(
+            point_id=str(point_id),
+            trial_index=int(trial_index),
+            q0=float(q0_value),
+            metric=float(metric_value),
+            next_q0=None if next_q0 is None else float(next_q0),
+            best_trial_index=int(best_index),
+            best_metric=float(metric_value),
+            raw_modeled_map=raw_modeled_map,
+            trial_metadata=merged_metadata,
+            shift_x=shift_kwargs.get("shift_x"),
+            shift_y=shift_kwargs.get("shift_y"),
+            shift_valid=shift_kwargs.get("shift_valid"),
+            chi2=chi2,
+            rho2=rho2,
+            eta2=eta2,
+        )
+        self._writer.write_grid_event(event)
+        self._trials_committed[point_key] = int(trial_index) + 1
+
+    def write_live_trial_snapshot(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_trials: list[float],
+        metric_trials: list[float],
+        active_trial_index: int | None = None,
+        active_trial_q0: float | None = None,
+        completed_trial_index: int | None = None,
+        completed_trial_raw_map: np.ndarray | None = None,
+        trial_metadata: dict[str, Any] | None = None,
+        chi2_trials: list[float] | None = None,
+        rho2_trials: list[float] | None = None,
+        eta2_trials: list[float] | None = None,
+        shift_x_trials: list[float] | None = None,
+        shift_y_trials: list[float] | None = None,
+        shift_valid_trials: list[bool] | None = None,
+    ) -> None:
+        if active_trial_q0 is not None and active_trial_index is not None:
+            self.update_active_q0(a_value=float(a_value), b_value=float(b_value), q0_value=float(active_trial_q0))
+        if completed_trial_index is None or completed_trial_raw_map is None:
+            return
+        metric_value = float(metric_trials[completed_trial_index]) if completed_trial_index < len(metric_trials) else float("nan")
+        q0_value = float(q0_trials[completed_trial_index]) if completed_trial_index < len(q0_trials) else float("nan")
+        trial_chi2 = None
+        trial_rho2 = None
+        trial_eta2 = None
+        if chi2_trials is not None and completed_trial_index < len(chi2_trials):
+            trial_chi2 = float(chi2_trials[completed_trial_index])
+        if rho2_trials is not None and completed_trial_index < len(rho2_trials):
+            trial_rho2 = float(rho2_trials[completed_trial_index])
+        if eta2_trials is not None and completed_trial_index < len(eta2_trials):
+            trial_eta2 = float(eta2_trials[completed_trial_index])
+        committed = int(self._trials_committed.get((float(a_value), float(b_value)), 0))
+        best_index = int(completed_trial_index)
+        best_metric = float(metric_value)
+        if metric_trials:
+            finite = [(idx, float(v)) for idx, v in enumerate(metric_trials) if np.isfinite(float(v))]
+            if finite:
+                best_index, best_metric = min(finite, key=lambda item: item[1])
+        shift_kwargs = _grid_trial_shift_commit_kwargs(
+            trial_index=int(completed_trial_index),
+            shift_x_trials=shift_x_trials,
+            shift_y_trials=shift_y_trials,
+            shift_valid_trials=shift_valid_trials,
+        )
+        merged_metadata = {**dict(shift_kwargs.get("trial_metadata") or {}), **dict(trial_metadata or {})}
+        self._writer.write_grid_event(
+            GridTrialCommittedEvent(
+                point_id=str(self.point_id_for(a_value, b_value) or ""),
+                trial_index=int(completed_trial_index),
+                q0=float(q0_value),
+                metric=float(metric_value),
+                next_q0=float(q0_value),
+                best_trial_index=int(best_index),
+                best_metric=float(best_metric),
+                raw_modeled_map=np.asarray(completed_trial_raw_map, dtype=np.float32),
+                trial_metadata=merged_metadata,
+                shift_x=shift_kwargs.get("shift_x"),
+                shift_y=shift_kwargs.get("shift_y"),
+                shift_valid=shift_kwargs.get("shift_valid"),
+                chi2=trial_chi2,
+                rho2=trial_rho2,
+                eta2=trial_eta2,
+            )
+        )
+        self._trials_committed[(float(a_value), float(b_value))] = max(
+            committed,
+            int(completed_trial_index) + 1,
+        )
+
+    def _commit_completed_point_from_payload(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        payload: dict[str, Any],
+        result: ABPointResult,
+    ) -> None:
+        point_key = (float(a_value), float(b_value))
+        point_id = self.point_id_for(a_value, b_value)
+        if point_id is None:
+            q0_start = float(payload.get("q0", result.q0))
+            self.assign_grid_points([(float(a_value), float(b_value), q0_start)])
+            point_id = self.point_id_for(a_value, b_value)
+        if point_id is None:
+            raise RuntimeError("grid point assignment did not produce a point_id")
+        q0_trials = [float(v) for v in payload.get("fit_q0_trials", result.trial_q0)]
+        metric_trials = [float(v) for v in payload.get("fit_metric_trials", result.trial_objective_values)]
+        chi2_trials = [float(v) for v in payload.get("fit_chi2_trials", result.trial_chi2_values)]
+        rho2_trials = [float(v) for v in payload.get("fit_rho2_trials", result.trial_rho2_values)]
+        eta2_trials = [float(v) for v in payload.get("fit_eta2_trials", result.trial_eta2_values)]
+        shift_x_trials = payload.get("fit_shift_x_trials", result.trial_shift_x_arcsec)
+        shift_y_trials = payload.get("fit_shift_y_trials", result.trial_shift_y_arcsec)
+        shift_valid_trials = payload.get("fit_find_shift_valid_trials", result.trial_find_shift_valid)
+        for trial_index, q0_value in enumerate(q0_trials):
+            raw_map = None
+            trial_maps = payload.get("trial_raw_modeled_maps")
+            if trial_maps is not None:
+                arr = np.asarray(trial_maps, dtype=float)
+                if arr.ndim == 3 and trial_index < arr.shape[0]:
+                    raw_map = np.asarray(arr[trial_index], dtype=np.float32)
+            if raw_map is None:
+                raw_map = self.trial_raw_map_for(float(a_value), float(b_value), float(q0_value))
+            metric_value = float(metric_trials[trial_index]) if trial_index < len(metric_trials) else float("nan")
+            finite_metrics = [
+                (idx, float(metric_trials[idx]))
+                for idx in range(len(metric_trials))
+                if idx < len(metric_trials) and np.isfinite(float(metric_trials[idx]))
+            ]
+            best_index = trial_index
+            best_metric = float(metric_value)
+            if finite_metrics:
+                best_index, best_metric = min(finite_metrics, key=lambda item: item[1])
+            shift_kwargs = _grid_trial_shift_commit_kwargs(
+                trial_index=int(trial_index),
+                payload=payload,
+                result=result,
+                shift_x_trials=shift_x_trials,
+                shift_y_trials=shift_y_trials,
+                shift_valid_trials=shift_valid_trials,
+            )
+            self._writer.write_grid_event(
+                GridTrialCommittedEvent(
+                    point_id=str(point_id),
+                    trial_index=int(trial_index),
+                    q0=float(q0_value),
+                    metric=float(metric_value),
+                    next_q0=float(q0_value),
+                    best_trial_index=int(best_index),
+                    best_metric=float(best_metric),
+                    raw_modeled_map=None if raw_map is None else np.asarray(raw_map, dtype=np.float32),
+                    trial_metadata=dict(shift_kwargs.get("trial_metadata") or {}),
+                    shift_x=shift_kwargs.get("shift_x"),
+                    shift_y=shift_kwargs.get("shift_y"),
+                    shift_valid=shift_kwargs.get("shift_valid"),
+                    chi2=float(chi2_trials[trial_index]) if trial_index < len(chi2_trials) else None,
+                    rho2=float(rho2_trials[trial_index]) if trial_index < len(rho2_trials) else None,
+                    eta2=float(eta2_trials[trial_index]) if trial_index < len(eta2_trials) else None,
+                )
+            )
+        finite_metrics = [
+            (idx, float(metric_trials[idx]))
+            for idx in range(len(metric_trials))
+            if np.isfinite(float(metric_trials[idx]))
+        ]
+        best_index = int(np.nanargmin(np.asarray(metric_trials, dtype=float))) if metric_trials else 0
+        best_metric = float(metric_trials[best_index]) if metric_trials else float(result.objective_value)
+        if finite_metrics:
+            best_index, best_metric = min(finite_metrics, key=lambda item: item[1])
+        self._writer.write_grid_event(
+            GridPointCompletedEvent(
+                point_id=str(point_id),
+                best_trial_index=int(best_index),
+                best_metric=float(best_metric),
+                best_q0=float(q0_trials[best_index]) if q0_trials else float(result.q0),
+            )
+        )
+        self._trials_committed[point_key] = len(q0_trials)
 
     @property
     def streaming_renderer_factory(self) -> Any:
+        slice_key = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip() or None
+        search_id = str(
+            self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or ""
+        ).strip() or None
         return _StreamingRendererFactory(
             self._renderer_factory,
             stream=self._render_stream,
@@ -1956,6 +2648,9 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             psf_source=self._psf_source,
             compatibility_signature=self._compatibility_signature,
             store_trial_map_cubes=self._store_trial_map_cubes,
+            artifact_h5=self._artifact_h5,
+            slice_key=slice_key,
+            search_id=search_id,
         )
 
     def close(self) -> None:
@@ -1967,39 +2662,20 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         except Exception:
             pass
 
-    def set_pending_points(self, points: list[tuple[float, float]] | tuple[tuple[float, float], ...]) -> None:
-        if self._viewer_heartbeat is not None:
-            self._viewer_heartbeat.set_pending_points(points)
+    def trial_raw_map_for(self, a_value: float, b_value: float, q0_value: float) -> np.ndarray | None:
+        record = self._render_stream.snapshot_record(a_value=float(a_value), b_value=float(b_value))
+        if record is None:
+            return None
+        raw_map = _lookup_stream_value_by_q0(record.raw_modeled_by_q0, float(q0_value))
+        if raw_map is None:
+            return None
+        return np.asarray(raw_map, dtype=np.float32)
 
-    def clear_pending_points(self) -> None:
-        if self._viewer_heartbeat is not None:
-            self._viewer_heartbeat.clear_pending_points()
-
-    def clear_live_trial_snapshot(self) -> None:
-        self._writer.clear_live_snapshot()
-
-    def write_live_trial_snapshot(
-        self,
-        *,
-        a_value: float,
-        b_value: float,
-        q0_trials: list[float],
-        metric_trials: list[float],
-        active_trial_index: int | None = None,
-        active_trial_q0: float | None = None,
-    ) -> None:
-        self._writer.write_live_snapshot(
-            {
-                "slice_key": self._target_slice_key(),
-                "search_id": str(self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or "").strip() or None,
-                "a": float(a_value),
-                "b": float(b_value),
-                "q0": None if active_trial_q0 is None else float(active_trial_q0),
-                "trial_index": None if active_trial_index is None else int(active_trial_index),
-                "metric_name": str(self._target_metric),
-                "fit_q0_trials": [float(v) for v in q0_trials],
-                "fit_metric_trials": [float(v) for v in metric_trials],
-            }
+    def drop_persisted_trial_render(self, a_value: float, b_value: float, q0_value: float) -> None:
+        self._render_stream.drop_trial_render(
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
         )
 
     def flush_pending_writes(self) -> None:
@@ -2034,6 +2710,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 explicit_mask=explicit_mask,
                 target_metric=self._target_metric,
                 psf_kernel=self._psf_kernel,
+                tr_region_mask=getattr(self._renderer_factory, "tr_region_mask", None),
             )
             if rescored is None:
                 continue
@@ -2045,7 +2722,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 **dict(point_payload.get("diagnostics") or {}),
                 COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
             }
-            self._writer.write_point(point_payload)
+            self._commit_completed_point_from_payload(
+                a_value=float(point.a),
+                b_value=float(point.b),
+                payload=point_payload,
+                result=point,
+            )
+            self._writer.drain()
             self._point_map[key] = point
             promoted_count += 1
         if promoted_count and self._viewer_heartbeat is not None:
@@ -2077,8 +2760,44 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             ):
                 continue
             point = _point_from_record(record, target_metric=self._target_metric)
-            self._point_map[(float(point.a), float(point.b))] = point
+            key = (float(point.a), float(point.b))
+            self._point_map[key] = point
+            grid_point_id = str(dict(record.get("diagnostics") or {}).get("grid_point_id") or "").strip()
+            if grid_point_id:
+                self._point_ids[key] = grid_point_id
             count += 1
+        import h5py
+
+        slice_key = self._target_slice_key()
+        search_id = str(self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or "").strip()
+        if slice_key and search_id:
+            try:
+                with h5py.File(str(self._artifact_h5), "r") as f:
+                    if SLICE_CONTAINER_GROUP in f and slice_key in f[SLICE_CONTAINER_GROUP]:
+                        slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+                        if SEARCHES_GROUP in slice_group and search_id in slice_group[SEARCHES_GROUP]:
+                            for header in list_grid_point_headers(slice_group[SEARCHES_GROUP][search_id]):
+                                key = (float(header["a"]), float(header["b"]))
+                                self._point_ids[key] = str(header["point_id"])
+                                self._trials_committed[key] = int(header.get("n_trials", 0))
+                                state = classify_grid_point_state(header)
+                                if state == "complete":
+                                    continue
+                                if state == "failed":
+                                    if not self._retry_failed:
+                                        continue
+                                    resume_q0 = float(header.get("q0_start", np.nan))
+                                elif state == "assigned_no_trials":
+                                    resume_q0 = float(header.get("q0_start", header.get("next_q0", np.nan)))
+                                else:
+                                    if self._resume_incomplete_from == "q0_start":
+                                        resume_q0 = float(header.get("q0_start", np.nan))
+                                    else:
+                                        resume_q0 = float(header.get("next_q0", header.get("q0_start", np.nan)))
+                                if np.isfinite(resume_q0):
+                                    self._resume_q0[key] = float(resume_q0)
+            except Exception:
+                pass
         return count
 
     def promote_current_slice_trial_maps(
@@ -2134,6 +2853,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     explicit_mask=explicit_mask,
                     target_metric=self._target_metric,
                     psf_kernel=self._psf_kernel,
+                    tr_region_mask=getattr(self._renderer_factory, "tr_region_mask", None),
                 )
                 if rescored is None:
                     continue
@@ -2142,9 +2862,17 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     **dict(point_payload.get("diagnostics") or {}),
                     COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
                 }
-                self._writer.write_point(point_payload)
+                self._commit_completed_point_from_payload(
+                    a_value=float(point.a),
+                    b_value=float(point.b),
+                    payload=point_payload,
+                    result=point,
+                )
+                self._writer.drain()
                 self._point_map[key] = point
                 promoted_count += 1
+        if promoted_count:
+            self._writer.drain()
         if promoted_count and self._viewer_heartbeat is not None:
             self._viewer_heartbeat.set_phase(f"{promoted_count} current-slice map_store point(s) promoted")
         return promoted_count
@@ -2170,8 +2898,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 f"serializing point a={float(value.a):.3f} b={float(value.b):.3f}"
             )
         save_started = time.perf_counter()
-        self._writer.write_point(payload)
-        self._writer.clear_live_snapshot()
+        self._commit_completed_point_from_payload(
+            a_value=float(value.a),
+            b_value=float(value.b),
+            payload=payload,
+            result=value,
+        )
+        self._writer.drain()
         save_elapsed = time.perf_counter() - save_started
         self._point_map[normalized_key] = value
         if self._viewer_heartbeat is not None:
@@ -2291,6 +3024,17 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start a fresh adaptive search instance in the existing artifact while seeding from the stored maps instead of resuming the previous compatible search state.",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="On resume, requeue grid points whose status is FAILED.",
+    )
+    parser.add_argument(
+        "--resume-incomplete-from",
+        choices=("next_q0", "q0_start"),
+        default="next_q0",
+        help="When resuming incomplete grid points, seed Q0 from stored next_q0 or original q0_start.",
+    )
     parser.add_argument("--no-grid-png", action="store_true", help="Skip the summary grid PNG at the end")
     parser.add_argument("--no-point-png", action="store_true", help="Skip the selected-point PNG at the end")
     parser.add_argument("--show-plot", action="store_true", help="Display the final plots interactively")
@@ -2304,6 +3048,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-workers", type=int, default=None, help="Optional worker cap for process execution")
     parser.add_argument("--worker-chunksize", type=int, default=1, help="Task chunksize for process execution")
     parser.add_argument("--dry-run", action="store_true", help="Resolve inputs and print run settings without starting the search")
+    add_chmp_search_cli_arguments(parser)
     return parser.parse_args()
 
 
@@ -2603,6 +3348,9 @@ def main() -> int:
         else geometry_policy.observer_dsun_cm
     )
 
+    model_obs_time = str(model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(model_h5) or "").strip()
+    obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
+
     target_header = _build_target_header(
         nx=int(geometry.nx),
         ny=int(geometry.ny),
@@ -2628,6 +3376,25 @@ def main() -> int:
         )
 
     model_sha256 = _compute_file_sha256(model_h5)
+    forward_model_identity = compute_forward_model_identity_placeholder(model_path=model_h5)
+    forward_model_sha256 = str(forward_model_identity.sha256)
+    forward_model_identity_version = str(forward_model_identity.version)
+    artifact_geometry_block = build_artifact_geometry_block(
+        {
+            "map_xc_arcsec": float(geometry.xc),
+            "map_yc_arcsec": float(geometry.yc),
+            "map_dx_arcsec": float(geometry.dx),
+            "map_dy_arcsec": float(geometry.dy),
+            "map_nx": int(geometry.nx),
+            "map_ny": int(geometry.ny),
+            "observer_name": effective_observer_name,
+            "observer_lonc_deg": effective_observer_lonc_deg,
+            "observer_b0sun_deg": effective_observer_b0sun_deg,
+            "observer_dsun_cm": effective_observer_dsun_cm,
+            "observer_obs_time": target_header.get("DATE-OBS", ""),
+        }
+    )
+    artifact_geometry_sha256_value = artifact_geometry_sha256(artifact_geometry_block)
     observation_source_path = obs_map.source_path
     observation_source_file = _resolve_existing_file(observation_source_path)
     observation_source_sha256 = (
@@ -2636,42 +3403,59 @@ def main() -> int:
         else None
     )
     ebtel_sha256 = _compute_file_sha256(ebtel_path)
-    observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
-    if np.isnan(observed_cropped).any():
-        observed_cropped = np.nan_to_num(observed_cropped, nan=float(np.nanmedian(observed_cropped)))
-    sigma_cropped = None
-    noise_diag = {}
-    if resume_slice_payload is not None:
-        stored_sigma = resume_slice_payload.get("sigma_map")
-        if stored_sigma is not None:
-            stored_sigma_arr = np.asarray(stored_sigma, dtype=float)
-            if stored_sigma_arr.shape == observed_cropped.shape and stored_sigma_arr.size:
-                sigma_cropped = stored_sigma_arr
-                noise_diag = dict(resume_slice_diagnostics.get("noise_diagnostics") or {})
-                finite_sigma = sigma_cropped[np.isfinite(sigma_cropped)]
-                restored_sigma = float(np.nanmedian(finite_sigma)) if finite_sigma.size else float("nan")
-                noise_unit = obs_map_noise_unit_label(obs_map)
-                print(
-                    f"  Noise preload: restored sigma map from artifact slice metadata "
-                    f"(median sigma={restored_sigma:.2f} {noise_unit})"
-                )
-    if sigma_cropped is None:
+    stored_slice_payload = resume_slice_payload if artifact_preexisting and not bool(args.recompute_existing) else None
+    sigma_map_full: np.ndarray | None = None
+    noise_diag: dict[str, Any] = {}
+    if stored_slice_payload is None:
         print("Estimating noise from map...")
         noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
-        sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
-        noise_diag = noise_result.diagnostics
+        sigma_map_full = np.asarray(noise_result.sigma_map, dtype=float)
+        noise_diag = dict(noise_result.diagnostics)
         noise_unit = obs_map_noise_unit_label(obs_map)
         print(
             f"  Estimated sigma: {float(noise_result.sigma):.2f} {noise_unit} "
             f"(method={str(noise_result.method_used)})"
         )
-        sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
-
-    if np.isnan(sigma_cropped).any():
-        fill_sigma = float(np.nanmedian(sigma_cropped))
-        if not np.isfinite(fill_sigma) or fill_sigma <= 0:
-            fill_sigma = 1.0
-        sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
+    try:
+        shift_policy, max_shift_arcsec, xy_shift_arcsec = resolve_shift_policy_from_args(args)
+        slice_obs_ref = resolve_slice_observation_reference(
+            observed,
+            header,
+            target_header,
+            sigma=sigma_map_full,
+            observation_source_sha256=observation_source_sha256,
+            artifact_geometry_sha256=artifact_geometry_sha256_value,
+            model_time_text=model_obs_time or None,
+            observation_time_text=obs_time_text or None,
+            stored_slice_payload=stored_slice_payload,
+            force_recompute=bool(args.recompute_existing),
+            shift_policy=shift_policy,
+            max_shift_arcsec=max_shift_arcsec,
+            xy_shift_arcsec=xy_shift_arcsec,
+            slice_canvas_max_shift_arcsec=max_shift_arcsec,
+        )
+    except SliceObservationReferenceError as exc:
+        raise SystemExit(str(exc)) from exc
+    observed_cropped = np.asarray(slice_obs_ref.observed, dtype=float)
+    sigma_cropped = np.asarray(slice_obs_ref.sigma, dtype=float)
+    header = slice_obs_ref.source_header
+    obs_time_alignment_diag = dict(slice_obs_ref.diagnostics)
+    if slice_obs_ref.restored_from_artifact:
+        noise_diag = dict(resume_slice_diagnostics.get("noise_diagnostics") or noise_diag)
+        finite_sigma = sigma_cropped[np.isfinite(sigma_cropped)]
+        restored_sigma = float(np.nanmedian(finite_sigma)) if finite_sigma.size else float("nan")
+        noise_unit = obs_map_noise_unit_label(obs_map)
+        print(
+            "  Slice observation reference: restored rotated+regridded observed/sigma maps "
+            f"from artifact slice metadata (median sigma={restored_sigma:.2f} {noise_unit})"
+        )
+    else:
+        for warning_line in obs_time_alignment_diag.get("observation_time_warning_lines", ()):
+            print(warning_line)
+        if obs_time_alignment_diag.get("observation_time_rotation_applied"):
+            print(f"  {obs_time_alignment_diag.get('observation_time_alignment_message', '')}")
+        elif str(obs_time_alignment_diag.get("observation_time_alignment", "")) not in {"exact", "unknown"}:
+            print(f"  {obs_time_alignment_diag.get('observation_time_alignment_message', '')}")
 
     blos_reference_for_fov = load_blos_reference_for_fov(
         model_h5,
@@ -2710,6 +3494,21 @@ def main() -> int:
         )
     else:
         print(f"  Metrics mask: union threshold={float(args.metrics_mask_threshold):.3f}")
+
+    metrics_mask_type = "explicit_fits" if explicit_metric_mask is not None else "union"
+    chmp_settings = resolve_chmp_search_settings(
+        args,
+        mask_type=metrics_mask_type,
+        explicit_mask=explicit_metric_mask,
+    )
+    if len(chmp_settings.q0_search_stages) > 1:
+        print(f"  Q0 search stages: {', '.join(chmp_settings.q0_search_stages)}")
+    print(
+        "  CHMP evaluation: "
+        f"shift_policy={chmp_settings.shift_policy} "
+        f"smoothed_obs_max={chmp_settings.use_smoothed_obs_max} "
+        f"emthreshold_gate={chmp_settings.use_emthreshold}"
+    )
 
     print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
     print(
@@ -2829,6 +3628,9 @@ def main() -> int:
         "spectral_label": str(render_selection.spectral_label),
         "target_slice_key": target_slice_key,
         "model_sha256": str(model_sha256),
+        "forward_model_sha256": str(forward_model_sha256),
+        "forward_model_identity_version": str(forward_model_identity_version),
+        "artifact_geometry_sha256": str(artifact_geometry_sha256_value),
         "fits_sha256": str(observation_source_sha256 or ""),
         "ebtel_sha256": str(ebtel_sha256),
         "euv_response_identity_version": euv_response_identity_version,
@@ -2876,6 +3678,9 @@ def main() -> int:
         "model_path": str(model_h5),
         "model_id": str(_load_model_identity(model_h5)),
         "model_sha256": str(model_sha256),
+        "forward_model_sha256": str(forward_model_sha256),
+        "forward_model_identity_version": str(forward_model_identity_version),
+        "artifact_geometry_sha256": str(artifact_geometry_sha256_value),
         "fits_file": str(observation_source_path or ""),
         "fits_sha256": str(observation_source_sha256 or ""),
         "observation_source_mode": str(obs_map.source_mode),
@@ -2917,6 +3722,7 @@ def main() -> int:
         "observer_b0sun_deg": effective_observer_b0sun_deg,
         "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
+        **obs_time_alignment_diag,
         "geometry_policy_mode": geometry_policy.geometry_mode,
         "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
         "geometry_policy_observation_los": geometry_policy.observation_observer,
@@ -2944,54 +3750,31 @@ def main() -> int:
         "execution_max_workers": None if args.max_workers is None else int(args.max_workers),
         "psf_source": str(psf_source),
         "resolved_psf": resolved_psf_meta,
+        "shift_policy": chmp_settings.shift_policy,
+        "max_shift_arcsec": chmp_settings.max_shift_arcsec,
+        "xy_shift_arcsec": [float(chmp_settings.xy_shift_arcsec[0]), float(chmp_settings.xy_shift_arcsec[1])],
+        "use_smoothed_obs_max": bool(chmp_settings.use_smoothed_obs_max),
+        "use_emthreshold": bool(chmp_settings.use_emthreshold),
+        "emthreshold": float(chmp_settings.emthreshold),
+        "q0_search_stages": [str(stage) for stage in chmp_settings.q0_search_stages],
     }
-    compatibility_signature = _build_physical_compatibility_signature(
-        {
-            "artifact_kind": root_diag["artifact_kind"],
-            "target_metric": root_diag["target_metric"],
-            "model_sha256": root_diag["model_sha256"],
-            "fits_sha256": root_diag["fits_sha256"],
-            "observation_source_mode": root_diag["observation_source_mode"],
-            "observation_source_map_id": root_diag["observation_source_map_id"],
-            "spectral_domain": root_diag["spectral_domain"],
-            "spectral_label": root_diag["spectral_label"],
-            "ebtel_sha256": root_diag["ebtel_sha256"],
-            "frequency_ghz": root_diag["frequency_ghz"],
-            "wavelength_angstrom": root_diag["wavelength_angstrom"],
-            "euv_channel": root_diag["euv_channel"],
-            "euv_instrument": root_diag["euv_instrument"],
-            "euv_response_identity_version": root_diag["euv_response_identity_version"],
-            "euv_response_sha256": root_diag["euv_response_sha256"],
-            "map_xc_arcsec": root_diag["map_xc_arcsec"],
-            "map_yc_arcsec": root_diag["map_yc_arcsec"],
-            "map_dx_arcsec": root_diag["map_dx_arcsec"],
-            "map_dy_arcsec": root_diag["map_dy_arcsec"],
-            "map_nx": root_diag["map_nx"],
-            "map_ny": root_diag["map_ny"],
-            "observer_name": root_diag["observer_name"],
-            "observer_lonc_deg": root_diag["observer_lonc_deg"],
-            "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
-            "observer_dsun_cm": root_diag["observer_dsun_cm"],
-            "observer_obs_time": root_diag["observer_obs_time"],
-            "threshold": root_diag["threshold"],
-            "metrics_mask_threshold": root_diag["metrics_mask_threshold"],
-            "metrics_mask_fits": root_diag["metrics_mask_fits"],
-            "threshold_metric": root_diag["threshold_metric"],
-            "mask_type": root_diag["mask_type"],
-            "tr_mask_bmin_gauss": root_diag["tr_mask_bmin_gauss"],
-            "tr_mask_source": root_diag["tr_mask_source"],
-            "no_area": root_diag["no_area"],
-            "psf_source": root_diag["psf_source"],
-            "resolved_psf": root_diag["resolved_psf"],
-        }
+    compatibility_signature = compatibility_signature_from_diagnostics(
+        root_diag,
+        layout={"kind": "point_list"},
     )
     root_diag[COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
+    target_search_id = search_id_from_evaluation_config(root_diag, layout={"kind": "point_list"})
+    root_diag["selected_search_id"] = target_search_id
+    root_diag["search_id"] = target_search_id
+    root_diag["search_active"] = True
+    root_diag["contract_version"] = GRID_POINTS_CONTRACT_VERSION
     common_blos_reference = blos_reference_for_fov
 
     viewer_refresh_signal = Path(f"{artifact_h5}.refresh")
     viewer_heartbeat = _ViewerRefreshHeartbeat(
         viewer_refresh_signal,
         slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
+        search_id=target_search_id,
     )
     print(f"Viewer heartbeat signal: {viewer_refresh_signal}")
     existing_run_history = load_run_history(artifact_h5) if artifact_preexisting else []
@@ -3013,6 +3796,7 @@ def main() -> int:
             psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         )
         print(f"Start over: resetting search history in {artifact_h5} while seeding from stored compatible maps")
+    artifact_initialized_this_run = False
     if not artifact_h5.exists() or bool(args.recompute_existing) or bool(args.start_over):
         write_point_scan_artifact(
             artifact_h5,
@@ -3025,9 +3809,70 @@ def main() -> int:
             point_records=start_over_seed_payloads if bool(args.start_over) else [],
             run_history=[] if bool(args.start_over) else existing_run_history,
             preserve_existing_searches=not bool(args.start_over),
+            observation_canvas=slice_obs_ref.observation_canvas,
+            sigma_canvas=slice_obs_ref.sigma_canvas,
+            canvas_wcs_header=slice_obs_ref.canvas_header,
         )
+        from pychmp.ab_scan_artifacts import _sync_preprocessed_content_identity_diagnostics
+
+        root_diag.update(
+            _sync_preprocessed_content_identity_diagnostics(
+                root_diag,
+                observed=observed_cropped,
+                sigma_map=sigma_cropped,
+                observation_canvas=slice_obs_ref.observation_canvas,
+                sigma_canvas=slice_obs_ref.sigma_canvas,
+            )
+        )
+        artifact_initialized_this_run = True
+        resolved_search_id = read_slice_active_search_id(artifact_h5, slice_key=target_slice_key)
+        if resolved_search_id:
+            target_search_id = resolved_search_id
+            root_diag["selected_search_id"] = resolved_search_id
+            root_diag["search_id"] = resolved_search_id
+        viewer_heartbeat.set_search_id(target_search_id)
+        viewer_heartbeat.set_phase("initialized")
         viewer_heartbeat.notify_refresh()
         print(f"Initialized sparse artifact: {artifact_h5}")
+    elif artifact_preexisting and not bool(args.recompute_existing) and not _artifact_has_target_slice(
+        artifact_h5, target_slice_key
+    ):
+        print(f"Initializing target slice shell in existing artifact: {target_slice_key}")
+        write_point_scan_artifact(
+            artifact_h5,
+            observed=observed_cropped,
+            sigma_map=sigma_cropped,
+            wcs_header=target_header,
+            diagnostics=root_diag,
+            blos_reference=common_blos_reference,
+            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+            point_records=[],
+            run_history=existing_run_history,
+            preserve_existing_searches=True,
+            observation_canvas=slice_obs_ref.observation_canvas,
+            sigma_canvas=slice_obs_ref.sigma_canvas,
+            canvas_wcs_header=slice_obs_ref.canvas_header,
+        )
+        from pychmp.ab_scan_artifacts import _sync_preprocessed_content_identity_diagnostics
+
+        root_diag.update(
+            _sync_preprocessed_content_identity_diagnostics(
+                root_diag,
+                observed=observed_cropped,
+                sigma_map=sigma_cropped,
+                observation_canvas=slice_obs_ref.observation_canvas,
+                sigma_canvas=slice_obs_ref.sigma_canvas,
+            )
+        )
+        artifact_initialized_this_run = True
+        resolved_search_id = read_slice_active_search_id(artifact_h5, slice_key=target_slice_key)
+        if resolved_search_id:
+            target_search_id = resolved_search_id
+            root_diag["selected_search_id"] = resolved_search_id
+            root_diag["search_id"] = resolved_search_id
+            viewer_heartbeat.set_search_id(resolved_search_id)
+        viewer_heartbeat.set_phase("initialized")
+        viewer_heartbeat.notify_refresh()
 
     factory = _AdaptiveRendererFactory(
         model_path=str(model_h5),
@@ -3062,6 +3907,12 @@ def main() -> int:
         pixel_scale_arcsec=float(args.pixel_scale_arcsec),
         psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         tr_region_mask=None if euv_tr_mask is None else np.asarray(euv_tr_mask, dtype=bool),
+        forward_model_sha256=str(forward_model_sha256),
+        forward_model_identity_version=str(forward_model_identity_version),
+        artifact_geometry_sha256=str(artifact_geometry_sha256_value),
+        ebtel_sha256=str(ebtel_sha256),
+        euv_response_sha256=euv_response_sha256,
+        euv_response_identity_version=euv_response_identity_version,
     )
     cache = _PersistentPointCache(
         artifact_h5=artifact_h5,
@@ -3078,14 +3929,41 @@ def main() -> int:
         store_trial_map_cubes=bool(args.store_trial_map_cubes),
         viewer_heartbeat=viewer_heartbeat,
     )
+    cache.set_recompute_existing(bool(args.recompute_existing))
+    cache.set_resume_policy(
+        retry_failed=bool(getattr(args, "retry_failed", False)),
+        resume_incomplete_from=str(getattr(args, "resume_incomplete_from", "next_q0")),
+    )
     search_renderer_factory = cache.streaming_renderer_factory
     try:
-        if not bool(args.recompute_existing):
+        if artifact_initialized_this_run and not bool(args.recompute_existing):
+            print("Resume preload: skipped for artifact initialized in this run")
+            reused_points = 0
+        elif not bool(args.recompute_existing):
             print("Resume preload: loading compatible points from existing artifact...")
-        reused_points = 0 if bool(args.recompute_existing) else cache.hydrate_from_existing()
+            reused_points = cache.hydrate_from_existing()
+        else:
+            reused_points = 0
+        promoted_same_slice = 0
+        promoted_auxiliary = 0
         if not bool(args.recompute_existing):
-            print(f"Resume preload: loaded {reused_points} compatible point(s) from existing artifact")
-            print("Resume preload: map-store promotion disabled by contract (metadata-only resume)")
+            promoted_same_slice = cache.promote_current_slice_trial_maps(
+                threshold=float(args.metrics_mask_threshold),
+                explicit_mask=explicit_metric_mask,
+                include_matching_signature=False,
+            )
+            promoted_auxiliary = cache.promote_auxiliary_maps_from_store(
+                threshold=float(args.metrics_mask_threshold),
+                explicit_mask=explicit_metric_mask,
+            )
+            if promoted_same_slice or promoted_auxiliary:
+                cache.flush_pending_writes()
+            reused_points += promoted_same_slice + promoted_auxiliary
+            print(
+                f"Resume preload: loaded {reused_points} compatible point(s) "
+                f"(hydrated={reused_points - promoted_same_slice - promoted_auxiliary}, "
+                f"same_slice={promoted_same_slice}, auxiliary={promoted_auxiliary})"
+            )
     except ScanArtifactCompatibilityError as exc:
         cache.close()
         raise SystemExit(str(exc)) from exc
@@ -3122,7 +4000,13 @@ def main() -> int:
     _maybe_launch_viewer("scan start")
 
     started = time.perf_counter()
-    viewer_heartbeat.start("adaptive search running")
+    viewer_heartbeat.set_phase("search initialized")
+    viewer_heartbeat.notify_refresh()
+    if str(args.execution_policy) != "serial":
+        print(
+            "  Note: process-pool mode reports progress per completed point; "
+            "per-trial console/viewer updates remain serial-only"
+        )
     progress_start_callback = None
     progress_callback = None
     if str(args.execution_policy) == "serial":
@@ -3130,6 +4014,12 @@ def main() -> int:
         if viewer_heartbeat is not None:
             live_q0_trials: list[float] = []
             live_metric_trials: list[float] = []
+            live_chi2_trials: list[float] = []
+            live_rho2_trials: list[float] = []
+            live_eta2_trials: list[float] = []
+            live_shift_x_trials: list[float] = []
+            live_shift_y_trials: list[float] = []
+            live_shift_valid_trials: list[bool] = []
             active_point: dict[str, tuple[float, float] | None] = {"value": None}
             console_start_callback = progress_start_callback
             console_progress_callback = progress_callback
@@ -3138,6 +4028,12 @@ def main() -> int:
                 active_point["value"] = (float(a_value), float(b_value))
                 live_q0_trials.clear()
                 live_metric_trials.clear()
+                live_chi2_trials.clear()
+                live_rho2_trials.clear()
+                live_eta2_trials.clear()
+                live_shift_x_trials.clear()
+                live_shift_y_trials.clear()
+                live_shift_valid_trials.clear()
                 cache.clear_live_trial_snapshot()
 
             def _viewer_point_complete(a_value: float, b_value: float) -> None:
@@ -3155,28 +4051,63 @@ def main() -> int:
                     b_value=float(point[1]),
                     q0_trials=list(live_q0_trials),
                     metric_trials=list(live_metric_trials),
+                    chi2_trials=list(live_chi2_trials),
+                    rho2_trials=list(live_rho2_trials),
+                    eta2_trials=list(live_eta2_trials),
+                    shift_x_trials=list(live_shift_x_trials),
+                    shift_y_trials=list(live_shift_y_trials),
+                    shift_valid_trials=list(live_shift_valid_trials),
                     active_trial_index=int(trial_index),
                     active_trial_q0=float(q0),
                 )
                 cache.flush_pending_writes()
 
-            def _viewer_progress_report(q0: float, objective_value: float, is_valid: bool, message: str, elapsed_s: float) -> None:
+            def _viewer_progress_report(
+                q0: float,
+                objective_value: float,
+                is_valid: bool,
+                message: str,
+                elapsed_s: float,
+                metrics: MetricValues,
+                evaluation: Any = None,
+            ) -> None:
                 if console_progress_callback is not None:
-                    console_progress_callback(q0, objective_value, is_valid, message, elapsed_s)
+                    console_progress_callback(q0, objective_value, is_valid, message, elapsed_s, metrics)
                 point = active_point.get("value")
                 if point is None:
                     return
                 live_q0_trials.append(float(q0))
                 live_metric_trials.append(float(objective_value))
+                live_chi2_trials.append(float(metrics.chi2))
+                live_rho2_trials.append(float(metrics.rho2))
+                live_eta2_trials.append(float(metrics.eta2))
+                if evaluation is not None:
+                    live_shift_x_trials.append(float(getattr(evaluation, "shift_x_arcsec", np.nan)))
+                    live_shift_y_trials.append(float(getattr(evaluation, "shift_y_arcsec", np.nan)))
+                    live_shift_valid_trials.append(bool(getattr(evaluation, "find_shift_valid", True)))
+                else:
+                    live_shift_x_trials.append(float("nan"))
+                    live_shift_y_trials.append(float("nan"))
+                    live_shift_valid_trials.append(True)
+                completed_index = int(len(live_q0_trials) - 1)
+                completed_raw_map = cache.trial_raw_map_for(float(point[0]), float(point[1]), float(q0))
                 cache.write_live_trial_snapshot(
                     a_value=float(point[0]),
                     b_value=float(point[1]),
                     q0_trials=list(live_q0_trials),
                     metric_trials=list(live_metric_trials),
-                    active_trial_index=None,
-                    active_trial_q0=None,
+                    chi2_trials=list(live_chi2_trials),
+                    rho2_trials=list(live_rho2_trials),
+                    eta2_trials=list(live_eta2_trials),
+                    shift_x_trials=list(live_shift_x_trials),
+                    shift_y_trials=list(live_shift_y_trials),
+                    shift_valid_trials=list(live_shift_valid_trials),
+                    completed_trial_index=completed_index,
+                    completed_trial_raw_map=completed_raw_map,
                 )
                 cache.flush_pending_writes()
+                if completed_raw_map is not None:
+                    cache.drop_persisted_trial_render(float(point[0]), float(point[1]), float(q0))
 
             progress_start_callback = _viewer_progress_start
             progress_callback = _viewer_progress_report
@@ -3221,11 +4152,31 @@ def main() -> int:
             worker_chunksize=int(args.worker_chunksize),
             point_start_callback=_viewer_point_start,
             point_complete_callback=_viewer_point_complete,
+            observation_reference=slice_obs_ref,
+            q0_search_stages=chmp_settings.q0_search_stages,
+            use_smoothed_obs_max=chmp_settings.use_smoothed_obs_max,
+            use_emthreshold=chmp_settings.use_emthreshold,
+            emthreshold=chmp_settings.emthreshold,
         )
     except Exception:
+        root_diag["search_active"] = False
+        finalize_search_runner_state(
+            artifact_h5,
+            slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
+            search_id=target_search_id,
+            completed=False,
+        )
         viewer_heartbeat.stop("adaptive search failed")
         cache.close()
         raise
+    root_diag["search_active"] = False
+    cache._diagnostics["search_active"] = False
+    finalize_search_runner_state(
+        artifact_h5,
+        slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
+        search_id=target_search_id,
+        completed=True,
+    )
     viewer_heartbeat.stop("scan complete")
     elapsed = time.perf_counter() - started
 

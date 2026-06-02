@@ -446,9 +446,25 @@ class KernelConvolvedRenderer:
     def __init__(self, base_renderer: Any, kernel: np.ndarray) -> None:
         self._base = base_renderer
         self._kernel = np.asarray(kernel, dtype=float)
+        self._last_stokes_v: np.ndarray | None = None
+
+    def render_stokes_raw(self, q0: float) -> tuple[np.ndarray, np.ndarray | None]:
+        base = self._base
+        if hasattr(base, "render_stokes_raw"):
+            stokes_i, stokes_v = base.render_stokes_raw(float(q0))
+            self._last_stokes_v = None if stokes_v is None else np.asarray(stokes_v, dtype=float)
+            return np.asarray(stokes_i, dtype=float), self._last_stokes_v
+        raw = np.asarray(base.render(q0), dtype=float)
+        self._last_stokes_v = None
+        return raw, None
 
     def render_pair(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
-        raw = np.asarray(self._base.render(q0), dtype=float)
+        if hasattr(self._base, "render_stokes_raw"):
+            raw, self._last_stokes_v = self.render_stokes_raw(q0)
+            raw = np.asarray(raw, dtype=float)
+        else:
+            raw = np.asarray(self._base.render(q0), dtype=float)
+            self._last_stokes_v = None
         convolved = fftconvolve(raw, self._kernel, mode="same")
         return raw, convolved
 

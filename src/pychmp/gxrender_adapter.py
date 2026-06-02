@@ -20,6 +20,7 @@ _EUV_PROJECTION_FLAGS_WARNING = (
     "(parallel=False, exact=False, nthreads=0) for the DLL simbox path."
 )
 EUV_RESPONSE_IDENTITY_VERSION = "pychmp.euv_response_identity.v1"
+FORWARD_MODEL_IDENTITY_VERSION = "pychmp.forward_model.file_sha256.v0"
 _euv_projection_flags_warning_emitted = False
 _euv_projection_flags_warning_lock = threading.Lock()
 
@@ -29,6 +30,14 @@ class EUVResponseIdentity:
     sha256: str
     version: str
     payload: dict[str, Any]
+    summary: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ForwardModelIdentity:
+    sha256: str
+    version: str
+    source_path: str
     summary: dict[str, Any]
 
 
@@ -169,6 +178,28 @@ def compute_euv_response_identity(*, response: Any, response_dt: Any, response_m
 
 def resolve_euv_response_identity(**adapter_kwargs: Any) -> EUVResponseIdentity | None:
     return GXRenderEUVAdapter(**adapter_kwargs).response_identity()
+
+
+def compute_forward_model_identity_placeholder(*, model_path: str | Path) -> ForwardModelIdentity:
+    """Interim forward-model identity: SHA256 of the source model H5 file.
+
+    Replace with gxrender-backed identity once ``compute_forward_model_identity``
+    is available upstream. Artifacts tagged with this version are not reusable
+    across future identity scheme upgrades.
+    """
+
+    path = Path(model_path).expanduser()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    sha256 = digest.hexdigest()
+    return ForwardModelIdentity(
+        sha256=sha256,
+        version=FORWARD_MODEL_IDENTITY_VERSION,
+        source_path=str(path),
+        summary={"source_path": str(path), "method": "file_sha256"},
+    )
 
 
 def build_tr_region_mask_from_blos(
@@ -397,6 +428,32 @@ class GXRenderMWContext:
         self._common = workflow_helpers.prepare_common_inputs(args)
         self._gxi = gxrender.GXRadioImageComputing()
 
+    def render_stokes_raw(
+        self,
+        *,
+        frequency_ghz: float,
+        tbase: float,
+        nbase: float,
+        q0: float,
+        a: float,
+        b: float,
+        mode: int = 0,
+        selective_heating: bool = False,
+        shtable: Any | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        stokes_i, stokes_v = self._render_stokes_cube(
+            frequencies_ghz=[float(frequency_ghz)],
+            tbase=tbase,
+            nbase=nbase,
+            q0=q0,
+            a=a,
+            b=b,
+            mode=mode,
+            selective_heating=selective_heating,
+            shtable=shtable,
+        )
+        return np.asarray(stokes_i[:, :, 0], dtype=float), np.asarray(stokes_v[:, :, 0], dtype=float)
+
     def render(
         self,
         *,
@@ -410,48 +467,20 @@ class GXRenderMWContext:
         selective_heating: bool = False,
         shtable: Any | None = None,
     ) -> np.ndarray:
-        plasma_args = SimpleNamespace(
+        stokes_i, _stokes_v = self.render_stokes_raw(
+            frequency_ghz=frequency_ghz,
             tbase=tbase,
             nbase=nbase,
-            q0=float(q0),
+            q0=q0,
             a=a,
             b=b,
-            corona_mode=mode,
-            force_isothermal=False,
-            interpol_b=False,
-            analytical_nt=False,
-            selective_heating=bool(selective_heating),
+            mode=mode,
+            selective_heating=selective_heating,
             shtable=shtable,
-            shtable_path=None,
         )
-        plasma = self._workflow_helpers.resolve_plasma_parameters(plasma_args)
-        result = self._gxi.synth_model(
-            self._common.model,
-            self._common.model_dt,
-            self._common.ebtel_c,
-            self._common.ebtel_dt,
-            np.asarray([float(frequency_ghz)], dtype=np.float64),
-            int(self._common.nx),
-            int(self._common.ny),
-            float(self._common.xc),
-            float(self._common.yc),
-            float(self._common.dx),
-            float(self._common.dy),
-            float(plasma.tbase),
-            float(plasma.nbase),
-            float(plasma.q0),
-            float(plasma.a),
-            float(plasma.b),
-            SHtable=plasma.shtable,
-            mode=int(plasma.mode),
-            warn_defaults=False,
-        )
-        ti = np.asarray(result["TI"], dtype=float)
-        if ti.ndim != 3 or ti.shape[2] != 1:
-            raise ValueError(f"expected single-frequency TI cube with shape (ny, nx, 1), got {ti.shape}")
-        return ti[:, :, 0]
+        return stokes_i
 
-    def render_cube(
+    def _render_stokes_cube(
         self,
         *,
         frequencies_ghz: Sequence[float],
@@ -463,7 +492,7 @@ class GXRenderMWContext:
         mode: int = 0,
         selective_heating: bool = False,
         shtable: Any | None = None,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         freqs = np.asarray([float(v) for v in frequencies_ghz], dtype=np.float64)
         if freqs.size == 0:
             raise ValueError("frequencies_ghz must contain at least one frequency")
@@ -504,9 +533,37 @@ class GXRenderMWContext:
             warn_defaults=False,
         )
         ti = np.asarray(result["TI"], dtype=float)
+        tv = np.asarray(result["TV"], dtype=float)
         if ti.ndim != 3 or ti.shape[2] != freqs.size:
             raise ValueError(f"expected MW TI cube with shape (ny, nx, {freqs.size}), got {ti.shape}")
-        return ti
+        if tv.ndim != 3 or tv.shape[2] != freqs.size:
+            raise ValueError(f"expected MW TV cube with shape (ny, nx, {freqs.size}), got {tv.shape}")
+        return ti, tv
+
+    def render_cube(
+        self,
+        *,
+        frequencies_ghz: Sequence[float],
+        tbase: float,
+        nbase: float,
+        q0: float,
+        a: float,
+        b: float,
+        mode: int = 0,
+        selective_heating: bool = False,
+        shtable: Any | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        return self._render_stokes_cube(
+            frequencies_ghz=frequencies_ghz,
+            tbase=tbase,
+            nbase=nbase,
+            q0=q0,
+            a=a,
+            b=b,
+            mode=mode,
+            selective_heating=selective_heating,
+            shtable=shtable,
+        )
 
 
 @dataclass(slots=True)
@@ -623,6 +680,19 @@ class GXRenderMWAdapter:
             shtable=self.shtable,
         )
 
+    def render_stokes_raw(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
+        return self._context.render_stokes_raw(
+            frequency_ghz=float(self.frequency_ghz),
+            tbase=float(self.tbase),
+            nbase=float(self.nbase),
+            q0=float(q0),
+            a=float(self.a),
+            b=float(self.b),
+            mode=int(self.mode),
+            selective_heating=bool(self.selective_heating),
+            shtable=self.shtable,
+        )
+
     def render_cube(self, q0: float) -> dict[str, Any]:
         q0_key = float(q0)
         cached = self._cube_cache.get(q0_key)
@@ -633,7 +703,7 @@ class GXRenderMWAdapter:
             numeric = float(value)
             if not any(np.isclose(numeric, existing, rtol=0.0, atol=1e-12) for existing in frequencies):
                 frequencies.append(numeric)
-        cube = self._context.render_cube(
+        cube, stokes_v_cube = self._context.render_cube(
             frequencies_ghz=frequencies,
             tbase=float(self.tbase),
             nbase=float(self.nbase),
@@ -647,8 +717,13 @@ class GXRenderMWAdapter:
         payload = {
             "frequencies_ghz": frequencies,
             "raw_modeled_cube": cube,
+            "raw_stokes_v_cube": stokes_v_cube,
             "raw_modeled_by_frequency": {
                 float(freq): np.asarray(cube[:, :, index], dtype=float)
+                for index, freq in enumerate(frequencies)
+            },
+            "stokes_v_by_frequency": {
+                float(freq): np.asarray(stokes_v_cube[:, :, index], dtype=float)
                 for index, freq in enumerate(frequencies)
             },
         }

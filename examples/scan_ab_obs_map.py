@@ -28,13 +28,15 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, obs_map_noise_unit_label, resolve_euv_response_identity, validate_obs_map_identity
+from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_model_obs_time_text, load_obs_map, obs_map_noise_unit_label, resolve_euv_response_identity, resolve_slice_observation_reference, SliceObservationReferenceError, validate_obs_map_identity
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     SPARSE_ARTIFACT_KIND,
     UNIFIED_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
     append_point_record,
+    artifact_geometry_sha256,
+    build_artifact_geometry_block,
     build_computed_point_payload,
     detect_scan_artifact_format,
     load_scan_file,
@@ -51,6 +53,7 @@ from pychmp.ab_search import idl_q0_start_heuristic
 from pychmp import resolve_render_geometry_via_gxrender
 from pychmp.geometry_policy import resolve_geometry_policy
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
+from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
 
 
 def _build_command_compatibility_signature(argv: list[str]) -> str:
@@ -1184,6 +1187,13 @@ class _RectangularWorkerBootstrap:
     observed: np.ndarray
     sigma: np.ndarray
     psf_kernel: np.ndarray | None
+    observation_reference: Any = None
+    threshold: float = 0.1
+    explicit_mask: np.ndarray | None = None
+    q0_search_stages: tuple[str, ...] = ("union",)
+    use_smoothed_obs_max: bool = True
+    use_emthreshold: bool = True
+    emthreshold: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -1195,6 +1205,13 @@ class _RectangularWorkerState:
     observed: np.ndarray
     sigma: np.ndarray
     psf_kernel: np.ndarray | None
+    observation_reference: Any = None
+    threshold: float = 0.1
+    explicit_mask: np.ndarray | None = None
+    q0_search_stages: tuple[str, ...] = ("union",)
+    use_smoothed_obs_max: bool = True
+    use_emthreshold: bool = True
+    emthreshold: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -1333,6 +1350,15 @@ def _bootstrap_rectangular_worker(payload: _RectangularWorkerBootstrap) -> _Rect
         observed=np.asarray(payload.observed, dtype=float),
         sigma=np.asarray(payload.sigma, dtype=float),
         psf_kernel=None if payload.psf_kernel is None else np.asarray(payload.psf_kernel, dtype=float),
+        observation_reference=payload.observation_reference,
+        threshold=float(payload.threshold),
+        explicit_mask=(
+            None if payload.explicit_mask is None else np.asarray(payload.explicit_mask, dtype=bool)
+        ),
+        q0_search_stages=tuple(str(stage) for stage in payload.q0_search_stages),
+        use_smoothed_obs_max=bool(payload.use_smoothed_obs_max),
+        use_emthreshold=bool(payload.use_emthreshold),
+        emthreshold=float(payload.emthreshold),
     )
 
 
@@ -1405,6 +1431,8 @@ def _evaluate_rectangular_point_request(
             q0_max=float(task.q0_max),
             hard_q0_min=request.hard_q0_min,
             hard_q0_max=request.hard_q0_max,
+            threshold=float(worker_state.threshold),
+            explicit_mask=worker_state.explicit_mask,
             target_metric=str(request.target_metric),
             xatol=float(request.xatol),
             maxiter=int(request.maxiter),
@@ -1413,6 +1441,11 @@ def _evaluate_rectangular_point_request(
             q0_step=float(request.q0_step),
             max_bracket_steps=int(request.max_bracket_steps),
             initial_evaluations=initial_evaluations,
+            observation_reference=worker_state.observation_reference,
+            q0_search_stages=worker_state.q0_search_stages,
+            use_smoothed_obs_max=worker_state.use_smoothed_obs_max,
+            use_emthreshold=worker_state.use_emthreshold,
+            emthreshold=float(worker_state.emthreshold),
         )
 
         cached_best_pair = _lookup_cached_render_pair(render_cache, result.q0)
@@ -1633,6 +1666,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--spinner", action=argparse.BooleanOptionalAction, default=True, help="Show a spinner during long-running stages.")
     p.add_argument("--validate-only", action="store_true", help="Validate inputs and artifact compatibility, then exit before creating/updating artifacts or running scan points.")
     p.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit.")
+    add_chmp_search_cli_arguments(p)
     return p, p.parse_args()
 
 
@@ -1788,17 +1822,8 @@ def main() -> int:
         print(f"  Frequency: {freq_ghz:.3f} GHz")
     print(f"  Data range: [{observed.min():.2f}, {observed.max():.2f}]")
 
-    print("\nEstimating noise from map...")
-    noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
-    noise_unit = obs_map_noise_unit_label(obs_map)
-    sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
-    noise_diag = noise_result.diagnostics
-    print(
-        f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit} "
-        f"(method={str(noise_result.method_used)})"
-    )
-    if np.isfinite(float(noise_result.mask_fraction)):
-        print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
+    sigma_map: np.ndarray | None = None
+    noise_diag: dict[str, Any] = {}
 
     sdk = import_module("gxrender.sdk")
 
@@ -1920,15 +1945,120 @@ def main() -> int:
         hglt_obs_deg=effective_observer_b0sun_deg,
         dsun_obs_m=effective_observer_dsun_cm / 100.0,
     )
-    observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
-    sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
-    if np.isnan(observed_cropped).any():
-        observed_cropped = np.nan_to_num(observed_cropped, nan=float(np.nanmedian(observed_cropped)))
-    if np.isnan(sigma_cropped).any():
-        fill_sigma = float(np.nanmedian(sigma_cropped))
-        if not np.isfinite(fill_sigma) or fill_sigma <= 0:
-            fill_sigma = float(np.nanmedian(sigma_map))
-        sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
+    model_obs_time = str(
+        model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(args.model_h5) or ""
+    ).strip()
+    obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
+    pre_artifacts_dir = args.artifacts_dir or (Path(".").resolve() / "ab_scan_artifacts")
+    pre_stem = args.artifacts_stem or f"{observation_stem}_ab_scan_{args.target_metric}"
+    pre_out_h5 = Path(args.artifact_h5) if args.artifact_h5 is not None else pre_artifacts_dir / f"{pre_stem}.h5"
+    pre_slice_key = str(
+        slice_descriptor_from_diagnostics(
+            {
+                "spectral_domain": str(obs_map.domain),
+                "spectral_label": str(obs_map.spectral_label or (f"{float(freq_ghz):.3f} GHz" if freq_ghz is not None else "slice")),
+                "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
+                "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+            }
+        )["key"]
+    )
+    stored_slice_payload = None
+    if pre_out_h5.exists() and not bool(args.recompute_existing):
+        try:
+            stored_slice_payload = load_scan_file(pre_out_h5, slice_key=pre_slice_key, include_maps=True)
+        except KeyError:
+            stored_slice_payload = None
+    observation_source_path = obs_map.source_path
+    observation_source_file = _resolve_existing_file(observation_source_path)
+    observation_source_sha256 = (
+        _compute_file_sha256(observation_source_file)
+        if observation_source_file is not None and observation_source_file.is_file()
+        else None
+    )
+    artifact_geometry_sha256_value = artifact_geometry_sha256(
+        build_artifact_geometry_block(
+            {
+                "map_xc_arcsec": float(geometry.xc),
+                "map_yc_arcsec": float(geometry.yc),
+                "map_dx_arcsec": float(geometry.dx),
+                "map_dy_arcsec": float(geometry.dy),
+                "map_nx": int(geometry.nx),
+                "map_ny": int(geometry.ny),
+                "observer_name": effective_observer_name,
+                "observer_lonc_deg": effective_observer_lonc_deg,
+                "observer_b0sun_deg": effective_observer_b0sun_deg,
+                "observer_dsun_cm": effective_observer_dsun_cm,
+                "observer_obs_time": target_header.get("DATE-OBS", ""),
+            }
+        )
+    )
+    if stored_slice_payload is None:
+        print("\nEstimating noise from map...")
+        noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+        noise_unit = obs_map_noise_unit_label(obs_map)
+        sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
+        noise_diag = dict(noise_result.diagnostics)
+        print(
+            f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit} "
+            f"(method={str(noise_result.method_used)})"
+        )
+        if np.isfinite(float(noise_result.mask_fraction)):
+            print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
+    try:
+        shift_policy, max_shift_arcsec, xy_shift_arcsec = resolve_shift_policy_from_args(args)
+        slice_obs_ref = resolve_slice_observation_reference(
+            observed,
+            header,
+            target_header,
+            sigma=sigma_map,
+            observation_source_sha256=observation_source_sha256,
+            artifact_geometry_sha256=artifact_geometry_sha256_value,
+            model_time_text=model_obs_time or None,
+            observation_time_text=obs_time_text or None,
+            stored_slice_payload=stored_slice_payload,
+            force_recompute=bool(args.recompute_existing),
+            shift_policy=shift_policy,
+            max_shift_arcsec=max_shift_arcsec,
+            xy_shift_arcsec=xy_shift_arcsec,
+        )
+    except SliceObservationReferenceError as exc:
+        parser.error(str(exc))
+    observed_cropped = np.asarray(slice_obs_ref.observed, dtype=float)
+    sigma_cropped = np.asarray(slice_obs_ref.sigma, dtype=float)
+    obs_preprocess_diag = dict(slice_obs_ref.diagnostics)
+    if slice_obs_ref.restored_from_artifact:
+        stored_noise_diag = dict(dict(stored_slice_payload or {}).get("diagnostics") or {}).get("noise_diagnostics") or {}
+        if stored_noise_diag:
+            noise_diag = dict(stored_noise_diag)
+        finite_sigma = sigma_cropped[np.isfinite(sigma_cropped)]
+        restored_sigma = float(np.nanmedian(finite_sigma)) if finite_sigma.size else float("nan")
+        noise_unit = obs_map_noise_unit_label(obs_map)
+        print(
+            "  Slice observation reference: restored rotated+regridded observed/sigma maps "
+            f"from artifact slice metadata (median sigma={restored_sigma:.2f} {noise_unit})"
+        )
+    else:
+        for warning_line in obs_preprocess_diag.get("observation_time_warning_lines", ()):
+            print(warning_line)
+        if obs_preprocess_diag.get("observation_time_rotation_applied"):
+            print(f"  {obs_preprocess_diag.get('observation_time_alignment_message', '')}")
+        elif str(obs_preprocess_diag.get("observation_time_alignment", "")) not in {"exact", "unknown"}:
+            print(f"  {obs_preprocess_diag.get('observation_time_alignment_message', '')}")
+
+    explicit_metric_mask = None
+    if args.metrics_mask_fits is not None:
+        explicit_metric_mask = _load_explicit_metric_mask(
+            args.metrics_mask_fits,
+            expected_shape=tuple(np.asarray(observed_cropped, dtype=float).shape),
+        )
+    metrics_mask_type = "explicit_fits" if explicit_metric_mask is not None else "union"
+    chmp_settings = resolve_chmp_search_settings(
+        args,
+        mask_type=metrics_mask_type,
+        explicit_mask=explicit_metric_mask,
+    )
+    if len(chmp_settings.q0_search_stages) > 1:
+        print(f"  Q0 search stages: {', '.join(chmp_settings.q0_search_stages)}")
 
     print("\nPreparing model-aligned observational submap...")
     print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
@@ -2169,13 +2299,6 @@ def main() -> int:
     }
 
     model_sha256 = _compute_file_sha256(args.model_h5)
-    observation_source_path = obs_map.source_path
-    observation_source_file = _resolve_existing_file(observation_source_path)
-    observation_source_sha256 = (
-        _compute_file_sha256(observation_source_file)
-        if observation_source_file is not None and observation_source_file.is_file()
-        else None
-    )
     ebtel_sha256 = _compute_file_sha256(args.ebtel_path)
     euv_response_identity = None
     resolved_euv_channel = None
@@ -2252,6 +2375,7 @@ def main() -> int:
         "observer_b0sun_deg": effective_observer_b0sun_deg,
         "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
+        **obs_preprocess_diag,
         "geometry_policy_mode": geometry_mode,
         "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
         "geometry_policy_observation_los": geometry_policy.observation_observer,
@@ -2296,6 +2420,9 @@ def main() -> int:
             "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
             "observer_dsun_cm": root_diag["observer_dsun_cm"],
             "observer_obs_time": root_diag["observer_obs_time"],
+            "slice_observation_identity_sha256": root_diag.get("slice_observation_identity_sha256"),
+            "preprocessed_observation_sha256": root_diag.get("preprocessed_observation_sha256"),
+            "preprocessed_sigma_sha256": root_diag.get("preprocessed_sigma_sha256"),
             "psf_source": root_diag["psf_source"],
             "psf_bmaj_arcsec": root_diag["psf_bmaj_arcsec"],
             "psf_bmin_arcsec": root_diag["psf_bmin_arcsec"],
@@ -2835,6 +2962,13 @@ def main() -> int:
             observed=np.asarray(observed_cropped, dtype=float),
             sigma=np.asarray(sigma_cropped, dtype=float),
             psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+            observation_reference=slice_obs_ref,
+            threshold=float(args.metrics_mask_threshold),
+            explicit_mask=explicit_metric_mask,
+            q0_search_stages=chmp_settings.q0_search_stages,
+            use_smoothed_obs_max=chmp_settings.use_smoothed_obs_max,
+            use_emthreshold=chmp_settings.use_emthreshold,
+            emthreshold=chmp_settings.emthreshold,
         )
         execution_settings = ABExecutionSettings(
             policy=execution_plan.policy,
