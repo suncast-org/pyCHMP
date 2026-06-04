@@ -56,23 +56,41 @@ act as an audit log of failed or abandoned attempts.
    that changes slice identity, such as a different EUV channel, MW frequency,
    geometry/WCS, observer contract, or other incompatibility that makes the
    stored maps physically non-reusable.
-- If the current run is compatible with the existing artifact and `--start-over`
-   is not requested, pyCHMP should resume implicitly from the existing search
-   state. Changing only search boundaries does not create a new slice or a new
-   search lineage.
-- `--start-over` means reset the existing search history for that same target
-   and begin again in place. pyCHMP should still take advantage of already
-   computed compatible maps, but it should not retain abandoned same-target
-   search history as additional visible slice/search clutter.
+- If the current run is compatible with the existing artifact and no grid-reset
+   flag is set, pyCHMP resumes implicitly from the existing search state.
+   Changing only search boundaries does not create a new slice or a new search
+   lineage.
+- `--recompute-search-id SEARCH_ID` (with `--artifact-h5`): **repair** mode —
+  restores the stored scoring recipe, preserves valid map-linked trials, resets
+  only contract-broken points, and resumes the adaptive walk to complete incomplete
+  cells. Allowed flags: `--artifact-h5`, `--recompute-search-id`, optional
+  `--no-viewer` / `--dry-run`.
+- `--expand-grid-search-id SEARCH_ID` (with `--artifact-h5`): widen `a`/`b` on the
+  same search id and stored recipe; hydrates completed cells; explores only new or
+  outstanding cells in the enlarged domain (Phase‑1 seeds from the prior footprint
+  wall toward the widened bound).
+- `pychmp-repair-grid-trial-maps`: purge invalid trial HDF5 groups and rebuild
+  headers; does not refit or clear `map_store`.
+- `pychmp-rescore build|commit`: rescore existing `map_store` maps into a new
+  `{root}_rN` search via a sidecar file (no gxrender, no viewer). Commit when no
+  adaptive run is active.
+- `--recompute-existing` clears the grid for the matching search identity and
+   refits every point, reusing `map_store` maps for warm q0 start (no gxrender
+   for compatible stored q0 values).
+- `--new-search-identity` does the same refit under a parallel search identity
+   for debugging (e.g. algorithm changes with the same target contract). Prior
+   searches remain in the artifact; `map_store` warm start still applies.
 - Changes that alter the scientific meaning of the stored results, such as
    different masks, thresholds, or beams, must not silently reuse incompatible
    results. They should branch only when the metadata signature requires it.
 
 Practical interpretation:
 
-- same target + same compatible signature + no `--start-over`: resume
-- same target + same compatible signature + `--start-over`: erase prior search
-   history for that target, keep compatible map reuse, restart in place
+- same target + same compatible signature + default (no flags): resume
+- same target + same compatible signature + `--recompute-existing`: same search
+   id, fresh grid, map_store warm start
+- same target + same compatible signature + `--new-search-identity`: parallel
+   search id, fresh grid, prior searches kept, map_store warm start
 - changed slice identity: create a new slice
 
 ## Development

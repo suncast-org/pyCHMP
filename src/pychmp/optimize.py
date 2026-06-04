@@ -463,9 +463,11 @@ def _choose_direction_from_triplet(
     if right_obj < middle_obj and right_obj < left_obj:
         return 1
     if math.isfinite(right_obj) and not math.isfinite(left_obj):
-        return 1
+        return 1 if right_obj < middle_obj else -1
     if math.isfinite(left_obj) and not math.isfinite(right_obj):
-        return -1
+        return -1 if left_obj < middle_obj else 1
+    if right_obj > middle_obj and left_obj > middle_obj:
+        return -1 if middle_obj > right_obj else 1
     return 1
 
 
@@ -530,6 +532,652 @@ def _choose_initial_direction(
     return 1
 
 
+_IDL_RELATIVE_ACC_DEFAULT = 1e-2
+_IDL_GOLDEN_RATIO = (1.0 + math.sqrt(5.0)) / 2.0
+
+
+def _i_ratio(a: float, b: float) -> float:
+    """Mirror CHMP ``IRatio.pro`` used in golden/Brent q0 refinement."""
+    if a < b:
+        return 1.0e100 if a <= 0.0 else b / a
+    if a > b:
+        return 1.0e100 if b <= 0.0 else a / b
+    return 1.0e100
+
+
+def _ebtel_table_violation(record: _Q0EvaluationRecord, *, emthreshold: float) -> bool:
+    message = str(record.message or "")
+    if "EBTEL miss ratio" not in message or "exceeds" not in message:
+        return False
+    return True
+
+
+def _idl_expansion_direction(
+    q_grid: list[float],
+    cache: dict[float, _Q0EvaluationRecord],
+    *,
+    emthreshold: float,
+) -> int:
+    """Return expansion sign: negative=left, positive=right, zero=bracketed (FindBestFitQ)."""
+    records = [cache[float(q)] for q in q_grid]
+    nq = len(records)
+    if nq == 1:
+        aw = 0.0
+        record = records[0]
+        if (
+            record.total_observed_flux is not None
+            and record.total_modeled_flux is not None
+            and math.isfinite(float(record.total_observed_flux))
+            and math.isfinite(float(record.total_modeled_flux))
+        ):
+            flux_delta = float(record.total_observed_flux) - float(record.total_modeled_flux)
+            if flux_delta > 0.0:
+                aw = 1.0
+            elif flux_delta < 0.0:
+                aw = -1.0
+        return 1 if aw == 0.0 else int(math.copysign(1, aw))
+
+    lmins = 0
+    rmins = 0
+    if any(not math.isfinite(record.objective_value) for record in records):
+        return 0
+    min_index = min(range(nq), key=lambda index: records[index].objective_value)
+    if min_index == 0:
+        lmins = 1
+    if min_index == nq - 1:
+        rmins = 1
+    if _ebtel_table_violation(records[0], emthreshold=emthreshold):
+        lmins = 0
+    if _ebtel_table_violation(records[-1], emthreshold=emthreshold):
+        rmins = 0
+    if lmins == 0 and rmins == 0:
+        return 0
+    aw = rmins - lmins
+    return 1 if aw == 0 else int(math.copysign(1, aw))
+
+
+def _idl_propose_expansion_q0(
+    q_grid: list[float],
+    *,
+    direction: int,
+    q0_step: float,
+    hard_q0_min: float | None,
+    hard_q0_max: float | None,
+) -> float | None:
+    if direction < 0:
+        anchor = min(q_grid)
+        proposed = anchor / q0_step
+        if hard_q0_min is not None:
+            proposed = max(proposed, float(hard_q0_min))
+        if proposed >= anchor * (1.0 - 1e-15):
+            return None
+        return proposed
+    anchor = max(q_grid)
+    proposed = anchor * q0_step
+    if hard_q0_max is not None:
+        proposed = min(proposed, float(hard_q0_max))
+    if proposed <= anchor * (1.0 + 1e-15):
+        return None
+    return proposed
+
+
+def _idl_interior_minimum_count(
+    q_grid: list[float],
+    cache: dict[float, _Q0EvaluationRecord],
+) -> int:
+    count = 0
+    for index in range(1, len(q_grid) - 1):
+        left = cache[float(q_grid[index - 1])]
+        middle = cache[float(q_grid[index])]
+        right = cache[float(q_grid[index + 1])]
+        if not (left.is_valid and middle.is_valid and right.is_valid):
+            continue
+        if middle.objective_value < left.objective_value and middle.objective_value < right.objective_value:
+            count += 1
+    return count
+
+
+def _idl_golden_brent_refine(
+    metric_function: Callable[[float], MetricFunctionResult],
+    *,
+    q_grid: list[float],
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    target_metric: MetricName,
+    relative_acc: float,
+    maxiter: int,
+    progress_start_callback: ProgressStartCallback | None,
+    progress_callback: ProgressCallback | None,
+    q_bound_min: float | None = None,
+    q_bound_max: float | None = None,
+) -> tuple[list[float], int]:
+    """Refine q0 on a sorted grid using CHMP golden/Brent steps (``FindBestFitQ.pro``)."""
+    grid = list(q_grid)
+    refine_steps = 0
+    for _ in range(max(1, int(maxiter))):
+        valid_indices = [index for index, q0 in enumerate(grid) if cache[float(q0)].is_valid]
+        if len(valid_indices) < 3:
+            break
+        ib = min(
+            valid_indices,
+            key=lambda index: cache[float(grid[index])].objective_value,
+        )
+        if ib <= 0 or ib >= len(grid) - 1:
+            break
+
+        qa = float(grid[ib - 1])
+        qb = float(grid[ib])
+        qc = float(grid[ib + 1])
+        mtra = float(cache[qa].objective_value)
+        mtrb = float(cache[qb].objective_value)
+        mtrc = float(cache[qc].objective_value)
+        if (qc + qa) <= 0.0 or ((qc - qa) / (qc + qa)) < relative_acc:
+            break
+
+        if (qc - qb) > (qb - qa):
+            qxg = qb + (qc - qb) * (1.0 - 1.0 / _IDL_GOLDEN_RATIO)
+        else:
+            qxg = qb - (qb - qa) * (1.0 - 1.0 / _IDL_GOLDEN_RATIO)
+
+        denom = (qb - qa) * (mtrb - mtrc) - (qb - qc) * (mtrb - mtra)
+        if math.isclose(denom, 0.0, rel_tol=0.0, abs_tol=1e-30):
+            qxb = qxg
+        else:
+            qxb = qb - 0.5 * (
+                (qb - qa) ** 2 * (mtrb - mtrc) - (qb - qc) ** 2 * (mtrb - mtra)
+            ) / denom
+
+        if qxb > qb:
+            rb_hit = _i_ratio(qc - qxb, qxb - qb)
+            rb_miss = _i_ratio(qxb - qb, qb - qa)
+        else:
+            rb_hit = _i_ratio(qb - qxb, qxb - qa)
+            rb_miss = _i_ratio(qc - qb, qb - qxb)
+
+        if qxb > qb:
+            dnewg = (qc - qb + qxg - qa) / 2.0
+            dnewb = (qc - qb + qxb - qa) / 2.0
+        else:
+            dnewg = (qb - qa + qc - qxg) / 2.0
+            dnewb = (qb - qa + qc - qxb) / 2.0
+
+        use_brent = (
+            qa < qxb < qc
+            and dnewb <= dnewg
+            and rb_hit <= 10.0
+            and rb_miss <= 10.0
+        )
+        qx = qxb if use_brent else qxg
+        if q_bound_min is not None:
+            qx = max(float(qx), float(q_bound_min))
+        if q_bound_max is not None:
+            qx = min(float(qx), float(q_bound_max))
+        if math.isclose(qx, qb, rel_tol=0.0, abs_tol=1e-15):
+            break
+
+        _evaluate_q0(
+            qx,
+            metric_function=metric_function,
+            target_metric=target_metric,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+        )
+        insert_at = ib if qx > qb else ib - 1
+        grid = grid[: insert_at + 1] + [float(qx)] + grid[insert_at + 1 :]
+        refine_steps += 1
+
+    return grid, refine_steps
+
+
+def _idl_sorted_q_grid(cache: dict[float, _Q0EvaluationRecord]) -> list[float]:
+    return [float(q0) for q0 in sorted(cache.keys())]
+
+
+def _idl_warm_best_edge_q0(
+    q_grid: list[float],
+    cache: dict[float, _Q0EvaluationRecord],
+) -> float:
+    valid_records = [cache[float(q0)] for q0 in q_grid if cache[float(q0)].is_valid]
+    if not valid_records:
+        return float(q_grid[0])
+    left_q0 = float(q_grid[0])
+    right_q0 = float(q_grid[-1])
+    left = cache[left_q0]
+    right = cache[right_q0]
+    if left.is_valid and right.is_valid:
+        return left_q0 if float(left.objective_value) <= float(right.objective_value) else right_q0
+    if left.is_valid:
+        return left_q0
+    if right.is_valid:
+        return right_q0
+    return float(min(valid_records, key=lambda item: item.objective_value).q0)
+
+
+def _idl_build_q0_result(
+    *,
+    q_grid: list[float],
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    target_metric: MetricName,
+    bracket_steps: int,
+    message_parts: list[str],
+    bracket_found: bool,
+    bracket: tuple[float, float, float] | None,
+) -> Q0OptimizationResult:
+    valid_records = [record for record in cache.values() if record.is_valid]
+    if not valid_records:
+        best_record = cache[float(q_grid[0])]
+        success = False
+    else:
+        best_record = min(valid_records, key=lambda item: item.objective_value)
+        success = bool(bracket_found)
+    trial_q0 = tuple(evaluation_order)
+    trial_chi2, trial_rho2, trial_eta2 = _trial_metric_histories(cache, evaluation_order)
+    shift_x, shift_y, shift_valid = _trial_shift_histories(cache, evaluation_order)
+    return Q0OptimizationResult(
+        q0=float(best_record.q0),
+        objective_value=float(best_record.objective_value),
+        metrics=best_record.metrics,
+        target_metric=target_metric,
+        success=success,
+        nfev=len(cache),
+        nit=bracket_steps,
+        message="; ".join(message_parts),
+        used_adaptive_bracketing=True,
+        bracket_found=bracket_found,
+        bracket=bracket,
+        boundary_constrained=not bracket_found,
+        trial_q0=trial_q0,
+        trial_objective_values=tuple(cache[q0].objective_value for q0 in trial_q0),
+        trial_chi2_values=trial_chi2,
+        trial_rho2_values=trial_rho2,
+        trial_eta2_values=trial_eta2,
+        trial_shift_x_arcsec=shift_x,
+        trial_shift_y_arcsec=shift_y,
+        trial_find_shift_valid=shift_valid,
+        trial_mask_stages=_trial_mask_stage_histories(cache, evaluation_order),
+    )
+
+
+def _idl_chmp_expand_q0_grid(
+    metric_function: Callable[[float], MetricFunctionResult],
+    *,
+    q_grid: list[float],
+    q0_step: float,
+    max_bracket_steps: int,
+    hard_q0_min: float | None,
+    hard_q0_max: float | None,
+    target_metric: MetricName,
+    emthreshold: float,
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    progress_start_callback: ProgressStartCallback | None,
+    progress_callback: ProgressCallback | None,
+) -> tuple[list[float], int, list[str], bool]:
+    bracket_steps = 0
+    message_parts: list[str] = []
+    boundary_constrained = False
+    done = False
+    while not done and bracket_steps < int(max_bracket_steps):
+        direction = _idl_expansion_direction(q_grid, cache, emthreshold=emthreshold)
+        if direction == 0:
+            done = True
+            break
+        proposed = _idl_propose_expansion_q0(
+            q_grid,
+            direction=direction,
+            q0_step=q0_step,
+            hard_q0_min=hard_q0_min,
+            hard_q0_max=hard_q0_max,
+        )
+        if proposed is None:
+            side = "upper" if direction > 0 else "lower"
+            message_parts.append(f"CHMP q0 search hit the {side} expansion limit")
+            boundary_constrained = True
+            break
+        if direction < 0:
+            q_grid = [float(proposed)] + q_grid
+        else:
+            q_grid = q_grid + [float(proposed)]
+        _evaluate_q0(
+            q_grid[0] if direction < 0 else q_grid[-1],
+            metric_function=metric_function,
+            target_metric=target_metric,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+        )
+        bracket_steps += 1
+    return q_grid, bracket_steps, message_parts, boundary_constrained
+
+
+def _idl_chmp_finalize_bracket_and_refine(
+    metric_function: Callable[[float], MetricFunctionResult],
+    *,
+    q_grid: list[float],
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    target_metric: MetricName,
+    xatol: float,
+    maxiter: int,
+    bracket_steps: int,
+    message_parts: list[str],
+    progress_start_callback: ProgressStartCallback | None,
+    progress_callback: ProgressCallback | None,
+    q_bound_min: float | None = None,
+    q_bound_max: float | None = None,
+    allow_refinement: bool = True,
+) -> Q0OptimizationResult:
+    interior_minima = _idl_interior_minimum_count(q_grid, cache)
+    bracket: tuple[float, float, float] | None = None
+    bracket_found = interior_minima == 1
+    if bracket_found:
+        bracket = _find_bracket(cache)
+        if bracket is not None:
+            message_parts.append("CHMP q0 bracketing found a valid interior minimum")
+        else:
+            bracket_found = False
+            message_parts.append("CHMP q0 bracketing found no interior minimum")
+    elif interior_minima == 0:
+        message_parts.append("CHMP q0 bracketing found no interior minimum")
+    else:
+        message_parts.append("CHMP q0 bracketing found more than one interior minimum")
+
+    relative_acc = max(float(xatol), _IDL_RELATIVE_ACC_DEFAULT)
+    if bracket_found and bracket is not None and allow_refinement:
+        q_grid, refine_steps = _idl_golden_brent_refine(
+            metric_function,
+            q_grid=q_grid,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            target_metric=target_metric,
+            relative_acc=relative_acc,
+            maxiter=maxiter,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+            q_bound_min=q_bound_min,
+            q_bound_max=q_bound_max,
+        )
+        message_parts.append("CHMP golden/Brent q0 refinement")
+        bracket_steps += refine_steps
+
+    return _idl_build_q0_result(
+        q_grid=q_grid,
+        cache=cache,
+        evaluation_order=evaluation_order,
+        target_metric=target_metric,
+        bracket_steps=bracket_steps,
+        message_parts=message_parts,
+        bracket_found=bracket_found,
+        bracket=bracket,
+    )
+
+
+def _idl_chmp_find_best_q0_warm_start(
+    metric_function: Callable[[float], MetricFunctionResult],
+    *,
+    q0_step: float,
+    max_bracket_steps: int,
+    hard_q0_min: float | None,
+    hard_q0_max: float | None,
+    target_metric: MetricName,
+    xatol: float,
+    maxiter: int,
+    emthreshold: float,
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    progress_start_callback: ProgressStartCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> Q0OptimizationResult:
+    """Continue CHMP q0 search from a rescored warm trial curve (IDL policy)."""
+    q_grid = _idl_sorted_q_grid(cache)
+    if not q_grid:
+        raise RuntimeError("warm-start q0 search requires seeded evaluations")
+
+    warm_lo = float(q_grid[0])
+    warm_hi = float(q_grid[-1])
+    message_parts = ["CHMP warm-start q0 search"]
+    interior_minima = _idl_interior_minimum_count(q_grid, cache)
+
+    if interior_minima == 1:
+        message_parts.append(
+            "rescored curve has one interior minimum; refine within stored q0 range only"
+        )
+        return _idl_chmp_finalize_bracket_and_refine(
+            metric_function,
+            q_grid=q_grid,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            target_metric=target_metric,
+            xatol=xatol,
+            maxiter=maxiter,
+            bracket_steps=0,
+            message_parts=message_parts,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+            q_bound_min=warm_lo,
+            q_bound_max=warm_hi,
+            allow_refinement=True,
+        )
+
+    if interior_minima > 1:
+        message_parts.append(
+            "rescored curve has more than one interior minimum; IDL skips refinement"
+        )
+        return _idl_chmp_finalize_bracket_and_refine(
+            metric_function,
+            q_grid=q_grid,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            target_metric=target_metric,
+            xatol=xatol,
+            maxiter=maxiter,
+            bracket_steps=0,
+            message_parts=message_parts,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+            allow_refinement=False,
+        )
+
+    message_parts.append(
+        "rescored curve has no interior minimum; expand from best metric edge"
+    )
+    q_grid, bracket_steps, expand_messages, _boundary = _idl_chmp_expand_q0_grid(
+        metric_function,
+        q_grid=q_grid,
+        q0_step=q0_step,
+        max_bracket_steps=max_bracket_steps,
+        hard_q0_min=hard_q0_min,
+        hard_q0_max=hard_q0_max,
+        target_metric=target_metric,
+        emthreshold=emthreshold,
+        cache=cache,
+        evaluation_order=evaluation_order,
+        progress_start_callback=progress_start_callback,
+        progress_callback=progress_callback,
+    )
+    message_parts.extend(expand_messages)
+    return _idl_chmp_finalize_bracket_and_refine(
+        metric_function,
+        q_grid=q_grid,
+        cache=cache,
+        evaluation_order=evaluation_order,
+        target_metric=target_metric,
+        xatol=xatol,
+        maxiter=maxiter,
+        bracket_steps=bracket_steps,
+        message_parts=message_parts,
+        progress_start_callback=progress_start_callback,
+        progress_callback=progress_callback,
+    )
+
+
+def _idl_chmp_find_best_q0(
+    metric_function: Callable[[float], MetricFunctionResult],
+    *,
+    q0_start: float,
+    q0_step: float,
+    max_bracket_steps: int,
+    hard_q0_min: float | None,
+    hard_q0_max: float | None,
+    target_metric: MetricName,
+    xatol: float,
+    maxiter: int,
+    emthreshold: float,
+    cache: dict[float, _Q0EvaluationRecord],
+    evaluation_order: list[float],
+    progress_start_callback: ProgressStartCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> Q0OptimizationResult:
+    """CHMP IDL ``FindBestFitQ``-style multiplicative bracketing plus golden/Brent refinement."""
+    q_grid = [float(q0_start)]
+    _evaluate_q0(
+        q_grid[0],
+        metric_function=metric_function,
+        target_metric=target_metric,
+        cache=cache,
+        evaluation_order=evaluation_order,
+        progress_start_callback=progress_start_callback,
+        progress_callback=progress_callback,
+    )
+
+    bracket_steps = 0
+    message_parts: list[str] = []
+    done = False
+    while not done and bracket_steps < int(max_bracket_steps):
+        direction = _idl_expansion_direction(q_grid, cache, emthreshold=emthreshold)
+        if direction == 0:
+            done = True
+            break
+        proposed = _idl_propose_expansion_q0(
+            q_grid,
+            direction=direction,
+            q0_step=q0_step,
+            hard_q0_min=hard_q0_min,
+            hard_q0_max=hard_q0_max,
+        )
+        if proposed is None:
+            side = "upper" if direction > 0 else "lower"
+            boundary_q0 = _boundary_best_q0(cache, side=side)
+            message_parts.append(f"CHMP q0 search hit the {side} expansion limit")
+            if boundary_q0 is not None:
+                record = cache[float(boundary_q0)]
+                trial_q0 = tuple(evaluation_order)
+                chi2, rho2, eta2 = _trial_metric_histories(cache, evaluation_order)
+                shift_x, shift_y, shift_valid = _trial_shift_histories(cache, evaluation_order)
+                return Q0OptimizationResult(
+                    q0=float(record.q0),
+                    objective_value=float(record.objective_value),
+                    metrics=record.metrics,
+                    target_metric=target_metric,
+                    success=False,
+                    nfev=len(cache),
+                    nit=bracket_steps,
+                    message="; ".join(message_parts),
+                    used_adaptive_bracketing=True,
+                    bracket_found=False,
+                    bracket=None,
+                    boundary_constrained=True,
+                    trial_q0=trial_q0,
+                    trial_objective_values=tuple(cache[q0].objective_value for q0 in trial_q0),
+                    trial_chi2_values=chi2,
+                    trial_rho2_values=rho2,
+                    trial_eta2_values=eta2,
+                    trial_shift_x_arcsec=shift_x,
+                    trial_shift_y_arcsec=shift_y,
+                    trial_find_shift_valid=shift_valid,
+                    trial_mask_stages=_trial_mask_stage_histories(cache, evaluation_order),
+                )
+            break
+        if direction < 0:
+            q_grid = [float(proposed)] + q_grid
+        else:
+            q_grid = q_grid + [float(proposed)]
+        _evaluate_q0(
+            q_grid[0] if direction < 0 else q_grid[-1],
+            metric_function=metric_function,
+            target_metric=target_metric,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+        )
+        bracket_steps += 1
+
+    interior_minima = _idl_interior_minimum_count(q_grid, cache)
+    bracket: tuple[float, float, float] | None = None
+    bracket_found = interior_minima == 1
+    if bracket_found:
+        for index in range(1, len(q_grid) - 1):
+            left = cache[float(q_grid[index - 1])]
+            middle = cache[float(q_grid[index])]
+            right = cache[float(q_grid[index + 1])]
+            if not (left.is_valid and middle.is_valid and right.is_valid):
+                continue
+            if middle.objective_value <= left.objective_value and middle.objective_value <= right.objective_value:
+                bracket = (float(left.q0), float(middle.q0), float(right.q0))
+                break
+        message_parts.append("CHMP q0 bracketing found a valid interior minimum")
+    elif interior_minima == 0:
+        message_parts.append("CHMP q0 bracketing found no interior minimum")
+    else:
+        message_parts.append("CHMP q0 bracketing found more than one interior minimum")
+
+    relative_acc = max(float(xatol), _IDL_RELATIVE_ACC_DEFAULT)
+    if bracket_found and bracket is not None:
+        q_grid, refine_steps = _idl_golden_brent_refine(
+            metric_function,
+            q_grid=q_grid,
+            cache=cache,
+            evaluation_order=evaluation_order,
+            target_metric=target_metric,
+            relative_acc=relative_acc,
+            maxiter=maxiter,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+        )
+        message_parts.append("CHMP golden/Brent q0 refinement")
+        bracket_steps += refine_steps
+
+    valid_records = [record for record in cache.values() if record.is_valid]
+    if not valid_records:
+        best_record = cache[float(q_grid[0])]
+        success = False
+    else:
+        best_record = min(valid_records, key=lambda item: item.objective_value)
+        success = bracket_found
+
+    trial_q0 = tuple(evaluation_order)
+    trial_chi2, trial_rho2, trial_eta2 = _trial_metric_histories(cache, evaluation_order)
+    shift_x, shift_y, shift_valid = _trial_shift_histories(cache, evaluation_order)
+    return Q0OptimizationResult(
+        q0=float(best_record.q0),
+        objective_value=float(best_record.objective_value),
+        metrics=best_record.metrics,
+        target_metric=target_metric,
+        success=success,
+        nfev=len(cache),
+        nit=bracket_steps,
+        message="; ".join(message_parts),
+        used_adaptive_bracketing=True,
+        bracket_found=bracket_found,
+        bracket=bracket,
+        boundary_constrained=not bracket_found,
+        trial_q0=trial_q0,
+        trial_objective_values=tuple(cache[q0].objective_value for q0 in trial_q0),
+        trial_chi2_values=trial_chi2,
+        trial_rho2_values=trial_rho2,
+        trial_eta2_values=trial_eta2,
+        trial_shift_x_arcsec=shift_x,
+        trial_shift_y_arcsec=shift_y,
+        trial_find_shift_valid=shift_valid,
+        trial_mask_stages=_trial_mask_stage_histories(cache, evaluation_order),
+    )
+
+
 def _adaptive_multiplicative_bracket(
     metric_function: Callable[[float], MetricFunctionResult],
     *,
@@ -573,6 +1221,24 @@ def _adaptive_multiplicative_bracket(
     bracket = _find_bracket(cache)
     if bracket is not None:
         return _BracketSearchResult(bracket=bracket, steps_taken=0, message="adaptive bracketing found initial triplet")
+
+    if (
+        start_record.is_valid
+        and right_record is not None
+        and right_record.is_valid
+        and right_record.objective_value > start_record.objective_value
+        and (left_record is None or not left_record.is_valid)
+    ):
+        return _BracketSearchResult(
+            bracket=None,
+            steps_taken=0,
+            message=(
+                "adaptive bracketing: q0_start is the best valid seed and the upper "
+                "initialization bound is worse; skipping upward expansion"
+            ),
+            fallback_to_bounded_refinement=True,
+            boundary_q0=float(start_record.q0),
+        )
 
     direction = _choose_direction_from_triplet(left_record, start_record, right_record)
     current_q0 = float(q0_min) if direction < 0 else float(q0_max)
@@ -700,12 +1366,17 @@ def find_best_q0(
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
     initial_evaluations: InitialQ0Evaluations | None = None,
+    emthreshold: float = 0.1,
 ) -> Q0OptimizationResult:
-    """Find best Q0 with optional adaptive multiplicative bracketing.
+    """Find best Q0 with optional CHMP IDL-style adaptive search.
 
-    q0_min and q0_max define the user-provided initialization interval. In
-    adaptive mode the search may expand beyond that interval unless explicit
-    hard_q0_min / hard_q0_max safety bounds are supplied.
+    When ``adaptive_bracketing`` is enabled, bracket expansion and golden/Brent
+    refinement follow ``FindBestFitQ.pro`` (start at ``q0_start``, grow by
+    ``q0_step``, not the legacy triplet-at-bounds algorithm).
+
+    ``q0_min`` and ``q0_max`` bound the non-adaptive SciPy path and warm-start
+    validation; adaptive expansion may continue beyond them unless
+    ``hard_q0_min`` / ``hard_q0_max`` are set.
     """
     if q0_min <= 0 or q0_max <= 0:
         raise ValueError("q0_min and q0_max must be positive")
@@ -769,67 +1440,38 @@ def find_best_q0(
     boundary_q0: float | None = None
 
     if adaptive_bracketing:
-        bracket_result = _adaptive_multiplicative_bracket(
-            metric_function,
-            q0_min=q0_min,
-            q0_max=q0_max,
-            q0_start=q0_start,
-            hard_q0_min=hard_q0_min,
-            hard_q0_max=hard_q0_max,
-            q0_step=q0_step,
-            max_bracket_steps=max_bracket_steps,
-            target_metric=target_metric,
-            cache=cache,
-            evaluation_order=evaluation_order,
-            progress_start_callback=progress_start_callback,
-            progress_callback=progress_callback,
-        )
-        bracket = bracket_result.bracket
-        bracket_found = bracket is not None
-        bracket_steps = bracket_result.steps_taken
-        boundary_q0 = bracket_result.boundary_q0
-        if bracket is not None:
-            refinement_bounds = _refine_sampled_neighborhood(
-                bracket=bracket,
-                metric_function=metric_function,
+        if cache:
+            return _idl_chmp_find_best_q0_warm_start(
+                metric_function,
+                q0_step=q0_step,
+                max_bracket_steps=max_bracket_steps,
+                hard_q0_min=hard_q0_min,
+                hard_q0_max=hard_q0_max,
                 target_metric=target_metric,
+                xatol=xatol,
+                maxiter=maxiter,
+                emthreshold=float(emthreshold),
                 cache=cache,
                 evaluation_order=evaluation_order,
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
             )
-            message_prefix = bracket_result.message
-        elif not bracket_result.fallback_to_bounded_refinement and boundary_q0 is not None:
-            boundary_record = cache[float(boundary_q0)]
-            trial_q0 = tuple(evaluation_order)
-            trial_objective_values = tuple(cache[q0].objective_value for q0 in evaluation_order)
-            trial_chi2_values, trial_rho2_values, trial_eta2_values = _trial_metric_histories(cache, evaluation_order)
-            trial_shift_x, trial_shift_y, trial_shift_valid = _trial_shift_histories(cache, evaluation_order)
-            trial_mask_stages = _trial_mask_stage_histories(cache, evaluation_order)
-            return Q0OptimizationResult(
-                q0=float(boundary_record.q0),
-                objective_value=boundary_record.objective_value,
-                metrics=boundary_record.metrics,
-                target_metric=target_metric,
-                success=False,
-                nfev=len(cache),
-                nit=int(bracket_steps),
-                message=bracket_result.message,
-                used_adaptive_bracketing=True,
-                bracket_found=False,
-                bracket=None,
-                trial_q0=trial_q0,
-                trial_objective_values=trial_objective_values,
-                trial_chi2_values=trial_chi2_values,
-                trial_rho2_values=trial_rho2_values,
-                trial_eta2_values=trial_eta2_values,
-                trial_shift_x_arcsec=trial_shift_x,
-                trial_shift_y_arcsec=trial_shift_y,
-                trial_find_shift_valid=trial_shift_valid,
-                trial_mask_stages=trial_mask_stages,
-            )
-        else:
-            message_prefix = f"{bracket_result.message}; falling back to bounded refinement"
+        return _idl_chmp_find_best_q0(
+            metric_function,
+            q0_start=q0_start,
+            q0_step=q0_step,
+            max_bracket_steps=max_bracket_steps,
+            hard_q0_min=hard_q0_min,
+            hard_q0_max=hard_q0_max,
+            target_metric=target_metric,
+            xatol=xatol,
+            maxiter=maxiter,
+            emthreshold=float(emthreshold),
+            cache=cache,
+            evaluation_order=evaluation_order,
+            progress_start_callback=progress_start_callback,
+            progress_callback=progress_callback,
+        )
 
     effective_xatol = _resolve_effective_xatol(xatol, bounds=refinement_bounds)
     result = minimize_scalar(

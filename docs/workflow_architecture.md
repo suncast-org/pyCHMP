@@ -1,6 +1,6 @@
 # pyCHMP Workflow Architecture
 
-**Status:** As implemented (May 2026)  
+**Status:** As implemented (June 2026)  
 **Audience:** Reviewers planning improvements to runner/viewer contracts, execution policies, and artifact I/O.
 
 This document describes the **current** pyCHMP adaptive-search workflow end to end: how workers run, how artifacts are structured and written, and how `pychmp-view` interacts with live versus completed runs. For the long-term target schema, see [artifact_data_contract.rst](artifact_data_contract.rst). For the heartbeat refactor details, see [viewer_refresh_workflow.rst](viewer_refresh_workflow.rst).
@@ -82,6 +82,8 @@ flowchart TB
 
 **Design principle (post-2026-05 refactor):** the runner writes **truth into the artifact**; the heartbeat file is only a **wake-up signal** with routing hints (`phase`, `slice_key`, `search_id`). The viewer reads live curves and maps from the H5, not from duplicated state in `.refresh`.
 
+**Warm start (map_store):** at each grid point start, the runner rescoring pass reads compatible `map_store` arrays, recomputes **χ², ρ², and η²** under the current mask/shift policy, and commits ordinary `grid_points/.../trials` rows with `map_refs.raw_modeled` pointing at the **existing** map path (no duplicate map datasets, no warm-only metadata). The viewer cannot distinguish those trials from gxrender-produced trials after refresh.
+
 ---
 
 ## 3. Adaptive search workflow
@@ -129,13 +131,35 @@ sequenceDiagram
 
 ### Resume / preload
 
-On startup, if the artifact already exists and `--recompute-existing` is not set:
+On startup when the artifact already exists:
 
-1. `cache.hydrate_from_existing()` loads compatible `(a,b)` points from `point_records` into memory (no maps).
-2. The search skips cells already in `point_results`.
-3. Heartbeat phase may be set to `"resume"` / `"loaded N compatible point(s)"`.
+1. **Slice map index**: `build_slice_map_index(artifact, slice_key=...)` scans `map_store` identities, synthetic registry, and all grid trials on that slice once. The in-memory `(a,b) → q0 → map_ref` table is the fast lookup for warm start and render reuse (artifact remains canonical).
+2. **Default resume** (no flags): `cache.hydrate_from_existing()` loads compatible completed `(a,b)` points from the active search; the adaptive walk skips those cells. `promote_*` plus the slice index register warm q0 curves without re-rendering stored maps.
+3. **`--recompute-existing` or `--new-search-identity`**: hydration is skipped (fresh grid). Startup builds the slice map index only (no `promote_*` rescore sweep). **Warm rescoring and grid trial commits run at each grid point start** via `commit_map_store_warm_trials_for_point`.
+4. **`--recompute-search-id SEARCH_ID`**: **repair** mode (not a full grid reset). Restores the stored scoring recipe from that search's `diagnostics_json` / `request_json`, rejects CLI flags that would override it, preserves valid map-linked trial rows without rescoring, resets only contract-broken points, and resumes the adaptive walk to complete incomplete cells. Requires `--artifact-h5`. Use `--recompute-existing` when you intend to wipe and refit the whole search grid.
+5. **`--expand-grid-search-id SEARCH_ID`**: **expand** mode on the same search identity. Restores the stored scoring recipe, rejects all CLI overrides except widened `--a-min` / `--a-max` / `--b-min` / `--b-max` (strict superset of the stored footprint), preserves valid trials without rescoring, hydrates completed `(a,b)` cells, and runs the adaptive walk only for new/outstanding cells in the enlarged domain. The first Phase‑1 step anchors on the best grid point along the **prior** footprint wall facing the widened bound (not the original interior `(a_start, b_start)`), matching IDL’s “fill only new shell cells” intent.
+
+### Map-store rescore sidecar (`pychmp-rescore`)
+
+Standalone utility (no viewer): read-only on the main artifact’s `map_store`, write a sidecar H5 with a new search identity `{root}_r1`, `{root}_r2`, …, then commit into the main file when no search is active.
+
+```bash
+pychmp-rescore build --artifact-h5 MAIN.h5 --source-search-id search_260dfc2a336f2666
+pychmp-rescore commit --artifact-h5 MAIN.h5 --sidecar MAIN.search_260dfc2a336f2666_r1.rescore.h5
+```
+
+Relaunch `pychmp-view` after commit to select the new identity.
+
+### Render reuse during search
+
+1. **Per-trial render**: `_TrackedRendererProxy.render_pair` returns maps from the in-memory stream or slice index before calling gxrender.
+2. Heartbeat phase may be set to `"resume"` / `"loaded N compatible point(s)"` or warm-preload messaging for grid-reset modes.
 
 Compatibility uses `compatibility_signature` in diagnostics plus effective content hashes (arrays win over stale metadata hashes).
+
+### Planned: per-point repair utility
+
+Cherry-picked refit of selected `grid_points` under an existing `search_id` (warm vs cold `map_store`) is **not** implemented. See handoff note `future-implementation-notes/pyCHMP/2026-06-01-pyCHMP-point-repair-utility-handoff.md`.
 
 ---
 
@@ -292,10 +316,11 @@ H5 opens use retry with backoff. Errors matching read-only lock contention (view
 
 ### Runner liveness (viewer detection)
 
-`_live_runner_detected()` is true if **either**:
+`_live_runner_detected()` is true if **any** of:
 
-1. `.refresh` mtime is within grace window (`_ACTIVE_REFRESH_GRACE_S`), or  
-2. Last `pid=` from `.log` refers to a running process.
+1. Last `pid=` from `.log` refers to a running process, or  
+2. `.refresh` mtime is within grace window (`_ACTIVE_REFRESH_GRACE_S`) **and** the search is not terminal, or  
+3. The selected search is not terminal (no fresh refresh and no live pid).
 
 ### Heartbeat → viewer action
 

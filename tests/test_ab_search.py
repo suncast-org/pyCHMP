@@ -3,7 +3,16 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from pychmp.ab_search import ABPointResult, idl_q0_start_heuristic, multi_scan_ab, search_local_minimum_ab
+from pychmp.ab_search import (
+    ABPointResult,
+    ExpandResumeContext,
+    idl_q0_start_heuristic,
+    multi_scan_ab,
+    search_local_minimum_ab,
+    select_expand_frontier_seed,
+    widened_boundary_axes,
+)
+from pychmp.metrics import MetricValues
 
 
 def _localized_peak_observed(*, size: int = 32, peak: float = 100.0) -> np.ndarray:
@@ -741,6 +750,65 @@ def test_search_local_minimum_ab_matches_bruteforce_scan_on_small_domain() -> No
     assert local_search.minimum_certified is True
 
 
+def test_widened_boundary_axes_detects_superset_edges() -> None:
+    axes = widened_boundary_axes(
+        prior_a_range=(-1.0, 1.0),
+        prior_b_range=(0.0, 5.0),
+        new_a_range=(-1.5, 1.0),
+        new_b_range=(0.0, 6.0),
+    )
+    assert axes == ("a_min", "b_max")
+
+
+def test_select_expand_frontier_seed_prefers_prior_wall_over_interior() -> None:
+    interior = ABPointResult(
+        a=0.0,
+        b=2.0,
+        q0=1.0,
+        objective_value=0.01,
+        metrics=MetricValues(chi2=0.01, rho2=0.0, eta2=0.0),
+        target_metric="chi2",
+        success=True,
+        nfev=1,
+        nit=0,
+        message="",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        trial_q0=(1.0,),
+        trial_objective_values=(0.01,),
+    )
+    wall = ABPointResult(
+        a=0.0,
+        b=5.0,
+        q0=1.0,
+        objective_value=0.5,
+        metrics=MetricValues(chi2=0.5, rho2=0.0, eta2=0.0),
+        target_metric="chi2",
+        success=True,
+        nfev=1,
+        nit=0,
+        message="",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        trial_q0=(1.0,),
+        trial_objective_values=(0.5,),
+    )
+    context = ExpandResumeContext(
+        prior_a_range=(-1.0, 1.0),
+        prior_b_range=(0.0, 5.0),
+        widened_axes=("b_max",),
+    )
+    seed = select_expand_frontier_seed(
+        {(0.0, 2.0): interior, (0.0, 5.0): wall},
+        context=context,
+        da=0.25,
+        db=0.25,
+    )
+    assert seed == (0.0, 5.0)
+
+
 def test_search_local_minimum_ab_resume_expands_cached_frontier_when_bounds_widen() -> None:
     """Resume from cached sparse points and expand further when wider bounds are requested."""
     observed = _localized_peak_observed()
@@ -766,6 +834,11 @@ def test_search_local_minimum_ab_resume_expands_cached_frontier_when_bounds_wide
     first_call_count = len(factory.calls)
     factory.calls.clear()
 
+    expand_context = ExpandResumeContext(
+        prior_a_range=(-1.0, 1.0),
+        prior_b_range=(-2.0, 1.0),
+        widened_axes=("a_max",),
+    )
     resumed = search_local_minimum_ab(
         factory,
         observed,
@@ -780,6 +853,7 @@ def test_search_local_minimum_ab_resume_expands_cached_frontier_when_bounds_wide
         q0_max=10.0,
         threshold_metric=1.01,
         cache=cache,
+        expand_resume_context=expand_context,
     )
 
     assert first.best_a == pytest.approx(1.0)

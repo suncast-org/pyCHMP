@@ -43,6 +43,8 @@ dev = [
 [project.scripts]
 pychmp = "pychmp.cli:main"
 pychmp-view = "pychmp.viewer:main"
+pychmp-rescore = "pychmp.rescore_search:main"
+pychmp-repair-grid-trial-maps = "pychmp.repair_grid_trial_maps:main"
 
 [project.urls]
 Homepage = "https://github.com/suncast-org/pyCHMP"

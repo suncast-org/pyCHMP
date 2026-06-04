@@ -6,6 +6,7 @@ from astropy.io import fits
 import pytest
 
 from pychmp import estimate_obs_map_noise, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity
+from pychmp.obs_maps import infer_effective_observation_time
 
 
 def test_load_obs_map_mw_external_fits_extracts_frequency(tmp_path) -> None:
@@ -257,3 +258,78 @@ def test_obs_map_noise_unit_label_uses_bunit_for_euv(tmp_path) -> None:
     obs_map = load_obs_map(obs_path=fits_path, domain="euv")
 
     assert obs_map_noise_unit_label(obs_map) == "DN/s"
+
+
+def test_infer_effective_observation_time_uses_date_obs_date_midpoint_for_one_hour() -> None:
+    header = fits.Header()
+    header["DATE-OBS"] = "2026-04-03T18:30:00"
+    header["DATE"] = "2026-04-03T19:30:00"
+
+    effective, diagnostics = infer_effective_observation_time(header)
+
+    assert effective == "2026-04-03T19:00:00.000"
+    assert diagnostics["observation_time_source"] == "date_obs_date_midpoint"
+    assert diagnostics["observation_time_integration_seconds"] == pytest.approx(3600.0)
+
+
+def test_infer_effective_observation_time_eovsa_uses_date_obs_as_integration_end() -> None:
+    header = fits.Header()
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE_OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE"] = "2026-04-03 19:32:00.000"
+
+    effective, diagnostics = infer_effective_observation_time(header)
+
+    assert effective == "2026-04-03T19:30:00.000"
+    assert diagnostics["observation_time_source"] == "eovsa_integration_midpoint"
+    assert diagnostics["observation_time_end_source"] == "DATE-OBS"
+    assert diagnostics["observation_time_end"] == "2026-04-03T20:00:00.000"
+
+
+def test_infer_effective_observation_time_eovsa_prefers_date_obs_over_stale_date_obs(tmp_path) -> None:
+    header = fits.Header()
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T14:38:29"
+    header["DATE_OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE"] = "2026-04-03 19:32:00"
+
+    effective, diagnostics = infer_effective_observation_time(header)
+
+    assert effective == "2026-04-03T19:30:00.000"
+    assert diagnostics["observation_time_end_source"] == "DATE_OBS"
+    assert diagnostics["observation_time_date_obs_ignored"] == "2026-04-03T14:38:29.000"
+
+
+def test_infer_effective_observation_time_eovsa_uses_filename_stamp_when_date_obs_stale(
+    tmp_path,
+) -> None:
+    header = fits.Header()
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T14:38:29"
+    header["DATE"] = "2026-04-03 19:32:00"
+    fits_path = tmp_path / "eovsa.synoptic_daily.calwidget.20260403T200000Z.s02-04.tb.disk.fits"
+
+    effective, diagnostics = infer_effective_observation_time(header, source_path=fits_path)
+
+    assert effective == "2026-04-03T19:30:00.000"
+    assert diagnostics["observation_time_end_source"] == "filename_synoptic_stamp"
+    assert diagnostics["observation_time_date_obs_ignored"] == "2026-04-03T14:38:29.000"
+
+
+def test_load_obs_map_mw_uses_effective_observation_time(tmp_path) -> None:
+    fits_path = tmp_path / "eovsa_20260403_200000_f2.874GHz.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CUNIT3"] = "Hz"
+    header["CRVAL3"] = 2.874e9
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE_OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE"] = "2026-04-03 19:32:00"
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="mw")
+
+    assert obs_map.date_obs == "2026-04-03T19:30:00.000"
+    assert obs_map.wcs_metadata["observation_time_end_source"] == "DATE-OBS"

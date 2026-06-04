@@ -9,6 +9,7 @@ selections for EUV/UV slices.
 from __future__ import annotations
 
 import argparse
+import math
 import queue
 import hashlib
 import json
@@ -19,15 +20,22 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 from astropy.io import fits
 from scipy.signal import fftconvolve
+
+# Persist per-trial map cubes (target EUV component stacks and auxiliary channel/frequency
+# entries in map_store). Not exposed on the CLI; set False here only for development.
+_STORE_TRIAL_MAP_CUBES = True
+
 
 def _format_console_scalar(value: float, *, fixed_precision: int = 6) -> str:
     numeric = float(value)
@@ -61,6 +69,7 @@ def _build_run_history_entry(
     action: str,
     target_metric: str,
     recompute_existing: bool,
+    new_search_identity: bool = False,
 ) -> dict[str, Any]:
     effective_python_argv = [str(sys.executable), *[str(item) for item in sys.argv]]
     wrapper_command = os.environ.get("PYCHMP_WRAPPER_COMMAND", "").strip()
@@ -81,6 +90,7 @@ def _build_run_history_entry(
         "log_path": str(log_path),
         "target_metric": str(target_metric),
         "recompute_existing": bool(recompute_existing),
+        "new_search_identity": bool(new_search_identity),
     }
 
 
@@ -202,15 +212,25 @@ from pychmp import (
     prepare_observation_for_metrics,
     resolve_geometry_policy,
     resolve_slice_observation_reference,
+    SliceObservationReference,
     SliceObservationReferenceError,
     resolve_euv_response_identity,
     resolve_render_geometry_via_gxrender,
     compute_forward_model_identity_placeholder,
     resolve_default_testdata_fixture_paths,
+    ExpandResumeContext,
     search_local_minimum_ab,
+    select_expand_frontier_seed,
+    widened_boundary_axes,
     validate_obs_map_identity,
 )
 from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
+from pychmp.render_obs_fits_dir import (
+    build_render_obs_target_context,
+    discover_render_channels_from_dir,
+    discover_render_frequencies_ghz_from_dir,
+    scan_render_obs_fits_directory,
+)
 from pychmp.spectral import (
     default_euv_channels_for_instrument,
     euv_slice_request,
@@ -219,7 +239,11 @@ from pychmp.spectral import (
     parse_csv_tokens,
     unique_preserve_order,
 )
-from pychmp.search_contract import compatibility_signature_from_diagnostics, search_id_from_evaluation_config
+from pychmp.search_contract import (
+    build_search_evaluation_config,
+    compatibility_signature_from_diagnostics,
+    search_id_from_evaluation_config,
+)
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     FORWARD_MODEL_IDENTITY_VERSION,
@@ -233,6 +257,7 @@ from pychmp.ab_scan_artifacts import (
     build_computed_point_payload,
     build_map_identity,
     finalize_search_runner_state,
+    reopen_search_runner_state,
     _derive_euv_raw_best_from_components,
     _derive_euv_trial_raw_from_components,
     detect_scan_artifact_format,
@@ -242,12 +267,24 @@ from pychmp.ab_scan_artifacts import (
     load_slice_observation_reference_payload,
     load_search_observation_reference_payload,
     point_record_matches_compatibility_signature,
+    apply_search_run_profile_to_namespace,
+    assert_expand_grid_search_cli_argv_allowed,
+    assert_recompute_search_cli_argv_allowed,
+    load_search_run_profile,
+    parse_expand_grid_bounds_from_argv,
+    validate_expanded_ab_bounds,
+    matching_search_id_for_slice,
+    resolve_search_location,
     read_slice_active_search_id,
+    register_sparse_search_in_artifact,
     validate_scan_artifact_compatibility,
     validate_scan_artifact_reuse_preflight,
     write_point_scan_artifact,
+    _H5PY_FILE,
+    is_h5_transient_read_error,
 )
 from pychmp.grid_points import (
+    GRID_POINTS_GROUP,
     GRID_POINTS_CONTRACT_VERSION,
     GridPointActiveQ0Event,
     GridPointAssignedEvent,
@@ -258,8 +295,15 @@ from pychmp.grid_points import (
     classify_grid_point_state,
     find_grid_point_group,
     list_grid_point_headers,
+    read_grid_point_header,
+    grid_point_storage_corrupt,
+    _load_grid_point_trials,
+    grid_point_finite_q0_trials_have_map_store_links,
     hydrate_render_maps_from_grid_point,
+    repair_invalid_grid_points_in_search,
+    reset_grid_point_for_rerun,
     resolve_trial_shift_commit_fields,
+    select_fit_trials_for_viewer,
 )
 from pychmp.refresh_signal import RefreshSignalWriter
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
@@ -521,6 +565,8 @@ class _TeeStream:
                 encoding = getattr(stream, "encoding", None) or "utf-8"
                 safe_text = str(data).encode(encoding, errors="replace").decode(encoding, errors="replace")
                 stream.write(safe_text)
+        if "\n" in data or "\r" in data:
+            self.flush()
         return len(data)
 
     def flush(self) -> None:
@@ -820,7 +866,6 @@ class _TrackedRendererProxy:
         target_metric: str,
         psf_source: str,
         compatibility_signature: str,
-        store_trial_map_cubes: bool,
     ) -> None:
         self._renderer = renderer
         self._stream = stream
@@ -831,10 +876,11 @@ class _TrackedRendererProxy:
         self._target_metric = str(target_metric)
         self._psf_source = str(psf_source)
         self._compatibility_signature = str(compatibility_signature)
-        self._store_trial_map_cubes = bool(store_trial_map_cubes)
         self._artifact_h5: Path | None = None
         self._slice_key: str | None = None
         self._search_id: str | None = None
+        self._slice_map_index: Any | None = None
+        self._psf_kernel: np.ndarray | None = None
         base = getattr(renderer, "_base", None)
         self._base = None
         if base is not None:
@@ -845,15 +891,49 @@ class _TrackedRendererProxy:
                 b_value=float(b_value),
             )
 
+    def _load_stored_render_pair(self, q0_value: float) -> tuple[np.ndarray, np.ndarray] | None:
+        stream_record = self._stream.snapshot_record(a_value=self._a_value, b_value=self._b_value)
+        if stream_record is not None:
+            raw_map = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, float(q0_value))
+            modeled_map = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, float(q0_value))
+            if raw_map is not None and modeled_map is not None:
+                return (
+                    np.asarray(raw_map, dtype=np.float32),
+                    np.asarray(modeled_map, dtype=np.float32),
+                )
+        slice_map_index = getattr(self, "_slice_map_index", None)
+        artifact_h5 = getattr(self, "_artifact_h5", None)
+        if slice_map_index is not None and artifact_h5 is not None:
+            from pychmp.slice_map_index import load_render_pair_from_index
+
+            return load_render_pair_from_index(
+                Path(artifact_h5),
+                index=slice_map_index,
+                a=float(self._a_value),
+                b=float(self._b_value),
+                q0=float(q0_value),
+                observed_template=self._observed_template,
+                psf_kernel=getattr(self, "_psf_kernel", None),
+            )
+        return None
+
     def render_pair(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
         q0_value = float(q0)
-        if hasattr(self._renderer, "render_pair"):
+        stored = self._load_stored_render_pair(q0_value)
+        from_map_store = stored is not None
+        if stored is not None:
+            raw_modeled, modeled = stored
+        elif hasattr(self._renderer, "render_pair"):
             raw_modeled, modeled = self._renderer.render_pair(q0_value)
         else:
             modeled = self._renderer.render(q0_value)
             raw_modeled = modeled
         stokes_v = getattr(self._renderer, "_last_stokes_v", None)
-        if stokes_v is None and hasattr(self._renderer, "render_stokes_raw"):
+        if (
+            not from_map_store
+            and stokes_v is None
+            and hasattr(self._renderer, "render_stokes_raw")
+        ):
             _stokes_i, stokes_v_raw = self._renderer.render_stokes_raw(q0_value)
             if stokes_v_raw is not None:
                 stokes_v = stokes_v_raw
@@ -874,6 +954,7 @@ class _TrackedRendererProxy:
         return modeled
 
     def build_artifact_payload(self, point: ABPointResult) -> dict[str, Any]:
+        self.prepare_stored_trial_maps()
         stream_record = self._stream.pop_record(a_value=self._a_value, b_value=self._b_value)
         if stream_record is None:
             stream_record = _PointRenderRecord()
@@ -894,8 +975,49 @@ class _TrackedRendererProxy:
             target_metric=self._target_metric,
             psf_source=self._psf_source,
             compatibility_signature=self._compatibility_signature,
-            store_trial_map_cubes=self._store_trial_map_cubes,
             stream_record=stream_record,
+            artifact_h5=getattr(self, "_artifact_h5", None),
+            slice_key=getattr(self, "_slice_key", None),
+            search_id=getattr(self, "_search_id", None),
+        )
+
+    def prepare_stored_trial_maps(self) -> int:
+        artifact_h5 = getattr(self, "_artifact_h5", None)
+        slice_key = getattr(self, "_slice_key", None)
+        search_id = getattr(self, "_search_id", None)
+        if artifact_h5 is None or not slice_key:
+            return 0
+        stream_record = self._stream.snapshot_record(a_value=self._a_value, b_value=self._b_value)
+        if stream_record is None:
+            stream_record = _PointRenderRecord()
+        slice_map_index = getattr(self, "_slice_map_index", None)
+        if slice_map_index is not None:
+            from pychmp.slice_map_index import hydrate_render_caches_from_index
+
+            hydrated = int(
+                hydrate_render_caches_from_index(
+                    Path(artifact_h5),
+                    index=slice_map_index,
+                    a=float(self._a_value),
+                    b=float(self._b_value),
+                    raw_modeled_by_q0=stream_record.raw_modeled_by_q0,
+                    modeled_by_q0=stream_record.modeled_by_q0,
+                    observed_template=self._observed_template,
+                    psf_kernel=getattr(self, "_psf_kernel", None),
+                )
+            )
+            if hydrated > 0:
+                return hydrated
+        return int(
+            hydrate_render_maps_from_grid_point(
+                Path(artifact_h5),
+                slice_key=str(slice_key),
+                search_id=search_id,
+                a=float(self._a_value),
+                b=float(self._b_value),
+                raw_modeled_by_q0=stream_record.raw_modeled_by_q0,
+                modeled_by_q0=stream_record.modeled_by_q0,
+            )
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -913,10 +1035,11 @@ class _StreamingRendererFactory:
         target_metric: str,
         psf_source: str,
         compatibility_signature: str,
-        store_trial_map_cubes: bool,
         artifact_h5: Path | None = None,
         slice_key: str | None = None,
         search_id: str | None = None,
+        slice_map_index: Any | None = None,
+        psf_kernel: np.ndarray | None = None,
     ) -> None:
         self._base_factory = base_factory
         self._stream = stream
@@ -924,10 +1047,11 @@ class _StreamingRendererFactory:
         self._target_metric = str(target_metric)
         self._psf_source = str(psf_source)
         self._compatibility_signature = str(compatibility_signature)
-        self._store_trial_map_cubes = bool(store_trial_map_cubes)
         self._artifact_h5 = None if artifact_h5 is None else Path(artifact_h5)
         self._slice_key = None if slice_key is None else str(slice_key).strip() or None
         self._search_id = None if search_id is None else str(search_id).strip() or None
+        self._slice_map_index = slice_map_index
+        self._psf_kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
 
     def __call__(self, a: float, b: float) -> Any:
         renderer = self._base_factory(float(a), float(b))
@@ -941,11 +1065,12 @@ class _StreamingRendererFactory:
             target_metric=self._target_metric,
             psf_source=self._psf_source,
             compatibility_signature=self._compatibility_signature,
-            store_trial_map_cubes=self._store_trial_map_cubes,
         )
         proxy._artifact_h5 = self._artifact_h5
         proxy._slice_key = self._slice_key
         proxy._search_id = self._search_id
+        proxy._slice_map_index = self._slice_map_index
+        proxy._psf_kernel = self._psf_kernel
         return proxy
 
     def __getattr__(self, name: str) -> Any:
@@ -960,10 +1085,11 @@ class _StreamingRendererFactory:
             "_target_metric": self._target_metric,
             "_psf_source": self._psf_source,
             "_compatibility_signature": self._compatibility_signature,
-            "_store_trial_map_cubes": self._store_trial_map_cubes,
             "_artifact_h5": self._artifact_h5,
             "_slice_key": self._slice_key,
             "_search_id": self._search_id,
+            "_slice_map_index": self._slice_map_index,
+            "_psf_kernel": self._psf_kernel,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -1109,7 +1235,7 @@ def _default_testdata_roots(repo_root: Path, *, testdata_repo: Path | None) -> t
 def _resolve_observation_request(args: argparse.Namespace, *, repo_root: Path) -> _ObservationRequest:
     positional_fits = _coerce_path(args.fits_file)
     explicit_obs_path = _coerce_path(args.obs_path)
-    model_h5 = _coerce_path(args.model_h5)
+    model_h5 = _coerce_path(getattr(args, "model_h5_override", None) or args.model_h5)
     ebtel_path = _coerce_path(args.ebtel_path)
     testdata_repo = _coerce_path(args.testdata_repo)
     obs_map_id = None if args.obs_map_id is None else str(args.obs_map_id).strip() or None
@@ -1154,6 +1280,22 @@ def _default_artifact_stem(obs_request: _ObservationRequest, *, target_metric: s
     return f"{source_token}_adaptive_ab_{target_metric}"
 
 
+def _print_render_obs_fits_scan_summary(scan) -> None:
+    if (
+        not scan.skipped_incompatible_domain
+        and not scan.skipped_incompatible_render_context
+        and not scan.skipped_unreadable
+    ):
+        return
+    print(
+        "  Render FITS directory filter: "
+        f"kept {len(scan.compatible)} compatible file(s) for domain {scan.target_domain!r}; "
+        f"skipped {len(scan.skipped_incompatible_domain)} other-domain, "
+        f"{len(scan.skipped_incompatible_render_context)} instrument/LOS mismatch, "
+        f"{len(scan.skipped_unreadable)} unreadable"
+    )
+
+
 def _resolve_render_slice_requests(
     *,
     domain: str,
@@ -1163,21 +1305,77 @@ def _resolve_render_slice_requests(
     all_channels: bool,
     render_channels_csv: str | None,
     render_frequencies_csv: str | None,
+    render_obs_fits_dir: Path | None = None,
+    exclude_obs_paths: tuple[Path, ...] = (),
+    render_target_context: Any | None = None,
 ) -> tuple[list[dict[str, Any]], tuple[float, ...], tuple[str, ...]]:
     resolved_domain = str(domain).strip().lower()
+    if render_obs_fits_dir is not None:
+        if render_channels_csv or render_frequencies_csv:
+            raise SystemExit(
+                "Use either --render-obs-fits-dir or explicit --render-channels / "
+                "--render-frequencies-ghz lists, not both"
+            )
+        if all_channels:
+            raise SystemExit("--all-channels cannot be combined with --render-obs-fits-dir")
     if resolved_domain == "mw":
         if all_channels:
             raise SystemExit("--all-channels is only defined for fixed-channel EUV/UV instruments")
         if frequency_ghz is None:
             raise SystemExit("MW rendering requires a target observation frequency")
-        extra_freqs = parse_csv_floats(render_frequencies_csv, option_name="--render-frequencies-ghz")
+        if render_obs_fits_dir is not None:
+            try:
+                render_scan = scan_render_obs_fits_directory(
+                    render_obs_fits_dir,
+                    target_domain=resolved_domain,
+                    exclude_paths=exclude_obs_paths,
+                    target_context=render_target_context,
+                )
+                _print_render_obs_fits_scan_summary(render_scan)
+                extra_freqs = discover_render_frequencies_ghz_from_dir(
+                    render_obs_fits_dir,
+                    target_domain=resolved_domain,
+                    exclude_paths=exclude_obs_paths,
+                    exclude_frequency_ghz=float(frequency_ghz),
+                    scan=render_scan,
+                    target_context=render_target_context,
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+        else:
+            extra_freqs = parse_csv_floats(render_frequencies_csv, option_name="--render-frequencies-ghz")
         requests = [mw_slice_request(float(frequency_ghz), is_target=True)]
         for freq in extra_freqs:
             if not np.isclose(float(freq), float(frequency_ghz), rtol=0.0, atol=1e-12):
                 requests.append(mw_slice_request(float(freq), is_target=False))
         return [item.as_descriptor() for item in requests], tuple(float(item.frequency_ghz) for item in requests), tuple()
 
-    requested_channels = list(parse_csv_tokens(render_channels_csv, option_name="--render-channels"))
+    if resolved_domain not in {"euv", "uv"} and render_obs_fits_dir is not None:
+        raise SystemExit(
+            f"--render-obs-fits-dir requires a resolved EUV/UV target observation; got domain={resolved_domain!r}"
+        )
+    if render_obs_fits_dir is not None:
+        try:
+            render_scan = scan_render_obs_fits_directory(
+                render_obs_fits_dir,
+                target_domain=resolved_domain,
+                exclude_paths=exclude_obs_paths,
+                target_context=render_target_context,
+            )
+            _print_render_obs_fits_scan_summary(render_scan)
+            dir_channels = discover_render_channels_from_dir(
+                render_obs_fits_dir,
+                target_domain=resolved_domain,
+                exclude_paths=exclude_obs_paths,
+                exclude_channel=euv_channel,
+                scan=render_scan,
+                target_context=render_target_context,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+        requested_channels = list(dir_channels)
+    else:
+        requested_channels = list(parse_csv_tokens(render_channels_csv, option_name="--render-channels"))
     if all_channels:
         requested_channels.extend(default_euv_channels_for_instrument(euv_instrument))
         if not requested_channels:
@@ -1251,6 +1449,80 @@ def _lookup_stream_value_by_q0(
     return None
 
 
+def _stream_q0_values_with_maps(stream_record: _PointRenderRecord) -> list[float]:
+    q0_values: list[float] = []
+    for key_text in stream_record.raw_modeled_by_q0:
+        if key_text not in stream_record.modeled_by_q0:
+            continue
+        try:
+            q0_values.append(float(key_text))
+        except Exception:
+            continue
+    return q0_values
+
+
+def _closest_stream_q0_with_maps(stream_record: _PointRenderRecord, target_q0: float) -> float | None:
+    candidates = _stream_q0_values_with_maps(stream_record)
+    if not candidates:
+        return None
+    target = float(target_q0)
+    return float(min(candidates, key=lambda value: abs(float(value) - target)))
+
+
+def _best_stream_q0_from_trials_with_maps(
+    stream_record: _PointRenderRecord,
+    *,
+    trial_q0_values: list[float],
+    trial_metric_values: list[float],
+) -> float | None:
+    if not trial_q0_values or len(trial_q0_values) != len(trial_metric_values):
+        return None
+    candidates: list[tuple[float, float]] = []
+    for q0_value, metric_value in zip(trial_q0_values, trial_metric_values, strict=False):
+        if not math.isfinite(float(metric_value)):
+            continue
+        if _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, float(q0_value)) is None:
+            continue
+        if _lookup_stream_value_by_q0(stream_record.modeled_by_q0, float(q0_value)) is None:
+            continue
+        candidates.append((float(q0_value), float(metric_value)))
+    if not candidates:
+        return None
+    return float(min(candidates, key=lambda item: item[1])[0])
+
+
+def _resolve_best_rendered_maps(
+    stream_record: _PointRenderRecord,
+    *,
+    point_q0: float,
+    trial_q0_values: list[float],
+    trial_metric_values: list[float],
+) -> tuple[float, Any, Any] | None:
+    raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, point_q0)
+    modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, point_q0)
+    if raw_modeled_best is not None and modeled_best is not None:
+        return float(point_q0), raw_modeled_best, modeled_best
+
+    closest_q0 = _closest_stream_q0_with_maps(stream_record, point_q0)
+    if closest_q0 is not None:
+        raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, closest_q0)
+        modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, closest_q0)
+        if raw_modeled_best is not None and modeled_best is not None:
+            return float(closest_q0), raw_modeled_best, modeled_best
+
+    trial_q0 = _best_stream_q0_from_trials_with_maps(
+        stream_record,
+        trial_q0_values=trial_q0_values,
+        trial_metric_values=trial_metric_values,
+    )
+    if trial_q0 is not None:
+        raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, trial_q0)
+        modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, trial_q0)
+        if raw_modeled_best is not None and modeled_best is not None:
+            return float(trial_q0), raw_modeled_best, modeled_best
+    return None
+
+
 def _convolve_with_psf_kernel(raw_map: np.ndarray, psf_kernel: np.ndarray | None) -> np.ndarray:
     raw = np.asarray(raw_map, dtype=float)
     kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
@@ -1287,28 +1559,54 @@ def _point_payload_from_result(
     target_metric: str,
     psf_source: str,
     compatibility_signature: str,
-    store_trial_map_cubes: bool = False,
     stream_record: _PointRenderRecord,
+    artifact_h5: Path | None = None,
+    slice_key: str | None = None,
+    search_id: str | None = None,
 ) -> dict[str, Any]:
     point_a = float(point.a)
     point_b = float(point.b)
     point_q0 = float(point.q0)
     trial_q0_values = [float(v) for v in point.trial_q0]
-    raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, point_q0)
-    modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, point_q0)
-    if raw_modeled_best is None or modeled_best is None:
-        metric_trials = [float(v) for v in point.trial_objective_values]
-        if len(metric_trials) == len(trial_q0_values) and metric_trials:
-            finite = [(idx, value) for idx, value in enumerate(metric_trials) if np.isfinite(value)]
-            if finite:
-                best_index = min(finite, key=lambda item: item[1])[0]
-                fallback_q0 = float(trial_q0_values[best_index])
-                raw_modeled_best = _lookup_stream_value_by_q0(stream_record.raw_modeled_by_q0, fallback_q0)
-                modeled_best = _lookup_stream_value_by_q0(stream_record.modeled_by_q0, fallback_q0)
-                if raw_modeled_best is not None and modeled_best is not None:
-                    point_q0 = float(fallback_q0)
-    if raw_modeled_best is None or modeled_best is None:
+    metric_trials = [float(v) for v in point.trial_objective_values]
+    resolved_maps = _resolve_best_rendered_maps(
+        stream_record,
+        point_q0=point_q0,
+        trial_q0_values=trial_q0_values,
+        trial_metric_values=metric_trials,
+    )
+    if resolved_maps is None and artifact_h5 is not None:
+        from pychmp.grid_points import load_grid_point_trial_plot_payload
+
+        plot_payload = load_grid_point_trial_plot_payload(
+            Path(artifact_h5),
+            a=point_a,
+            b=point_b,
+            slice_key=slice_key,
+            search_id=search_id,
+        )
+        if plot_payload is not None:
+            fit_q0_trials = np.asarray(plot_payload.get("fit_q0_trials", ()), dtype=float)
+            if fit_q0_trials.size:
+                chosen_index = int(np.argmin(np.abs(fit_q0_trials - point_q0)))
+                point_q0 = float(fit_q0_trials[chosen_index])
+            stream_record.raw_modeled_by_q0[_PointRenderStream._q0_key(point_q0)] = np.asarray(
+                plot_payload["raw_modeled_best"],
+                dtype=np.float32,
+            )
+            stream_record.modeled_by_q0[_PointRenderStream._q0_key(point_q0)] = np.asarray(
+                plot_payload["modeled_best"],
+                dtype=np.float32,
+            )
+            resolved_maps = _resolve_best_rendered_maps(
+                stream_record,
+                point_q0=point_q0,
+                trial_q0_values=trial_q0_values,
+                trial_metric_values=metric_trials,
+            )
+    if resolved_maps is None:
         raise RuntimeError("point payload stream record is missing the best rendered maps")
+    point_q0, raw_modeled_best, modeled_best = resolved_maps
     modeled_best = np.asarray(modeled_best, dtype=float)
     raw_modeled_best = np.asarray(raw_modeled_best, dtype=float)
     residual = np.asarray(modeled_best - np.asarray(observed_template, dtype=float), dtype=float)
@@ -1444,13 +1742,7 @@ def _point_payload_from_result(
         for trial_index, q0_value in enumerate(trial_q0_values):
             raw_trial = _lookup_stream_value_by_q0(trial_raw_by_q0, q0_value)
             if raw_trial is None:
-                raw_trials = []
-                modeled_trials = []
-                residual_trials = []
-                euv_coronal_trials = []
-                euv_tr_trials = []
-                stokes_v_trials = []
-                break
+                continue
             raw_trial_arr = np.asarray(raw_trial, dtype=np.float32)
             raw_trials.append(raw_trial_arr)
             modeled_trial = _lookup_stream_value_by_q0(trial_modeled_by_q0, q0_value)
@@ -1461,7 +1753,7 @@ def _point_payload_from_result(
             if stokes_v_trial is not None:
                 stokes_v_trials.append(np.asarray(stokes_v_trial, dtype=np.float32))
 
-            if bool(store_trial_map_cubes):
+            if _STORE_TRIAL_MAP_CUBES:
                 trial_components = _lookup_stream_value_by_q0(stream_record.components_by_q0, q0_value)
                 if isinstance(trial_components, dict):
                     components = trial_components
@@ -1571,7 +1863,7 @@ def _point_payload_from_result(
         "psf_source": str(psf_source),
         "synthetic_map_db_version": 1,
         "synthetic_map_keys": synthetic_map_keys,
-        "store_trial_map_cubes": bool(store_trial_map_cubes),
+        "store_trial_map_cubes": bool(_STORE_TRIAL_MAP_CUBES),
         COMPATIBILITY_SIGNATURE_KEY: str(compatibility_signature),
         "point_status": "computed",
     }
@@ -1852,6 +2144,65 @@ class _ArtifactWriteDispatcher:
                 self._queue.task_done()
 
 
+def _ab_point_from_completed_grid_point(
+    header: dict[str, Any],
+    trials: list[dict[str, Any]],
+    *,
+    target_metric: str,
+) -> ABPointResult | None:
+    """Build an in-memory ABPointResult from stored grid trials (expand/resume skip renders)."""
+    fit_trials = select_fit_trials_for_viewer(trials)
+    if not fit_trials:
+        return None
+    metric_name = str(target_metric)
+    chi2_trials = tuple(float(item.get("chi2", np.nan)) for item in fit_trials)
+    rho2_trials = tuple(float(item.get("rho2", np.nan)) for item in fit_trials)
+    eta2_trials = tuple(float(item.get("eta2", np.nan)) for item in fit_trials)
+    if metric_name == "chi2":
+        metric_trials = chi2_trials
+    elif metric_name == "rho2":
+        metric_trials = rho2_trials
+    else:
+        metric_trials = eta2_trials
+    best_trial_index = int(header.get("best_trial_index", -1))
+    best_entry = next(
+        (item for item in fit_trials if int(item.get("trial_index", -1)) == best_trial_index),
+        fit_trials[-1],
+    )
+    objective_value = float(best_entry.get("target_metric_value", np.nan))
+    if not np.isfinite(objective_value):
+        objective_value = float(
+            best_entry.get(metric_name, best_entry.get("eta2", best_entry.get("chi2", np.nan)))
+        )
+    if not np.isfinite(objective_value):
+        return None
+    q0_values = tuple(float(item["q0"]) for item in fit_trials)
+    return ABPointResult(
+        a=float(header["a"]),
+        b=float(header["b"]),
+        q0=float(best_entry["q0"]),
+        objective_value=objective_value,
+        metrics=MetricValues(
+            chi2=float(best_entry.get("chi2", np.nan)),
+            rho2=float(best_entry.get("rho2", np.nan)),
+            eta2=float(best_entry.get("eta2", np.nan)),
+        ),
+        target_metric=metric_name,
+        success=True,
+        nfev=int(len(fit_trials)),
+        nit=max(0, int(len(fit_trials)) - 1),
+        message="restored from grid point trials",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        trial_q0=q0_values,
+        trial_objective_values=metric_trials,
+        trial_chi2_values=chi2_trials,
+        trial_rho2_values=rho2_trials,
+        trial_eta2_values=eta2_trials,
+    )
+
+
 def _point_from_record(record: dict[str, Any], *, target_metric: str) -> ABPointResult:
     diagnostics = dict(record.get("diagnostics", {}))
     return ABPointResult(
@@ -1890,6 +2241,73 @@ def _target_metric_value(metrics: Any, target_metric: str) -> float:
     if metric_name == "eta2":
         return float(metrics.eta2)
     raise ValueError(f"unsupported target metric: {target_metric!r}")
+
+
+def _rescore_record_to_warm_initial_evaluations(
+    record: dict[str, Any],
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+    psf_kernel: np.ndarray | None = None,
+    evaluation_context: ObservationEvaluationContext | None = None,
+) -> dict[float, Q0MetricEvaluation] | None:
+    """Rescore stored trial maps for warm-start q0 search (IDL policy); no point commit."""
+    from pychmp.chmp_evaluation import ObservationEvaluationContext, evaluate_modeled_trial
+
+    trial_q0 = tuple(float(value) for value in record.get("fit_q0_trials", ()))
+    trial_maps_raw = record.get("trial_raw_modeled_maps")
+    if trial_maps_raw is None:
+        trial_maps_raw = _derive_euv_trial_raw_from_components(record)
+    if trial_maps_raw is None:
+        trial_maps_raw = record.get("trial_modeled_maps")
+    if not trial_q0 or trial_maps_raw is None:
+        return None
+    trial_maps = np.asarray(trial_maps_raw, dtype=float)
+    if trial_maps.ndim != 3 or int(trial_maps.shape[0]) != len(trial_q0):
+        return None
+
+    if evaluation_context is None:
+        from astropy.io import fits
+
+        observed_arr = np.asarray(observed, dtype=float)
+        header = fits.Header()
+        header["NAXIS"] = 2
+        header["NAXIS1"] = int(observed_arr.shape[1])
+        header["NAXIS2"] = int(observed_arr.shape[0])
+        header["CDELT1"] = 1.0
+        header["CDELT2"] = 1.0
+        header["CRPIX1"] = (float(observed_arr.shape[1]) + 1.0) / 2.0
+        header["CRPIX2"] = (float(observed_arr.shape[0]) + 1.0) / 2.0
+        evaluation_context = ObservationEvaluationContext(
+            model_header=header,
+            shift_policy="fixed",
+            observed=observed_arr,
+            sigma=np.asarray(sigma_map, dtype=float),
+            use_smoothed_obs_max=True,
+        )
+
+    evaluations: dict[float, Q0MetricEvaluation] = {}
+    for q0_value, modeled in zip(trial_q0, trial_maps, strict=False):
+        raw_arr = np.asarray(modeled, dtype=float)
+        modeled_arr = _convolve_with_psf_kernel(raw_arr, psf_kernel)
+        evaluation = evaluate_modeled_trial(
+            modeled_arr,
+            evaluation_context,
+            threshold=float(threshold),
+            mask_type="union",
+            explicit_mask=explicit_mask,
+            use_emthreshold=True,
+        )
+        if not evaluation.is_valid:
+            continue
+        objective = _target_metric_value(evaluation.metrics, target_metric)
+        if not np.isfinite(objective):
+            continue
+        evaluations[float(q0_value)] = evaluation
+    return evaluations or None
 
 
 def _rescore_auxiliary_map_record(
@@ -2104,7 +2522,247 @@ def _rescore_auxiliary_map_record(
     return point, payload
 
 
-def _collect_start_over_seed_point_payloads(
+def _grid_reset_requested(args: argparse.Namespace) -> bool:
+    """True when the active search grid is cleared and points are refit."""
+    if _pinned_search_id(args):
+        return False
+    return bool(getattr(args, "recompute_existing", False)) or bool(getattr(args, "new_search_identity", False))
+
+
+def _normalized_expand_grid_search_id(args: argparse.Namespace) -> str:
+    return str(getattr(args, "expand_grid_search_id", "") or "").strip()
+
+
+def _pinned_search_id(args: argparse.Namespace) -> str:
+    return _normalized_recompute_search_id(args) or _normalized_expand_grid_search_id(args)
+
+
+def _preserve_stored_search_trials_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "preserve_stored_search_trials", False))
+
+
+def _targeted_recompute_repair_requested(args: argparse.Namespace) -> bool:
+    return bool(_normalized_recompute_search_id(args))
+
+
+def _normalized_recompute_search_id(args: argparse.Namespace) -> str:
+    return str(getattr(args, "recompute_search_id", "") or "").strip()
+
+
+def _configure_targeted_recompute_search(args: argparse.Namespace) -> str | None:
+    """Repair an existing search: restore stored recipe, resume incomplete points only."""
+    import sys
+
+    recompute_search_id = _normalized_recompute_search_id(args)
+    if not recompute_search_id:
+        return None
+    if bool(getattr(args, "new_search_identity", False)):
+        raise SystemExit("--recompute-search-id cannot be combined with --new-search-identity")
+    if bool(getattr(args, "recompute_existing", False)):
+        raise SystemExit("--recompute-search-id cannot be combined with --recompute-existing")
+    artifact_h5 = _coerce_path(getattr(args, "artifact_h5", None))
+    if artifact_h5 is None:
+        raise SystemExit("--artifact-h5 is required with --recompute-search-id")
+    from pychmp.ab_scan_artifacts import build_recompute_search_guard_argv
+
+    assert_recompute_search_cli_argv_allowed(
+        build_recompute_search_guard_argv(
+            artifact_h5=artifact_h5,
+            recompute_search_id=recompute_search_id,
+            no_viewer=bool(getattr(args, "no_viewer", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    )
+    if not artifact_h5.exists():
+        raise SystemExit(f"Artifact H5 file not found: {artifact_h5}")
+    try:
+        profile = load_search_run_profile(artifact_h5, search_id=recompute_search_id)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    apply_search_run_profile_to_namespace(args, profile)
+    args.preserve_stored_search_trials = True
+    args.targeted_recompute_repair = True
+    print(
+        "Targeted repair: restored scoring recipe from "
+        f"search {recompute_search_id} on slice {profile.get('slice_key')!r}; "
+        "valid trials are preserved (no rescore), incomplete points will be completed"
+    )
+    return recompute_search_id
+
+
+def _stored_ab_ranges_from_profile(profile: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]]:
+    diagnostics = dict(profile.get("diagnostics") or {})
+    a_range = diagnostics.get("a_range")
+    b_range = diagnostics.get("b_range")
+    if not isinstance(a_range, (list, tuple)) or len(a_range) != 2:
+        raise SystemExit("Stored search profile is missing a valid a_range")
+    if not isinstance(b_range, (list, tuple)) or len(b_range) != 2:
+        raise SystemExit("Stored search profile is missing a valid b_range")
+    return (float(a_range[0]), float(a_range[1])), (float(b_range[0]), float(b_range[1]))
+
+
+def _configure_expand_grid_search(args: argparse.Namespace) -> str | None:
+    """Expand an existing search footprint with widened a/b bounds; preserve valid trials."""
+    import sys
+
+    expand_search_id = _normalized_expand_grid_search_id(args)
+    if not expand_search_id:
+        return None
+    if _normalized_recompute_search_id(args):
+        raise SystemExit("--expand-grid-search-id cannot be combined with --recompute-search-id")
+    if bool(getattr(args, "new_search_identity", False)):
+        raise SystemExit("--expand-grid-search-id cannot be combined with --new-search-identity")
+    if bool(getattr(args, "recompute_existing", False)):
+        raise SystemExit("--expand-grid-search-id cannot be combined with --recompute-existing")
+    bounds_overrides = parse_expand_grid_bounds_from_argv(list(sys.argv))
+    if not bounds_overrides:
+        raise SystemExit(
+            "--expand-grid-search-id requires at least one widened bound: "
+            "--a-min, --a-max, --b-min, and/or --b-max"
+        )
+    artifact_h5 = _coerce_path(getattr(args, "artifact_h5", None))
+    if artifact_h5 is None:
+        raise SystemExit("--artifact-h5 is required with --expand-grid-search-id")
+    from pychmp.ab_scan_artifacts import build_expand_grid_search_guard_argv
+
+    assert_expand_grid_search_cli_argv_allowed(
+        build_expand_grid_search_guard_argv(
+            artifact_h5=artifact_h5,
+            expand_search_id=expand_search_id,
+            bounds_overrides=bounds_overrides,
+            no_viewer=bool(getattr(args, "no_viewer", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    )
+    if not artifact_h5.exists():
+        raise SystemExit(f"Artifact H5 file not found: {artifact_h5}")
+    try:
+        profile = load_search_run_profile(artifact_h5, search_id=expand_search_id)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    stored_a_range, stored_b_range = _stored_ab_ranges_from_profile(profile)
+    apply_search_run_profile_to_namespace(args, profile)
+    for field_name, value in bounds_overrides.items():
+        setattr(args, field_name, float(value))
+    validate_expanded_ab_bounds(
+        stored_a_range=stored_a_range,
+        stored_b_range=stored_b_range,
+        new_a_range=(float(args.a_min), float(args.a_max)),
+        new_b_range=(float(args.b_min), float(args.b_max)),
+    )
+    args.preserve_stored_search_trials = True
+    args.expand_prior_a_range = stored_a_range
+    args.expand_prior_b_range = stored_b_range
+    print(
+        "Expand grid search: restored scoring recipe from "
+        f"search {expand_search_id} on slice {profile.get('slice_key')!r}; "
+        f"new footprint a=({float(args.a_min):g}, {float(args.a_max):g}) "
+        f"b=({float(args.b_min):g}, {float(args.b_max):g}); "
+        "completed grid points restored into cache (no re-render); "
+        "adaptive walk resumes from the prior wall toward widened bounds"
+    )
+    return expand_search_id
+
+
+def _diag_optional_float(diagnostics: dict[str, Any], key: str, default: float) -> float:
+    value = diagnostics.get(key, default)
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _diag_xy_shift_arcsec(diagnostics: dict[str, Any]) -> tuple[float, float]:
+    xy = diagnostics.get("xy_shift_arcsec")
+    if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+        x_value = 0.0 if xy[0] is None else float(xy[0])
+        y_value = 0.0 if xy[1] is None else float(xy[1])
+        return x_value, y_value
+    return (
+        _diag_optional_float(diagnostics, "shift_x_arcsec", 0.0),
+        _diag_optional_float(diagnostics, "shift_y_arcsec", 0.0),
+    )
+
+
+def _restore_stored_slice_identity_from_artifact(
+    *,
+    resume_slice_payload: dict[str, Any] | None,
+    resume_slice_diagnostics: dict[str, Any],
+    target_header: fits.Header,
+    geometry: Any,
+) -> tuple[fits.Header, Any, dict[str, Any], str]:
+    """Reuse slice WCS/FOV identity from artifact for expand/recompute continuation."""
+    stored_header = None if resume_slice_payload is None else resume_slice_payload.get("wcs_header")
+    if isinstance(stored_header, fits.Header):
+        target_header = stored_header.copy()
+    for field_name, diag_key in (
+        ("xc", "map_xc_arcsec"),
+        ("yc", "map_yc_arcsec"),
+        ("dx", "map_dx_arcsec"),
+        ("dy", "map_dy_arcsec"),
+        ("nx", "map_nx"),
+        ("ny", "map_ny"),
+    ):
+        if diag_key not in resume_slice_diagnostics:
+            continue
+        value = resume_slice_diagnostics[diag_key]
+        if field_name in {"nx", "ny"}:
+            value = int(value)
+        else:
+            value = float(value)
+        try:
+            setattr(geometry, field_name, value)
+        except AttributeError:
+            pass
+    artifact_geometry_block = build_artifact_geometry_block(resume_slice_diagnostics)
+    stored_sha = str(resume_slice_diagnostics.get("artifact_geometry_sha256") or "").strip()
+    artifact_geometry_sha256_value = stored_sha or artifact_geometry_sha256(artifact_geometry_block)
+    return target_header, geometry, artifact_geometry_block, artifact_geometry_sha256_value
+
+
+def _preload_search_cache_from_artifact(
+    cache: _PersistentPointCache,
+    *,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    artifact_preexisting: bool,
+    hydrate_completed_points: bool,
+) -> tuple[int, int, int, int]:
+    """Hydrate completed points (resume) and register map_store warm q0 curves."""
+    if not artifact_preexisting:
+        return 0, 0, 0, 0
+    hydrated = 0
+    if hydrate_completed_points:
+        print("Resume preload: loading compatible points from existing artifact...", flush=True)
+        hydrated = cache.hydrate_from_existing()
+    else:
+        print(
+            "Map-store warm preload: slice index ready "
+            "(per-point rescore at grid point start; no full-artifact rescore)"
+        )
+    promoted_index = 0
+    promoted_same_slice = 0
+    promoted_auxiliary = 0
+    if hydrate_completed_points is False and getattr(cache, "_slice_map_index", None) is not None:
+        promoted_index = cache.count_indexed_warm_points_from_index()
+    else:
+        promoted_same_slice = cache.promote_current_slice_trial_maps(
+            threshold=float(threshold),
+            explicit_mask=explicit_mask,
+            include_matching_signature=False,
+        )
+        promoted_auxiliary = cache.promote_auxiliary_maps_from_store(
+            threshold=float(threshold),
+            explicit_mask=explicit_mask,
+        )
+    if hydrate_completed_points and (promoted_same_slice or promoted_auxiliary):
+        cache.flush_pending_writes()
+    return hydrated, promoted_same_slice, promoted_auxiliary, promoted_index
+
+
+def _collect_parallel_search_seed_point_payloads(
     *,
     artifact_h5: Path,
     slice_key: str | None,
@@ -2176,11 +2834,12 @@ def _maybe_validate_artifact_preflight(
     artifact_h5: Path,
     artifact_preexisting: bool,
     recompute_existing: bool,
+    matching_search_id: str | None,
     target_slice_key: str,
     target_header: fits.Header,
     diagnostics: dict[str, Any],
 ) -> None:
-    if not artifact_preexisting or bool(recompute_existing):
+    if not artifact_preexisting or bool(recompute_existing) or not str(matching_search_id or "").strip():
         return
     try:
         current_payload = _load_slice_preflight_payload(
@@ -2259,21 +2918,27 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         psf_source: str,
         psf_kernel: np.ndarray | None,
         compatibility_signature: str,
-        store_trial_map_cubes: bool = False,
         viewer_heartbeat: _ViewerRefreshHeartbeat | None = None,
+        observation_reference: SliceObservationReference | None = None,
+        explicit_metric_mask: np.ndarray | None = None,
     ) -> None:
         self._artifact_h5 = Path(artifact_h5)
         self._observed = np.asarray(observed, dtype=float)
         self._sigma_map = np.asarray(sigma_map, dtype=float)
         self._target_header = target_header
         self._diagnostics = dict(diagnostics)
+        self._observation_reference = observation_reference
+        self._explicit_metric_mask = (
+            None
+            if explicit_metric_mask is None
+            else np.asarray(explicit_metric_mask, dtype=bool)
+        )
         self._blos_reference = blos_reference
         self._renderer_factory = renderer_factory
         self._target_metric = str(target_metric)
         self._psf_source = str(psf_source)
         self._psf_kernel = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
         self._compatibility_signature = str(compatibility_signature)
-        self._store_trial_map_cubes = bool(store_trial_map_cubes)
         self._viewer_heartbeat = viewer_heartbeat
         self._render_stream = _PointRenderStream()
         self._writer = _ArtifactWriteDispatcher(
@@ -2293,6 +2958,239 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         self._retry_failed = False
         self._resume_incomplete_from = "next_q0"
         self._recompute_existing = False
+        self._preserve_stored_search_trials = False
+        self._warm_initial: dict[tuple[float, float], dict[float, Any]] = {}
+        self._slice_map_index: Any | None = None
+
+    def set_preserve_stored_search_trials(self, enabled: bool) -> None:
+        self._preserve_stored_search_trials = bool(enabled)
+
+    def set_slice_map_index(self, index: Any | None) -> None:
+        self._slice_map_index = index
+
+    def count_indexed_warm_points_from_index(self) -> int:
+        """Count (a,b) with map_store entries in the slice index (no rescore; cheap preload stat)."""
+        if self._slice_map_index is None:
+            return 0
+        return int(self._slice_map_index.point_count())
+
+    def register_warm_initial_evaluations(
+        self,
+        a_value: float,
+        b_value: float,
+        evaluations: dict[float, Any],
+    ) -> None:
+        if not evaluations:
+            return
+        self._warm_initial[(float(a_value), float(b_value))] = {
+            float(q0): evaluation for q0, evaluation in evaluations.items()
+        }
+
+    def _grid_point_map_links_status(
+        self,
+        *,
+        slice_key: str,
+        search_id: str,
+        point_id: str,
+    ) -> bool | None:
+        """True/False when the link check completes; None on transient HDF5 read (do not reset the point)."""
+        try:
+            return grid_point_finite_q0_trials_have_map_store_links(
+                self._artifact_h5,
+                slice_key=str(slice_key),
+                search_id=str(search_id),
+                point_id=str(point_id),
+            )
+        except (OSError, RuntimeError) as exc:
+            if is_h5_transient_read_error(exc):
+                return None
+            raise
+
+    def _load_grid_trials_for_point(self, point_id: str) -> list[dict[str, Any]]:
+        from pychmp.grid_points import GRID_POINTS_GROUP, GRID_POINTS_TRIALS_GROUP, SEARCHES_GROUP, _load_grid_point_trials
+
+        slice_key = self._target_slice_key()
+        search_id = self._resolve_search_id_from_artifact()
+        if not slice_key or not search_id or not self._artifact_h5.exists():
+            return []
+        with _H5PY_FILE(str(self._artifact_h5), "r") as f:
+            if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
+                return []
+            slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+            if SEARCHES_GROUP not in slice_group or search_id not in slice_group[SEARCHES_GROUP]:
+                return []
+            search_group = slice_group[SEARCHES_GROUP][search_id]
+            if GRID_POINTS_GROUP not in search_group or point_id not in search_group[GRID_POINTS_GROUP]:
+                return []
+            return _load_grid_point_trials(search_group[GRID_POINTS_GROUP][point_id], include_maps=False)
+
+    def _ensure_grid_point_map_contract(self, a_value: float, b_value: float) -> None:
+        """Reject restored trial metadata without map_store links; reset point for a clean run."""
+        slice_key = self._target_slice_key()
+        search_id = self._resolve_search_id_from_artifact()
+        if not slice_key or not search_id or not self._artifact_h5.exists():
+            return
+        point_id = self.point_id_for(float(a_value), float(b_value))
+        if point_id is None:
+            point_id = self._sync_point_id_from_artifact(float(a_value), float(b_value))
+        if point_id is None:
+            return
+        links_ok = self._grid_point_map_links_status(
+            slice_key=str(slice_key),
+            search_id=str(search_id),
+            point_id=str(point_id),
+        )
+        if links_ok is None:
+            print(
+                f"    Warning: transient HDF5 read while checking map links for {point_id}; "
+                "skipping contract reset (warm start will use map_store / rescored trials)."
+            )
+            return
+        if links_ok:
+            return
+        resume_q0 = self.pending_resume_q0_start(float(a_value), float(b_value))
+        if resume_q0 is None or not np.isfinite(float(resume_q0)):
+            resume_q0 = float(self._diagnostics.get("q0_start", np.sqrt(float(self._diagnostics.get("q0_min", 1e-5)) * float(self._diagnostics.get("q0_max", 1e-3)))))
+        reset_grid_point_for_rerun(
+            self._artifact_h5,
+            slice_key=str(slice_key),
+            search_id=str(search_id),
+            point_id=str(point_id),
+            q0_start=float(resume_q0),
+            next_q0=float(resume_q0),
+            metric_name=str(self._target_metric),
+        )
+        point_key = (float(a_value), float(b_value))
+        self._trials_committed[point_key] = 0
+        print(
+            f"    Reset grid point {point_id} at a={float(a_value):.3f} b={float(b_value):.3f}: "
+            "restored trial metadata lacked map_store links; point will be recomputed."
+        )
+
+    def commit_map_store_warm_trials_for_point(self, a_value: float, b_value: float) -> int:
+        """Persist grid trials from map_store (rescore) or skip when valid trials already exist."""
+        self._ensure_grid_point_map_contract(float(a_value), float(b_value))
+        point_id = self.point_id_for(float(a_value), float(b_value))
+        if point_id is not None:
+            existing_trials = select_fit_trials_for_viewer(
+                self._load_grid_trials_for_point(str(point_id))
+            )
+            slice_key = self._target_slice_key() or ""
+            search_id = self._resolve_search_id_from_artifact() or ""
+            links_ok = (
+                self._grid_point_map_links_status(
+                    slice_key=str(slice_key),
+                    search_id=str(search_id),
+                    point_id=str(point_id),
+                )
+                if slice_key and search_id
+                else False
+            )
+            if existing_trials and (links_ok is True or links_ok is None):
+                point_key = (float(a_value), float(b_value))
+                self._trials_committed[point_key] = len(existing_trials)
+                return len(existing_trials)
+        if self._slice_map_index is None or not self._slice_map_index.has_point(float(a_value), float(b_value)):
+            return 0
+        point_id = self.point_id_for(float(a_value), float(b_value))
+        if point_id is None:
+            q0_seed = float(self._diagnostics.get("q0_start", 5e-4))
+            self.assign_grid_points([(float(a_value), float(b_value), q0_seed)])
+            point_id = self.point_id_for(float(a_value), float(b_value))
+            if point_id is not None and self._viewer_heartbeat is not None:
+                self._viewer_heartbeat.emit_event(
+                    "point_assigned",
+                    point_id=str(point_id),
+                    legacy_phase=f"point assigned {float(a_value):.3f},{float(b_value):.3f}",
+                )
+        if point_id is None:
+            return 0
+        from pychmp.warm_q0 import build_warm_grid_trial_commit_events
+
+        events = build_warm_grid_trial_commit_events(
+            self._artifact_h5,
+            point_id=str(point_id),
+            slice_map_index=self._slice_map_index,
+            a_value=float(a_value),
+            b_value=float(b_value),
+            context=self._warm_evaluation_context(),
+            threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
+            explicit_mask=self._explicit_metric_mask,
+            target_metric=self._target_metric,
+            use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+        )
+        if not events:
+            return 0
+        for event in events:
+            self._writer.write_grid_event(event)
+        point_key = (float(a_value), float(b_value))
+        self._trials_committed[point_key] = len(events)
+        self._writer.drain()
+        if self._viewer_heartbeat is not None:
+            self._viewer_heartbeat.emit_event(
+                "trial_committed",
+                point_id=str(point_id),
+                trial_index=max(0, len(events) - 1),
+                legacy_phase=f"grid trials: {len(events)} from map_store",
+            )
+            self._viewer_heartbeat.notify_refresh()
+        return len(events)
+
+    def peek_initial_evaluations_for(self, a_value: float, b_value: float) -> dict[float, Any] | None:
+        """Return registered warm Q0 evaluations without consuming them."""
+        return self._warm_initial.get((float(a_value), float(b_value)))
+
+    def initial_evaluations_for(self, a_value: float, b_value: float) -> dict[float, Any] | None:
+        """Optimizer warm start from artifact grid trials (written at point start)."""
+        self._ensure_grid_point_map_contract(float(a_value), float(b_value))
+        key = (float(a_value), float(b_value))
+        pending = self._warm_initial.pop(key, None)
+        if pending is not None:
+            return pending
+        point_id = self.point_id_for(float(a_value), float(b_value))
+        slice_key = self._target_slice_key()
+        if point_id is not None and slice_key:
+            from pychmp.warm_q0 import initial_evaluations_from_grid_trials
+
+            trials = self._load_grid_trials_for_point(str(point_id))
+            if (
+                not trials
+                and self._slice_map_index is not None
+                and self._slice_map_index.has_point(float(a_value), float(b_value))
+            ):
+                self.commit_map_store_warm_trials_for_point(float(a_value), float(b_value))
+                trials = self._load_grid_trials_for_point(str(point_id))
+            evaluations = initial_evaluations_from_grid_trials(
+                self._artifact_h5,
+                trials,
+                slice_key=str(slice_key),
+                target_metric=self._target_metric,
+                context=self._warm_evaluation_context(),
+                threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
+                explicit_mask=self._explicit_metric_mask,
+                use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+                rescore=not bool(self._preserve_stored_search_trials),
+            )
+            if evaluations:
+                return evaluations
+        slice_key = self._target_slice_key()
+        if not slice_key or not self._artifact_h5.exists():
+            return None
+        from pychmp.warm_q0 import load_warm_q0_evaluations_for_grid_point
+
+        return load_warm_q0_evaluations_for_grid_point(
+            self._artifact_h5,
+            slice_key=str(slice_key),
+            search_id=self._resolve_search_id_from_artifact(),
+            a_value=float(a_value),
+            b_value=float(b_value),
+            context=self._warm_evaluation_context(),
+            threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
+            explicit_mask=self._explicit_metric_mask,
+            target_metric=self._target_metric,
+            use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+            slice_map_index=self._slice_map_index,
+        )
 
     def set_resume_policy(
         self,
@@ -2311,9 +3209,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         configured = str(
             self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or ""
         ).strip()
+        if configured:
+            return configured
         slice_key = self._target_slice_key()
         if not slice_key or not self._artifact_h5.exists():
-            return configured or None
+            return None
         import h5py
 
         from pychmp.ab_scan_artifacts import ACTIVE_SEARCH_ID_DATASET
@@ -2321,7 +3221,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         try:
             with h5py.File(str(self._artifact_h5), "r") as f:
                 if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
-                    return configured or None
+                    return None
                 slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
                 if ACTIVE_SEARCH_ID_DATASET in slice_group:
                     active = str(slice_group[ACTIVE_SEARCH_ID_DATASET][()].decode("utf-8")).strip()
@@ -2329,7 +3229,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                         return active
         except Exception:
             pass
-        return configured or None
+        return None
 
     def _sync_point_id_from_artifact(self, a_value: float, b_value: float) -> str | None:
         import h5py
@@ -2496,26 +3396,34 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             self.update_active_q0(a_value=float(a_value), b_value=float(b_value), q0_value=float(active_trial_q0))
         if completed_trial_index is None or completed_trial_raw_map is None:
             return
-        metric_value = float(metric_trials[completed_trial_index]) if completed_trial_index < len(metric_trials) else float("nan")
-        q0_value = float(q0_trials[completed_trial_index]) if completed_trial_index < len(q0_trials) else float("nan")
+        live_index = int(completed_trial_index)
+        if live_index < 0 or live_index >= len(q0_trials):
+            return
+        q0_value = float(q0_trials[live_index])
+        if not np.isfinite(q0_value) or q0_value <= 0.0:
+            return
+        metric_value = float(metric_trials[live_index]) if live_index < len(metric_trials) else float("nan")
         trial_chi2 = None
         trial_rho2 = None
         trial_eta2 = None
-        if chi2_trials is not None and completed_trial_index < len(chi2_trials):
-            trial_chi2 = float(chi2_trials[completed_trial_index])
-        if rho2_trials is not None and completed_trial_index < len(rho2_trials):
-            trial_rho2 = float(rho2_trials[completed_trial_index])
-        if eta2_trials is not None and completed_trial_index < len(eta2_trials):
-            trial_eta2 = float(eta2_trials[completed_trial_index])
-        committed = int(self._trials_committed.get((float(a_value), float(b_value)), 0))
-        best_index = int(completed_trial_index)
+        if chi2_trials is not None and live_index < len(chi2_trials):
+            trial_chi2 = float(chi2_trials[live_index])
+        if rho2_trials is not None and live_index < len(rho2_trials):
+            trial_rho2 = float(rho2_trials[live_index])
+        if eta2_trials is not None and live_index < len(eta2_trials):
+            trial_eta2 = float(eta2_trials[live_index])
+        point_key = (float(a_value), float(b_value))
+        grid_trial_index = int(self._trials_committed.get(point_key, 0))
+        base_index = int(grid_trial_index) - int(live_index)
+        best_index = int(grid_trial_index)
         best_metric = float(metric_value)
         if metric_trials:
             finite = [(idx, float(v)) for idx, v in enumerate(metric_trials) if np.isfinite(float(v))]
             if finite:
-                best_index, best_metric = min(finite, key=lambda item: item[1])
+                best_live_index, best_metric = min(finite, key=lambda item: item[1])
+                best_index = int(base_index) + int(best_live_index)
         shift_kwargs = _grid_trial_shift_commit_kwargs(
-            trial_index=int(completed_trial_index),
+            trial_index=int(live_index),
             shift_x_trials=shift_x_trials,
             shift_y_trials=shift_y_trials,
             shift_valid_trials=shift_valid_trials,
@@ -2524,7 +3432,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         self._writer.write_grid_event(
             GridTrialCommittedEvent(
                 point_id=str(self.point_id_for(a_value, b_value) or ""),
-                trial_index=int(completed_trial_index),
+                trial_index=int(grid_trial_index),
                 q0=float(q0_value),
                 metric=float(metric_value),
                 next_q0=float(q0_value),
@@ -2540,9 +3448,9 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 eta2=trial_eta2,
             )
         )
-        self._trials_committed[(float(a_value), float(b_value))] = max(
-            committed,
-            int(completed_trial_index) + 1,
+        self._trials_committed[point_key] = max(
+            int(self._trials_committed.get(point_key, 0)),
+            int(grid_trial_index) + 1,
         )
 
     def _commit_completed_point_from_payload(
@@ -2569,8 +3477,16 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         shift_x_trials = payload.get("fit_shift_x_trials", result.trial_shift_x_arcsec)
         shift_y_trials = payload.get("fit_shift_y_trials", result.trial_shift_y_arcsec)
         shift_valid_trials = payload.get("fit_find_shift_valid_trials", result.trial_find_shift_valid)
+        existing_refs: dict[int, str] = {}
+        loaded_trials = self._load_grid_trials_for_point(str(point_id))
+        for item in loaded_trials:
+            ref = str(item.get("raw_map_ref", "") or "").strip()
+            if ref:
+                existing_refs[int(item["trial_index"])] = ref
+
         for trial_index, q0_value in enumerate(q0_trials):
             raw_map = None
+            linked_ref = ""
             trial_maps = payload.get("trial_raw_modeled_maps")
             if trial_maps is not None:
                 arr = np.asarray(trial_maps, dtype=float)
@@ -2578,6 +3494,14 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     raw_map = np.asarray(arr[trial_index], dtype=np.float32)
             if raw_map is None:
                 raw_map = self.trial_raw_map_for(float(a_value), float(b_value), float(q0_value))
+            if raw_map is None:
+                linked_ref = str(existing_refs.get(int(trial_index), "")).strip()
+            q0_numeric = float(q0_value)
+            if raw_map is None and not linked_ref and np.isfinite(q0_numeric) and q0_numeric > 0.0:
+                raise RuntimeError(
+                    "Cannot commit grid trial without a stored map: "
+                    f"a={float(a_value):.3f} b={float(b_value):.3f} trial_index={int(trial_index)} q0={q0_numeric:g}"
+                )
             metric_value = float(metric_trials[trial_index]) if trial_index < len(metric_trials) else float("nan")
             finite_metrics = [
                 (idx, float(metric_trials[idx]))
@@ -2606,6 +3530,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     best_trial_index=int(best_index),
                     best_metric=float(best_metric),
                     raw_modeled_map=None if raw_map is None else np.asarray(raw_map, dtype=np.float32),
+                    raw_map_ref=linked_ref or None,
                     trial_metadata=dict(shift_kwargs.get("trial_metadata") or {}),
                     shift_x=shift_kwargs.get("shift_x"),
                     shift_y=shift_kwargs.get("shift_y"),
@@ -2647,10 +3572,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             target_metric=self._target_metric,
             psf_source=self._psf_source,
             compatibility_signature=self._compatibility_signature,
-            store_trial_map_cubes=self._store_trial_map_cubes,
             artifact_h5=self._artifact_h5,
             slice_key=slice_key,
             search_id=search_id,
+            slice_map_index=self._slice_map_index,
+            psf_kernel=self._psf_kernel,
         )
 
     def close(self) -> None:
@@ -2685,6 +3611,34 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         value = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip()
         return value or None
 
+    def _warm_evaluation_context(self) -> ObservationEvaluationContext:
+        from pychmp.chmp_evaluation import ObservationEvaluationContext
+        from pychmp.fitting import observation_reference_to_evaluation_context
+
+        reference = self._observation_reference
+        if reference is not None:
+            return observation_reference_to_evaluation_context(
+                reference,
+                use_smoothed_obs_max=bool(self._diagnostics.get("use_smoothed_obs_max", True)),
+                emthreshold=_diag_optional_float(self._diagnostics, "emthreshold", 0.1),
+            )
+
+        header = self._target_header.copy() if hasattr(self._target_header, "copy") else fits.Header(self._target_header)
+        if "CDELT1" not in header:
+            header["CDELT1"] = 1.0
+        if "CDELT2" not in header:
+            header["CDELT2"] = 1.0
+        return ObservationEvaluationContext(
+            model_header=header,
+            shift_policy=str(self._diagnostics.get("shift_policy") or "auto"),
+            max_shift_arcsec=_diag_optional_float(self._diagnostics, "max_shift_arcsec", 20.0),
+            xy_shift_arcsec=_diag_xy_shift_arcsec(self._diagnostics),
+            observed=self._observed,
+            sigma=self._sigma_map,
+            use_smoothed_obs_max=bool(self._diagnostics.get("use_smoothed_obs_max", True)),
+            emthreshold=_diag_optional_float(self._diagnostics, "emthreshold", 0.1),
+        )
+
     def promote_auxiliary_maps_from_store(
         self,
         *,
@@ -2700,9 +3654,10 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             records = load_auxiliary_map_store_point_records(self._artifact_h5, slice_key=slice_key)
         except KeyError:
             return 0
+        evaluation_context = self._warm_evaluation_context()
         promoted_count = 0
         for record in records:
-            rescored = _rescore_auxiliary_map_record(
+            warm_evaluations = _rescore_record_to_warm_initial_evaluations(
                 record,
                 observed=self._observed,
                 sigma_map=self._sigma_map,
@@ -2710,29 +3665,21 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 explicit_mask=explicit_mask,
                 target_metric=self._target_metric,
                 psf_kernel=self._psf_kernel,
-                tr_region_mask=getattr(self._renderer_factory, "tr_region_mask", None),
+                evaluation_context=evaluation_context,
             )
-            if rescored is None:
+            if warm_evaluations is None:
                 continue
-            point, point_payload = rescored
-            key = (float(point.a), float(point.b))
+            key = (float(record["a"]), float(record["b"]))
             if key in self._point_map:
                 continue
-            point_payload["diagnostics"] = {
-                **dict(point_payload.get("diagnostics") or {}),
-                COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
-            }
-            self._commit_completed_point_from_payload(
-                a_value=float(point.a),
-                b_value=float(point.b),
-                payload=point_payload,
-                result=point,
+            self.register_warm_initial_evaluations(
+                float(record["a"]),
+                float(record["b"]),
+                warm_evaluations,
             )
-            self._writer.drain()
-            self._point_map[key] = point
             promoted_count += 1
         if promoted_count and self._viewer_heartbeat is not None:
-            self._viewer_heartbeat.set_phase(f"{promoted_count} map_store point(s) promoted")
+            self._viewer_heartbeat.set_phase(f"{promoted_count} map_store warm q0 curve(s) registered")
         return promoted_count
 
     def hydrate_from_existing(self) -> int:
@@ -2744,14 +3691,15 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             return 0
         if bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False)) and not payload.get("point_records"):
             return 0
-        validate_scan_artifact_compatibility(
-            payload,
-            observed=self._observed,
-            sigma_map=self._sigma_map,
-            wcs_header=self._target_header,
-            diagnostics=self._diagnostics,
-            artifact_path=self._artifact_h5,
-        )
+        if not self._preserve_stored_search_trials:
+            validate_scan_artifact_compatibility(
+                payload,
+                observed=self._observed,
+                sigma_map=self._sigma_map,
+                wcs_header=self._target_header,
+                diagnostics=self._diagnostics,
+                artifact_path=self._artifact_h5,
+            )
         count = 0
         for record in payload.get("point_records", []):
             if not point_record_matches_compatibility_signature(
@@ -2772,33 +3720,102 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         search_id = str(self._diagnostics.get("selected_search_id") or self._diagnostics.get("search_id") or "").strip()
         if slice_key and search_id:
             try:
-                with h5py.File(str(self._artifact_h5), "r") as f:
+                with _H5PY_FILE(str(self._artifact_h5), "r") as f:
                     if SLICE_CONTAINER_GROUP in f and slice_key in f[SLICE_CONTAINER_GROUP]:
                         slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
                         if SEARCHES_GROUP in slice_group and search_id in slice_group[SEARCHES_GROUP]:
-                            for header in list_grid_point_headers(slice_group[SEARCHES_GROUP][search_id]):
-                                key = (float(header["a"]), float(header["b"]))
-                                self._point_ids[key] = str(header["point_id"])
-                                self._trials_committed[key] = int(header.get("n_trials", 0))
-                                state = classify_grid_point_state(header)
-                                if state == "complete":
-                                    continue
-                                if state == "failed":
-                                    if not self._retry_failed:
+                            search_group = slice_group[SEARCHES_GROUP][search_id]
+                            if GRID_POINTS_GROUP in search_group:
+                                for point_name in sorted(search_group[GRID_POINTS_GROUP].keys()):
+                                    point_group = search_group[GRID_POINTS_GROUP][point_name]
+                                    if grid_point_storage_corrupt(point_group):
                                         continue
-                                    resume_q0 = float(header.get("q0_start", np.nan))
-                                elif state == "assigned_no_trials":
-                                    resume_q0 = float(header.get("q0_start", header.get("next_q0", np.nan)))
-                                else:
-                                    if self._resume_incomplete_from == "q0_start":
+                                    header = read_grid_point_header(point_group)
+                                    key = (float(header["a"]), float(header["b"]))
+                                    self._point_ids[key] = str(header["point_id"])
+                                    self._trials_committed[key] = int(header.get("n_trials", 0))
+                                    state = classify_grid_point_state(header)
+                                    if (
+                                        self._preserve_stored_search_trials
+                                        and state == "complete"
+                                        and key not in self._point_map
+                                    ):
+                                        try:
+                                            trials = _load_grid_point_trials(
+                                                point_group, include_maps=False
+                                            )
+                                            restored = _ab_point_from_completed_grid_point(
+                                                header,
+                                                trials,
+                                                target_metric=self._target_metric,
+                                            )
+                                        except (OSError, RuntimeError, KeyError):
+                                            restored = None
+                                        if restored is not None:
+                                            self._point_map[key] = restored
+                                            count += 1
+                                    if state == "complete":
+                                        continue
+                                    if state == "failed":
+                                        if not self._retry_failed:
+                                            continue
                                         resume_q0 = float(header.get("q0_start", np.nan))
+                                    elif state == "assigned_no_trials":
+                                        resume_q0 = float(header.get("q0_start", header.get("next_q0", np.nan)))
                                     else:
-                                        resume_q0 = float(header.get("next_q0", header.get("q0_start", np.nan)))
-                                if np.isfinite(resume_q0):
-                                    self._resume_q0[key] = float(resume_q0)
+                                        if self._resume_incomplete_from == "q0_start":
+                                            resume_q0 = float(header.get("q0_start", np.nan))
+                                        else:
+                                            resume_q0 = float(
+                                                header.get("next_q0", header.get("q0_start", np.nan))
+                                            )
+                                    if np.isfinite(resume_q0):
+                                        self._resume_q0[key] = float(resume_q0)
             except Exception:
                 pass
         return count
+
+    def _iter_rescore_candidate_records(self, *, include_maps: bool) -> Iterator[tuple[str | None, dict[str, Any]]]:
+        try:
+            current_payload = load_scan_file(
+                self._artifact_h5,
+                slice_key=self._target_slice_key(),
+                include_maps=bool(include_maps),
+            )
+        except KeyError:
+            return
+        seen_keys: set[tuple[float, float]] = set()
+        for record in current_payload.get("point_records", []):
+            if not isinstance(record, dict):
+                continue
+            key = (float(record["a"]), float(record["b"]))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            yield None, dict(record)
+        for search in current_payload.get("search_records", []):
+            search_id = str(search.get("search_id", "")).strip() or None
+            if search_id:
+                try:
+                    search_payload = load_scan_file(
+                        self._artifact_h5,
+                        slice_key=self._target_slice_key(),
+                        search_id=search_id,
+                        include_maps=bool(include_maps),
+                    )
+                except KeyError:
+                    continue
+                records = search_payload.get("point_records", [])
+            else:
+                records = ()
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                key = (float(record["a"]), float(record["b"]))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                yield search_id, dict(record)
 
     def promote_current_slice_trial_maps(
         self,
@@ -2815,66 +3832,50 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             return 0
         if bool(dict(current_payload.get("diagnostics") or {}).get("render_only_slice", False)):
             return 0
-        validate_scan_artifact_compatibility(
-            current_payload,
-            observed=self._observed,
-            sigma_map=self._sigma_map,
-            wcs_header=self._target_header,
-            diagnostics=self._diagnostics,
-            artifact_path=self._artifact_h5,
-        )
+        if not self._preserve_stored_search_trials:
+            validate_scan_artifact_compatibility(
+                current_payload,
+                observed=self._observed,
+                sigma_map=self._sigma_map,
+                wcs_header=self._target_header,
+                diagnostics=self._diagnostics,
+                artifact_path=self._artifact_h5,
+            )
+        evaluation_context = self._warm_evaluation_context()
         promoted_count = 0
-        for search in current_payload.get("search_records", []):
-            search_id = str(search.get("search_id", "")).strip()
-            if not search_id:
+        for search_id, record in self._iter_rescore_candidate_records(include_maps=True):
+            key = (float(record["a"]), float(record["b"]))
+            if key in self._point_map:
                 continue
-            try:
-                search_payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key(), search_id=search_id)
-            except KeyError:
+            if point_record_matches_compatibility_signature(
+                record,
+                compatibility_signature=self._compatibility_signature,
+            ) and not bool(include_matching_signature):
                 continue
-            for record in search_payload.get("point_records", []):
-                key = (float(record["a"]), float(record["b"]))
-                if key in self._point_map:
-                    continue
-                if point_record_matches_compatibility_signature(
-                    record,
-                    compatibility_signature=self._compatibility_signature,
-                ) and not bool(include_matching_signature):
-                    continue
-                rescored = _rescore_auxiliary_map_record(
-                    {
-                        **dict(record),
-                        "source_slice_key": self._target_slice_key(),
-                        "source_search_id": search_id,
-                    },
-                    observed=self._observed,
-                    sigma_map=self._sigma_map,
-                    threshold=float(threshold),
-                    explicit_mask=explicit_mask,
-                    target_metric=self._target_metric,
-                    psf_kernel=self._psf_kernel,
-                    tr_region_mask=getattr(self._renderer_factory, "tr_region_mask", None),
-                )
-                if rescored is None:
-                    continue
-                point, point_payload = rescored
-                point_payload["diagnostics"] = {
-                    **dict(point_payload.get("diagnostics") or {}),
-                    COMPATIBILITY_SIGNATURE_KEY: self._compatibility_signature,
-                }
-                self._commit_completed_point_from_payload(
-                    a_value=float(point.a),
-                    b_value=float(point.b),
-                    payload=point_payload,
-                    result=point,
-                )
-                self._writer.drain()
-                self._point_map[key] = point
-                promoted_count += 1
-        if promoted_count:
-            self._writer.drain()
+            warm_evaluations = _rescore_record_to_warm_initial_evaluations(
+                {
+                    **dict(record),
+                    "source_slice_key": self._target_slice_key(),
+                    "source_search_id": search_id,
+                },
+                observed=self._observed,
+                sigma_map=self._sigma_map,
+                threshold=float(threshold),
+                explicit_mask=explicit_mask,
+                target_metric=self._target_metric,
+                psf_kernel=self._psf_kernel,
+                evaluation_context=evaluation_context,
+            )
+            if warm_evaluations is None:
+                continue
+            self.register_warm_initial_evaluations(
+                float(record["a"]),
+                float(record["b"]),
+                warm_evaluations,
+            )
+            promoted_count += 1
         if promoted_count and self._viewer_heartbeat is not None:
-            self._viewer_heartbeat.set_phase(f"{promoted_count} current-slice map_store point(s) promoted")
+            self._viewer_heartbeat.set_phase(f"{promoted_count} current-slice warm q0 curve(s) registered")
         return promoted_count
 
     def __getitem__(self, key: tuple[float, float]) -> ABPointResult:
@@ -2935,6 +3936,12 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("fits_file", nargs="?", type=Path, help="Path to the observational FITS map")
+    parser.add_argument(
+        "--observation-time",
+        default=None,
+        help="Override observation UTC time for alignment (ISO format, e.g. 2026-04-03T19:24:00). "
+        "Default: inferred from FITS headers (EOVSA: midpoint of ~1 h integration ending at DATE-OBS).",
+    )
     parser.add_argument("model_h5", nargs="?", type=Path, help="Path to the model H5 file")
     parser.add_argument("--obs-source", choices=("external_fits", "model_refmap"), default=None, help="Select whether the observation comes from an external FITS product or an internal model refmap")
     parser.add_argument("--obs-path", type=Path, default=None, help="Explicit path to an external observational FITS map")
@@ -2950,6 +3957,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--all-channels", action="store_true", help="For fixed-channel EUV/UV instruments, render all known channels for the same geometry while fitting only the selected observation slice.")
     parser.add_argument("--render-channels", default=None, help="Comma-separated EUV/UV channels to render in addition to the fitted observation channel, for example 94,131,193.")
     parser.add_argument("--render-frequencies-ghz", default=None, help="Comma-separated MW frequencies to render in addition to the fitted observation frequency. MW extra frequencies must be explicit.")
+    parser.add_argument(
+        "--render-obs-fits-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory of observational FITS maps whose headers define auxiliary render "
+            "channels/frequencies (non-recursive). Only FITS matching the full target "
+            "observation identity (domain, instrument, LOS, and observer geometry when present) "
+            "are used; other "
+            "files in the same folder are ignored so one directory can hold mixed products. "
+            "Replaces --render-channels and "
+            "--render-frequencies-ghz to avoid manual typos."
+        ),
+    )
     parser.add_argument("--a-start", type=float, default=DEFAULT_A, help="Adaptive search starting a value")
     parser.add_argument("--b-start", type=float, default=DEFAULT_B, help="Adaptive search starting b value")
     parser.add_argument("--da", type=float, default=0.3, help="Adaptive a step size")
@@ -2963,11 +3984,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-q0-min", type=float, default=None, help="Optional hard lower q0 bound")
     parser.add_argument("--hard-q0-max", type=float, default=None, help="Optional hard upper q0 bound")
     parser.add_argument("--target-metric", choices=("chi2", "rho2", "eta2"), default="chi2", help="Metric minimized during the search")
-    parser.add_argument(
-        "--store-trial-map-cubes",
-        action="store_true",
-        help="Persist full per-trial rendered map cubes (expensive; disabled by default)",
-    )
     parser.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     parser.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
     parser.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
@@ -3017,12 +4033,42 @@ def _parse_args() -> argparse.Namespace:
         "--recompute-existing",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Reset a compatible sparse artifact at the target path and recompute all points from scratch.",
+        help=(
+            "Reuse map_store and restart on a fresh grid under the same search identity "
+            "(matching evaluation + observation contract). Prior searches stay in the artifact. "
+            "Stored simulation maps are rescored for warm q0 start; gxrender is not rerun for them."
+        ),
     )
     reset_group.add_argument(
-        "--start-over",
+        "--new-search-identity",
         action="store_true",
-        help="Start a fresh adaptive search instance in the existing artifact while seeding from the stored maps instead of resuming the previous compatible search state.",
+        help=(
+            "Like --recompute-existing, but register a parallel search identity for debugging "
+            "(e.g. algorithm changes with the same target contract). Prior searches and map_store "
+            "are preserved; the new identity starts on an empty grid with implicit warm start from map_store."
+        ),
+    )
+    parser.add_argument(
+        "--recompute-search-id",
+        default=None,
+        metavar="SEARCH_ID",
+        help=(
+            "Repair a specific existing search: restore its stored scoring recipe from artifact "
+            "metadata, preserve valid map-linked trials without rescoring, and complete only "
+            "incomplete or contract-broken grid points. Requires --artifact-h5; do not pass "
+            "CLI flags that override metric, mask, grid, q0, observation, or render settings."
+        ),
+    )
+    parser.add_argument(
+        "--expand-grid-search-id",
+        default=None,
+        metavar="SEARCH_ID",
+        help=(
+            "Continue an existing search with widened a/b bounds only: restore the stored scoring "
+            "recipe from artifact metadata, keep valid map-linked trials without rescoring, and "
+            "evaluate only new/outstanding (a,b) cells inside the expanded footprint. Requires "
+            "--artifact-h5 plus at least one of --a-min/--a-max/--b-min/--b-max (superset of stored bounds)."
+        ),
     )
     parser.add_argument(
         "--retry-failed",
@@ -3063,6 +4109,8 @@ def _resolve_geometry_request_flags(args: argparse.Namespace) -> tuple[bool, boo
 
 def main() -> int:
     args = _parse_args()
+    recompute_search_id = _configure_targeted_recompute_search(args)
+    expand_grid_search_id = _configure_expand_grid_search(args)
     _validate_gxrender_runtime()
     repo_root = Path(__file__).resolve().parents[2]
     obs_request = _resolve_observation_request(args, repo_root=repo_root)
@@ -3095,6 +4143,16 @@ def main() -> int:
     )
     try:
         render_selection = _resolve_render_selection(args, obs_map)
+        exclude_obs_paths = (
+            (obs_request.obs_path,)
+            if obs_request.obs_path is not None
+            else tuple()
+        )
+        render_target_context = build_render_obs_target_context(
+            obs_map,
+            domain=render_selection.domain,
+            euv_instrument=render_selection.euv_instrument,
+        )
         slice_descriptors, render_frequencies_ghz, render_channels = _resolve_render_slice_requests(
             domain=render_selection.domain,
             frequency_ghz=render_selection.active_frequency_ghz,
@@ -3103,6 +4161,9 @@ def main() -> int:
             all_channels=bool(args.all_channels),
             render_channels_csv=args.render_channels,
             render_frequencies_csv=args.render_frequencies_ghz,
+            render_obs_fits_dir=_coerce_path(args.render_obs_fits_dir),
+            exclude_obs_paths=exclude_obs_paths,
+            render_target_context=render_target_context,
         )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
@@ -3126,14 +4187,14 @@ def main() -> int:
             slice_key=target_slice_key,
             include_maps=True,
         )
-        if artifact_preexisting and not bool(args.recompute_existing)
+        if artifact_preexisting and not _grid_reset_requested(args)
         else None
     )
     resume_slice_diagnostics = dict(resume_slice_payload.get("diagnostics") or {}) if resume_slice_payload is not None else {}
     if (
         render_selection.domain != "mw"
         and render_selection.euv_response_sav is None
-        and not bool(args.recompute_existing)
+        and not _grid_reset_requested(args)
     ):
         cached_response_override = str(resume_slice_diagnostics.get("euv_response_override_path") or "").strip()
         if cached_response_override:
@@ -3154,15 +4215,19 @@ def main() -> int:
     suppress_auto_viewer = os.environ.get("PYCHMP_NO_AUTO_VIEWER", "").strip().lower() in {"1", "true", "yes", "on"}
     auto_viewer_enabled = not bool(args.no_viewer) and not suppress_auto_viewer
 
-    def _maybe_launch_viewer(phase: str) -> None:
+    def _maybe_launch_viewer(phase: str, *, on_reused: Callable[[], None] | None = None) -> None:
         nonlocal viewer_process
         if not auto_viewer_enabled:
             return
         if viewer_process is not None and viewer_process.poll() is None:
             print(f"pychmp-view already running ({phase}) pid={viewer_process.pid}")
+            if on_reused is not None:
+                on_reused()
             return
         existing_viewer_pid = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=artifact_h5)
         if existing_viewer_pid is not None:
+            if on_reused is not None:
+                on_reused()
             if _focus_existing_viewer_pid(int(existing_viewer_pid)):
                 print(f"Reusing existing pychmp-view ({phase}) pid={existing_viewer_pid} (brought to front)")
                 return
@@ -3229,11 +4294,6 @@ def main() -> int:
         print(f"Live log file: {log_path}")
     except Exception as exc:
         print(f"WARNING: failed to initialize live log sidecar: {exc}")
-
-    # Launch as early as possible for existing artifacts so long preflight work
-    # (e.g. PSF/model setup) does not look like a stalled run.
-    if artifact_h5.exists():
-        _maybe_launch_viewer("preflight")
 
     print("Using resolved observational map payload")
     observed = np.asarray(obs_map.data, dtype=float)
@@ -3350,6 +4410,27 @@ def main() -> int:
 
     model_obs_time = str(model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(model_h5) or "").strip()
     obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
+    observation_time_override = str(getattr(args, "observation_time", "") or "").strip()
+    if observation_time_override:
+        obs_time_text = observation_time_override
+        print(f"  Observation time: override {obs_time_text}")
+    else:
+        time_meta = dict(obs_map.wcs_metadata or {})
+        time_source = str(time_meta.get("observation_time_source", "")).strip()
+        if time_source and time_source != "date_obs":
+            start_text = str(time_meta.get("observation_time_start", "")).strip()
+            end_text = str(time_meta.get("observation_time_end", "")).strip()
+            print(
+                "  Observation time: "
+                f"{obs_time_text} ({time_source}"
+                + (f"; integration {start_text} .. {end_text}" if start_text and end_text else "")
+                + ")"
+            )
+        if str(time_meta.get("observation_time_date_obs_ignored", "")).strip():
+            print(
+                "  Observation time note: ignored stale DATE-OBS="
+                f"{time_meta.get('observation_time_date_obs_ignored')}"
+            )
 
     target_header = _build_target_header(
         nx=int(geometry.nx),
@@ -3379,22 +4460,33 @@ def main() -> int:
     forward_model_identity = compute_forward_model_identity_placeholder(model_path=model_h5)
     forward_model_sha256 = str(forward_model_identity.sha256)
     forward_model_identity_version = str(forward_model_identity.version)
-    artifact_geometry_block = build_artifact_geometry_block(
-        {
-            "map_xc_arcsec": float(geometry.xc),
-            "map_yc_arcsec": float(geometry.yc),
-            "map_dx_arcsec": float(geometry.dx),
-            "map_dy_arcsec": float(geometry.dy),
-            "map_nx": int(geometry.nx),
-            "map_ny": int(geometry.ny),
-            "observer_name": effective_observer_name,
-            "observer_lonc_deg": effective_observer_lonc_deg,
-            "observer_b0sun_deg": effective_observer_b0sun_deg,
-            "observer_dsun_cm": effective_observer_dsun_cm,
-            "observer_obs_time": target_header.get("DATE-OBS", ""),
-        }
-    )
-    artifact_geometry_sha256_value = artifact_geometry_sha256(artifact_geometry_block)
+    if _pinned_search_id(args) and resume_slice_diagnostics:
+        target_header, geometry, artifact_geometry_block, artifact_geometry_sha256_value = (
+            _restore_stored_slice_identity_from_artifact(
+                resume_slice_payload=resume_slice_payload,
+                resume_slice_diagnostics=resume_slice_diagnostics,
+                target_header=target_header,
+                geometry=geometry,
+            )
+        )
+        print("  Pinned search: restored slice WCS and geometry identity from artifact")
+    else:
+        artifact_geometry_block = build_artifact_geometry_block(
+            {
+                "map_xc_arcsec": float(geometry.xc),
+                "map_yc_arcsec": float(geometry.yc),
+                "map_dx_arcsec": float(geometry.dx),
+                "map_dy_arcsec": float(geometry.dy),
+                "map_nx": int(geometry.nx),
+                "map_ny": int(geometry.ny),
+                "observer_name": effective_observer_name,
+                "observer_lonc_deg": effective_observer_lonc_deg,
+                "observer_b0sun_deg": effective_observer_b0sun_deg,
+                "observer_dsun_cm": effective_observer_dsun_cm,
+                "observer_obs_time": target_header.get("DATE-OBS", ""),
+            }
+        )
+        artifact_geometry_sha256_value = artifact_geometry_sha256(artifact_geometry_block)
     observation_source_path = obs_map.source_path
     observation_source_file = _resolve_existing_file(observation_source_path)
     observation_source_sha256 = (
@@ -3403,7 +4495,13 @@ def main() -> int:
         else None
     )
     ebtel_sha256 = _compute_file_sha256(ebtel_path)
-    stored_slice_payload = resume_slice_payload if artifact_preexisting and not bool(args.recompute_existing) else None
+    if resume_slice_payload is not None:
+        stored_fits_sha256 = str(resume_slice_diagnostics.get("fits_sha256") or "").strip()
+        current_fits_sha256 = str(observation_source_sha256 or "").strip()
+        if stored_fits_sha256 and current_fits_sha256 and stored_fits_sha256 != current_fits_sha256:
+            resume_slice_payload = None
+            resume_slice_diagnostics = {}
+    stored_slice_payload = resume_slice_payload if artifact_preexisting and not _grid_reset_requested(args) else None
     sigma_map_full: np.ndarray | None = None
     noise_diag: dict[str, Any] = {}
     if stored_slice_payload is None:
@@ -3428,7 +4526,7 @@ def main() -> int:
             model_time_text=model_obs_time or None,
             observation_time_text=obs_time_text or None,
             stored_slice_payload=stored_slice_payload,
-            force_recompute=bool(args.recompute_existing),
+            force_recompute=_grid_reset_requested(args),
             shift_policy=shift_policy,
             max_shift_arcsec=max_shift_arcsec,
             xy_shift_arcsec=xy_shift_arcsec,
@@ -3583,7 +4681,7 @@ def main() -> int:
     euv_response_identity_summary = None
     if render_selection.domain != "mw":
         reused_identity = False
-        if artifact_preexisting and not bool(args.recompute_existing):
+        if artifact_preexisting and not _grid_reset_requested(args):
             cached_version = str(resume_slice_diagnostics.get("euv_response_identity_version") or "").strip()
             cached_sha = str(resume_slice_diagnostics.get("euv_response_sha256") or "").strip()
             cached_summary = resume_slice_diagnostics.get("euv_response_identity_summary")
@@ -3654,17 +4752,23 @@ def main() -> int:
         "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
     }
-    try:
-        _maybe_validate_artifact_preflight(
-            artifact_h5=artifact_h5,
-            artifact_preexisting=artifact_preexisting,
-            recompute_existing=bool(args.recompute_existing),
-            target_slice_key=target_slice_key,
-            target_header=target_header,
-            diagnostics=preflight_diag,
-        )
-    except ScanArtifactCompatibilityError as exc:
-        raise SystemExit(str(exc)) from exc
+    if _pinned_search_id(args) and resume_slice_diagnostics:
+        for key in (
+            "map_xc_arcsec",
+            "map_yc_arcsec",
+            "map_dx_arcsec",
+            "map_dy_arcsec",
+            "map_nx",
+            "map_ny",
+            "observer_name",
+            "observer_lonc_deg",
+            "observer_b0sun_deg",
+            "observer_dsun_cm",
+            "observer_obs_time",
+            "artifact_geometry_sha256",
+        ):
+            if key in resume_slice_diagnostics:
+                preflight_diag[key] = resume_slice_diagnostics[key]
 
     root_diag = {
         "artifact_kind": "pychmp_ab_scan_sparse_points",
@@ -3674,6 +4778,11 @@ def main() -> int:
         "target_slice_key": target_slice_key,
         "render_frequencies_ghz": [float(v) for v in render_frequencies_ghz],
         "render_channels": [str(v) for v in render_channels],
+        "render_obs_fits_dir": (
+            None
+            if _coerce_path(args.render_obs_fits_dir) is None
+            else str(_coerce_path(args.render_obs_fits_dir))
+        ),
         "render_extra_slices": int(max(0, len(slice_descriptors) - 1)),
         "model_path": str(model_h5),
         "model_id": str(_load_model_identity(model_h5)),
@@ -3751,19 +4860,79 @@ def main() -> int:
         "psf_source": str(psf_source),
         "resolved_psf": resolved_psf_meta,
         "shift_policy": chmp_settings.shift_policy,
-        "max_shift_arcsec": chmp_settings.max_shift_arcsec,
-        "xy_shift_arcsec": [float(chmp_settings.xy_shift_arcsec[0]), float(chmp_settings.xy_shift_arcsec[1])],
+        "max_shift_arcsec": (
+            20.0 if chmp_settings.max_shift_arcsec is None else float(chmp_settings.max_shift_arcsec)
+        ),
+        "xy_shift_arcsec": [
+            float(chmp_settings.xy_shift_arcsec[0]),
+            float(chmp_settings.xy_shift_arcsec[1]),
+        ],
         "use_smoothed_obs_max": bool(chmp_settings.use_smoothed_obs_max),
         "use_emthreshold": bool(chmp_settings.use_emthreshold),
         "emthreshold": float(chmp_settings.emthreshold),
         "q0_search_stages": [str(stage) for stage in chmp_settings.q0_search_stages],
     }
-    compatibility_signature = compatibility_signature_from_diagnostics(
-        root_diag,
-        layout={"kind": "point_list"},
-    )
+    search_layout = {"kind": "point_list"}
+    search_request = build_search_evaluation_config(root_diag, layout=search_layout)
+    compatibility_signature = compatibility_signature_from_diagnostics(root_diag, layout=search_layout)
     root_diag[COMPATIBILITY_SIGNATURE_KEY] = compatibility_signature
-    target_search_id = search_id_from_evaluation_config(root_diag, layout={"kind": "point_list"})
+    new_search_identity = bool(getattr(args, "new_search_identity", False))
+    pinned_search_id = recompute_search_id or expand_grid_search_id
+    matching_search_id = (
+        matching_search_id_for_slice(artifact_h5, slice_key=target_slice_key, request=search_request)
+        if artifact_preexisting and not new_search_identity and not pinned_search_id
+        else None
+    )
+    if pinned_search_id:
+        try:
+            located_slice_key, _ = resolve_search_location(artifact_h5, search_id=pinned_search_id)
+        except KeyError as exc:
+            raise SystemExit(str(exc)) from exc
+        if str(located_slice_key) != str(target_slice_key):
+            raise SystemExit(
+                f"Search {pinned_search_id!r} is registered on slice {located_slice_key!r}, "
+                f"but the restored observation resolves to {target_slice_key!r}"
+            )
+        target_search_id = pinned_search_id
+        matching_search_id = pinned_search_id
+    elif bool(args.recompute_existing) and matching_search_id:
+        target_search_id = matching_search_id
+    elif matching_search_id and not bool(args.recompute_existing) and not new_search_identity:
+        target_search_id = matching_search_id
+    elif new_search_identity:
+        root_diag["search_instance_id"] = f"parallel_{uuid.uuid4().hex}"
+        target_search_id = search_id_from_evaluation_config(root_diag, layout=search_layout)
+    else:
+        target_search_id = search_id_from_evaluation_config(root_diag, layout=search_layout)
+    if matching_search_id and not bool(args.recompute_existing) and not new_search_identity:
+        try:
+            _maybe_validate_artifact_preflight(
+                artifact_h5=artifact_h5,
+                artifact_preexisting=artifact_preexisting,
+                recompute_existing=bool(args.recompute_existing),
+                matching_search_id=matching_search_id,
+                target_slice_key=target_slice_key,
+                target_header=target_header,
+                diagnostics=preflight_diag,
+            )
+        except ScanArtifactCompatibilityError as exc:
+            raise SystemExit(str(exc)) from exc
+    elif artifact_preexisting and (new_search_identity or pinned_search_id or not matching_search_id):
+        if expand_grid_search_id:
+            print(
+                f"Slice preflight: skipped (expand-grid-search-id {expand_grid_search_id}; "
+                "stored recipe and valid trials preserved)"
+            )
+        elif recompute_search_id:
+            print(
+                f"Slice preflight: skipped (targeted repair of search {recompute_search_id}; "
+                "valid trials and map_store are preserved)"
+            )
+        else:
+            print(
+                "Slice preflight: skipped (new search identity on existing slice; "
+                "prior searches and map_store are preserved)"
+            )
     root_diag["selected_search_id"] = target_search_id
     root_diag["search_id"] = target_search_id
     root_diag["search_active"] = True
@@ -3777,27 +4946,54 @@ def main() -> int:
         search_id=target_search_id,
     )
     print(f"Viewer heartbeat signal: {viewer_refresh_signal}")
+
+    def _notify_viewer_active_routing() -> None:
+        viewer_heartbeat.set_phase("search initialized")
+        viewer_heartbeat.notify_refresh()
+
+    if pinned_search_id and artifact_h5.exists():
+        slice_key_for_repair = str(root_diag.get("target_slice_key") or "").strip()
+        if slice_key_for_repair:
+            repaired_points = repair_invalid_grid_points_in_search(
+                artifact_h5,
+                slice_key=slice_key_for_repair,
+                search_id=str(target_search_id),
+            )
+            if repaired_points:
+                print(
+                    f"Contract repair: reset {repaired_points} grid point(s) with invalid trial/map links",
+                    flush=True,
+                )
+            root_diag["search_active"] = True
+            root_diag.pop("search_completed_at", None)
+
+    if artifact_h5.exists():
+        _maybe_launch_viewer("artifact ready", on_reused=_notify_viewer_active_routing)
+
     existing_run_history = load_run_history(artifact_h5) if artifact_preexisting else []
+    grid_reset = _grid_reset_requested(args)
     if bool(args.recompute_existing) and artifact_h5.exists():
-        print(f"Recompute existing: resetting sparse artifact at {artifact_h5}")
-    start_over_seed_payloads: list[dict[str, Any]] = []
-    if bool(args.start_over) and artifact_h5.exists():
-        start_over_seed_payloads = _collect_start_over_seed_point_payloads(
-            artifact_h5=artifact_h5,
-            slice_key=str(root_diag.get("target_slice_key") or "").strip() or None,
-            observed=observed_cropped,
-            sigma_map=sigma_cropped,
-            wcs_header=target_header,
-            diagnostics=root_diag,
-            threshold=float(args.metrics_mask_threshold),
-            explicit_mask=explicit_metric_mask,
-            target_metric=str(args.target_metric),
-            compatibility_signature=compatibility_signature,
-            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+        print(
+            f"Recompute existing: clearing grid points for search {target_search_id} in {artifact_h5}"
         )
-        print(f"Start over: resetting search history in {artifact_h5} while seeding from stored compatible maps")
+    if expand_grid_search_id and artifact_h5.exists():
+        print(
+            f"Expand grid search: resuming search {target_search_id} in {artifact_h5} "
+            f"with widened bounds a=({float(args.a_min):g},{float(args.a_max):g}) "
+            f"b=({float(args.b_min):g},{float(args.b_max):g})"
+        )
+    elif recompute_search_id and artifact_h5.exists():
+        print(
+            f"Targeted repair: resuming search {target_search_id} in {artifact_h5} "
+            "(valid trials kept, no rescore)"
+        )
+    if new_search_identity and artifact_h5.exists():
+        print(
+            f"New search identity: registering parallel search {target_search_id} in {artifact_h5} "
+            "(prior searches preserved; map_store warm start)"
+        )
     artifact_initialized_this_run = False
-    if not artifact_h5.exists() or bool(args.recompute_existing) or bool(args.start_over):
+    if not artifact_h5.exists():
         write_point_scan_artifact(
             artifact_h5,
             observed=observed_cropped,
@@ -3806,9 +5002,9 @@ def main() -> int:
             diagnostics=root_diag,
             blos_reference=common_blos_reference,
             psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
-            point_records=start_over_seed_payloads if bool(args.start_over) else [],
-            run_history=[] if bool(args.start_over) else existing_run_history,
-            preserve_existing_searches=not bool(args.start_over),
+            point_records=[],
+            run_history=existing_run_history,
+            preserve_existing_searches=True,
             observation_canvas=slice_obs_ref.observation_canvas,
             sigma_canvas=slice_obs_ref.sigma_canvas,
             canvas_wcs_header=slice_obs_ref.canvas_header,
@@ -3834,7 +5030,64 @@ def main() -> int:
         viewer_heartbeat.set_phase("initialized")
         viewer_heartbeat.notify_refresh()
         print(f"Initialized sparse artifact: {artifact_h5}")
-    elif artifact_preexisting and not bool(args.recompute_existing) and not _artifact_has_target_slice(
+    elif grid_reset and artifact_h5.exists() and _artifact_has_target_slice(artifact_h5, target_slice_key):
+        resolved_search_id = register_sparse_search_in_artifact(
+            artifact_h5,
+            observed=observed_cropped,
+            sigma_map=sigma_cropped,
+            wcs_header=target_header,
+            diagnostics=root_diag,
+            search_id=target_search_id,
+            reset_search_points=True,
+            blos_reference=common_blos_reference,
+            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+            observation_canvas=slice_obs_ref.observation_canvas,
+            sigma_canvas=slice_obs_ref.sigma_canvas,
+            canvas_wcs_header=slice_obs_ref.canvas_header,
+        )
+        target_search_id = resolved_search_id
+        root_diag["selected_search_id"] = resolved_search_id
+        root_diag["search_id"] = resolved_search_id
+        viewer_heartbeat.set_search_id(resolved_search_id)
+        artifact_initialized_this_run = True
+        viewer_heartbeat.set_phase("initialized")
+        viewer_heartbeat.notify_refresh()
+        if new_search_identity:
+            print(f"Registered parallel search {resolved_search_id} in {artifact_h5}")
+        else:
+            print(f"Reset search {resolved_search_id} for recomputation in {artifact_h5}")
+    elif (
+        artifact_preexisting
+        and not grid_reset
+        and _artifact_has_target_slice(artifact_h5, target_slice_key)
+        and matching_search_id is None
+    ):
+        resolved_search_id = register_sparse_search_in_artifact(
+            artifact_h5,
+            observed=observed_cropped,
+            sigma_map=sigma_cropped,
+            wcs_header=target_header,
+            diagnostics=root_diag,
+            search_id=target_search_id,
+            reset_search_points=False,
+            blos_reference=common_blos_reference,
+            psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+            observation_canvas=slice_obs_ref.observation_canvas,
+            sigma_canvas=slice_obs_ref.sigma_canvas,
+            canvas_wcs_header=slice_obs_ref.canvas_header,
+        )
+        target_search_id = resolved_search_id
+        root_diag["selected_search_id"] = resolved_search_id
+        root_diag["search_id"] = resolved_search_id
+        viewer_heartbeat.set_search_id(resolved_search_id)
+        artifact_initialized_this_run = True
+        viewer_heartbeat.set_phase("initialized")
+        viewer_heartbeat.notify_refresh()
+        print(
+            f"Registered new search {resolved_search_id} on slice {target_slice_key} "
+            f"(prior searches preserved; map_store eligible for reuse)"
+        )
+    elif artifact_preexisting and not grid_reset and not _artifact_has_target_slice(
         artifact_h5, target_slice_key
     ):
         print(f"Initializing target slice shell in existing artifact: {target_slice_key}")
@@ -3914,6 +5167,15 @@ def main() -> int:
         euv_response_sha256=euv_response_sha256,
         euv_response_identity_version=euv_response_identity_version,
     )
+    slice_map_index = None
+    if artifact_h5.exists():
+        from pychmp.slice_map_index import build_slice_map_index
+
+        try:
+            slice_map_index = build_slice_map_index(artifact_h5, slice_key=str(target_slice_key))
+            print(f"Slice map index ({target_slice_key}): {slice_map_index.summary()}")
+        except Exception as exc:
+            print(f"Slice map index: unavailable ({exc})")
     cache = _PersistentPointCache(
         artifact_h5=artifact_h5,
         observed=observed_cropped,
@@ -3926,47 +5188,95 @@ def main() -> int:
         psf_source=str(psf_source),
         psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         compatibility_signature=compatibility_signature,
-        store_trial_map_cubes=bool(args.store_trial_map_cubes),
         viewer_heartbeat=viewer_heartbeat,
+        observation_reference=slice_obs_ref,
+        explicit_metric_mask=explicit_metric_mask,
     )
-    cache.set_recompute_existing(bool(args.recompute_existing))
+    cache.set_slice_map_index(slice_map_index)
+    cache.set_recompute_existing(grid_reset)
+    cache.set_preserve_stored_search_trials(_preserve_stored_search_trials_requested(args))
+    if pinned_search_id and artifact_h5.exists():
+        slice_key_for_reopen = str(root_diag.get("target_slice_key") or "").strip()
+        if slice_key_for_reopen:
+            reopen_search_runner_state(
+                artifact_h5,
+                slice_key=slice_key_for_reopen,
+                search_id=str(target_search_id),
+            )
+            cache._diagnostics["search_active"] = True
+            cache._diagnostics.pop("search_completed_at", None)
+            viewer_heartbeat.emit_event("search_initialized", legacy_phase="search resumed")
+            print(
+                f"Search lifecycle: reopened {target_search_id} for live viewer updates",
+                flush=True,
+            )
     cache.set_resume_policy(
         retry_failed=bool(getattr(args, "retry_failed", False)),
         resume_incomplete_from=str(getattr(args, "resume_incomplete_from", "next_q0")),
     )
     search_renderer_factory = cache.streaming_renderer_factory
     try:
-        if artifact_initialized_this_run and not bool(args.recompute_existing):
-            print("Resume preload: skipped for artifact initialized in this run")
-            reused_points = 0
-        elif not bool(args.recompute_existing):
-            print("Resume preload: loading compatible points from existing artifact...")
-            reused_points = cache.hydrate_from_existing()
-        else:
-            reused_points = 0
-        promoted_same_slice = 0
-        promoted_auxiliary = 0
-        if not bool(args.recompute_existing):
-            promoted_same_slice = cache.promote_current_slice_trial_maps(
-                threshold=float(args.metrics_mask_threshold),
-                explicit_mask=explicit_metric_mask,
-                include_matching_signature=False,
+        hydrated, promoted_same_slice, promoted_auxiliary, promoted_index = (
+            _preload_search_cache_from_artifact(
+            cache,
+            threshold=float(args.metrics_mask_threshold),
+            explicit_mask=explicit_metric_mask,
+            artifact_preexisting=artifact_preexisting,
+            hydrate_completed_points=not grid_reset,
             )
-            promoted_auxiliary = cache.promote_auxiliary_maps_from_store(
-                threshold=float(args.metrics_mask_threshold),
-                explicit_mask=explicit_metric_mask,
-            )
-            if promoted_same_slice or promoted_auxiliary:
-                cache.flush_pending_writes()
-            reused_points += promoted_same_slice + promoted_auxiliary
-            print(
-                f"Resume preload: loaded {reused_points} compatible point(s) "
-                f"(hydrated={reused_points - promoted_same_slice - promoted_auxiliary}, "
-                f"same_slice={promoted_same_slice}, auxiliary={promoted_auxiliary})"
-            )
+        )
+        reused_points = hydrated + promoted_same_slice + promoted_auxiliary + promoted_index
+        preload_label = (
+            "Warm"
+            if grid_reset
+            else ("Expand" if expand_grid_search_id else ("Repair" if recompute_search_id else "Resume"))
+        )
+        print(
+            f"{preload_label} preload: {reused_points} compatible point(s) "
+            f"(hydrated={hydrated}, same_slice={promoted_same_slice}, "
+            f"auxiliary={promoted_auxiliary}, indexed_points={promoted_index})",
+            flush=True,
+        )
     except ScanArtifactCompatibilityError as exc:
         cache.close()
         raise SystemExit(str(exc)) from exc
+    expand_resume_context: ExpandResumeContext | None = None
+    if expand_grid_search_id:
+        prior_a_range = getattr(args, "expand_prior_a_range", None)
+        prior_b_range = getattr(args, "expand_prior_b_range", None)
+        if (
+            isinstance(prior_a_range, (list, tuple))
+            and len(prior_a_range) == 2
+            and isinstance(prior_b_range, (list, tuple))
+            and len(prior_b_range) == 2
+        ):
+            widened_axes = widened_boundary_axes(
+                prior_a_range=(float(prior_a_range[0]), float(prior_a_range[1])),
+                prior_b_range=(float(prior_b_range[0]), float(prior_b_range[1])),
+                new_a_range=(float(args.a_min), float(args.a_max)),
+                new_b_range=(float(args.b_min), float(args.b_max)),
+            )
+            if widened_axes and cache:
+                expand_resume_context = ExpandResumeContext(
+                    prior_a_range=(float(prior_a_range[0]), float(prior_a_range[1])),
+                    prior_b_range=(float(prior_b_range[0]), float(prior_b_range[1])),
+                    widened_axes=widened_axes,
+                )
+                seed = select_expand_frontier_seed(
+                    dict(cache),
+                    context=expand_resume_context,
+                    da=float(args.da),
+                    db=float(args.db),
+                )
+                if seed is not None:
+                    args.a_start = float(seed[0])
+                    args.b_start = float(seed[1])
+                    print(
+                        "Expand resume: hill-climb anchor at prior wall "
+                        f"a={args.a_start:g} b={args.b_start:g} "
+                        f"(widened: {', '.join(widened_axes)})",
+                        flush=True,
+                    )
     append_run_history_entry(
         artifact_h5,
         {
@@ -3975,33 +5285,44 @@ def main() -> int:
             log_path=log_path,
             viewer_cmd_text=viewer_cmd_text,
             action=(
-                "recompute"
-                if bool(args.recompute_existing) and artifact_preexisting
+                "new_search_identity"
+                if new_search_identity and artifact_preexisting
                 else (
-                    "start_over"
-                    if bool(args.start_over) and artifact_preexisting
-                    else ("resume" if artifact_preexisting and not bool(args.recompute_existing) else "create")
+                    "expand"
+                    if expand_grid_search_id and artifact_preexisting
+                    else (
+                        "repair"
+                        if recompute_search_id and artifact_preexisting
+                        else (
+                        "recompute"
+                        if bool(args.recompute_existing) and artifact_preexisting
+                            else ("resume" if artifact_preexisting and not grid_reset else "create")
+                        )
+                    )
                 )
             ),
             target_metric=str(args.target_metric),
             recompute_existing=bool(args.recompute_existing),
+            new_search_identity=new_search_identity,
             ),
             "compatibility_signature": compatibility_signature,
         },
     )
-    if bool(args.start_over):
-        print(f"Start-over seed state: {reused_points} point(s) restored into the reset search")
-    else:
+    if grid_reset:
+        print(
+            f"Grid reset preload: {reused_points} compatible point(s) with map_store indexed q0(s) "
+            f"(simulation maps are not re-rendered when compatible)"
+        )
+    elif artifact_preexisting:
         print(f"Resume state: {reused_points} compatible point(s) loaded from the existing artifact")
     if auto_viewer_enabled:
         print("Viewer command above is shown for reference; pychmp-view will also be auto-launched unless it is already running.")
     else:
         print("Open the viewer command above now if you want to inspect the artifact while the run is in progress.")
-    _maybe_launch_viewer("scan start")
+    _maybe_launch_viewer("scan start", on_reused=_notify_viewer_active_routing)
 
     started = time.perf_counter()
-    viewer_heartbeat.set_phase("search initialized")
-    viewer_heartbeat.notify_refresh()
+    _notify_viewer_active_routing()
     if str(args.execution_policy) != "serial":
         print(
             "  Note: process-pool mode reports progress per completed point; "
@@ -4009,33 +5330,43 @@ def main() -> int:
         )
     progress_start_callback = None
     progress_callback = None
+    point_start_callback = None
+    point_complete_callback = None
     if str(args.execution_policy) == "serial":
         progress_start_callback, progress_callback = _make_trial_progress_reporter(target_metric=str(args.target_metric))
+        live_q0_trials: list[float] = []
+        live_metric_trials: list[float] = []
+        live_chi2_trials: list[float] = []
+        live_rho2_trials: list[float] = []
+        live_eta2_trials: list[float] = []
+        live_shift_x_trials: list[float] = []
+        live_shift_y_trials: list[float] = []
+        live_shift_valid_trials: list[bool] = []
+        active_point: dict[str, tuple[float, float] | None] = {"value": None}
+        console_start_callback = progress_start_callback
+        console_progress_callback = progress_callback
+        def _serial_point_start(a_value: float, b_value: float) -> None:
+            active_point["value"] = (float(a_value), float(b_value))
+            committed = cache.commit_map_store_warm_trials_for_point(float(a_value), float(b_value))
+            if committed > 0:
+                rescore_note = (
+                    "maps linked by ref"
+                    if cache._preserve_stored_search_trials
+                    else "all metrics rescored; maps linked by ref"
+                )
+                print(
+                    f"    Warm start: {committed} grid trial(s) from map_store ({rescore_note})",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"    Starting point: a={float(a_value):.3f} b={float(b_value):.3f} (rendering new trials)",
+                    flush=True,
+                )
+
+        point_start_callback = _serial_point_start
+
         if viewer_heartbeat is not None:
-            live_q0_trials: list[float] = []
-            live_metric_trials: list[float] = []
-            live_chi2_trials: list[float] = []
-            live_rho2_trials: list[float] = []
-            live_eta2_trials: list[float] = []
-            live_shift_x_trials: list[float] = []
-            live_shift_y_trials: list[float] = []
-            live_shift_valid_trials: list[bool] = []
-            active_point: dict[str, tuple[float, float] | None] = {"value": None}
-            console_start_callback = progress_start_callback
-            console_progress_callback = progress_callback
-
-            def _viewer_point_start(a_value: float, b_value: float) -> None:
-                active_point["value"] = (float(a_value), float(b_value))
-                live_q0_trials.clear()
-                live_metric_trials.clear()
-                live_chi2_trials.clear()
-                live_rho2_trials.clear()
-                live_eta2_trials.clear()
-                live_shift_x_trials.clear()
-                live_shift_y_trials.clear()
-                live_shift_valid_trials.clear()
-                cache.clear_live_trial_snapshot()
-
             def _viewer_point_complete(a_value: float, b_value: float) -> None:
                 _ = (a_value, b_value)
                 cache.clear_live_trial_snapshot()
@@ -4061,6 +5392,13 @@ def main() -> int:
                     active_trial_q0=float(q0),
                 )
                 cache.flush_pending_writes()
+                point_id = cache.point_id_for(float(point[0]), float(point[1]))
+                if point_id:
+                    viewer_heartbeat.emit_event(
+                        "point_assigned",
+                        point_id=str(point_id),
+                        legacy_phase=f"trial {int(trial_index):02d} rendering",
+                    )
 
             def _viewer_progress_report(
                 q0: float,
@@ -4089,7 +5427,8 @@ def main() -> int:
                     live_shift_x_trials.append(float("nan"))
                     live_shift_y_trials.append(float("nan"))
                     live_shift_valid_trials.append(True)
-                completed_index = int(len(live_q0_trials) - 1)
+                point_key = (float(point[0]), float(point[1]))
+                completed_live_index = int(len(live_q0_trials) - 1)
                 completed_raw_map = cache.trial_raw_map_for(float(point[0]), float(point[1]), float(q0))
                 cache.write_live_trial_snapshot(
                     a_value=float(point[0]),
@@ -4102,21 +5441,27 @@ def main() -> int:
                     shift_x_trials=list(live_shift_x_trials),
                     shift_y_trials=list(live_shift_y_trials),
                     shift_valid_trials=list(live_shift_valid_trials),
-                    completed_trial_index=completed_index,
+                    completed_trial_index=completed_live_index,
                     completed_trial_raw_map=completed_raw_map,
                 )
                 cache.flush_pending_writes()
                 if completed_raw_map is not None:
                     cache.drop_persisted_trial_render(float(point[0]), float(point[1]), float(q0))
+                point_id = cache.point_id_for(float(point[0]), float(point[1]))
+                if point_id:
+                    viewer_heartbeat.emit_event(
+                        "trial_committed",
+                        point_id=str(point_id),
+                        trial_index=int(completed_live_index),
+                        legacy_phase=f"trial {int(completed_live_index) + 1:02d} complete",
+                    )
 
             progress_start_callback = _viewer_progress_start
             progress_callback = _viewer_progress_report
-        else:
-            _viewer_point_start = None
-            _viewer_point_complete = None
+            point_complete_callback = _viewer_point_complete
     else:
-        _viewer_point_start = None
-        _viewer_point_complete = None
+        point_start_callback = None
+        point_complete_callback = None
     try:
         result = search_local_minimum_ab(
             search_renderer_factory,
@@ -4150,13 +5495,14 @@ def main() -> int:
             execution_policy=str(args.execution_policy),
             max_workers=args.max_workers,
             worker_chunksize=int(args.worker_chunksize),
-            point_start_callback=_viewer_point_start,
-            point_complete_callback=_viewer_point_complete,
+            point_start_callback=point_start_callback,
+            point_complete_callback=point_complete_callback,
             observation_reference=slice_obs_ref,
             q0_search_stages=chmp_settings.q0_search_stages,
             use_smoothed_obs_max=chmp_settings.use_smoothed_obs_max,
             use_emthreshold=chmp_settings.use_emthreshold,
             emthreshold=chmp_settings.emthreshold,
+            expand_resume_context=expand_resume_context,
         )
     except Exception:
         root_diag["search_active"] = False

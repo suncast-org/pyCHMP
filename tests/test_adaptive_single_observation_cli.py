@@ -20,14 +20,19 @@ from examples.python.adaptive_ab_search_single_observation import (
     _focus_existing_viewer_pid,
     _build_live_point_snapshot_payload,
     _find_existing_viewer_pid,
+    _configure_targeted_recompute_search,
+    _grid_reset_requested,
     _is_hdf5_lock_contention_error,
     _maybe_validate_artifact_preflight,
     _point_payload_from_result,
+    _preload_search_cache_from_artifact,
     _rescore_auxiliary_map_record,
     _resolve_geometry_request_flags,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
+from pychmp.ab_scan_artifacts import register_sparse_search_in_artifact
+from pychmp.search_contract import search_id_from_evaluation_config
 from pychmp.search_contract import compatibility_signature_from_diagnostics
 from pychmp.ab_scan_artifacts import COMPATIBILITY_SIGNATURE_KEY, load_scan_file, write_point_scan_artifact
 from pychmp.ab_search import ABPointResult
@@ -147,6 +152,98 @@ def test_resolve_render_slice_requests_requires_explicit_mw_frequency_list() -> 
     assert channels == tuple()
     assert freqs == (2.874, 3.2, 5.8)
     assert [item["key"] for item in descriptors] == ["mw_2p874000ghz", "mw_3p200000ghz", "mw_5p800000ghz"]
+
+
+def test_resolve_render_slice_requests_reads_mw_frequencies_from_fits_dir(tmp_path: Path) -> None:
+    target = tmp_path / "target.fits"
+    extra_a = tmp_path / "extra_a.fits"
+    extra_b = tmp_path / "extra_b.fits"
+    for path, hz in (
+        (target, 2.874e9),
+        (extra_a, 3.2e9),
+        (extra_b, 5.8e9),
+    ):
+        header = fits.Header({"RESTFRQ": hz, "NAXIS": 2, "NAXIS1": 4, "NAXIS2": 4})
+        fits.PrimaryHDU(np.ones((2, 2), dtype=float), header=header).writeto(path, overwrite=True)
+
+    descriptors, freqs, channels = _resolve_render_slice_requests(
+        domain="mw",
+        frequency_ghz=2.874,
+        euv_channel=None,
+        euv_instrument=None,
+        all_channels=False,
+        render_channels_csv=None,
+        render_frequencies_csv=None,
+        render_obs_fits_dir=tmp_path,
+        exclude_obs_paths=(target,),
+    )
+
+    assert channels == tuple()
+    assert freqs == pytest.approx((2.874, 3.2, 5.8))
+    assert [item["key"] for item in descriptors] == ["mw_2p874000ghz", "mw_3p200000ghz", "mw_5p800000ghz"]
+
+
+def test_resolve_render_slice_requests_filters_mixed_domain_fits_dir(tmp_path: Path) -> None:
+    target = tmp_path / "target.fits"
+    extra = tmp_path / "extra.fits"
+    for path, header in (
+        (target, fits.Header({"RESTFRQ": 2.874e9, "NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2})),
+        (extra, fits.Header({"RESTFRQ": 3.2e9, "NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2})),
+    ):
+        fits.PrimaryHDU(np.ones((2, 2), dtype=float), header=header).writeto(path, overwrite=True)
+    fits.PrimaryHDU(
+        np.ones((2, 2), dtype=float),
+        header=fits.Header({"WAVELNTH": 193.0, "NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2}),
+    ).writeto(tmp_path / "aia193.fits", overwrite=True)
+
+    descriptors, freqs, channels = _resolve_render_slice_requests(
+        domain="mw",
+        frequency_ghz=2.874,
+        euv_channel=None,
+        euv_instrument=None,
+        all_channels=False,
+        render_channels_csv=None,
+        render_frequencies_csv=None,
+        render_obs_fits_dir=tmp_path,
+        exclude_obs_paths=(target,),
+    )
+
+    assert freqs == pytest.approx((2.874, 3.2))
+    assert channels == tuple()
+    assert len(descriptors) == 2
+
+
+def test_resolve_render_slice_requests_errors_when_fits_dir_has_no_compatible_aux(tmp_path: Path) -> None:
+    fits.PrimaryHDU(
+        np.ones((2, 2), dtype=float),
+        header=fits.Header({"WAVELNTH": 193.0, "NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2}),
+    ).writeto(tmp_path / "aia193.fits", overwrite=True)
+
+    with pytest.raises(SystemExit, match="Reconsider --render-obs-fits-dir"):
+        _resolve_render_slice_requests(
+            domain="mw",
+            frequency_ghz=2.874,
+            euv_channel=None,
+            euv_instrument=None,
+            all_channels=False,
+            render_channels_csv=None,
+            render_frequencies_csv=None,
+            render_obs_fits_dir=tmp_path,
+        )
+
+
+def test_resolve_render_slice_requests_rejects_dir_and_csv_together(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="not both"):
+        _resolve_render_slice_requests(
+            domain="mw",
+            frequency_ghz=2.874,
+            euv_channel=None,
+            euv_instrument=None,
+            all_channels=False,
+            render_channels_csv=None,
+            render_frequencies_csv="3.2",
+            render_obs_fits_dir=tmp_path,
+        )
 
 
 def test_resolve_render_slice_requests_rejects_all_channels_for_mw() -> None:
@@ -314,6 +411,7 @@ def test_adaptive_preflight_skips_render_only_auxiliary_slice(monkeypatch: pytes
         artifact_h5=tmp_path / "artifact.h5",
         artifact_preexisting=True,
         recompute_existing=False,
+        matching_search_id="search_resume",
         target_slice_key="euv_193",
         target_header=fits.Header({"DATE-OBS": "2020-11-26T19:58:28.840"}),
         diagnostics={
@@ -339,6 +437,31 @@ def test_adaptive_preflight_skips_render_only_auxiliary_slice(monkeypatch: pytes
             "observer_dsun_cm": 1.0,
             "observer_obs_time": "2020-11-26T19:58:28.840",
         },
+    )
+
+    assert calls == []
+
+
+def test_adaptive_preflight_skips_when_no_matching_search_id(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation._load_slice_preflight_payload",
+        lambda *_args, **_kwargs: {"diagnostics": {"artifact_kind": "pychmp_ab_scan_sparse_points"}},
+    )
+    monkeypatch.setattr(
+        "examples.python.adaptive_ab_search_single_observation.validate_scan_artifact_reuse_preflight",
+        lambda *_args, **_kwargs: calls.append("validated"),
+    )
+
+    _maybe_validate_artifact_preflight(
+        artifact_h5=tmp_path / "artifact.h5",
+        artifact_preexisting=True,
+        recompute_existing=False,
+        matching_search_id=None,
+        target_slice_key="mw_2p873584ghz",
+        target_header=fits.Header({"DATE-OBS": "2020-11-26T20:00:00"}),
+        diagnostics={"artifact_kind": "pychmp_ab_scan_sparse_points"},
     )
 
     assert calls == []
@@ -396,7 +519,7 @@ class _FakePSFRenderer:
         return modeled
 
 
-def test_adaptive_point_payload_uses_lightweight_storage_by_default() -> None:
+def test_adaptive_point_payload_omits_trial_stacks_when_stream_lacks_all_trials() -> None:
     point = ABPointResult(
         a=0.3,
         b=2.7,
@@ -440,12 +563,12 @@ def test_adaptive_point_payload_uses_lightweight_storage_by_default() -> None:
     assert payload["trial_euv_coronal_maps"] is None
     assert payload["trial_euv_tr_maps"] is None
     diagnostics = payload["diagnostics"]
-    assert diagnostics["store_trial_map_cubes"] is False
+    assert diagnostics["store_trial_map_cubes"] is True
     assert diagnostics["synthetic_map_db_version"] == 1
     assert isinstance(diagnostics["synthetic_map_keys"], list)
 
 
-def test_adaptive_point_payload_can_persist_trial_maps_when_enabled() -> None:
+def test_adaptive_point_payload_persists_trial_maps_and_auxiliary_registry() -> None:
     point = ABPointResult(
         a=0.3,
         b=2.7,
@@ -499,7 +622,6 @@ def test_adaptive_point_payload_can_persist_trial_maps_when_enabled() -> None:
         target_metric="chi2",
         psf_source="test",
         compatibility_signature="sig",
-        store_trial_map_cubes=True,
         stream_record=stream_record,
     )
 
@@ -551,7 +673,6 @@ def test_adaptive_point_payload_uses_stream_record_without_renderer_fallback() -
         target_metric="chi2",
         psf_source="test",
         compatibility_signature="sig",
-        store_trial_map_cubes=True,
         stream_record=stream_record,
     )
 
@@ -559,6 +680,52 @@ def test_adaptive_point_payload_uses_stream_record_without_renderer_fallback() -
     np.testing.assert_allclose(payload["modeled_best"], np.full((2, 2), 12.0, dtype=float))
     assert payload["trial_modeled_maps"] is not None
     assert payload["trial_modeled_maps"].shape == (2, 2, 2)
+
+
+def test_adaptive_point_payload_uses_closest_stream_q0_when_optimizer_q0_differs() -> None:
+    point = ABPointResult(
+        a=0.25,
+        b=2.75,
+        q0=0.00306357,
+        objective_value=0.5949111,
+        metrics=MetricValues(chi2=1.0, rho2=2.0, eta2=0.5949111),
+        target_metric="eta2",
+        success=True,
+        nfev=26,
+        nit=2,
+        message="ok",
+        used_adaptive_bracketing=True,
+        bracket_found=True,
+        bracket=(0.002951, 0.003021, 0.003082),
+        trial_q0=(0.002951, 0.003021, 0.003082),
+        trial_objective_values=(0.5949235, 0.5949744, 0.5949663),
+        trial_chi2_values=(1.0, 1.0, 1.0),
+        trial_rho2_values=(2.0, 2.0, 2.0),
+        trial_eta2_values=(0.5949235, 0.5949744, 0.5949663),
+        elapsed_seconds=73.3,
+    )
+    stream_record = _PointRenderRecord()
+    for q0_value, raw_value, modeled_value in (
+        (0.002951, 1.0, 11.0),
+        (0.003021, 2.0, 12.0),
+        (0.003082, 3.0, 13.0),
+    ):
+        key = _PointRenderStream._q0_key(q0_value)
+        stream_record.raw_modeled_by_q0[key] = np.full((2, 2), raw_value, dtype=np.float32)
+        stream_record.modeled_by_q0[key] = np.full((2, 2), modeled_value, dtype=np.float32)
+
+    payload = _point_payload_from_result(
+        point,
+        renderer_factory=lambda a, b: _FakePSFRenderer(),
+        observed_template=np.zeros((2, 2), dtype=float),
+        target_metric="eta2",
+        psf_source="test",
+        compatibility_signature="sig",
+        stream_record=stream_record,
+    )
+
+    np.testing.assert_allclose(payload["raw_modeled_best"], np.full((2, 2), 3.0, dtype=float))
+    np.testing.assert_allclose(payload["modeled_best"], np.full((2, 2), 13.0, dtype=float))
 
 
 def test_rescore_auxiliary_map_record_builds_promoted_point_payload() -> None:
@@ -638,8 +805,8 @@ def test_rescore_auxiliary_map_record_reuses_saved_trial_metrics_without_trial_m
     assert payload["trial_modeled_maps"] is None
 
 
-def test_start_over_promotes_same_signature_current_slice_points(tmp_path: Path) -> None:
-    observed = np.ones((2, 2), dtype=float)
+def test_promote_current_slice_skips_matching_signature_by_default(tmp_path: Path) -> None:
+    observed = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float)
     sigma_map = np.ones((2, 2), dtype=float)
     header = fits.Header()
     header["SIMPLE"] = True
@@ -693,8 +860,8 @@ def test_start_over_promotes_same_signature_current_slice_points(tmp_path: Path)
         "q0": 1.0,
         "success": True,
         "status": "computed",
-        "modeled_best": np.ones((2, 2), dtype=float),
-        "raw_modeled_best": np.ones((2, 2), dtype=float),
+        "modeled_best": observed.copy(),
+        "raw_modeled_best": observed.copy(),
         "residual": np.zeros((2, 2), dtype=float),
         "fit_q0_trials": (0.5, 1.0),
         "fit_metric_trials": (0.4, 0.1),
@@ -703,15 +870,15 @@ def test_start_over_promotes_same_signature_current_slice_points(tmp_path: Path)
         "fit_eta2_trials": (0.6, 0.3),
         "trial_modeled_maps": np.stack(
             [
-                np.full((2, 2), 0.9, dtype=float),
-                np.full((2, 2), 1.0, dtype=float),
+                observed * 0.85,
+                observed * 0.95,
             ],
             axis=0,
         ),
         "trial_raw_modeled_maps": np.stack(
             [
-                np.full((2, 2), 0.9, dtype=float),
-                np.full((2, 2), 1.0, dtype=float),
+                observed * 0.85,
+                observed * 0.95,
             ],
             axis=0,
         ),
@@ -761,17 +928,13 @@ def test_start_over_promotes_same_signature_current_slice_points(tmp_path: Path)
         explicit_mask=None,
         include_matching_signature=False,
     ) == 0
-    assert cache.promote_current_slice_trial_maps(
-        threshold=0.1,
-        explicit_mask=None,
-        include_matching_signature=True,
-    ) == 1
-    assert len(cache) == 1
 
 
 def test_promote_current_slice_trial_maps_allows_metric_change(tmp_path: Path) -> None:
-    observed = np.ones((2, 2), dtype=float)
+    observed = np.array([[0.0, 2.0], [0.0, 0.0]], dtype=float)
     sigma_map = np.ones((2, 2), dtype=float)
+    trial_map_a = np.array([[0.0, 1.8], [0.0, 0.0]], dtype=float)
+    trial_map_b = np.array([[0.0, 2.1], [0.0, 0.0]], dtype=float)
     header = fits.Header()
     header["SIMPLE"] = True
     header["BITPIX"] = -32
@@ -824,28 +987,16 @@ def test_promote_current_slice_trial_maps_allows_metric_change(tmp_path: Path) -
         "q0": 1.0,
         "success": True,
         "status": "computed",
-        "modeled_best": np.ones((2, 2), dtype=float),
-        "raw_modeled_best": np.ones((2, 2), dtype=float),
-        "residual": np.zeros((2, 2), dtype=float),
+        "modeled_best": trial_map_b.copy(),
+        "raw_modeled_best": trial_map_b.copy(),
+        "residual": observed - trial_map_b,
         "fit_q0_trials": (0.5, 1.0),
         "fit_metric_trials": (0.4, 0.1),
         "fit_chi2_trials": (0.4, 0.1),
         "fit_rho2_trials": (0.5, 0.2),
         "fit_eta2_trials": (0.6, 0.3),
-        "trial_modeled_maps": np.stack(
-            [
-                np.full((2, 2), 0.9, dtype=float),
-                np.full((2, 2), 1.0, dtype=float),
-            ],
-            axis=0,
-        ),
-        "trial_raw_modeled_maps": np.stack(
-            [
-                np.full((2, 2), 0.9, dtype=float),
-                np.full((2, 2), 1.0, dtype=float),
-            ],
-            axis=0,
-        ),
+        "trial_modeled_maps": np.stack([trial_map_a, trial_map_b], axis=0),
+        "trial_raw_modeled_maps": np.stack([trial_map_a, trial_map_b], axis=0),
         "nfev": 2,
         "nit": 1,
         "message": "ok",
@@ -877,6 +1028,7 @@ def test_promote_current_slice_trial_maps_allows_metric_change(tmp_path: Path) -
         COMPATIBILITY_SIGNATURE_KEY: "sig-eta2-threshold-0p5",
         "target_metric": "eta2",
         "metrics_mask_threshold": 0.5,
+        "shift_policy": "fixed",
     }
     cache = _PersistentPointCache(
         artifact_h5=artifact_h5,
@@ -898,7 +1050,10 @@ def test_promote_current_slice_trial_maps_allows_metric_change(tmp_path: Path) -
         explicit_mask=None,
         include_matching_signature=False,
     ) == 1
-    assert len(cache) == 1
+    warm = cache.peek_initial_evaluations_for(0.3, 2.7)
+    assert warm is not None
+    assert len(warm) == 2
+    cache.close()
 
 
 class _FakeCacheRenderer:
@@ -984,9 +1139,10 @@ def test_cache_setitem_persists_point_via_dispatcher(tmp_path: Path) -> None:
         elapsed_seconds=0.0,
     )
     point_stream_record = _PointRenderRecord()
-    point_q0_key = _PointRenderStream._q0_key(point_template.q0)
-    point_stream_record.raw_modeled_by_q0[point_q0_key] = np.full((2, 2), point_template.q0, dtype=np.float32)
-    point_stream_record.modeled_by_q0[point_q0_key] = np.full((2, 2), point_template.q0, dtype=np.float32)
+    for trial_q0 in point_template.trial_q0:
+        trial_key = _PointRenderStream._q0_key(float(trial_q0))
+        point_stream_record.raw_modeled_by_q0[trial_key] = np.full((2, 2), float(trial_q0), dtype=np.float32)
+        point_stream_record.modeled_by_q0[trial_key] = np.full((2, 2), float(trial_q0), dtype=np.float32)
     point = replace(
         point_template,
         artifact_payload=_point_payload_from_result(
@@ -1290,7 +1446,6 @@ def test_streaming_renderer_factory_pickle_roundtrip() -> None:
         target_metric="eta2",
         psf_source="test",
         compatibility_signature="sig-123",
-        store_trial_map_cubes=False,
     )
 
     roundtrip = pickle.loads(pickle.dumps(wrapper))
@@ -1503,3 +1658,273 @@ def test_dispatcher_advances_live_trial_marker_to_next_pending_point(
 def test_is_hdf5_lock_contention_error_recognizes_read_only_open_conflict() -> None:
     exc = OSError("Unable to synchronously open file (file is already open for read-only)")
     assert _is_hdf5_lock_contention_error(exc) is True
+
+
+def test_grid_reset_requested_for_recompute_and_parallel_identity() -> None:
+    assert _grid_reset_requested(Namespace(recompute_existing=False, new_search_identity=False)) is False
+    assert _grid_reset_requested(Namespace(recompute_existing=True, new_search_identity=False)) is True
+    assert _grid_reset_requested(Namespace(recompute_existing=False, new_search_identity=True)) is True
+    assert _grid_reset_requested(
+        Namespace(recompute_existing=False, new_search_identity=False, recompute_search_id="search_abc")
+    ) is False
+
+
+def test_configure_targeted_recompute_search_restores_profile(tmp_path: Path) -> None:
+    from pychmp.ab_scan_artifacts import COMPATIBILITY_SIGNATURE_KEY, write_point_scan_artifact
+
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["SIMPLE"] = True
+    header["BITPIX"] = -32
+    header["NAXIS"] = 2
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    header["CTYPE1"] = "HPLN-TAN"
+    header["CTYPE2"] = "HPLT-TAN"
+    header["CUNIT1"] = "arcsec"
+    header["CUNIT2"] = "arcsec"
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 2.0
+    header["CDELT2"] = 2.0
+    header["DATE-OBS"] = "2020-11-26T20:00:00"
+    obs_fits = tmp_path / "obs.fits"
+    model_h5 = tmp_path / "model.h5"
+    ebtel_path = tmp_path / "ebtel.sav"
+    for path in (obs_fits, model_h5, ebtel_path):
+        path.write_bytes(b"stub")
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-targeted",
+        "target_metric": "eta2",
+        "metrics_mask_threshold": 0.1,
+        "target_slice_key": "mw_2.873584ghz",
+        "spectral_domain": "mw",
+        "frequency_ghz": 2.873584,
+        "observation_source_mode": "external_fits",
+        "fits_file": str(obs_fits),
+        "model_path": str(model_h5),
+        "ebtel_path": str(ebtel_path),
+        "a_start": 0.25,
+        "b_start": 2.75,
+        "da": 0.25,
+        "db": 0.25,
+        "a_range": [-1.0, 3.0],
+        "b_range": [0.0, 4.0],
+        "model_sha256": "a" * 64,
+        "fits_sha256": "b" * 64,
+        "ebtel_sha256": "c" * 64,
+        "map_xc_arcsec": 0.0,
+        "map_yc_arcsec": 0.0,
+        "map_dx_arcsec": 2.0,
+        "map_dy_arcsec": 2.0,
+        "map_nx": 2,
+        "map_ny": 2,
+        "observer_name": "earth",
+        "observer_lonc_deg": 0.0,
+        "observer_b0sun_deg": 0.0,
+        "observer_dsun_cm": 1.495978707e13,
+        "observer_obs_time": "2020-11-26T20:00:00",
+    }
+    artifact_h5 = tmp_path / "artifact.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    payload = load_scan_file(artifact_h5)
+    search_id = str(payload["selected_search_id"])
+    args = Namespace(
+        artifact_h5=artifact_h5,
+        recompute_search_id=search_id,
+        new_search_identity=False,
+        recompute_existing=False,
+        fits_file=None,
+        model_h5=None,
+        model_h5_override=None,
+        ebtel_path=None,
+        a_start=0.0,
+        target_metric="chi2",
+    )
+    resolved = _configure_targeted_recompute_search(args)
+    assert resolved == search_id
+    assert args.recompute_existing is False
+    assert args.targeted_recompute_repair is True
+    assert args.fits_file == obs_fits
+    assert args.model_h5 == model_h5
+    assert args.target_metric == "eta2"
+
+
+def test_preload_skips_hydrate_when_grid_reset(tmp_path: Path) -> None:
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["SIMPLE"] = True
+    header["BITPIX"] = -32
+    header["NAXIS"] = 2
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    header["CTYPE1"] = "HPLN-TAN"
+    header["CTYPE2"] = "HPLT-TAN"
+    header["CUNIT1"] = "arcsec"
+    header["CUNIT2"] = "arcsec"
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 2.0
+    header["CDELT2"] = 2.0
+    header["DATE-OBS"] = "2020-11-26T20:00:00"
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-preload",
+        "target_metric": "chi2",
+        "metrics_mask_threshold": 0.1,
+        "target_slice_key": "default",
+    }
+    artifact_h5 = tmp_path / "preload.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[
+            {
+                "a": 0.1,
+                "b": 1.0,
+                "q0": 0.001,
+                "success": True,
+                "status": "computed",
+                "modeled_best": observed,
+                "raw_modeled_best": observed,
+                "residual": np.zeros_like(observed),
+                "fit_q0_trials": (0.001,),
+                "fit_metric_trials": (1.0,),
+                "fit_chi2_trials": (1.0,),
+                "fit_rho2_trials": (1.0,),
+                "fit_eta2_trials": (1.0,),
+                "nfev": 1,
+                "nit": 0,
+                "message": "ok",
+                "used_adaptive_bracketing": False,
+                "bracket_found": False,
+                "bracket": None,
+                "target_metric": "chi2",
+                "diagnostics": {COMPATIBILITY_SIGNATURE_KEY: "sig-preload"},
+            }
+        ],
+    )
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics={**diagnostics, "search_id": load_scan_file(artifact_h5)["selected_search_id"]},
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="chi2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-preload",
+        viewer_heartbeat=None,
+    )
+    hydrated, _, _, _ = _preload_search_cache_from_artifact(
+        cache,
+        threshold=0.1,
+        explicit_mask=None,
+        artifact_preexisting=True,
+        hydrate_completed_points=False,
+    )
+    assert hydrated == 0
+    assert len(cache) == 0
+
+
+def test_register_parallel_search_preserves_prior_search(tmp_path: Path) -> None:
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["SIMPLE"] = True
+    header["BITPIX"] = -32
+    header["NAXIS"] = 2
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    header["CTYPE1"] = "HPLN-TAN"
+    header["CTYPE2"] = "HPLT-TAN"
+    header["CUNIT1"] = "arcsec"
+    header["CUNIT2"] = "arcsec"
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 2.0
+    header["CDELT2"] = 2.0
+    header["DATE-OBS"] = "2020-11-26T20:00:00"
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-parallel",
+        "target_metric": "chi2",
+        "metrics_mask_threshold": 0.1,
+        "target_slice_key": "default",
+    }
+    artifact_h5 = tmp_path / "parallel.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[
+            {
+                "a": 0.2,
+                "b": 1.1,
+                "q0": 0.001,
+                "success": True,
+                "status": "computed",
+                "modeled_best": observed,
+                "raw_modeled_best": observed,
+                "residual": np.zeros_like(observed),
+                "fit_q0_trials": (0.001,),
+                "fit_metric_trials": (1.0,),
+                "fit_chi2_trials": (1.0,),
+                "fit_rho2_trials": (1.0,),
+                "fit_eta2_trials": (1.0,),
+                "nfev": 1,
+                "nit": 0,
+                "message": "ok",
+                "used_adaptive_bracketing": False,
+                "bracket_found": False,
+                "bracket": None,
+                "target_metric": "chi2",
+                "diagnostics": {COMPATIBILITY_SIGNATURE_KEY: "sig-parallel"},
+            }
+        ],
+    )
+    first_payload = load_scan_file(artifact_h5)
+    first_search_id = str(first_payload["selected_search_id"])
+    parallel_diag = dict(diagnostics)
+    parallel_diag["search_instance_id"] = "parallel_debug_run"
+    parallel_search_id = search_id_from_evaluation_config(parallel_diag, layout={"kind": "point_list"})
+    resolved = register_sparse_search_in_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=parallel_diag,
+        search_id=parallel_search_id,
+        reset_search_points=True,
+    )
+    assert resolved == parallel_search_id
+    latest = load_scan_file(artifact_h5)
+    assert len(latest["search_records"]) == 2
+    assert str(latest["selected_search_id"]) == parallel_search_id
+    first_search_payload = load_scan_file(artifact_h5, search_id=first_search_id)
+    assert len(first_search_payload["point_records"]) == 1
+    parallel_payload = load_scan_file(artifact_h5, search_id=parallel_search_id)
+    assert parallel_payload["point_records"] == []

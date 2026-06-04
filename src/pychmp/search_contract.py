@@ -137,6 +137,12 @@ def build_search_evaluation_config(
         "no_area": diagnostics.get("no_area"),
         "psf_source": diagnostics.get("psf_source"),
         "resolved_psf": diagnostics.get("resolved_psf"),
+        "observation": {
+            "fits_sha256": diagnostics.get("fits_sha256") or diagnostics.get("observation_source_sha256"),
+            "observation_source_sha256": diagnostics.get("observation_source_sha256"),
+            "fits_file": diagnostics.get("fits_file"),
+            "observer_obs_time": diagnostics.get("observer_obs_time"),
+        },
     }
     if "requested_points" in diagnostics:
         config["requested_points"] = diagnostics["requested_points"]

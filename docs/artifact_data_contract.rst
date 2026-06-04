@@ -53,6 +53,54 @@ Design Principles
    present. It should not require a different file type for single-point versus
    scan artifacts.
 
+6. ``map_store`` is append-only evidence.
+
+   Search maintenance (purge search, slice reset, repair utilities) must never
+   delete datasets under the root ``map_store`` group. Orphaned map datasets are
+   acceptable; missing links from trial rows to ``map_store`` are not.
+
+7. Every finite-Q₀ trial row must link ``map_store``.
+
+   Metrics are derived from stored maps. A committed grid trial with finite
+   ``q0 > 0`` must persist ``map_refs_json`` with a non-empty ``raw_modeled``
+   path that resolves to a readable ``map_store`` array in the same artifact (or
+   linked map-store file). Trial rows with metrics only, broken refs, or
+   non-finite ``q0`` (phantom index rows) violate the contract.
+
+8. Warm start and repair enforce the contract.
+
+   Optimizer warm start must not trust metrics-only restored rows; it rescored
+   only from ``map_store``. When on-disk trial metadata for a grid point lacks
+   valid map links, the adaptive workflow resets that point and rebuilds trials
+   from ``map_store`` or reruns Q₀ as needed. The CLI
+   ``pychmp-repair-grid-trial-maps`` purges invalid trial HDF5 groups and
+   rebuilds grid-point headers without touching ``map_store``.
+
+9. Targeted search repair preserves valid trials.
+
+   ``--recompute-search-id`` repairs an existing search identity using the
+   stored scoring recipe only (CLI overrides that would change metric, mask,
+   grid, Q₀, observation, or render settings are rejected). Valid finite-Q₀
+   trial rows with readable ``map_store`` links are kept without rescoring;
+   only incomplete or contract-broken grid points are reset and completed.
+
+10. Grid expansion reuses the same search identity.
+
+    ``--expand-grid-search-id`` keeps the stored scoring recipe and search id,
+    accepts only widened ``a``/``b`` bounds (superset of the stored footprint),
+    preserves valid trials without rescoring, hydrates completed ``(a,b)`` cells,
+    and evaluates only cells that were not already completed inside the expanded
+    domain. Phase‑1 resume seeds from the prior footprint wall toward the widened
+    bound (not the original interior ``(a_start, b_start)``).
+
+11. Per-point repair utility (planned, not implemented).
+
+    Cherry-picked refit of selected ``grid_points`` under an existing ``search_id``
+    (optional cold ``map_store`` purge) is specified in
+    ``future-implementation-notes/pyCHMP/2026-06-01-pyCHMP-point-repair-utility-handoff.md``.
+    Until then use ``--recompute-search-id``, ``pychmp-repair-grid-trial-maps``, or
+    ``pychmp-rescore`` as appropriate.
+
 
 Canonical Architecture
 ----------------------
@@ -122,9 +170,11 @@ Current implementation status:
   render slices so the viewer and downstream tools can discover them under the
   unified layout.
 - Auxiliary rendered arrays are stored in the root ``map_store`` and referenced
-  from the target search point records via ``map_refs_json``. Auxiliary slice
-  shells remain render-only until a later search promotes one of those slices
-  into an active rescored search.
+  from the target search point records via ``map_refs_json``. Per-trial auxiliary
+  maps are always persisted (not a CLI option) so a later search can rescore the
+  full Q0 trial curve for that channel or frequency. Auxiliary slice shells
+  remain render-only until a later search promotes one of those slices into an
+  active rescored search.
 - When an adaptive single-observation run targets a compatible slice that
   already has saved trial maps, pyCHMP rescoring can seed the new search from
   stored maps instead of starting cold. This applies both to prior searches on

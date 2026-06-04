@@ -9,13 +9,16 @@ from astropy.io import fits
 from pychmp.viewer_plot_style import (
     apply_figure_autolayout,
     apply_heatmap_data_limits,
+    heatmap_facecolors_from_values,
     apply_q0_panel_trials_axis_style,
     limits_frame_finite_data,
     normalize_axis_scale_choice,
     reserve_q0_trials_subplot,
     resolve_grid_axis_limits,
+    resolve_heatmap_color_norm,
     resolve_trial_metric_arrays,
 )
+from matplotlib.colors import LogNorm, Normalize
 
 
 def test_q0_artifact_panel_calls_autolayout_after_update(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -106,6 +109,74 @@ def test_apply_heatmap_data_limits_uses_auto_aspect() -> None:
     assert ax.xlim == (-1.0, 1.0)
     assert ax.ylim == (2.0, 4.0)
     assert ax.aspect == "auto"
+
+
+def test_resolve_heatmap_color_norm_uses_log_for_positive_values() -> None:
+    values = np.asarray([1.0, 10.0, 100.0], dtype=float)
+    norm, vmin, vmax = resolve_heatmap_color_norm(values, log_scale=True)
+    assert isinstance(norm, LogNorm)
+    assert vmin == pytest.approx(1.0)
+    assert vmax == pytest.approx(100.0)
+
+
+def test_heatmap_colorbar_reset_after_remove_recreates_cax() -> None:
+    from matplotlib.figure import Figure
+    import matplotlib.cm as mpl_cm
+    from matplotlib.colors import LogNorm
+
+    fig = Figure(layout=None)
+    gs = fig.add_gridspec(1, 2, width_ratios=[22, 1], wspace=0.08)
+    ax = fig.add_subplot(gs[0, 0])
+    cax = fig.add_subplot(gs[0, 1])
+    mappable = mpl_cm.ScalarMappable(norm=LogNorm(0.75, 1.05), cmap=mpl_cm.get_cmap("viridis"))
+    mappable.set_array([0.8, 1.0])
+    cb = fig.colorbar(mappable, cax=cax)
+    cb.remove()
+    assert cax.get_figure(root=False) is None
+    cax = fig.add_subplot(gs[0, 1])
+    fig.colorbar(mappable, cax=cax)
+
+
+def test_heatmap_colorbar_cax_does_not_shrink_main_axes_on_repeat() -> None:
+    from matplotlib.figure import Figure
+    import matplotlib.cm as mpl_cm
+    from matplotlib.colors import LogNorm
+
+    fig = Figure(layout=None)
+    gs = fig.add_gridspec(1, 2, width_ratios=[22, 1], wspace=0.08)
+    ax = fig.add_subplot(gs[0, 0])
+    cax = fig.add_subplot(gs[0, 1])
+    width0 = float(ax.get_position().width)
+    cmap = mpl_cm.get_cmap("viridis")
+    mappable = mpl_cm.ScalarMappable(norm=LogNorm(0.75, 1.05), cmap=cmap)
+    mappable.set_array([0.8, 1.0, 1.04])
+    for _ in range(6):
+        cax.cla()
+        fig.colorbar(mappable, cax=cax)
+        ax.clear()
+    width_after = float(ax.get_position().width)
+    assert width_after == pytest.approx(width0, rel=1e-4)
+
+
+def test_heatmap_facecolors_differ_between_linear_and_log_norm() -> None:
+    import matplotlib.cm as mpl_cm
+
+    values = np.asarray([0.6, 0.8, 1.0], dtype=float)
+    cmap = mpl_cm.get_cmap("viridis")
+    linear_norm, _, _ = resolve_heatmap_color_norm(values, log_scale=False)
+    log_norm, _, _ = resolve_heatmap_color_norm(values, log_scale=True)
+    linear_colors = heatmap_facecolors_from_values(values, norm=linear_norm, cmap=cmap)
+    log_colors = heatmap_facecolors_from_values(values, norm=log_norm, cmap=cmap)
+    assert not np.allclose(linear_colors, log_colors)
+
+
+def test_resolve_heatmap_color_norm_falls_back_to_linear_without_positive_values() -> None:
+    values = np.asarray([0.0, -1.0, 0.5], dtype=float)
+    norm, vmin, vmax = resolve_heatmap_color_norm(values, log_scale=True)
+    assert isinstance(norm, Normalize)
+    assert not isinstance(norm, LogNorm)
+    assert vmin == pytest.approx(-1.0)
+    assert vmax == pytest.approx(0.5)
 
 
 def test_resolve_grid_axis_limits_uses_shared_extents_when_enabled() -> None:

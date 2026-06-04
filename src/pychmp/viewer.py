@@ -13,12 +13,13 @@ import textwrap
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from types import SimpleNamespace
 from typing import Any
 import numpy as np
 from astropy.io import fits
 from matplotlib.collections import PatchCollection
+import matplotlib.cm as mpl_cm
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
@@ -47,6 +48,8 @@ from .ab_scan_artifacts import (
     load_selected_trial_plot_payload,
     load_scan_file,
     load_shared_grid_extents,
+    purge_search_from_artifact,
+    point_records_for_payload,
     resolve_point_index,
     search_lifecycle_is_in_progress,
     with_observer_metadata,
@@ -57,6 +60,9 @@ from .viewer_plot_style import (
     apply_heatmap_axis_style,
     apply_figure_autolayout,
     apply_heatmap_data_limits,
+    configure_heatmap_colorbar,
+    heatmap_facecolors_from_values,
+    resolve_heatmap_color_norm,
     apply_trials_axis_style,
     resolve_grid_axis_limits,
     show_trials_message,
@@ -135,6 +141,17 @@ def _load_shared_grid_axes_pref() -> bool:
 def _save_shared_grid_axes_pref(enabled: bool) -> None:
     payload = _read_viewer_state()
     payload["shared_grid_axes"] = bool(enabled)
+    _write_viewer_state(payload)
+
+
+def _load_heatmap_log_scale_pref() -> bool:
+    value = _read_viewer_state().get("heatmap_log_scale")
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _save_heatmap_log_scale_pref(enabled: bool) -> None:
+    payload = _read_viewer_state()
+    payload["heatmap_log_scale"] = bool(enabled)
     _write_viewer_state(payload)
 
 
@@ -331,48 +348,58 @@ class _SelectedSolutionWindow:
         self.load_blos = False
         self.current_context: dict[str, Any] | None = None
         self.show_mask_contours_var = tk.BooleanVar(value=True)
-        self.mask_type_var = tk.StringVar(value="ROI mask: union")
+        self.toolbar_context_var = tk.StringVar(value="Selected solution window is ready.")
+        self.common_map_link_var = tk.StringVar(value="Auto (each panel)")
         self.common_map_scale_var = tk.StringVar(value="linear")
-        self.common_map_vmin_var = tk.StringVar(value="")
-        self.common_map_vmax_var = tk.StringVar(value="")
+        self.residual_map_mode_var = tk.StringVar(value="Tb (M−O)")
         self.residual_map_scale_var = tk.StringVar(value="linear")
-        self.residual_map_vmin_var = tk.StringVar(value="")
-        self.residual_map_vmax_var = tk.StringVar(value="")
 
         outer = ttk.Frame(self.window, padding=8)
         outer.pack(fill=tk.BOTH, expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(1, weight=1)
-        outer.rowconfigure(2, weight=0)
+        outer.rowconfigure(2, weight=1)
+        outer.rowconfigure(3, weight=0)
 
         toolbar = ttk.Frame(outer)
-        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        toolbar.columnconfigure(13, weight=1)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        toolbar_pad = (4, 0)
+        col = 0
+
+        def place(widget: tk.Widget, *, pad: tuple[int, int] = toolbar_pad) -> None:
+            nonlocal col
+            widget.grid(row=0, column=col, sticky="w", padx=pad)
+            col += 1
+
         self.blos_button = ttk.Button(toolbar, text="Load B_los", command=self._load_blos_now)
-        self.blos_button.grid(row=0, column=0, sticky="w")
+        place(self.blos_button, pad=(0, 0))
         _ToolTip(self.blos_button, "Load B_los: fetch and cache the external reference panel on demand for the current model.")
         self.export_png_button = ttk.Button(toolbar, text="Export PNG", command=self._export_current_png)
-        self.export_png_button.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        place(self.export_png_button)
         _ToolTip(self.export_png_button, "Export the currently displayed selected-solution figure to PNG, preserving the current zoom/pan axis state.")
         self.plot_beam_button = ttk.Button(toolbar, text="Plot Beam", command=self._plot_convolving_beam)
-        self.plot_beam_button.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        place(self.plot_beam_button)
         _ToolTip(self.plot_beam_button, "Plot the convolving beam at the same map FOV and pixel scale as the synthetic image.")
         self.mask_contour_check = ttk.Checkbutton(
             toolbar,
-            text="Show ROI Mask Contour",
+            text="Show Mask Contours",
             variable=self.show_mask_contours_var,
             command=self._toggle_mask_contours,
         )
-        self.mask_contour_check.grid(row=0, column=3, sticky="w", padx=(10, 0))
+        place(self.mask_contour_check)
         _ToolTip(
             self.mask_contour_check,
             "Toggle the metrics ROI threshold contour on all map panels (B_los, observed, raw modeled, modeled, residual).",
         )
-        ttk.Label(toolbar, textvariable=self.mask_type_var, anchor=tk.W).grid(row=0, column=4, sticky="w", padx=(10, 0))
-        self.status_var = tk.StringVar(value="Selected solution window is ready.")
-        ttk.Label(toolbar, textvariable=self.status_var, anchor=tk.W).grid(row=0, column=5, columnspan=9, sticky="ew", padx=(10, 0))
 
-        ttk.Label(toolbar, text="Maps").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        place(ttk.Label(toolbar, text="Maps"))
+        maps_link_menu = ttk.Combobox(
+            toolbar,
+            width=16,
+            state="readonly",
+            values=("Auto (each panel)", "Lock to observed", "Lock to modeled"),
+            textvariable=self.common_map_link_var,
+        )
+        place(maps_link_menu)
         maps_scale_menu = ttk.Combobox(
             toolbar,
             width=7,
@@ -380,16 +407,19 @@ class _SelectedSolutionWindow:
             values=("linear", "log"),
             textvariable=self.common_map_scale_var,
         )
-        maps_scale_menu.grid(row=1, column=1, sticky="w", padx=(4, 6), pady=(8, 0))
-        maps_vmin_entry = ttk.Entry(toolbar, width=9, textvariable=self.common_map_vmin_var)
-        maps_vmin_entry.grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(8, 0))
-        ttk.Label(toolbar, text="to").grid(row=1, column=3, sticky="w", pady=(8, 0))
-        maps_vmax_entry = ttk.Entry(toolbar, width=9, textvariable=self.common_map_vmax_var)
-        maps_vmax_entry.grid(row=1, column=4, sticky="w", padx=(4, 6), pady=(8, 0))
+        place(maps_scale_menu)
         maps_auto_button = ttk.Button(toolbar, text="Auto", width=6, command=self._reset_common_map_display)
-        maps_auto_button.grid(row=1, column=5, sticky="w", pady=(8, 0))
+        place(maps_auto_button)
 
-        ttk.Label(toolbar, text="Residual").grid(row=1, column=6, sticky="w", padx=(14, 0), pady=(8, 0))
+        place(ttk.Label(toolbar, text="Residual"))
+        residual_mode_menu = ttk.Combobox(
+            toolbar,
+            width=22,
+            state="readonly",
+            values=("Tb (M−O)", "Normalized (M−O)/(M+O)"),
+            textvariable=self.residual_map_mode_var,
+        )
+        place(residual_mode_menu)
         residual_scale_menu = ttk.Combobox(
             toolbar,
             width=7,
@@ -397,23 +427,38 @@ class _SelectedSolutionWindow:
             values=("linear", "symlog"),
             textvariable=self.residual_map_scale_var,
         )
-        residual_scale_menu.grid(row=1, column=7, sticky="w", padx=(4, 6), pady=(8, 0))
-        residual_vmin_entry = ttk.Entry(toolbar, width=9, textvariable=self.residual_map_vmin_var)
-        residual_vmin_entry.grid(row=1, column=8, sticky="w", padx=(0, 4), pady=(8, 0))
-        ttk.Label(toolbar, text="to").grid(row=1, column=9, sticky="w", pady=(8, 0))
-        residual_vmax_entry = ttk.Entry(toolbar, width=9, textvariable=self.residual_map_vmax_var)
-        residual_vmax_entry.grid(row=1, column=10, sticky="w", padx=(4, 6), pady=(8, 0))
+        place(residual_scale_menu)
         residual_auto_button = ttk.Button(toolbar, text="Auto", width=6, command=self._reset_residual_map_display)
-        residual_auto_button.grid(row=1, column=11, sticky="w", pady=(8, 0))
+        place(residual_auto_button)
 
-        _ToolTip(maps_scale_menu, "Shared intensity scale for the observed, raw modeled, and PSF-convolved modeled panels.")
-        _ToolTip(maps_auto_button, "Reset the shared observed/raw/modeled intensity display to automatic limits.")
+        info_bar = ttk.Frame(outer)
+        info_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        info_bar.columnconfigure(0, weight=1)
+        ttk.Label(
+            info_bar,
+            textvariable=self.toolbar_context_var,
+            anchor=tk.W,
+            wraplength=0,
+        ).grid(row=0, column=0, sticky="ew")
+
+        _ToolTip(
+            maps_link_menu,
+            "Share color limits across observed, raw modeled, and PSF-modeled panels. "
+            "Lock modes use the min/max of the chosen reference map (respecting linear/log scale).",
+        )
+        _ToolTip(
+            maps_scale_menu,
+            "Shared intensity scale (linear or log) for observed, raw modeled, and PSF-modeled panels.",
+        )
+        _ToolTip(maps_auto_button, "Reset map link and scale to defaults (per-panel auto limits).")
+        _ToolTip(
+            residual_mode_menu,
+            "Residual definition: Tb difference (model−obs) or normalized (M−O)/(M+O) in [-1, 1].",
+        )
         _ToolTip(residual_scale_menu, "Residual intensity scale. Use symlog for signed residuals with wide dynamic range.")
-        _ToolTip(residual_auto_button, "Reset the residual intensity display to automatic limits.")
-        for widget in (maps_scale_menu, residual_scale_menu):
+        _ToolTip(residual_auto_button, "Reset residual type and scale to defaults.")
+        for widget in (maps_link_menu, maps_scale_menu, residual_mode_menu, residual_scale_menu):
             widget.bind("<<ComboboxSelected>>", lambda _event: self.update_selection())
-        for entry in (maps_vmin_entry, maps_vmax_entry, residual_vmin_entry, residual_vmax_entry):
-            entry.bind("<Return>", lambda _event: self.update_selection())
 
         from matplotlib.figure import Figure
 
@@ -421,11 +466,11 @@ class _SelectedSolutionWindow:
         self.panel = Q0ArtifactPanelFigure(self.figure)
         self.canvas = FigureCanvasTkAgg(self.figure, master=outer)
         canvas_widget = self.canvas.get_tk_widget()
-        canvas_widget.grid(row=1, column=0, sticky="nsew")
+        canvas_widget.grid(row=2, column=0, sticky="nsew")
         self._autolayout_after_id: str | None = None
         canvas_widget.bind("<Configure>", lambda _event: self._schedule_autolayout())
         toolbar_frame = ttk.Frame(outer)
-        toolbar_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        toolbar_frame.grid(row=3, column=0, sticky="ew", pady=(6, 0))
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame, pack_toolbar=False)
         self.toolbar.update()
         self.toolbar.grid(row=0, column=0, sticky="w")
@@ -467,16 +512,6 @@ class _SelectedSolutionWindow:
         self.window.focus_force()
         self.window.after_idle(self._run_autolayout)
 
-    def _parse_display_limit(self, value: str) -> float | None:
-        text = str(value).strip()
-        if not text:
-            return None
-        try:
-            numeric = float(text)
-        except Exception:
-            return None
-        return numeric if np.isfinite(numeric) else None
-
     def _get_psf_metadata_cache(self) -> dict[str, PSFMetadata | None]:
         app = getattr(self, "app", None)
         if app is not None:
@@ -511,10 +546,63 @@ class _SelectedSolutionWindow:
         finally:
             self.app.selected_solution_window = None
 
+    def _format_toolbar_context(
+        self,
+        *,
+        diagnostics: dict[str, Any],
+        context: dict[str, Any],
+        slice_label: str,
+        trial_label: str,
+    ) -> str:
+        if bool(self.show_mask_contours_var.get()):
+            mask_text = format_metrics_mask_label(diagnostics)
+        else:
+            mask_text = "Mask contours: off"
+        elapsed_seconds = diagnostics.get("elapsed_seconds")
+        try:
+            elapsed_value = float(elapsed_seconds)
+        except Exception:
+            elapsed_value = float("nan")
+        elapsed_text = f"elapsed={elapsed_value:.3f} s" if np.isfinite(elapsed_value) else ""
+        has_saved_blos = context.get("blos_reference") is not None
+        blos_state = "saved" if has_saved_blos else ("loaded" if self.load_blos else "lazy")
+        parts = [
+            mask_text,
+            f"Slice: {slice_label}{trial_label}",
+            f"a={float(diagnostics.get('a', np.nan)):.3f} b={float(diagnostics.get('b', np.nan)):.3f}",
+            f"q0={_format_scalar(diagnostics.get('q0_recovered', np.nan), '.6f')}",
+            f"B_los: {blos_state}",
+            f"Maps: {self.common_map_link_var.get()} / {self.common_map_scale_var.get()}",
+            f"Residual: {self.residual_map_mode_var.get()} / {self.residual_map_scale_var.get()}",
+        ]
+        if elapsed_text:
+            parts.append(elapsed_text)
+        return "  |  ".join(parts)
+
+    def _refresh_toolbar_context(self) -> None:
+        context = self.current_context
+        if context is None:
+            self.toolbar_context_var.set("No completed point available yet.")
+            return
+        diagnostics = dict(context.get("diagnostics", {}))
+        selected_trial_index = diagnostics.get("selected_trial_index")
+        selected_trial_count = diagnostics.get("selected_trial_count")
+        trial_label = ""
+        if selected_trial_index is not None and selected_trial_count is not None:
+            trial_label = f" - trial {int(selected_trial_index) + 1}/{int(selected_trial_count)}"
+        self.toolbar_context_var.set(
+            self._format_toolbar_context(
+                diagnostics=diagnostics,
+                context=context,
+                slice_label=str(context.get("slice_label", "")),
+                trial_label=trial_label,
+            )
+        )
+
     def update_selection(self) -> None:
         context = self.app._selected_solution_plot_context()
         if context is None:
-            self.status_var.set("No completed point available yet.")
+            self.toolbar_context_var.set("No completed point available yet.")
             return
         self.current_context = context
         diagnostics = dict(context["diagnostics"])
@@ -538,14 +626,13 @@ class _SelectedSolutionWindow:
             trials_ylim=context.get("trials_ylim"),
             trials_match_parent_view=bool(context.get("trials_match_parent_view")),
             common_map_scale=str(self.common_map_scale_var.get() or "linear"),
-            common_map_vmin=self._parse_display_limit(self.common_map_vmin_var.get()),
-            common_map_vmax=self._parse_display_limit(self.common_map_vmax_var.get()),
+            common_map_link=str(self.common_map_link_var.get() or "auto"),
             residual_map_scale=str(self.residual_map_scale_var.get() or "linear"),
-            residual_map_vmin=self._parse_display_limit(self.residual_map_vmin_var.get()),
-            residual_map_vmax=self._parse_display_limit(self.residual_map_vmax_var.get()),
+            residual_map_mode=str(self.residual_map_mode_var.get() or "tb"),
             wcs_header_transform=context["wcs_header_transform"],
             load_blos=self.load_blos,
             blos_reference=context.get("blos_reference"),
+            psf_kernel=context.get("psf_kernel"),
         )
         self.panel.set_mask_contours_visible(bool(self.show_mask_contours_var.get()))
         self.panel._draw_mask_contours(
@@ -556,29 +643,16 @@ class _SelectedSolutionWindow:
         )
         self.panel.apply_autolayout()
         slice_label = str(context["slice_label"])
-        mask_type = str(diagnostics.get("mask_type", "union")).strip() or "union"
         selected_trial_index = diagnostics.get("selected_trial_index")
         selected_trial_count = diagnostics.get("selected_trial_count")
         trial_label = ""
         if selected_trial_index is not None and selected_trial_count is not None:
             trial_label = f" - trial {int(selected_trial_index) + 1}/{int(selected_trial_count)}"
-        self.mask_type_var.set(format_metrics_mask_label(diagnostics))
+        self._refresh_toolbar_context()
         self.window.title(
             "pyCHMP Selected Solution"
             f" - {slice_label}{trial_label} - a={float(diagnostics.get('a', np.nan)):.3f}"
             f" b={float(diagnostics.get('b', np.nan)):.3f}"
-        )
-        elapsed_seconds = diagnostics.get("elapsed_seconds")
-        try:
-            elapsed_value = float(elapsed_seconds)
-        except Exception:
-            elapsed_value = float("nan")
-        elapsed_text = f" | elapsed={elapsed_value:.3f} s" if np.isfinite(elapsed_value) else ""
-        has_saved_blos = context.get("blos_reference") is not None
-        blos_state = "saved" if has_saved_blos else ("loaded" if self.load_blos else "lazy")
-        self.status_var.set(
-            f"Slice: {slice_label}{trial_label} | q0={_format_scalar(diagnostics.get('q0_recovered', np.nan), '.6f')}"
-            f" | B_los: {blos_state}{elapsed_text}"
         )
         self.canvas.draw_idle()
 
@@ -587,15 +661,13 @@ class _SelectedSolutionWindow:
         self.update_selection()
 
     def _reset_common_map_display(self) -> None:
+        self.common_map_link_var.set("Auto (each panel)")
         self.common_map_scale_var.set("linear")
-        self.common_map_vmin_var.set("")
-        self.common_map_vmax_var.set("")
         self.update_selection()
 
     def _reset_residual_map_display(self) -> None:
+        self.residual_map_mode_var.set("Tb (M−O)")
         self.residual_map_scale_var.set("linear")
-        self.residual_map_vmin_var.set("")
-        self.residual_map_vmax_var.set("")
         self.update_selection()
 
     def _toggle_mask_contours(self) -> None:
@@ -609,12 +681,13 @@ class _SelectedSolutionWindow:
             np.asarray(self.current_context["modeled_best"], dtype=float),
             diagnostics,
         )
+        self._refresh_toolbar_context()
         self.panel.apply_autolayout()
         self.canvas.draw_idle()
 
     def _export_current_png(self) -> None:
         if self.current_context is None:
-            self.status_var.set("No selected solution is available to export.")
+            self.toolbar_context_var.set("No selected solution is available to export.")
             return
 
         diagnostics = dict(self.current_context.get("diagnostics", {}))
@@ -645,11 +718,11 @@ class _SelectedSolutionWindow:
             out_png.parent.mkdir(parents=True, exist_ok=True)
             self.panel.apply_autolayout()
             self.figure.savefig(out_png, dpi=self.figure.dpi)
-            self.status_var.set(f"Exported PNG: {out_png}")
+            self.toolbar_context_var.set(f"Exported PNG: {out_png}")
             _save_last_directory(out_png.parent)
             self.app.last_artifact_dir = out_png.parent
         except Exception as exc:
-            self.status_var.set(f"PNG export failed: {exc}")
+            self.toolbar_context_var.set(f"PNG export failed: {exc}")
 
     def _psf_metadata_from_diagnostics(self, diagnostics: dict[str, Any]) -> PSFMetadata | None:
         diag = dict(diagnostics or {})
@@ -745,13 +818,13 @@ class _SelectedSolutionWindow:
 
     def _plot_convolving_beam(self) -> None:
         if self.current_context is None:
-            self.status_var.set("No selected solution available for beam plotting.")
+            self.toolbar_context_var.set("No selected solution available for beam plotting.")
             return
 
         diagnostics = dict(self.current_context.get("diagnostics", {}))
         map_shape = tuple(np.asarray(self.current_context.get("modeled_best", np.zeros((1, 1))), dtype=float).shape)
         if len(map_shape) != 2:
-            self.status_var.set("Beam plot unavailable: modeled map is not 2D.")
+            self.toolbar_context_var.set("Beam plot unavailable: modeled map is not 2D.")
             return
 
         dx = _optional_float(diagnostics.get("map_dx_arcsec"))
@@ -762,7 +835,7 @@ class _SelectedSolutionWindow:
                 dx = dx or abs(_optional_float(header.get("CDELT1")) or 0.0)
                 dy = dy or abs(_optional_float(header.get("CDELT2")) or 0.0)
         if dx is None or dy is None or dx <= 0.0 or dy <= 0.0:
-            self.status_var.set("Beam plot unavailable: invalid map pixel scale.")
+            self.toolbar_context_var.set("Beam plot unavailable: invalid map pixel scale.")
             return
 
         kernel: np.ndarray | None = None
@@ -780,7 +853,7 @@ class _SelectedSolutionWindow:
         if kernel is None:
             metadata = self._psf_metadata_from_diagnostics(diagnostics)
             if metadata is None:
-                self.status_var.set("Beam plot unavailable: missing PSF metadata.")
+                self.toolbar_context_var.set("Beam plot unavailable: missing PSF metadata.")
                 return
 
             active_frequency_ghz = _optional_float(
@@ -811,7 +884,7 @@ class _SelectedSolutionWindow:
                     kernel_cache[kernel_cache_key] = np.asarray(kernel, dtype=float)
             source = str(metadata.source or diagnostics.get("psf_source") or "unknown")
         if kernel is None:
-            self.status_var.set("Beam plot unavailable: failed to build PSF kernel.")
+            self.toolbar_context_var.set("Beam plot unavailable: failed to build PSF kernel.")
             return
 
         beam_map, captured_fraction = _center_kernel_to_shape(np.asarray(kernel, dtype=float), map_shape)
@@ -864,13 +937,13 @@ class _SelectedSolutionWindow:
         )
         fig.tight_layout()
         plt.show(block=False)
-        self.status_var.set("Opened convolving-beam plot window.")
+        self.toolbar_context_var.set("Opened convolving-beam plot window.")
 
 
 class PychmpViewApp:
     _LOAD_RETRY_ATTEMPTS = 8
     _LOAD_RETRY_DELAY_S = 0.35
-    _EXTERNAL_REFRESH_POLL_MS = 1200
+    _EXTERNAL_REFRESH_POLL_MS = 600
     _MIN_HEARTBEAT_RELOAD_INTERVAL_S = 2.0
     _MAX_LOG_LINES = 3000
     _INITIAL_LOG_READ_BYTES = 262_144
@@ -932,6 +1005,7 @@ class PychmpViewApp:
         self.trial_index_var = tk.IntVar(value=0)
         self.trial_label_var = tk.StringVar(value="trial: n/a")
         self.shared_heatmap_axes_var = tk.BooleanVar(value=_load_shared_grid_axes_pref())
+        self.heatmap_log_scale_var = tk.BooleanVar(value=_load_heatmap_log_scale_pref())
         self._shared_heatmap_extents: dict[str, float] | None = None
         self._open_global_best_applied = False
         self.a_index_var = tk.IntVar(value=0)
@@ -1073,7 +1147,7 @@ class PychmpViewApp:
 
         primary_toolbar = ttk.Frame(toolbar)
         primary_toolbar.grid(row=0, column=0, sticky="ew")
-        primary_toolbar.columnconfigure(9, weight=1)
+        primary_toolbar.columnconfigure(10, weight=1)
 
         secondary_toolbar = ttk.Frame(toolbar)
         secondary_toolbar.grid(row=1, column=0, sticky="ew", pady=(6, 0))
@@ -1118,16 +1192,20 @@ class PychmpViewApp:
         self.search_display_label = ttk.Label(primary_toolbar, textvariable=self.search_display_var, anchor=tk.W)
         self.search_display_label.grid(row=0, column=7, sticky="w", padx=(6, 10))
 
-        ttk.Label(primary_toolbar, text="a").grid(row=0, column=8, sticky="w")
+        purge_search_button = ttk.Button(primary_toolbar, text="⊖", width=3, command=self._purge_selected_search)
+        purge_search_button.grid(row=0, column=8, sticky="w", padx=(0, 6))
+        self.purge_search_button = purge_search_button
+
+        ttk.Label(primary_toolbar, text="a").grid(row=0, column=9, sticky="w")
         self.a_menu = ttk.Combobox(primary_toolbar, width=10, state="readonly")
         self.a_menu.configure(width=10)
-        self.a_menu.grid(row=0, column=9, sticky="w", padx=(6, 10))
+        self.a_menu.grid(row=0, column=10, sticky="w", padx=(6, 10))
         self.a_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_a_changed())
 
-        ttk.Label(primary_toolbar, text="b").grid(row=0, column=10, sticky="w")
+        ttk.Label(primary_toolbar, text="b").grid(row=0, column=11, sticky="w")
         self.b_menu = ttk.Combobox(primary_toolbar, width=10, state="readonly")
         self.b_menu.configure(width=10)
-        self.b_menu.grid(row=0, column=11, sticky="w", padx=(6, 12))
+        self.b_menu.grid(row=0, column=12, sticky="w", padx=(6, 12))
         self.b_menu.bind("<<ComboboxSelected>>", lambda _event: self._on_b_changed())
 
         ttk.Separator(secondary_toolbar, orient=tk.VERTICAL).grid(row=0, column=0, sticky="ns", padx=(0, 10))
@@ -1163,6 +1241,12 @@ class PychmpViewApp:
         _ToolTip(display_selected_button, "Display Selected Solution: open or refresh the persistent detailed solution window for the current (a, b) point.")
         _ToolTip(summary_button, "Display Grid Summary: open the external grid-summary plot for the current artifact.")
         _ToolTip(refresh_button, "Refresh Artifact: reload the current artifact and update the viewer if the scan has advanced.")
+        _ToolTip(
+            purge_search_button,
+            "Purge search: remove metadata for the selected search branch. "
+            "Disabled while that branch is live (runner heartbeat or in-progress session). "
+            "Does not delete map_store entries.",
+        )
         _ToolTip(scan_state_badge, "Scan status: indicates whether the current slice appears to be running, finished, incomplete, or empty. Full details are shown in the Info pane.")
 
         content = ttk.Frame(outer)
@@ -1261,8 +1345,15 @@ class PychmpViewApp:
         right_notebook.add(trials_tab, text="Trials")
         self.q0_trials_tab = trials_tab
 
-        self.heatmap_figure = Figure(figsize=(6.0, 4.0), dpi=self._FIGURE_DPI)
-        self.ax_heatmap = self.heatmap_figure.add_subplot(111)
+        self.heatmap_figure = Figure(figsize=(6.0, 4.0), dpi=self._FIGURE_DPI, layout=None)
+        self._heatmap_gridspec = self.heatmap_figure.add_gridspec(
+            1,
+            2,
+            width_ratios=[22, 1],
+            wspace=0.08,
+        )
+        self.ax_heatmap = self.heatmap_figure.add_subplot(self._heatmap_gridspec[0, 0])
+        self.ax_heatmap_cbar = self.heatmap_figure.add_subplot(self._heatmap_gridspec[0, 1])
 
         self.trials_figure = Figure(figsize=(6.0, 4.0), dpi=self._FIGURE_DPI)
         self.ax_trials = self.trials_figure.add_subplot(111)
@@ -1510,14 +1601,28 @@ class PychmpViewApp:
         figure.set_size_inches(width_px / dpi, height_px / dpi, forward=False)
         canvas.draw_idle()
 
-    def _reset_heatmap_colorbar(self) -> None:
-        if self._heatmap_colorbar is None:
+    def _ensure_heatmap_colorbar_axes(self) -> None:
+        """Recreate the dedicated colorbar axes after colorbar.remove() detaches it."""
+        cax = getattr(self, "ax_heatmap_cbar", None)
+        if cax is not None and cax.get_figure(root=False) is self.heatmap_figure:
             return
-        try:
-            self._heatmap_colorbar.remove()
-        except Exception:
-            pass
-        self._heatmap_colorbar = None
+        gridspec = getattr(self, "_heatmap_gridspec", None)
+        if gridspec is None:
+            return
+        self.ax_heatmap_cbar = self.heatmap_figure.add_subplot(gridspec[0, 1])
+
+    def _reset_heatmap_colorbar(self) -> None:
+        if self._heatmap_colorbar is not None:
+            try:
+                self._heatmap_colorbar.remove()
+            except Exception:
+                pass
+            self._heatmap_colorbar = None
+        # colorbar.remove() detaches cax from the figure; never call cla() on it then.
+        self._ensure_heatmap_colorbar_axes()
+        cax = getattr(self, "ax_heatmap_cbar", None)
+        if cax is not None:
+            cax.set_visible(False)
 
     def _refresh_info_text(self) -> None:
         if self.info_text is None:
@@ -1714,15 +1819,17 @@ class PychmpViewApp:
         if self._refresh_event_is_terminal() or self._refresh_phase_is_terminal():
             return True
         payload = getattr(self, "payload", None) or {}
-        if not payload:
+        if payload:
+            selected = dict(payload.get("selected_search") or {})
+            lifecycle = dict(selected.get("lifecycle") or {})
+            status = str(selected.get("status", "") or "").strip().lower()
+            if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
+                return True
+            if str(lifecycle.get("completed_at") or "").strip():
+                return True
+        pid = self._runner_pid_from_log()
+        if pid is not None and self._process_is_running(pid):
             return False
-        selected = dict(payload.get("selected_search") or {})
-        lifecycle = dict(selected.get("lifecycle") or {})
-        status = str(selected.get("status", "") or "").strip().lower()
-        if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
-            return True
-        if str(lifecycle.get("completed_at") or "").strip():
-            return True
         return False
 
     def _clear_live_runner_state(self) -> None:
@@ -1777,12 +1884,12 @@ class PychmpViewApp:
         return bool(selected.get("active", lifecycle.get("active", False)))
 
     def _live_runner_detected(self) -> bool:
-        if self._search_run_terminal():
-            return False
-        if self._refresh_signal_is_fresh():
-            return True
         pid = self._runner_pid_from_log()
-        return pid is not None and self._process_is_running(pid)
+        if pid is not None and self._process_is_running(pid):
+            return True
+        if self._refresh_signal_is_fresh() and not self._search_run_terminal():
+            return True
+        return not self._search_run_terminal()
 
     def _bind_refresh_signal_path(self) -> None:
         artifact_h5 = getattr(self, "artifact_h5", None)
@@ -1809,6 +1916,175 @@ class PychmpViewApp:
         live_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip() or None
         live_search_id = str(getattr(self, "_refresh_signal_search_id", None) or "").strip() or None
         return live_slice_key, live_search_id
+
+    def _live_session_activity_present(self) -> bool:
+        return self._live_runner_detected() or self._heartbeat_activity_present()
+
+    def _heartbeat_matches_selection(
+        self,
+        *,
+        selected_slice_key: str = "",
+        selected_search_id: str = "",
+    ) -> tuple[bool, bool]:
+        heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
+        heartbeat_search_id = str(getattr(self, "_refresh_signal_search_id", None) or "").strip()
+        slice_key = str(selected_slice_key or self._selected_slice_key() or "").strip()
+        search_id = str(selected_search_id or self._selected_search_id() or "").strip()
+        matches_slice = not (heartbeat_slice_key and slice_key and heartbeat_slice_key != slice_key)
+        matches_search = not (heartbeat_search_id and search_id and heartbeat_search_id != search_id)
+        return matches_slice, matches_search
+
+    def _runner_targets_selection(
+        self,
+        *,
+        selected_slice_key: str = "",
+        selected_search_id: str = "",
+    ) -> bool:
+        if not self._live_runner_detected():
+            return False
+        matches_slice, matches_search = self._heartbeat_matches_selection(
+            selected_slice_key=selected_slice_key,
+            selected_search_id=selected_search_id,
+        )
+        return matches_slice and matches_search
+
+    def _live_heartbeat_search_id_for_slice(self, slice_key: str) -> str:
+        key = str(slice_key or "").strip()
+        if not self._live_session_activity_present():
+            return ""
+        hb_slice, hb_search = self._heartbeat_slice_and_search()
+        if not hb_search:
+            return ""
+        if key and hb_slice and hb_slice != key:
+            return ""
+        return hb_search
+
+    def _search_record_is_live(self, record: dict[str, Any]) -> bool:
+        lifecycle = dict(record.get("lifecycle") or {})
+        lifecycle["in_progress"] = bool(record.get("in_progress", lifecycle.get("in_progress", False)))
+        if not search_lifecycle_is_in_progress(lifecycle):
+            return False
+        if not self._live_session_activity_present():
+            return False
+        slice_key = str(record.get("slice_key", "") or "").strip()
+        search_id = str(record.get("search_id", "") or "").strip()
+        live_id = self._live_heartbeat_search_id_for_slice(slice_key)
+        if live_id:
+            return search_id == live_id
+        hb_slice, _hb_search = self._heartbeat_slice_and_search()
+        if hb_slice and slice_key and hb_slice == slice_key:
+            live_candidates = [
+                str(item.get("search_id", "") or "").strip()
+                for item in list(getattr(self, "available_searches", []) or [])
+                if str(item.get("slice_key", "") or "").strip() == slice_key
+                and search_lifecycle_is_in_progress(dict(item.get("lifecycle") or {}))
+            ]
+            live_candidates = [item for item in live_candidates if item]
+            if len(live_candidates) == 1:
+                return search_id == live_candidates[0]
+        return False
+
+    def _selected_search_record(self) -> dict[str, Any] | None:
+        selected_id = str(self._selected_search_id() or "").strip()
+        if not selected_id:
+            return None
+        for record in list(getattr(self, "available_searches", []) or []):
+            if str(record.get("search_id", "")).strip() == selected_id:
+                return dict(record)
+        return None
+
+    def _search_purge_enabled(self, record: dict[str, Any] | None = None) -> bool:
+        if self.artifact_h5 is None:
+            return False
+        if record is None:
+            record = self._selected_search_record()
+        if record is None:
+            return False
+        search_id = str(record.get("search_id", "")).strip()
+        if not search_id:
+            return False
+        slice_key = str(record.get("slice_key", "") or self._selected_slice_key() or "").strip()
+        if self._search_record_is_live(record):
+            return False
+        if self._runner_targets_selection(
+            selected_slice_key=slice_key,
+            selected_search_id=search_id,
+        ):
+            return False
+        hb_slice, hb_search = self._heartbeat_slice_and_search()
+        if self._live_session_activity_present() and hb_search and hb_search == search_id:
+            if not slice_key or not hb_slice or hb_slice == slice_key:
+                return False
+        return True
+
+    def _search_purge_disabled_reason(self, record: dict[str, Any] | None = None) -> str:
+        if self.artifact_h5 is None:
+            return "No artifact loaded."
+        if record is None:
+            record = self._selected_search_record()
+        if record is None:
+            return "No search selected."
+        if self._search_record_is_live(record):
+            return "The selected search is the live active branch."
+        search_id = str(record.get("search_id", "")).strip()
+        slice_key = str(record.get("slice_key", "") or self._selected_slice_key() or "").strip()
+        if self._runner_targets_selection(
+            selected_slice_key=slice_key,
+            selected_search_id=search_id,
+        ):
+            return "The adaptive runner is writing to this search."
+        hb_slice, hb_search = self._heartbeat_slice_and_search()
+        if self._live_session_activity_present() and hb_search and hb_search == search_id:
+            if not slice_key or not hb_slice or hb_slice == slice_key:
+                return "The refresh heartbeat targets this search."
+        return ""
+
+    def _update_purge_search_button_state(self) -> None:
+        button = getattr(self, "purge_search_button", None)
+        if button is None:
+            return
+        if self._search_purge_enabled():
+            button.state(["!disabled"])
+        else:
+            button.state(["disabled"])
+
+    def _purge_selected_search(self) -> None:
+        record = self._selected_search_record()
+        if not self._search_purge_enabled(record):
+            reason = self._search_purge_disabled_reason(record)
+            if reason:
+                self.status_var.set(reason)
+            return
+        if self.artifact_h5 is None:
+            return
+        search_id = str(record.get("search_id", "")).strip()
+        slice_key = str(record.get("slice_key", "") or self._selected_slice_key() or "").strip()
+        if not search_id or not slice_key:
+            self.status_var.set("Cannot purge search: missing slice or search id.")
+            return
+        prompt = (
+            f"Remove search metadata for\n\n"
+            f"  slice:  {slice_key}\n"
+            f"  search: {search_id}\n\n"
+            f"map_store arrays are not deleted. Other searches are unchanged."
+        )
+        if not messagebox.askyesno("Purge search", prompt, icon="warning", default="no"):
+            return
+        try:
+            result = purge_search_from_artifact(
+                Path(self.artifact_h5),
+                slice_key=slice_key,
+                search_id=search_id,
+            )
+        except Exception as exc:
+            messagebox.showerror("Purge search failed", str(exc))
+            self.status_var.set(f"Purge search failed: {exc}")
+            return
+        if str(self._selected_search_id() or "").strip() == search_id:
+            remaining = list(result.get("remaining_search_ids") or [])
+            self.search_id_var.set(str(remaining[-1]) if remaining else "")
+        self._refresh_artifact_catalog()
+        self._schedule_payload_reload(status_text=f"Purged search {search_id}")
 
     def _search_id_in_artifact(self, search_id: str | None, *, slice_key: str | None = None) -> bool:
         key = str(search_id or "").strip()
@@ -1947,6 +2223,8 @@ class PychmpViewApp:
 
     def _heartbeat_activity_present(self) -> bool:
         if self._search_run_terminal():
+            return False
+        if not self._refresh_signal_is_fresh() and not self._live_runner_detected():
             return False
         if getattr(self, "_refresh_signal_active_point", None) is not None:
             return True
@@ -2187,8 +2465,8 @@ class PychmpViewApp:
             self._selected_trial_token = None
 
     def _apply_best_navigation(self, *, force_reanchor: bool = False) -> None:
-        search_metric = self._run_target_metric_for_selection()
-        selection = best_point_selection(self.payload, search_metric)
+        display_metric = self._heatmap_display_metric()
+        selection = best_point_selection(self.payload, display_metric)
         if selection is None:
             self._best_tied_records = []
             return
@@ -2199,8 +2477,6 @@ class PychmpViewApp:
             self.a_index_var.set(target[0])
             self.b_index_var.set(target[1])
             self._selected_trial_token = None
-            if selection.search_metric_best_trial_index is not None:
-                self.trial_index_var.set(int(selection.search_metric_best_trial_index))
 
     def _apply_navigation_from_refresh(self, refresh_payload: dict[str, Any]) -> None:
         mode = self._navigation_mode()
@@ -2213,16 +2489,20 @@ class PychmpViewApp:
         self._apply_refresh_signal_payload(refresh_payload)
         if self.artifact_h5 is None:
             return
+        event = str(refresh_payload.get("event", "") or "").strip().lower()
+        if event == "search_initialized" and self._live_runner_detected():
+            self.navigation_mode_var.set("active")
+            self._navigation_mode_initialized = True
         if not getattr(self, "payload", None):
             self._reload_payload()
             return
         mode = self._navigation_mode()
-        if mode == "active":
+        if mode == "active" or event == "search_initialized":
             slice_key = str(refresh_payload.get("slice_key", "") or "").strip()
             search_id = str(refresh_payload.get("search_id", "") or "").strip()
             if slice_key:
                 self.slice_key_var.set(slice_key)
-            if search_id and self._search_id_in_artifact(search_id):
+            if search_id and self._search_id_in_artifact(search_id, slice_key=slice_key or None):
                 self.search_id_var.set(search_id)
         if not self._refresh_slice_grid_metadata():
             return
@@ -2357,6 +2637,7 @@ class PychmpViewApp:
             self._apply_best_navigation(force_reanchor=True)
         self._navigation_mode_user_chosen = True
         if requested == "free":
+            self._anchor_free_selection_to_current_indices()
             self._stale_active_notice = ""
         self._refresh_navigation_control_states()
         if self._apply_locked_navigation_selection():
@@ -2382,6 +2663,7 @@ class PychmpViewApp:
             self.summary_button.state(["!disabled"] if has_artifact else ["disabled"])
         if self.refresh_button is not None:
             self.refresh_button.state(["!disabled"] if has_artifact else ["disabled"])
+        self._update_purge_search_button_state()
         self._refresh_navigation_control_states()
 
     def _scan_state_snapshot(self) -> tuple[str, str, str, str, str]:
@@ -2441,13 +2723,13 @@ class PychmpViewApp:
                     refresh_active = refresh_age_s <= float(self._ACTIVE_REFRESH_GRACE_S)
                 except Exception:
                     refresh_active = False
-            heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
-            heartbeat_matches_selected = not (heartbeat_slice_key and selected_slice_key and heartbeat_slice_key != selected_slice_key)
-            artifact_live = self._heartbeat_activity_present() and heartbeat_matches_selected
-            runner_active = self._live_runner_detected()
-            heartbeat_running = artifact_live and runner_active
+            matches_slice, matches_search = self._heartbeat_matches_selection(
+                selected_slice_key=selected_slice_key,
+            )
+            artifact_live = self._heartbeat_activity_present() and matches_slice and matches_search
+            runner_active = self._runner_targets_selection(selected_slice_key=selected_slice_key)
 
-            if runner_active or (adaptive_point_run and refresh_active and heartbeat_matches_selected):
+            if runner_active or artifact_live or (adaptive_point_run and refresh_active and matches_slice):
                 badge = "RUNNING"
                 color = "#0b7285"
             elif artifact_live or search_active_flag:
@@ -2497,19 +2779,28 @@ class PychmpViewApp:
             "failed",
         }
         heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
-        heartbeat_matches_selected = not (heartbeat_slice_key and selected_slice_key and heartbeat_slice_key != selected_slice_key)
         heartbeat_search_id = str(getattr(self, "_refresh_signal_search_id", None) or "").strip()
-        heartbeat_matches_selected_search = not (
-            heartbeat_search_id and selected_search_id and heartbeat_search_id != selected_search_id
+        matches_slice, matches_search = self._heartbeat_matches_selection(
+            selected_slice_key=selected_slice_key,
+            selected_search_id=selected_search_id,
         )
-        scoped_refresh_active = refresh_active and heartbeat_matches_selected
-        scoped_phase_complete = phase_complete and heartbeat_matches_selected
-        artifact_live_active = self._heartbeat_activity_present() and heartbeat_matches_selected and heartbeat_matches_selected_search
+        scoped_refresh_active = refresh_active and matches_slice
+        scoped_phase_complete = phase_complete and matches_slice
+        artifact_live_active = self._heartbeat_activity_present() and matches_slice and matches_search
         search_completed = (search_status == "complete") or bool(completed_at)
-        runner_active = self._live_runner_detected()
+        runner_active = self._runner_targets_selection(
+            selected_slice_key=selected_slice_key,
+            selected_search_id=selected_search_id,
+        )
         live_runner = runner_active and (artifact_live_active or self._heartbeat_activity_present())
+        cross_slice_runner = self._live_runner_detected() and not matches_slice
 
-        if runner_active or artifact_live_active or (adaptive_point_run and scoped_refresh_active and not scoped_phase_complete):
+        if (
+            runner_active
+            or artifact_live_active
+            or cross_slice_runner
+            or (adaptive_point_run and scoped_refresh_active and not scoped_phase_complete)
+        ):
             if self._search_run_terminal():
                 badge = "FINISHED"
                 color = "#2b8a3e"
@@ -2604,15 +2895,15 @@ class PychmpViewApp:
             info_lines.append(f"Live runner: yes (pid from {self.artifact_h5}.log)" if self.artifact_h5 is not None else "Live runner: yes")
         if heartbeat_slice_key:
             info_lines.append(f"Heartbeat slice key: {heartbeat_slice_key}")
-        if runner_active and heartbeat_slice_key and not heartbeat_matches_selected:
+        if (runner_active or cross_slice_runner) and heartbeat_slice_key and not matches_slice:
             live_slice_label = self._slice_label_for_key(heartbeat_slice_key) or heartbeat_slice_key
             info_lines.append(f"Live scan slice: {live_slice_label} (switch Slice menu to follow)")
         active_point = getattr(self, "_refresh_signal_active_point", None)
         if (
             active_point is not None
             and not self._search_run_terminal()
-            and heartbeat_matches_selected
-            and heartbeat_matches_selected_search
+            and matches_slice
+            and matches_search
         ):
             try:
                 active_a = float(active_point[0])
@@ -2626,7 +2917,7 @@ class PychmpViewApp:
             info_lines.append("Active point: running on a different slice/search")
         live_trials = dict(getattr(self, "_refresh_signal_live_trials", None) or {})
         active_trial_q0 = live_trials.get("active_trial_q0")
-        if active_trial_q0 is not None and heartbeat_matches_selected and heartbeat_matches_selected_search:
+        if active_trial_q0 is not None and matches_slice and matches_search:
             try:
                 info_lines.append(f"Live trial q0: {float(active_trial_q0):.6e}")
             except Exception:
@@ -2871,10 +3162,41 @@ class PychmpViewApp:
             ),
         }
 
+    def _should_show_active_trial_marker(self, live_state: dict[str, Any] | None) -> bool:
+        if live_state is None:
+            return False
+        if not self._live_search_matches_selected(live_state):
+            return False
+        if self._navigation_mode() == "active":
+            return True
+        a_index_var = getattr(self, "a_index_var", None)
+        b_index_var = getattr(self, "b_index_var", None)
+        if a_index_var is None or b_index_var is None:
+            return False
+        return self._selection_matches_live_active_point(
+            int(a_index_var.get()),
+            int(b_index_var.get()),
+        )
+
     def _should_use_live_trials(self, live_state: dict[str, Any] | None) -> bool:
         if live_state is None:
             return False
+        if self._search_run_terminal():
+            return False
         if self._navigation_mode() == "best":
+            if not self._live_slice_matches_selected(live_state):
+                return False
+            if not self._live_search_matches_selected(live_state):
+                return False
+            a_index = int(self.a_index_var.get())
+            b_index = int(self.b_index_var.get())
+            if self._selection_matches_live_active_point(a_index, b_index):
+                return True
+            if "a_index" in live_state and "b_index" in live_state:
+                return (
+                    a_index == int(live_state["a_index"])
+                    and b_index == int(live_state["b_index"])
+                )
             return False
         if not self._live_slice_matches_selected(live_state):
             return False
@@ -2925,17 +3247,46 @@ class PychmpViewApp:
         return not (live_slice_key and selected_slice_key and live_slice_key != selected_slice_key)
 
     def _in_progress_search_id_for_slice(self, slice_key: str) -> str:
+        live_id = self._live_heartbeat_search_id_for_slice(slice_key)
+        if live_id:
+            return live_id
+        if not self._live_session_activity_present():
+            return ""
         key = str(slice_key or "").strip()
+        explicit_in_progress: list[str] = []
+        lifecycle_in_progress: list[str] = []
+        stale_in_progress: list[str] = []
+        selected_search_id = str(self._selected_search_id() or "").strip()
         for record in list(getattr(self, "available_searches", []) or []):
             lifecycle = dict(record.get("lifecycle") or {})
-            if not bool(record.get("in_progress", lifecycle.get("in_progress", False))):
-                continue
+            lifecycle["in_progress"] = bool(record.get("in_progress", lifecycle.get("in_progress", False)))
+            lifecycle["active"] = bool(record.get("active", lifecycle.get("active", False)))
+            lifecycle["status"] = str(record.get("status", lifecycle.get("status", "")) or "")
             record_slice = str(record.get("slice_key", "") or "").strip()
             if key and record_slice and record_slice != key:
                 continue
             search_id = str(record.get("search_id", "") or "").strip()
-            if search_id:
-                return search_id
+            if not search_id:
+                continue
+            if bool(record.get("in_progress", False)):
+                explicit_in_progress.append(search_id)
+            if search_lifecycle_is_in_progress(lifecycle):
+                lifecycle_in_progress.append(search_id)
+            elif (
+                bool(record.get("in_progress", False))
+                and self._live_runner_detected()
+                and str(record.get("status", "") or "").strip().lower() in {"complete", "completed"}
+            ):
+                stale_in_progress.append(search_id)
+        if explicit_in_progress:
+            non_selected = [sid for sid in explicit_in_progress if sid != selected_search_id]
+            if non_selected:
+                return non_selected[0]
+            return explicit_in_progress[0]
+        if len(lifecycle_in_progress) == 1:
+            return lifecycle_in_progress[0]
+        if len(stale_in_progress) == 1:
+            return stale_in_progress[0]
         return ""
 
     def _catalog_live_search_id_for_slice(self, slice_key: str) -> str:
@@ -2945,20 +3296,7 @@ class PychmpViewApp:
         if not (self._refresh_signal_is_fresh() or self._live_runner_detected()):
             return ""
         key = str(slice_key or "").strip()
-        active_ids: list[str] = []
-        for record in list(getattr(self, "available_searches", []) or []):
-            lifecycle = dict(record.get("lifecycle") or {})
-            if not bool(record.get("active", lifecycle.get("active", False))):
-                continue
-            record_slice = str(record.get("slice_key", "") or "").strip()
-            if key and record_slice and record_slice != key:
-                continue
-            search_id = str(record.get("search_id", "") or "").strip()
-            if search_id:
-                active_ids.append(search_id)
-        if len(active_ids) == 1:
-            return active_ids[0]
-        return ""
+        return self._in_progress_search_id_for_slice(slice_key)
 
     def _resolved_heartbeat_search_id(self, live_state: dict[str, Any] | None) -> str:
         if live_state is None:
@@ -2984,14 +3322,10 @@ class PychmpViewApp:
         if not selected:
             return True
         lifecycle = dict(selected.get("lifecycle") or {})
-        status = str(selected.get("status", "") or "").strip().lower()
-        if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
-            return False
-        if bool(selected.get("in_progress", lifecycle.get("in_progress", False))):
-            return True
-        if str(lifecycle.get("completed_at") or "").strip():
-            return False
-        return bool(selected.get("active", lifecycle.get("active", False)))
+        lifecycle["in_progress"] = bool(selected.get("in_progress", lifecycle.get("in_progress", False)))
+        lifecycle["active"] = bool(selected.get("active", lifecycle.get("active", False)))
+        lifecycle["status"] = str(selected.get("status", lifecycle.get("status", "")) or "")
+        return search_lifecycle_is_in_progress(lifecycle)
 
     def _live_search_matches_selected(self, live_state: dict[str, Any] | None) -> bool:
         if live_state is None:
@@ -3191,8 +3525,30 @@ class PychmpViewApp:
         self.shared_heatmap_axes_check = shared_axes_check
         _ToolTip(
             shared_axes_check,
-            "Use the same (a, b) axis limits for every slice (plot fills the panel; cells are not forced square).",
+            "Use the same (a, b) axis limits across slices and searches so heatmaps align when comparing runs.",
         )
+        log_scale_check = ttk.Checkbutton(
+            parent,
+            text="Log scale",
+            variable=self.heatmap_log_scale_var,
+            command=self._on_heatmap_log_scale_changed,
+        )
+        log_scale_check.pack(side=tk.LEFT, padx=(12, 4))
+        self.heatmap_log_scale_check = log_scale_check
+        _ToolTip(
+            log_scale_check,
+            "Apply logarithmic scaling to the heatmap color scale (positive metric values only).",
+        )
+
+    def _use_heatmap_log_scale(self) -> bool:
+        return bool(getattr(self, "heatmap_log_scale_var", None) and self.heatmap_log_scale_var.get())
+
+    def _on_heatmap_log_scale_changed(self) -> None:
+        _save_heatmap_log_scale_pref(self._use_heatmap_log_scale())
+        if not self.payload:
+            return
+        self._draw_heatmap()
+        self.heatmap_canvas.draw_idle()
 
     def _refresh_shared_heatmap_extents(self) -> None:
         self._shared_heatmap_extents = None
@@ -3210,6 +3566,7 @@ class PychmpViewApp:
             self._shared_heatmap_extents = load_shared_grid_extents(
                 Path(self.artifact_h5),
                 slice_keys=slice_keys,
+                search_id=None,
             )
         except Exception:
             self._shared_heatmap_extents = None
@@ -3507,6 +3864,38 @@ class PychmpViewApp:
         value = str(payload.get("selected_search_id", "")).strip()
         return value or None
 
+    def _payload_matches_search_selection(self) -> bool:
+        payload = getattr(self, "payload", None) or {}
+        if not payload:
+            return True
+        requested_search_id = str(self._selected_search_id() or "").strip()
+        if not requested_search_id:
+            return True
+        loaded_search_id = str(payload.get("selected_search_id", "") or "").strip()
+        return loaded_search_id == requested_search_id
+
+    def _ensure_payload_matches_search_selection(self) -> bool:
+        """Return True when the loaded payload already matches the UI search selector."""
+        if self._payload_matches_search_selection():
+            return True
+        if self.artifact_h5 is None:
+            return False
+        self._schedule_payload_reload(status_text="Loading selected search...")
+        return False
+
+    def _invalidate_payload_cache_for_selection(
+        self,
+        *,
+        slice_key: str | None = None,
+        search_id: str | None = None,
+    ) -> None:
+        resolved_slice = str(slice_key or self._selected_slice_key() or "").strip()
+        resolved_search = str(search_id or self._selected_search_id() or "").strip()
+        cache = getattr(self, "_payload_cache_by_selection", None)
+        if not isinstance(cache, dict):
+            return
+        cache.pop((resolved_slice, resolved_search), None)
+
     def _slice_state_token(self, slice_key: str | None = None) -> str | None:
         if self.artifact_h5 is None:
             return None
@@ -3622,6 +4011,23 @@ class PychmpViewApp:
             float(b_values[b_index]),
         )
 
+    def _anchor_free_selection_to_current_indices(self) -> None:
+        """When entering Free mode, keep the grid point already shown in the selectors."""
+        a_index_var = getattr(self, "a_index_var", None)
+        b_index_var = getattr(self, "b_index_var", None)
+        if a_index_var is None or b_index_var is None:
+            return
+        a_index = int(a_index_var.get())
+        b_index = int(b_index_var.get())
+        if not self._is_valid_grid_index(a_index, b_index):
+            return
+        a_values = np.asarray(getattr(self, "a_values", ()), dtype=float)
+        b_values = np.asarray(getattr(self, "b_values", ()), dtype=float)
+        self._free_selection_ab = (
+            float(a_values[a_index]),
+            float(b_values[b_index]),
+        )
+
     def _capture_free_grid_selection_coords(self) -> None:
         try:
             if self._navigation_mode() != "free":
@@ -3663,6 +4069,22 @@ class PychmpViewApp:
             return resolved
         return self._point_indices_for_coordinates(float(selection[0]), float(selection[1]))
 
+    def _record_payload_for_coordinates(self, a_value: float, b_value: float) -> dict[str, Any] | None:
+        """Return a computed point_records entry for (a, b), ignoring rectangular placeholders."""
+        for record in point_records_for_payload(self.payload):
+            if str(record.get("status", "computed")).strip().lower() in {"missing", "pending"}:
+                continue
+            try:
+                record_a = float(record["a"])
+                record_b = float(record["b"])
+            except Exception:
+                continue
+            if np.isclose(record_a, float(a_value), rtol=0.0, atol=1e-6) and np.isclose(
+                record_b, float(b_value), rtol=0.0, atol=1e-6
+            ):
+                return dict(record)
+        return None
+
     def _point_payload_for_selection(self) -> dict[str, Any] | None:
         resolved = self._resolved_point_index(metric_name=self._trials_display_metric())
         if resolved is None:
@@ -3670,7 +4092,22 @@ class PychmpViewApp:
         points = dict(self.payload.get("points", {}))
         if resolved not in points:
             return None
-        return dict(points[resolved])
+        point = dict(points[resolved])
+        status = str(point.get("status", "computed")).strip().lower()
+        if status in {"missing", "pending"}:
+            try:
+                a_value = float(point.get("a", np.nan))
+                b_value = float(point.get("b", np.nan))
+            except Exception:
+                a_value = b_value = float("nan")
+            if not (np.isfinite(a_value) and np.isfinite(b_value)):
+                selection = self._free_grid_selection_ab()
+                if selection is not None:
+                    a_value, b_value = float(selection[0]), float(selection[1])
+            fallback = self._record_payload_for_coordinates(a_value, b_value)
+            if fallback is not None:
+                return fallback
+        return point
 
     def _selected_grid_point_has_solution(self) -> bool:
         if not self._has_saved_selected_point():
@@ -3756,6 +4193,7 @@ class PychmpViewApp:
             if int(self.a_index_var.get()) != int(a_index) or int(self.b_index_var.get()) != int(b_index):
                 self.a_index_var.set(int(a_index))
                 self.b_index_var.set(int(b_index))
+                self._selected_trial_token = None
                 self._refresh_selector_values()
             return True
         resolved = self._resolved_point_index(metric_name=metric_name)
@@ -3943,9 +4381,18 @@ class PychmpViewApp:
 
     def _search_label(self, record: dict[str, Any]) -> str:
         search_id = str(record.get("search_id", "")).strip() or "legacy_current"
-        lifecycle = dict(record.get("lifecycle") or {})
-        in_progress = bool(record.get("in_progress", lifecycle.get("in_progress", False)))
-        suffix = " *" if in_progress else ""
+        suffix = " *" if self._search_record_is_live(record) else ""
+        diagnostics = dict(record.get("diagnostics") or {})
+        if str(diagnostics.get("search_mode", "")).strip() == "map_store_rescore":
+            source_id = str(diagnostics.get("rescore_source_search_id", "")).strip()
+            rescore_pass = diagnostics.get("rescore_pass")
+            footprint = str(diagnostics.get("rescore_footprint", "")).strip()
+            detail_parts = [f"map-store rescore #{rescore_pass}" if rescore_pass is not None else "map-store rescore"]
+            if source_id:
+                detail_parts.append(f"from {source_id}")
+            if footprint:
+                detail_parts.append(f"footprint={footprint}")
+            return f"{search_id} ({', '.join(detail_parts)}){suffix}"
         return f"{search_id}{suffix}"
 
     def _refresh_search_controls(self) -> None:
@@ -3953,7 +4400,14 @@ class PychmpViewApp:
         labels = [self._search_label(record) for record in records]
         ids = [str(record.get("search_id", "")) for record in records]
         labels = self._unique_menu_labels(labels, ids)
-        selected_id = str(self.payload.get("selected_search_id", self._selected_search_id() or "") or "").strip()
+        ui_search_id = str(self._selected_search_id() or "").strip()
+        payload_search_id = str(self.payload.get("selected_search_id", "") or "").strip()
+        if ui_search_id and ui_search_id in ids:
+            selected_id = ui_search_id
+        elif payload_search_id and payload_search_id in ids:
+            selected_id = payload_search_id
+        else:
+            selected_id = ""
         if selected_id and selected_id in ids:
             selected_index = ids.index(selected_id)
         else:
@@ -3974,6 +4428,7 @@ class PychmpViewApp:
                     self.search_display_label.grid()
         elif self.search_display_label is not None:
             self.search_display_label.grid()
+        self._update_purge_search_button_state()
 
     def _refresh_selector_values(self) -> None:
         self._refresh_slice_controls()
@@ -4063,6 +4518,11 @@ class PychmpViewApp:
             self._selected_trial_map_cache_value = None
         cache_key = (str(requested_slice_key or ""), str(requested_search_id or ""))
         cached_payload = self._payload_cache_by_selection.get(cache_key)
+        if cached_payload is not None and requested_search_id:
+            cached_search_id = str(cached_payload.get("selected_search_id", "") or "").strip()
+            if cached_search_id and cached_search_id != str(requested_search_id).strip():
+                cached_payload = None
+                self._payload_cache_by_selection.pop(cache_key, None)
         try:
             if cached_payload is not None:
                 self.payload = cached_payload
@@ -4490,6 +4950,34 @@ class PychmpViewApp:
             return None
         return int(np.nanargmin(metric_trials))
 
+    def _annotate_display_metric_best_trial(
+        self,
+        ax,
+        *,
+        q0_trials: np.ndarray,
+        metric_trials: np.ndarray,
+        selected_trial_index: int | None,
+    ) -> None:
+        best_trial_index = self._best_trial_index_from_metric(metric_trials)
+        if best_trial_index is None:
+            return
+        if not (0 <= int(best_trial_index) < q0_trials.size):
+            return
+        if not np.isfinite(float(metric_trials[int(best_trial_index)])):
+            return
+        if selected_trial_index is not None and int(best_trial_index) == int(selected_trial_index):
+            return
+        ax.scatter(
+            [float(q0_trials[int(best_trial_index)])],
+            [float(metric_trials[int(best_trial_index)])],
+            facecolor="#ffd43b",
+            edgecolor="#8a5b00",
+            linewidth=1.2,
+            s=74,
+            zorder=4,
+            label="best trial",
+        )
+
     def _current_trial_token(self, point_metric: str, q0_trials: np.ndarray) -> tuple[int, int, str, int]:
         a_index_var = getattr(self, "a_index_var", None)
         b_index_var = getattr(self, "b_index_var", None)
@@ -4522,6 +5010,9 @@ class PychmpViewApp:
         q0_trials: np.ndarray,
         metric_trials: np.ndarray,
     ) -> int | None:
+        display_best = self._best_trial_index_from_metric(metric_trials)
+        if display_best is not None:
+            return display_best
         q0_value = point.get("q0")
         if q0_value is not None:
             try:
@@ -4529,12 +5020,14 @@ class PychmpViewApp:
             except Exception:
                 q0_numeric = float("nan")
             if np.isfinite(q0_numeric) and q0_trials.size > 0:
-                return int(np.argmin(np.abs(q0_trials - q0_numeric)))
+                q0_index = int(np.argmin(np.abs(q0_trials - q0_numeric)))
+                if 0 <= q0_index < metric_trials.size and np.isfinite(float(metric_trials[q0_index])):
+                    return q0_index
         target_metric = str(point.get("target_metric", self.run_target_metric or "chi2"))
         search_metric_trials = self._metric_history_for_point(point, target_metric)
         if search_metric_trials.size == q0_trials.size and search_metric_trials.size > 0:
             return self._best_trial_index_from_metric(search_metric_trials)
-        return self._best_trial_index_from_metric(metric_trials)
+        return None
 
     def _selected_trial_index_for_point(
         self,
@@ -4560,19 +5053,24 @@ class PychmpViewApp:
             b_token=token[1],
             point_metric=point_metric,
         )
-        if (
-            force_best
-            or not token_matches_context
+        if force_best:
+            current_index = 0 if display_best_index is None else int(display_best_index)
+        elif (
+            not token_matches_context
             or current_index < 0
             or current_index >= q0_trials.size
         ):
-            if force_best:
-                current_index = 0 if display_best_index is None else int(display_best_index)
-            else:
-                default_index = self._default_trial_index_for_point(point, q0_trials, metric_trials)
-                current_index = 0 if default_index is None else int(default_index)
-            if trial_index_var is not None:
-                trial_index_var.set(current_index)
+            default_index = self._default_trial_index_for_point(point, q0_trials, metric_trials)
+            current_index = 0 if default_index is None else int(default_index)
+        elif (
+            self._navigation_mode() != "free"
+            and display_best_index is not None
+            and 0 <= current_index < metric_trials.size
+            and not np.isfinite(float(metric_trials[current_index]))
+        ):
+            current_index = int(display_best_index)
+        if trial_index_var is not None and int(trial_index_var.get()) != int(current_index):
+            trial_index_var.set(int(current_index))
         self._selected_trial_token = token
         return current_index
 
@@ -4586,7 +5084,12 @@ class PychmpViewApp:
         selected_index_override: int | None = None,
     ) -> None:
         if selected_index_override is None and point is not None:
-            selected_index = self._selected_trial_index_for_point(point, q0_trials, metric_trials, point_metric)
+            selected_index = self._selected_trial_index_for_point(
+                point,
+                q0_trials,
+                metric_trials,
+                point_metric,
+            )
         elif q0_trials.ndim == 1 and q0_trials.size > 0 and metric_trials.size == q0_trials.size:
             selected_index = int(np.clip(0 if selected_index_override is None else selected_index_override, 0, max(0, len(q0_trials) - 1)))
             if point is not None:
@@ -4771,12 +5274,28 @@ class PychmpViewApp:
                 b_value=float(point.get("b", np.nan)),
                 selected_trial_index=int(selected_trial_index),
             )
+            if loaded_maps is None:
+                loaded_maps = self._load_selected_trial_maps(
+                    a_value=float(point.get("a", np.nan)),
+                    b_value=float(point.get("b", np.nan)),
+                    selected_trial_index=None,
+                )
+                if loaded_maps is not None:
+                    diagnostics["selected_trial_map_fallback"] = True
+                    diagnostics["selected_trial_map_fallback_reason"] = "search_metric_best"
             if loaded_maps is not None:
                 raw_modeled = np.asarray(loaded_maps.get("raw_modeled_best"), dtype=float)
                 modeled = np.asarray(loaded_maps.get("modeled_best"), dtype=float)
                 residual = np.asarray(loaded_maps.get("residual"), dtype=float)
                 diagnostics["selected_trial_maps_available"] = True
-                diagnostics["selected_trial_index"] = int(loaded_maps.get("trial_index", selected_trial_index))
+                resolved_index = int(loaded_maps.get("trial_index", selected_trial_index))
+                diagnostics["selected_trial_index"] = resolved_index
+                if (
+                    int(resolved_index) != int(selected_trial_index)
+                    and not diagnostics.get("selected_trial_map_fallback")
+                ):
+                    diagnostics["selected_trial_map_fallback"] = True
+                    diagnostics["selected_trial_map_fallback_reason"] = "nearest_stored_trial_map"
             else:
                 raw_trial_maps = point.get("trial_raw_modeled_maps")
                 modeled_trial_maps = point.get("trial_modeled_maps")
@@ -5249,6 +5768,8 @@ class PychmpViewApp:
             self.metric_var.set(self._run_target_metric_for_selection())
             return
         self._capture_current_slice_view_state(self._last_rendered_metric)
+        if self._navigation_mode() != "free":
+            self._selected_trial_token = None
         self._restore_trials_controls_for_metric(str(self.metric_var.get()))
         self._refresh_all()
 
@@ -5299,6 +5820,11 @@ class PychmpViewApp:
         self._capture_free_grid_selection_coords()
         self.search_id_var.set(selected_id)
         self._selected_trial_token = None
+        self._invalidate_payload_cache_for_selection(search_id=selected_id)
+        self.display_model = {"records": [], "a_min": 0.0, "a_max": 1.0, "b_min": 0.0, "b_max": 1.0}
+        if self._use_shared_grid_axes():
+            self._shared_heatmap_extents = None
+            self._refresh_shared_heatmap_extents()
         self._schedule_payload_reload(status_text="Loading selected search...")
 
     def _on_b_changed(self) -> None:
@@ -5412,6 +5938,8 @@ class PychmpViewApp:
         return resolved
 
     def _refresh_all(self, *, update_selected_solution: bool = True) -> None:
+        if self.payload and not self._ensure_payload_matches_search_selection():
+            return
         if not self.payload:
             self._clear_trial_selector_controls()
             self._refresh_action_states()
@@ -5425,7 +5953,7 @@ class PychmpViewApp:
             self.heatmap_canvas.draw_idle()
             self.trials_canvas.draw_idle()
             if self.selected_solution_window is not None:
-                self.selected_solution_window.status_var.set("No artifact loaded.")
+                self.selected_solution_window.toolbar_context_var.set("No artifact loaded.")
             return
         live_state = self._live_trial_state()
         if (
@@ -5471,7 +5999,7 @@ class PychmpViewApp:
             self.heatmap_canvas.draw_idle()
             self.trials_canvas.draw_idle()
             if self.selected_solution_window is not None:
-                self.selected_solution_window.status_var.set("No completed point available yet.")
+                self.selected_solution_window.toolbar_context_var.set("No completed point available yet.")
             return
         if live_state is not None and not self._has_selected_point():
             self._refresh_action_states()
@@ -5494,11 +6022,11 @@ class PychmpViewApp:
             self.trials_canvas.draw_idle()
             if self.selected_solution_window is not None:
                 if self._live_trials_streaming(live_state):
-                    self.selected_solution_window.status_var.set(
+                    self.selected_solution_window.toolbar_context_var.set(
                         "Live trial maps are available; open Display Selected Solution to inspect them."
                     )
                 else:
-                    self.selected_solution_window.status_var.set("Waiting for active point to be saved.")
+                    self.selected_solution_window.toolbar_context_var.set("Waiting for active point to be saved.")
             if update_selected_solution and self.selected_solution_window is not None:
                 self._schedule_selected_solution_update()
             return
@@ -5545,13 +6073,27 @@ class PychmpViewApp:
             [float(record["metrics"].get(metric_name, np.nan)) for record in computed_records],
             dtype=float,
         )
+        color_values = values
+        if self._use_heatmap_log_scale():
+            # Unexplored / invalid cells are not in computed_records; mask non-positive
+            # metrics so they do not compress the log color scale (chi2 can be 0).
+            color_values = np.where(np.isfinite(values) & (values > 0.0), values, np.nan)
+        metric_mappable = None
         metric_collection = None
+        heatmap_norm = None
         if patches:
-            metric_collection = PatchCollection(patches, cmap="viridis", edgecolor="none", linewidth=0.0)
-            metric_collection.set_array(values)
-            finite = np.isfinite(values)
-            if np.any(finite):
-                metric_collection.set_clim(float(np.nanmin(values[finite])), float(np.nanmax(values[finite])))
+            log_scale = self._use_heatmap_log_scale()
+            cmap = mpl_cm.get_cmap("viridis")
+            heatmap_norm, _vmin, _vmax = resolve_heatmap_color_norm(color_values, log_scale=log_scale)
+            facecolors = heatmap_facecolors_from_values(color_values, norm=heatmap_norm, cmap=cmap)
+            metric_collection = PatchCollection(
+                patches,
+                facecolors=facecolors,
+                edgecolor="none",
+                linewidth=0.0,
+            )
+            metric_mappable = mpl_cm.ScalarMappable(norm=heatmap_norm, cmap=cmap)
+            metric_mappable.set_array(np.asarray(color_values, dtype=float))
             self.ax_heatmap.add_collection(metric_collection)
         if pending_records:
             pending_patches = [_heatmap_grid_rectangle(record) for record in pending_records]
@@ -5748,19 +6290,23 @@ class PychmpViewApp:
                         zorder=10,
                     )
 
-        has_colorbar = metric_collection is not None
-        if has_colorbar:
+        self._ensure_heatmap_colorbar_axes()
+        cax = getattr(self, "ax_heatmap_cbar", None)
+        has_colorbar = metric_mappable is not None and cax is not None
+        if has_colorbar and metric_mappable is not None and cax is not None:
+            cax.set_visible(True)
             self._heatmap_colorbar = self.heatmap_figure.colorbar(
-                metric_collection,
-                ax=self.ax_heatmap,
-                fraction=self._HEATMAP_COLORBAR_FRACTION,
-                pad=self._HEATMAP_COLORBAR_PAD,
+                metric_mappable,
+                cax=cax,
             )
             self._heatmap_colorbar.set_label(metric_name)
             self._heatmap_colorbar.ax.tick_params(length=3, pad=2)
+            if heatmap_norm is not None:
+                configure_heatmap_colorbar(self._heatmap_colorbar, norm=heatmap_norm)
         else:
+            if cax is not None:
+                cax.set_visible(False)
             self._heatmap_colorbar = None
-        self._apply_figure_autolayout(self.heatmap_figure)
 
     def _draw_trials(self) -> None:
         live_state = self._live_trial_state()
@@ -5897,7 +6443,12 @@ class PychmpViewApp:
                 )
             else:
                 if selected_trial_index is None:
-                    selected_trial_index = self._selected_trial_index_for_point(point, q0_trials, metric_trials, point_metric)
+                    selected_trial_index = self._selected_trial_index_for_point(
+                        point,
+                        q0_trials,
+                        metric_trials,
+                        point_metric,
+                    )
                 self._refresh_trial_selector_controls(
                     point,
                     q0_trials,
@@ -5908,17 +6459,34 @@ class PychmpViewApp:
                 order = np.argsort(q0_trials)
                 self.ax_trials.plot(q0_trials[order], metric_trials[order], "-o", ms=4, lw=1.2, color="#2b6cb0")
                 self.ax_trials.scatter(q0_trials, metric_trials, s=24, color="#2b6cb0", alpha=0.55)
-                best_trial_index = self._best_trial_index_from_metric(metric_trials)
-                if selected_trial_index is not None:
-                    self.ax_trials.axvline(float(q0_trials[int(selected_trial_index)]), color="#d62728", ls="--", lw=1.6)
-                    self.ax_trials.scatter(
-                        [float(q0_trials[int(selected_trial_index)])],
-                        [float(metric_trials[int(selected_trial_index)])],
+                highlight_index = selected_trial_index
+                if (
+                    highlight_index is not None
+                    and 0 <= int(highlight_index) < q0_trials.size
+                    and np.isfinite(float(q0_trials[int(highlight_index)]))
+                ):
+                    self.ax_trials.axvline(
+                        float(q0_trials[int(highlight_index)]),
                         color="#d62728",
-                        s=42,
-                        zorder=5,
+                        ls="--",
+                        lw=1.6,
+                        label="selected trial",
                     )
-                if active_trial_q0 is not None:
+                    if np.isfinite(float(metric_trials[int(highlight_index)])):
+                        self.ax_trials.scatter(
+                            [float(q0_trials[int(highlight_index)])],
+                            [float(metric_trials[int(highlight_index)])],
+                            color="#d62728",
+                            s=42,
+                            zorder=5,
+                        )
+                self._annotate_display_metric_best_trial(
+                    self.ax_trials,
+                    q0_trials=q0_trials,
+                    metric_trials=metric_trials,
+                    selected_trial_index=selected_trial_index,
+                )
+                if active_trial_q0 is not None and self._should_show_active_trial_marker(live_state):
                     active_label = "active trial"
                     if active_trial_index is not None:
                         active_label = f"active trial #{int(active_trial_index) + 1}"
@@ -5931,16 +6499,6 @@ class PychmpViewApp:
                         va="top",
                         ha="center",
                         color="#b26a00",
-                    )
-                if best_trial_index is not None:
-                    self.ax_trials.scatter(
-                        [float(q0_trials[best_trial_index])],
-                        [float(metric_trials[best_trial_index])],
-                        facecolor="none",
-                        edgecolor="#f08c00",
-                        linewidth=1.8,
-                        s=74,
-                        zorder=4,
                     )
                 self.ax_trials.grid(alpha=0.25)
                 self._apply_trials_axis_controls(q0_trials=q0_trials, metric_trials=metric_trials)
@@ -5960,7 +6518,12 @@ class PychmpViewApp:
         success_text = point_status if point_status != "computed" else ("success" if point_success else "boundary/failed")
         best_metric_value = float(np.nanmin(metric_trials)) if metric_trials.size else float("nan")
         if selected_trial_index is None and point is not None:
-            selected_trial_index = self._selected_trial_index_for_point(point, q0_trials, metric_trials, point_metric)
+            selected_trial_index = self._selected_trial_index_for_point(
+                point,
+                q0_trials,
+                metric_trials,
+                point_metric,
+            )
         selected_trial_text = "n/a"
         selected_metric_text = "n/a"
         if selected_trial_index is not None:
@@ -6179,6 +6742,34 @@ class PychmpViewApp:
             return
         self._reload_payload(Path(selected))
 
+    def _selected_solution_maps_status_message(self) -> str:
+        if not self._has_selected_point():
+            return "No completed point available yet; refresh after the scan advances."
+        point = self._selected_point()
+        q0_trials, metric_trials, point_metric = self._trial_series_for_point(point)
+        if q0_trials.size == 0 or metric_trials.size != q0_trials.size:
+            return "No completed point available yet; refresh after the scan advances."
+        selected_trial_index = self._selected_trial_index_for_point(point, q0_trials, metric_trials, point_metric)
+        if selected_trial_index is not None:
+            probe = self._load_selected_trial_maps(
+                a_value=float(point.get("a", np.nan)),
+                b_value=float(point.get("b", np.nan)),
+                selected_trial_index=int(selected_trial_index),
+            )
+            if probe is None:
+                probe = self._load_selected_trial_maps(
+                    a_value=float(point.get("a", np.nan)),
+                    b_value=float(point.get("b", np.nan)),
+                    selected_trial_index=None,
+                )
+            if probe is None:
+                return (
+                    "Trial metrics are saved, but no map_store cubes exist for this (a, b) point "
+                    f"(trial {int(selected_trial_index) + 1}/{int(q0_trials.size)}). "
+                    "Re-run the cell with trial map storage enabled, or rescale from a search that stored maps."
+                )
+        return "No completed point available yet; refresh after the scan advances."
+
     def _open_selected_maps(self) -> None:
         if self._selected_solution_plot_context() is None:
             live_state = self._live_trial_state()
@@ -6187,7 +6778,7 @@ class PychmpViewApp:
                     "Live trial maps are not available yet for the selected trial; wait for the next artifact refresh."
                 )
             else:
-                self.status_var.set("No completed point available yet; refresh after the scan advances.")
+                self.status_var.set(self._selected_solution_maps_status_message())
             return
         if self.selected_solution_window is None:
             self.selected_solution_window = _SelectedSolutionWindow(self)

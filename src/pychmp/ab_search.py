@@ -13,7 +13,13 @@ from .ab_scan_tasks import ABPointTask, ABSliceTaskDescriptor, compile_rectangul
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .metrics import MetricValues
 from .obs_preprocessing import SliceObservationReference
-from .optimize import MetricName, ProgressCallback, ProgressStartCallback, Q0OptimizationResult
+from .optimize import (
+    InitialQ0Evaluations,
+    MetricName,
+    ProgressCallback,
+    ProgressStartCallback,
+    Q0OptimizationResult,
+)
 
 
 PointLifecycleCallback: TypeAlias = Callable[[float, float], None]
@@ -129,6 +135,7 @@ class ABPointEvaluationRequest:
     use_smoothed_obs_max: bool = True
     use_emthreshold: bool = True
     emthreshold: float = 0.1
+    initial_evaluations: InitialQ0Evaluations | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +146,7 @@ class ABSearchWorkerPayload:
     observed: np.ndarray
     sigma: np.ndarray | None
     observation_reference: SliceObservationReference | None = None
+    cache_map: ABPointCache | None = None
     progress_start_callback: ProgressStartCallback | None = None
     progress_callback: ProgressCallback | None = None
     point_start_callback: PointLifecycleCallback | None = None
@@ -202,6 +210,7 @@ def evaluate_ab_point(
     use_smoothed_obs_max: bool = True,
     use_emthreshold: bool = True,
     emthreshold: float = 0.1,
+    initial_evaluations: InitialQ0Evaluations | None = None,
 ) -> ABPointResult:
     """Evaluate the best-fit `q0` for one `(a, b)` point."""
 
@@ -232,6 +241,7 @@ def evaluate_ab_point(
         use_smoothed_obs_max=use_smoothed_obs_max,
         use_emthreshold=use_emthreshold,
         emthreshold=emthreshold,
+        initial_evaluations=initial_evaluations,
     )
     return ABPointResult(
         a=float(a),
@@ -284,8 +294,16 @@ def _evaluate_ab_search_request(
     )
     if worker_payload.point_start_callback is not None:
         worker_payload.point_start_callback(a, b)
+    initial_evaluations = request.initial_evaluations
+    if initial_evaluations is None and worker_payload.cache_map is not None:
+        warm_resolver = getattr(worker_payload.cache_map, "initial_evaluations_for", None)
+        if callable(warm_resolver):
+            initial_evaluations = warm_resolver(float(a), float(b))
     try:
         renderer = worker_payload.renderer_factory(a, b)
+        prepare_maps = getattr(renderer, "prepare_stored_trial_maps", None)
+        if callable(prepare_maps):
+            prepare_maps()
         result = evaluate_ab_point(
             worker_payload.renderer_factory,
             worker_payload.observed,
@@ -314,6 +332,7 @@ def _evaluate_ab_search_request(
             use_smoothed_obs_max=request.use_smoothed_obs_max,
             use_emthreshold=request.use_emthreshold,
             emthreshold=float(request.emthreshold),
+            initial_evaluations=initial_evaluations,
         )
     except BaseException:
         print(
@@ -394,6 +413,7 @@ def _execute_ab_requests(
     point_start_callback: PointLifecycleCallback | None = None,
     point_complete_callback: PointLifecycleCallback | None = None,
     observation_reference: SliceObservationReference | None = None,
+    cache_map: ABPointCache | None = None,
 ) -> Iterator[ABPointResult]:
     if not pending_requests:
         return iter(())
@@ -415,6 +435,7 @@ def _execute_ab_requests(
         observed=np.asarray(observed, dtype=float),
         sigma=None if sigma is None else np.asarray(sigma, dtype=float),
         observation_reference=observation_reference,
+        cache_map=cache_map,
         progress_start_callback=progress_start_callback if execution_plan.policy == "serial" else None,
         progress_callback=progress_callback if execution_plan.policy == "serial" else None,
         point_start_callback=point_start_callback if execution_plan.policy == "serial" else None,
@@ -678,6 +699,7 @@ def _append_adaptive_request_if_needed(
             use_smoothed_obs_max=use_smoothed_obs_max,
             use_emthreshold=use_emthreshold,
             emthreshold=float(emthreshold),
+            initial_evaluations=None,
         )
     )
 
@@ -791,6 +813,7 @@ def _evaluate_adaptive_index_batch(
                     point_start_callback=point_start_callback,
                     point_complete_callback=point_complete_callback,
                     observation_reference=observation_reference,
+                    cache_map=cache_map,
                 ):
                     _persist_adaptive_point(
                         cache_map=cache_map,
@@ -812,6 +835,7 @@ def _evaluate_adaptive_index_batch(
                 point_start_callback=point_start_callback,
                 point_complete_callback=point_complete_callback,
                 observation_reference=observation_reference,
+                cache_map=cache_map,
             ):
                 _persist_adaptive_point(
                     cache_map=cache_map,
@@ -1022,6 +1046,153 @@ def _boundary_axes_for_best_point(
     return tuple(axes)
 
 
+@dataclass(frozen=True)
+class ExpandResumeContext:
+    """Prior footprint and widened axes for grid-expand resume (IDL-style wall continuation)."""
+
+    prior_a_range: tuple[float, float]
+    prior_b_range: tuple[float, float]
+    widened_axes: tuple[str, ...]
+
+
+def widened_boundary_axes(
+    *,
+    prior_a_range: tuple[float, float],
+    prior_b_range: tuple[float, float],
+    new_a_range: tuple[float, float],
+    new_b_range: tuple[float, float],
+) -> tuple[str, ...]:
+    """Return footprint axes that were widened (strict superset along that edge)."""
+    tol = 1e-9
+    axes: list[str] = []
+    if float(new_a_range[0]) < float(prior_a_range[0]) - tol:
+        axes.append("a_min")
+    if float(new_a_range[1]) > float(prior_a_range[1]) + tol:
+        axes.append("a_max")
+    if float(new_b_range[0]) < float(prior_b_range[0]) - tol:
+        axes.append("b_min")
+    if float(new_b_range[1]) > float(prior_b_range[1]) + tol:
+        axes.append("b_max")
+    return tuple(axes)
+
+
+def _wall_tolerance(*, da: float, db: float) -> float:
+    return max(1e-9, 0.51 * max(float(da), float(db)))
+
+
+def _point_on_prior_wall(
+    *,
+    a_value: float,
+    b_value: float,
+    axis: str,
+    prior_a_range: tuple[float, float],
+    prior_b_range: tuple[float, float],
+    wall_tol: float,
+) -> bool:
+    if axis == "a_min":
+        return float(a_value) <= float(prior_a_range[0]) + float(wall_tol)
+    if axis == "a_max":
+        return float(a_value) >= float(prior_a_range[1]) - float(wall_tol)
+    if axis == "b_min":
+        return float(b_value) <= float(prior_b_range[0]) + float(wall_tol)
+    if axis == "b_max":
+        return float(b_value) >= float(prior_b_range[1]) - float(wall_tol)
+    raise ValueError(f"unsupported wall axis: {axis!r}")
+
+
+def _distance_to_prior_wall(
+    *,
+    a_value: float,
+    b_value: float,
+    axis: str,
+    prior_a_range: tuple[float, float],
+    prior_b_range: tuple[float, float],
+) -> float:
+    if axis == "a_min":
+        return float(a_value) - float(prior_a_range[0])
+    if axis == "a_max":
+        return float(prior_a_range[1]) - float(a_value)
+    if axis == "b_min":
+        return float(b_value) - float(prior_b_range[0])
+    if axis == "b_max":
+        return float(prior_b_range[1]) - float(b_value)
+    raise ValueError(f"unsupported wall axis: {axis!r}")
+
+
+def select_expand_frontier_seed(
+    point_results: dict[tuple[float, float], ABPointResult],
+    *,
+    context: ExpandResumeContext,
+    da: float,
+    db: float,
+) -> tuple[float, float] | None:
+    """Pick `(a, b)` on the prior wall facing widened bounds (best metric among wall points)."""
+    if not point_results or not context.widened_axes:
+        return None
+    wall_tol = _wall_tolerance(da=float(da), db=float(db))
+    wall_points: list[ABPointResult] = []
+    for point in point_results.values():
+        for axis in context.widened_axes:
+            if _point_on_prior_wall(
+                a_value=float(point.a),
+                b_value=float(point.b),
+                axis=str(axis),
+                prior_a_range=context.prior_a_range,
+                prior_b_range=context.prior_b_range,
+                wall_tol=wall_tol,
+            ):
+                wall_points.append(point)
+                break
+    if wall_points:
+        best = min(wall_points, key=lambda item: float(item.objective_value))
+        return float(best.a), float(best.b)
+
+    def _min_wall_distance(point: ABPointResult) -> float:
+        return min(
+            _distance_to_prior_wall(
+                a_value=float(point.a),
+                b_value=float(point.b),
+                axis=str(axis),
+                prior_a_range=context.prior_a_range,
+                prior_b_range=context.prior_b_range,
+            )
+            for axis in context.widened_axes
+        )
+
+    nearest = min(point_results.values(), key=_min_wall_distance)
+    return float(nearest.a), float(nearest.b)
+
+
+def _adaptive_best_point(
+    *,
+    a_values: np.ndarray,
+    b_values: np.ndarray,
+    point_results: dict[tuple[float, float], ABPointResult],
+    expand_resume_context: ExpandResumeContext | None = None,
+    da: float = 1.0,
+    db: float = 1.0,
+) -> tuple[int, int, ABPointResult]:
+    """Resolve the hill-climb anchor; on expand resume prefer the prior footprint wall."""
+    if expand_resume_context is not None and expand_resume_context.widened_axes:
+        seed = select_expand_frontier_seed(
+            point_results,
+            context=expand_resume_context,
+            da=float(da),
+            db=float(db),
+        )
+        if seed is not None:
+            seed_point = point_results.get(seed)
+            if seed_point is not None:
+                a_index = int(np.argmin(np.abs(np.asarray(a_values, dtype=float) - float(seed[0]))))
+                b_index = int(np.argmin(np.abs(np.asarray(b_values, dtype=float) - float(seed[1]))))
+                return a_index, b_index, seed_point
+    return _current_best_point(
+        a_values=a_values,
+        b_values=b_values,
+        point_results=point_results,
+    )
+
+
 def _seed_point_results_from_cache(
     cache_map: ABPointCache,
     *,
@@ -1224,6 +1395,7 @@ def search_local_minimum_ab(
     use_smoothed_obs_max: bool = True,
     use_emthreshold: bool = True,
     emthreshold: float = 0.1,
+    expand_resume_context: ExpandResumeContext | None = None,
 ) -> ABLocalSearchResult:
     """Search for a local minimum in `(a, b)` using adaptive Phase 1 and Phase 2 expansion."""
     if float(da) <= 0 or float(db) <= 0:
@@ -1252,13 +1424,18 @@ def search_local_minimum_ab(
     termination_reason = "not_started"
     minimum_certified = False
     frontier_open_axes: tuple[str, ...] = ()
+    expand_resume_pass = expand_resume_context is not None
 
     while True:
         n_phase1_iters += 1
-        best_a_index, best_b_index, best_point_before = _current_best_point(
+        phase_expand_context = expand_resume_context if expand_resume_pass else None
+        best_a_index, best_b_index, best_point_before = _adaptive_best_point(
             a_values=a_arr,
             b_values=b_arr,
             point_results=point_results,
+            expand_resume_context=phase_expand_context,
+            da=float(da),
+            db=float(db),
         ) if point_results else (0, 0, None)
 
         if best_point_before is None:
@@ -1302,10 +1479,13 @@ def search_local_minimum_ab(
             )
             if not point_results:
                 raise RuntimeError("adaptive search failed to evaluate the starting point")
-            best_a_index, best_b_index, best_point_before = _current_best_point(
+            best_a_index, best_b_index, best_point_before = _adaptive_best_point(
                 a_values=a_arr,
                 b_values=b_arr,
                 point_results=point_results,
+                expand_resume_context=phase_expand_context,
+                da=float(da),
+                db=float(db),
             )
 
         a_arr, best_a_index, _expanded_a = _expand_axis_around_index(
@@ -1360,11 +1540,15 @@ def search_local_minimum_ab(
             emthreshold=float(emthreshold),
         )
 
-        best_a_index, best_b_index, best_point_after = _current_best_point(
+        best_a_index, best_b_index, best_point_after = _adaptive_best_point(
             a_values=a_arr,
             b_values=b_arr,
             point_results=point_results,
+            expand_resume_context=phase_expand_context,
+            da=float(da),
+            db=float(db),
         )
+        expand_resume_pass = False
         if float(best_point_after.objective_value) >= float(best_point_before.objective_value):
             break
 

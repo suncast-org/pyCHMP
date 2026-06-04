@@ -596,10 +596,23 @@ For a fresh adaptive artifact:
 To rerun the same adaptive search settings as a fresh search while still reusing
 the stored map products in the existing artifact, pass:
 
-- `--start-over`
+- `--recompute-existing` (same search identity) or `--new-search-identity`
+  (parallel search for debugging). Both refit on a fresh grid and warm-start q0
+  from `map_store` without re-rendering compatible maps.
 
-This creates a new adaptive search instance in the same artifact instead of
-resuming the previous compatible search state.
+Default behavior (no flags) resumes the compatible active search.
+
+Targeted artifact operations (same launcher + `--artifact-h5`):
+
+- `--recompute-search-id SEARCH_ID` — repair incomplete/contract-broken points using the
+  stored recipe only (no metric/mask/render CLI overrides).
+- `--expand-grid-search-id SEARCH_ID` — widen `--a-min`/`--a-max`/`--b-min`/`--b-max`
+  (strict superset of stored footprint); hydrates completed cells; explores new shell only.
+- `pychmp-rescore build|commit` — rescore `map_store` into a parallel `{root}_rN` search.
+- `pychmp-repair-grid-trial-maps` — purge invalid trial groups (metadata repair, not refit).
+
+Per-point cherry-pick refit is planned; see
+`future-implementation-notes/pyCHMP/2026-06-01-pyCHMP-point-repair-utility-handoff.md`.
 
 Adaptive launcher path-resolution notes:
 

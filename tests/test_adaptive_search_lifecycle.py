@@ -11,6 +11,7 @@ from pychmp.ab_scan_artifacts import (
     append_scan_point_record,
     extend_patch_grid_model_with_pending_point,
     finalize_search_runner_state,
+    reopen_search_runner_state,
     write_point_scan_artifact,
 )
 
@@ -141,6 +142,41 @@ def test_finalize_search_runner_state_marks_search_complete(tmp_path: Path) -> N
         assert search.attrs["status"].decode() == "complete"
         lifecycle = search["lifecycle_json"][()].decode()
         assert '"active": false' in lifecycle
+
+
+def test_reopen_search_runner_state_clears_completed_at(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "adaptive_reopen.h5"
+    observed = np.ones((4, 4), dtype=float)
+    sigma_map = np.ones((4, 4), dtype=float)
+    header = _make_header()
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-adaptive-reopen",
+        "target_slice_key": "default",
+        "target_metric": "eta2",
+        "search_mode": "adaptive_local_single_observation",
+        "search_active": True,
+    }
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+        run_history=[],
+        preserve_existing_searches=True,
+    )
+    with h5py.File(out_h5, "r") as handle:
+        search_id = handle["slices/default/active_search_id"][()].decode()
+    finalize_search_runner_state(out_h5, slice_key="default", search_id=search_id, completed=True)
+    reopen_search_runner_state(out_h5, slice_key="default", search_id=search_id)
+    with h5py.File(out_h5, "r") as handle:
+        search = handle["slices/default/searches"][search_id]
+        lifecycle = search["lifecycle_json"][()].decode()
+        assert '"active": true' in lifecycle
+        assert '"completed_at": null' in lifecycle or "completed_at" not in lifecycle
+        assert search.attrs["status"].decode() in {"in_progress", "partial", "empty"}
 
 
 def test_extend_patch_grid_model_with_pending_point_adds_ghost_cell() -> None:

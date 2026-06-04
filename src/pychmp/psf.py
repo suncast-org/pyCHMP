@@ -314,6 +314,56 @@ def effective_psf_parameters(
     }
 
 
+_FWHM_FROM_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def beam_fwhm_from_kernel(
+    kernel: np.ndarray,
+    *,
+    dx_arcsec: float,
+    dy_arcsec: float,
+) -> dict[str, float] | None:
+    """Estimate elliptical Gaussian FWHM (arcsec) from a 2D PSF kernel."""
+    arr = np.asarray(kernel, dtype=float)
+    if arr.ndim != 2 or arr.size == 0:
+        return None
+    weights = np.where(np.isfinite(arr) & (arr > 0.0), arr, 0.0)
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+
+    ny, nx = arr.shape
+    yy, xx = np.mgrid[0:ny, 0:nx]
+    x0 = float(np.sum(xx * weights) / total)
+    y0 = float(np.sum(yy * weights) / total)
+    dx_pix = float(np.sum((xx - x0) ** 2 * weights) / total)
+    dy_pix = float(np.sum((yy - y0) ** 2 * weights) / total)
+    dxy_pix = float(np.sum((xx - x0) * (yy - y0) * weights) / total)
+    if not all(np.isfinite(value) for value in (dx_pix, dy_pix, dxy_pix)):
+        return None
+
+    scale_x = max(abs(float(dx_arcsec)), 1e-12)
+    scale_y = max(abs(float(dy_arcsec)), 1e-12)
+    cov_xx = dx_pix * scale_x**2
+    cov_yy = dy_pix * scale_y**2
+    cov_xy = dxy_pix * scale_x * scale_y
+    cov = np.array([[cov_xx, cov_xy], [cov_xy, cov_yy]], dtype=float)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    eigvals = np.maximum(eigvals, 0.0)
+    order = np.argsort(eigvals)
+    bmin_arcsec = float(_FWHM_FROM_SIGMA * np.sqrt(eigvals[order[0]]))
+    bmaj_arcsec = float(_FWHM_FROM_SIGMA * np.sqrt(eigvals[order[1]]))
+    if bmaj_arcsec <= 0.0 or bmin_arcsec <= 0.0:
+        return None
+    major_vec = eigvecs[:, order[1]]
+    bpa_deg = float(np.degrees(np.arctan2(major_vec[1], major_vec[0])))
+    return {
+        "bmaj_arcsec": bmaj_arcsec,
+        "bmin_arcsec": max(bmin_arcsec, 1e-6),
+        "bpa_deg": bpa_deg,
+    }
+
+
 def elliptical_gaussian_kernel(
     bmaj_arcsec: float,
     bmin_arcsec: float,

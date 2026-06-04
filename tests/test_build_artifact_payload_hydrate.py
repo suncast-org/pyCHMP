@@ -155,7 +155,6 @@ def test_build_artifact_payload_hydrates_best_maps_from_grid_point(tmp_path: Pat
         target_metric="eta2",
         psf_source="none",
         compatibility_signature="sig",
-        store_trial_map_cubes=False,
     )
     proxy._artifact_h5 = artifact_h5
     proxy._slice_key = "euv_193"

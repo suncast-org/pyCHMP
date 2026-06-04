@@ -8,6 +8,7 @@ import pytest
 
 from pychmp import build_psf_kernel, default_psf_metadata, extract_psf_metadata_from_header, resolve_psf_metadata
 from pychmp import psf as psf_module
+from pychmp.psf import beam_fwhm_from_kernel, elliptical_gaussian_kernel
 
 
 def test_extract_psf_metadata_from_header_converts_degree_beam_to_arcsec() -> None:
@@ -24,6 +25,21 @@ def test_extract_psf_metadata_from_header_converts_degree_beam_to_arcsec() -> No
     assert metadata.bmaj_arcsec == pytest.approx(2.0)
     assert metadata.bmin_arcsec == pytest.approx(1.0)
     assert metadata.bpa_deg == pytest.approx(33.0)
+
+
+def test_beam_fwhm_from_kernel_recovers_gaussian_beam() -> None:
+    kernel = elliptical_gaussian_kernel(
+        bmaj_arcsec=40.0,
+        bmin_arcsec=28.0,
+        bpa_deg=35.0,
+        dx_arcsec=2.0,
+        dy_arcsec=2.0,
+        size=61,
+    )
+    payload = beam_fwhm_from_kernel(kernel, dx_arcsec=2.0, dy_arcsec=2.0)
+    assert payload is not None
+    assert payload["bmaj_arcsec"] == pytest.approx(40.0, rel=0.08)
+    assert payload["bmin_arcsec"] == pytest.approx(28.0, rel=0.08)
 
 
 def test_build_psf_kernel_normalizes_direct_kernel() -> None:

@@ -22,6 +22,16 @@ def test_search_lifecycle_is_in_progress_honors_running_flag() -> None:
     assert search_lifecycle_is_in_progress({"in_progress": True, "status": "running"}) is True
 
 
+def test_search_lifecycle_is_in_progress_ignores_stale_in_progress_on_complete() -> None:
+    lifecycle = {
+        "in_progress": True,
+        "active": True,
+        "status": "complete",
+        "completed_at": "2026-06-03T14:00:00Z",
+    }
+    assert search_lifecycle_is_in_progress(lifecycle) is False
+
+
 def test_find_global_best_domain_prefers_lower_eta2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     h5_path = tmp_path / "scan.h5"
 

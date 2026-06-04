@@ -14,7 +14,10 @@ from .metrics import (
     compute_metrics,
     mask_area_fractions,
     resolve_threshold_mask,
+    should_prefer_data_mask_over_union,
     smoothed_observation_max,
+    threshold_data_mask,
+    union_mask_flux_totals,
 )
 from .obs_alignment import (
     DEFAULT_MAX_SHIFT_ARSEC,
@@ -177,21 +180,73 @@ def evaluate_modeled_trial(
         else float(np.max(observed_arr))
     )
 
+    resolved_mask_type = mask_type.strip().lower()
     mask_fn = resolve_threshold_mask(mask_type)
     if explicit_mask is not None:
         mask = np.asarray(explicit_mask, dtype=bool)
-    elif mask_type.strip().lower() in {"union", "data", "and"}:
+        effective_mask_stage = resolved_mask_stage
+    elif resolved_mask_type in {"union", "data", "and"}:
         mask = mask_fn(observed_arr, modeled_arr, threshold, obs_max=obs_peak)
+        effective_mask_stage = resolved_mask_stage
+        mask_obs_frac, mask_mod_frac = mask_area_fractions(
+            observed_arr,
+            modeled_arr,
+            threshold=threshold,
+            obs_max=obs_peak,
+        )
+        obs_flux, mod_flux = union_mask_flux_totals(
+            observed_arr,
+            modeled_arr,
+            mask,
+            pixel_scale_x_arcsec=scale_x,
+            pixel_scale_y_arcsec=scale_y,
+        )
+        valid_mask, mask_message = chmp_mask_valid(mask_obs_frac, mask_mod_frac)
+        if resolved_mask_type == "union" and (
+            not valid_mask
+            or should_prefer_data_mask_over_union(
+                mask_obs_fraction=mask_obs_frac,
+                mask_mod_fraction=mask_mod_frac,
+                total_observed_flux=obs_flux,
+                total_modeled_flux=mod_flux,
+            )
+        ):
+            mask = threshold_data_mask(observed_arr, modeled_arr, threshold, obs_max=obs_peak)
+            effective_mask_stage = "data"
+            mask_obs_frac, mask_mod_frac = mask_area_fractions(
+                observed_arr,
+                modeled_arr,
+                threshold=threshold,
+                obs_max=obs_peak,
+            )
+            obs_flux, mod_flux = union_mask_flux_totals(
+                observed_arr,
+                modeled_arr,
+                mask,
+                pixel_scale_x_arcsec=scale_x,
+                pixel_scale_y_arcsec=scale_y,
+            )
+            valid_mask, mask_message = chmp_mask_valid(mask_obs_frac, mask_mod_frac)
+            if effective_mask_stage == "data":
+                valid_mask = mask_obs_frac <= 0.99
+                mask_message = "" if valid_mask else "observation mask fraction > 0.99"
     else:
         mask = mask_fn(observed_arr, modeled_arr, threshold)
-
-    mask_obs_frac, mask_mod_frac = mask_area_fractions(
-        observed_arr,
-        modeled_arr,
-        threshold=threshold,
-        obs_max=obs_peak,
-    )
-    valid_mask, mask_message = chmp_mask_valid(mask_obs_frac, mask_mod_frac)
+        effective_mask_stage = resolved_mask_stage
+        mask_obs_frac, mask_mod_frac = mask_area_fractions(
+            observed_arr,
+            modeled_arr,
+            threshold=threshold,
+            obs_max=obs_peak,
+        )
+        obs_flux, mod_flux = union_mask_flux_totals(
+            observed_arr,
+            modeled_arr,
+            mask,
+            pixel_scale_x_arcsec=scale_x,
+            pixel_scale_y_arcsec=scale_y,
+        )
+        valid_mask, mask_message = chmp_mask_valid(mask_obs_frac, mask_mod_frac)
     if not valid_mask:
         return Q0MetricEvaluation(
             metrics=_invalid_metrics(),
@@ -200,9 +255,11 @@ def evaluate_modeled_trial(
             shift_x_arcsec=shift_x,
             shift_y_arcsec=shift_y,
             find_shift_valid=True,
+            total_observed_flux=obs_flux,
+            total_modeled_flux=mod_flux,
             mask_obs_fraction=mask_obs_frac,
             mask_mod_fraction=mask_mod_frac,
-            mask_stage=resolved_mask_stage,
+            mask_stage=effective_mask_stage,
         )
 
     try:
@@ -215,15 +272,17 @@ def evaluate_modeled_trial(
             shift_x_arcsec=shift_x,
             shift_y_arcsec=shift_y,
             find_shift_valid=True,
+            total_observed_flux=obs_flux,
+            total_modeled_flux=mod_flux,
             mask_obs_fraction=mask_obs_frac,
             mask_mod_fraction=mask_mod_frac,
-            mask_stage=resolved_mask_stage,
+            mask_stage=effective_mask_stage,
         )
 
     return Q0MetricEvaluation(
         metrics=metrics,
-        total_observed_flux=float(np.sum(observed_arr[mask], dtype=float)),
-        total_modeled_flux=float(np.sum(modeled_arr[mask], dtype=float)),
+        total_observed_flux=obs_flux,
+        total_modeled_flux=mod_flux,
         is_valid=True,
         shift_x_arcsec=shift_x,
         shift_y_arcsec=shift_y,
@@ -232,5 +291,5 @@ def evaluate_modeled_trial(
         mask_mod_fraction=mask_mod_frac,
         find_shift_version=FIND_SHIFT_VERSION,
         chmp_eval_policy_version=CHMP_EVAL_POLICY_VERSION,
-        mask_stage=resolved_mask_stage,
+        mask_stage=effective_mask_stage,
     )

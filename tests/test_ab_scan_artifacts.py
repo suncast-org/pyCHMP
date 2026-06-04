@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from argparse import Namespace
 from pathlib import Path
 
 import h5py
@@ -11,8 +12,20 @@ from astropy.io import fits
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     CANONICAL_ARTIFACT_CONTRACT_VERSION,
+    MAP_STORE_GROUP,
+    MAP_STORE_MAPS_GROUP,
+    OBSERVATION_REF_GROUP,
+    SEARCHES_GROUP,
+    SLICE_CONTAINER_GROUP,
     UNIFIED_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
+    apply_search_run_profile_to_namespace,
+    load_search_run_profile,
+    matching_search_id_for_slice,
+    resolve_search_location,
+    purge_search_from_artifact,
+    read_slice_active_search_id,
+    register_sparse_search_in_artifact,
     append_point_record,
     append_scan_point_record,
     backfill_artifact_diagnostics,
@@ -40,6 +53,8 @@ from pychmp.ab_scan_artifacts import (
     write_point_scan_artifact,
 )
 from pychmp import ab_scan_artifacts
+from pychmp.ab_scan_artifacts import _is_h5_locking_flag_mismatch, is_h5_transient_read_error
+from pychmp.search_contract import build_search_evaluation_config
 
 
 def _make_header(*, crval1: float = 0.0) -> fits.Header:
@@ -133,6 +148,20 @@ def _make_blos_reference() -> tuple[np.ndarray, fits.Header]:
     header = _make_header(crval1=12.0)
     data = np.asarray([[10.0, -10.0], [5.0, -5.0]], dtype=float)
     return data, header
+
+
+def test_is_h5_locking_flag_mismatch_detects_h5py_message() -> None:
+    exc = OSError("Unable to synchronously open file (file locking flag values don't match)")
+    assert _is_h5_locking_flag_mismatch(exc)
+    assert not _is_h5_locking_flag_mismatch(OSError("No such file"))
+
+
+def test_is_h5_transient_read_error_detects_symbol_table_and_lock_races() -> None:
+    sym = RuntimeError("Unable to synchronously check link existence (bad symbol table node signature)")
+    assert is_h5_transient_read_error(sym)
+    lock = OSError("Unable to synchronously open file (file locking flag values don't match)")
+    assert is_h5_transient_read_error(lock)
+    assert not is_h5_transient_read_error(ValueError("bad symbol table node signature"))
 
 
 def test_active_point_snapshot_round_trip(tmp_path: Path) -> None:
@@ -812,6 +841,250 @@ def test_validate_scan_artifact_reuse_preflight_allows_sparse_search_specific_ch
         diagnostics=changed_diagnostics,
         artifact_path=out_h5,
     )
+
+
+def test_validate_scan_artifact_reuse_preflight_allows_different_observation_fits(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "sparse_scan.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+
+    payload = load_scan_file(out_h5)
+    changed_diagnostics = dict(diagnostics)
+    changed_diagnostics["fits_sha256"] = "f" * 64
+    changed_diagnostics["observer_obs_time"] = "2020-11-26T21:00:00"
+    changed_diagnostics["artifact_geometry_sha256"] = payload["diagnostics"].get("artifact_geometry_sha256")
+
+    validate_scan_artifact_reuse_preflight(
+        payload,
+        wcs_header=header,
+        diagnostics=changed_diagnostics,
+        artifact_path=out_h5,
+    )
+
+
+def test_purge_search_from_artifact_removes_branch_and_preserves_map_store(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "artifact.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    payload = load_scan_file(out_h5)
+    first_search_id = str(payload["selected_search_id"])
+    slice_key = str(payload.get("selected_slice_key") or payload["diagnostics"].get("target_slice_key") or "default")
+
+    second_diag = dict(diagnostics)
+    second_diag["fits_sha256"] = "d" * 64
+    second_search_id = register_sparse_search_in_artifact(
+        out_h5,
+        observed=observed * 2.0,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=second_diag,
+    )
+    assert read_slice_active_search_id(out_h5, slice_key=slice_key) == second_search_id
+
+    with h5py.File(out_h5, "r") as f:
+        map_count_before = len(f[MAP_STORE_GROUP][MAP_STORE_MAPS_GROUP])
+
+    result = purge_search_from_artifact(
+        out_h5,
+        slice_key=slice_key,
+        search_id=first_search_id,
+    )
+    assert result["purged_search_id"] == first_search_id
+    assert result["cleared_active_search_id"] is False
+    assert first_search_id not in result["remaining_search_ids"]
+    assert second_search_id in result["remaining_search_ids"]
+    assert read_slice_active_search_id(out_h5, slice_key=slice_key) == second_search_id
+
+    with h5py.File(out_h5, "r") as f:
+        searches = f[SLICE_CONTAINER_GROUP][slice_key][SEARCHES_GROUP]
+        assert first_search_id not in searches
+        assert second_search_id in searches
+        assert len(f[MAP_STORE_GROUP][MAP_STORE_MAPS_GROUP]) == map_count_before
+
+    latest = load_scan_file(out_h5, search_id=second_search_id)
+    assert len(latest["search_records"]) == 1
+    assert str(latest["search_records"][0]["search_id"]) == second_search_id
+
+
+def test_purge_search_clears_active_search_id_when_purged(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "artifact.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    payload = load_scan_file(out_h5)
+    search_id = str(payload["selected_search_id"])
+    slice_key = str(payload.get("selected_slice_key") or payload["diagnostics"].get("target_slice_key") or "default")
+
+    result = purge_search_from_artifact(out_h5, slice_key=slice_key, search_id=search_id)
+    assert result["cleared_active_search_id"] is True
+    assert read_slice_active_search_id(out_h5, slice_key=slice_key) is None
+
+
+def test_register_sparse_search_preserves_prior_searches_and_observation_ref(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "artifact.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    first_diag = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=first_diag,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    first_payload = load_scan_file(out_h5)
+    first_search_id = str(first_payload["selected_search_id"])
+    slice_key = str(first_payload.get("selected_slice_key") or first_payload["diagnostics"].get("target_slice_key") or "default")
+
+    second_observed = observed * 2.0
+    second_diag = dict(first_diag)
+    second_diag["target_slice_key"] = slice_key
+    second_diag["mask_type"] = str(first_payload["diagnostics"].get("mask_type") or "union")
+    second_diag["fits_sha256"] = "d" * 64
+    second_diag["fits_file"] = "/tmp/other_obs.fits"
+    second_search_id = register_sparse_search_in_artifact(
+        out_h5,
+        observed=second_observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=second_diag,
+    )
+
+    assert second_search_id != first_search_id
+    latest_payload = load_scan_file(out_h5, search_id=second_search_id)
+    np.testing.assert_allclose(latest_payload["observed"], second_observed)
+    assert len(latest_payload["search_records"]) == 2
+    assert len(latest_payload["point_records"]) == 0
+
+    with h5py.File(out_h5, "r") as f:
+        searches = f[SLICE_CONTAINER_GROUP][slice_key][SEARCHES_GROUP]
+        assert first_search_id in searches
+        assert OBSERVATION_REF_GROUP in searches[second_search_id]
+        assert len(searches[first_search_id]["point_records"]) == 1
+
+    request = build_search_evaluation_config(second_diag, layout={"kind": "point_list"})
+    assert matching_search_id_for_slice(out_h5, slice_key=slice_key, request=request) == second_search_id
+
+
+def test_load_search_run_profile_and_apply_to_namespace(tmp_path: Path) -> None:
+    out_h5 = tmp_path / "profile.h5"
+    observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma_map = np.ones_like(observed)
+    header = _make_header()
+    diagnostics = _make_diagnostics(artifact_kind="pychmp_ab_scan_sparse_points")
+    diagnostics.update(
+        {
+            "target_slice_key": "mw_5.7ghz",
+            "spectral_domain": "mw",
+            "observation_source_mode": "external_fits",
+            "observation_source_path": str(tmp_path / "obs.fits"),
+            "fits_file": str(tmp_path / "obs.fits"),
+            "a_start": 0.25,
+            "b_start": 2.75,
+            "da": 0.25,
+            "db": 0.25,
+            "a_range": [-1.0, 3.0],
+            "b_range": [0.0, 4.0],
+            "target_metric": "eta2",
+            "render_frequencies_ghz": [5.7, 1.4, 6.9],
+            "execution_policy": "serial",
+        }
+    )
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[_make_point_payload(0.0, 1.0)],
+    )
+    payload = load_scan_file(out_h5)
+    search_id = str(payload["selected_search_id"])
+    slice_key = str(payload.get("selected_slice_key") or payload["diagnostics"].get("target_slice_key") or "default")
+
+    assert resolve_search_location(out_h5, search_id=search_id) == (slice_key, search_id)
+    profile = load_search_run_profile(out_h5, search_id=search_id)
+    assert profile["search_id"] == search_id
+    assert profile["slice_key"] == slice_key
+    assert float(profile["diagnostics"]["a_start"]) == 0.25
+
+    args = Namespace(
+        fits_file=None,
+        obs_path=None,
+        obs_source=None,
+        obs_map_id=None,
+        model_h5=None,
+        model_h5_override=None,
+        ebtel_path=None,
+        obs_domain=None,
+        obs_frequency_ghz=None,
+        a_start=0.0,
+        b_start=0.0,
+        da=0.3,
+        db=0.3,
+        a_min=-1.2,
+        a_max=1.2,
+        b_min=2.1,
+        b_max=3.6,
+        target_metric="chi2",
+        metrics_mask_threshold=0.1,
+        render_frequencies_ghz=None,
+        execution_policy="process-pool",
+        shift_policy="auto",
+        max_shift_arcsec=None,
+        xy_shift_arcsec=None,
+        use_smoothed_obs_max=True,
+        use_emthreshold=True,
+        emthreshold=0.1,
+        q0_search_stages=None,
+        pixel_scale_arcsec=2.0,
+        no_area=False,
+        threshold_metric=1.1,
+        metrics_mask_fits=None,
+        tr_mask_bmin_gauss=1000.0,
+        adaptive_bracketing=True,
+    )
+    apply_search_run_profile_to_namespace(args, profile)
+    assert args.fits_file == Path(str(tmp_path / "obs.fits"))
+    assert args.obs_source == "external_fits"
+    assert args.a_start == 0.25
+    assert args.b_start == 2.75
+    assert args.a_min == -1.0
+    assert args.a_max == 3.0
+    assert args.target_metric == "eta2"
+    assert args.render_frequencies_ghz == "1.4,6.9"
+    assert args.execution_policy == "serial"
 
 
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:
@@ -2614,6 +2887,32 @@ def test_grid_extents_from_ab_values_uses_cell_edges() -> None:
     assert shared["a_max"] > 0.3
     assert shared["b_min"] < 2.1
     assert shared["b_max"] > 3.0
+
+
+def test_grid_extents_from_search_diagnostics_uses_adaptive_bounds() -> None:
+    extents = ab_scan_artifacts.grid_extents_from_search_diagnostics(
+        {"a_range": [-1.0, 3.0], "b_range": [0.0, 4.0]}
+    )
+    assert extents == {
+        "a_min": -1.0,
+        "a_max": 3.0,
+        "b_min": 0.0,
+        "b_max": 4.0,
+    }
+
+
+def test_merge_grid_extents_unions_points_and_declared_bounds() -> None:
+    merged = ab_scan_artifacts.merge_grid_extents(
+        ab_scan_artifacts.grid_extents_from_ab_values([0.25], [2.75]),
+        ab_scan_artifacts.grid_extents_from_search_diagnostics(
+            {"a_range": [-1.0, 3.0], "b_range": [0.0, 4.0]}
+        ),
+    )
+    assert merged is not None
+    assert merged["a_min"] == pytest.approx(-1.0)
+    assert merged["a_max"] == pytest.approx(3.0)
+    assert merged["b_min"] == pytest.approx(0.0)
+    assert merged["b_max"] == pytest.approx(4.0)
 
 
 def test_grid_plot_helpers_use_a_on_x_and_b_on_y() -> None:

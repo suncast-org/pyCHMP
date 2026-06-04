@@ -163,6 +163,24 @@ def test_load_slice_observation_reference_payload_legacy_search_ref_fallback(tmp
     np.testing.assert_allclose(payload["observed"], observed)
 
 
+def test_search_evaluation_config_includes_observation_fits_identity() -> None:
+    diagnostics = _make_diagnostics()
+    diagnostics["fits_file"] = "/data/obs.fits"
+    config = build_search_evaluation_config(diagnostics, layout={"kind": "point_list"})
+    assert config["observation"]["fits_sha256"] == "b" * 64
+    assert config["observation"]["fits_file"] == "/data/obs.fits"
+
+    changed = dict(diagnostics)
+    changed["fits_sha256"] = "d" * 64
+    changed_sig = search_evaluation_signature(
+        build_search_evaluation_config(changed, layout={"kind": "point_list"})
+    )
+    base_sig = search_evaluation_signature(
+        build_search_evaluation_config(diagnostics, layout={"kind": "point_list"})
+    )
+    assert changed_sig != base_sig
+
+
 def test_search_evaluation_config_excludes_slice_observation_content_hashes() -> None:
     diagnostics = _make_diagnostics()
     diagnostics["slice_observation_identity_sha256"] = "deadbeef"

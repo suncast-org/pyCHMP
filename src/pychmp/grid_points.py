@@ -22,6 +22,9 @@ from .ab_scan_artifacts import (
     TRIAL_HISTORY_DATASET,
     UNIFIED_ARTIFACT_KIND,
     _H5PY_FILE,
+    _SPARSE_APPEND_RETRY_ATTEMPTS,
+    _SPARSE_APPEND_RETRY_DELAY_S,
+    is_h5_transient_read_error,
     _create_text_dataset,
     _replace_text_dataset,
     _derive_display_maps_from_raw,
@@ -43,8 +46,6 @@ from .ab_scan_artifacts import (
     _search_status_counts_from_records,
     _search_status_from_counts,
     _set_slice_group_attrs,
-    _SPARSE_APPEND_RETRY_ATTEMPTS,
-    _SPARSE_APPEND_RETRY_DELAY_S,
     _validate_new_slice_geometry_compatibility,
     _write_auxiliary_slice_shells,
     _write_common_group,
@@ -60,8 +61,14 @@ from .ab_scan_artifacts import _read_point_group_sparse
 
 GRID_POINTS_GROUP = "grid_points"
 GRID_POINTS_TRIALS_GROUP = "trials"
+GRID_POINT_STORAGE_CORRUPT_ATTR = "storage_corrupt"
 GRID_POINTS_CONTRACT_VERSION = "2026-06-header-grid-points-v1"
 GRID_POINT_AB_TOLERANCE = 1e-6
+
+
+def grid_point_storage_corrupt(point_group: h5py.Group) -> bool:
+    raw = point_group.attrs.get(GRID_POINT_STORAGE_CORRUPT_ATTR, 0)
+    return raw in (1, True, "1", b"1")
 
 
 class GridPointStatus(str, Enum):
@@ -127,7 +134,7 @@ def read_grid_point_header(group: h5py.Group) -> dict[str, Any]:
 
 def classify_grid_point_state(header: dict[str, Any]) -> str:
     status = str(header.get("status", "")).strip().upper()
-    if status == GridPointStatus.COMPLETED.value and "next_q0" not in header:
+    if status == GridPointStatus.COMPLETED.value:
         return "complete"
     if status == GridPointStatus.FAILED.value:
         return "failed"
@@ -177,6 +184,8 @@ def find_grid_point_group(
     best_order = -1
     for name in grid_group.keys():
         candidate = grid_group[name]
+        if grid_point_storage_corrupt(candidate):
+            continue
         try:
             cand_a = float(candidate.attrs["a"])
             cand_b = float(candidate.attrs["b"])
@@ -225,6 +234,34 @@ def _ensure_contract_version(search_group: h5py.Group) -> None:
         _create_text_dataset(search_group, "diagnostics_json", _json_dumps(diagnostics))
 
 
+def _grid_points_count_for_search(search_group: h5py.Group) -> int:
+    if GRID_POINTS_GROUP not in search_group:
+        return 0
+    return int(len(search_group[GRID_POINTS_GROUP]))
+
+
+def _resolve_current_search_id(
+    searches_group: h5py.Group,
+    slice_group: h5py.Group,
+    *,
+    diagnostics: dict[str, Any],
+    request_payload: dict[str, Any],
+    layout_payload: dict[str, Any],
+) -> str:
+    """Pick the search group for grid writes (explicit runner id wins over contract matching)."""
+    requested = str(diagnostics.get("selected_search_id") or diagnostics.get("search_id") or "").strip()
+    if requested:
+        return requested
+    matched = _matching_search_id_for_request(searches_group, request_payload)
+    if matched:
+        return str(matched)
+    if ACTIVE_SEARCH_ID_DATASET in slice_group:
+        active = decode_scalar(slice_group[ACTIVE_SEARCH_ID_DATASET][()]).strip()
+        if active and active in searches_group:
+            return active
+    return _search_id_from_diagnostics(diagnostics, layout=layout_payload)
+
+
 def _ensure_search_context(
     h5_file: h5py.File,
     *,
@@ -234,6 +271,7 @@ def _ensure_search_context(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None,
     psf_kernel: np.ndarray | None,
+    ensure_slice_common: bool = True,
 ) -> tuple[h5py.Group, h5py.Group, str]:
     diagnostics_out = dict(diagnostics)
     diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
@@ -259,27 +297,28 @@ def _ensure_search_context(
         slice_group = slices_group[resolved_slice_key]
         _set_slice_group_attrs(slice_group, descriptor)
     if "common" not in slice_group:
-        common = slice_group.create_group("common")
-        _write_common_group(
-            common,
-            observed=observed,
-            sigma_map=sigma_map,
-            wcs_header=wcs_header,
-            diagnostics=diagnostics_out,
-            blos_reference=blos_reference,
-            psf_kernel=psf_kernel,
-            run_history=None,
-        )
-        _write_auxiliary_slice_shells(
-            slices_group,
-            observed_template=observed,
-            sigma_template=sigma_map,
-            wcs_header=wcs_header,
-            diagnostics=diagnostics_out,
-            blos_reference=blos_reference,
-            existing_names=set(slices_group.keys()),
-        )
-    elif blos_reference is not None and "refmaps" not in slice_group["common"]:
+        if ensure_slice_common:
+            common = slice_group.create_group("common")
+            _write_common_group(
+                common,
+                observed=observed,
+                sigma_map=sigma_map,
+                wcs_header=wcs_header,
+                diagnostics=diagnostics_out,
+                blos_reference=blos_reference,
+                psf_kernel=psf_kernel,
+                run_history=None,
+            )
+            _write_auxiliary_slice_shells(
+                slices_group,
+                observed_template=observed,
+                sigma_template=sigma_map,
+                wcs_header=wcs_header,
+                diagnostics=diagnostics_out,
+                blos_reference=blos_reference,
+                existing_names=set(slices_group.keys()),
+            )
+    elif ensure_slice_common and blos_reference is not None and "refmaps" not in slice_group["common"]:
         refmaps = slice_group["common"].create_group("refmaps")
         blos_data, blos_header = blos_reference
         _write_reference_map_group(
@@ -291,14 +330,13 @@ def _ensure_search_context(
     searches_group = slice_group.require_group(SEARCHES_GROUP)
     layout_payload = {"kind": "point_list"}
     request_payload = _search_request_from_diagnostics(diagnostics_out, layout=layout_payload)
-    current_search_id = _matching_search_id_for_request(searches_group, request_payload)
-    if not current_search_id:
-        if ACTIVE_SEARCH_ID_DATASET in slice_group:
-            active = decode_scalar(slice_group[ACTIVE_SEARCH_ID_DATASET][()]).strip()
-            if active and active in searches_group:
-                current_search_id = active
-        if not current_search_id:
-            current_search_id = _search_id_from_diagnostics(diagnostics_out, layout=layout_payload)
+    current_search_id = _resolve_current_search_id(
+        searches_group,
+        slice_group,
+        diagnostics=diagnostics_out,
+        request_payload=request_payload,
+        layout_payload=layout_payload,
+    )
     if ACTIVE_SEARCH_ID_DATASET in slice_group:
         del slice_group[ACTIVE_SEARCH_ID_DATASET]
     _create_text_dataset(slice_group, ACTIVE_SEARCH_ID_DATASET, current_search_id)
@@ -433,6 +471,7 @@ class GridTrialCommittedEvent:
     best_trial_index: int
     best_metric: float
     raw_modeled_map: np.ndarray | None = None
+    raw_map_ref: str | None = None
     trial_metadata: dict[str, Any] | None = None
     shift_x: float | None = None
     shift_y: float | None = None
@@ -457,6 +496,21 @@ class GridPointFailedEvent:
     terminal: bool = False
 
 
+def _validate_linked_map_store_ref(
+    h5_file: h5py.File,
+    linked_ref: str,
+    *,
+    map_store_artifact: Path | None,
+) -> None:
+    if map_store_artifact is not None:
+        with _H5PY_FILE(map_store_artifact, "r") as ref_store:
+            if _read_map_store_ref_array(ref_store, linked_ref) is None:
+                raise ValueError(f"map_store reference not found: {linked_ref}")
+        return
+    if _read_map_store_ref_array(h5_file, linked_ref) is None:
+        raise ValueError(f"map_store reference not found: {linked_ref}")
+
+
 def apply_grid_point_active_q0(
     h5_path: Path,
     *,
@@ -468,6 +522,8 @@ def apply_grid_point_active_q0(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     psf_kernel: np.ndarray | None = None,
+    map_store_artifact: Path | None = None,
+    ensure_slice_common: bool = True,
 ) -> None:
     with _H5PY_FILE(h5_path, "a") as f:
         _slice_group, search_group, _search_id = _ensure_search_context(
@@ -478,6 +534,7 @@ def apply_grid_point_active_q0(
             diagnostics=diagnostics,
             blos_reference=blos_reference,
             psf_kernel=psf_kernel,
+            ensure_slice_common=ensure_slice_common,
         )
         point_group = _grid_point_group(search_group, str(point_id))
         header = read_grid_point_header(point_group)
@@ -504,7 +561,10 @@ def apply_grid_point_assigned(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     psf_kernel: np.ndarray | None = None,
+    map_store_artifact: Path | None = None,
+    ensure_slice_common: bool = True,
 ) -> str:
+    _ = map_store_artifact
     with _H5PY_FILE(h5_path, "a") as f:
         _slice_group, search_group, _search_id = _ensure_search_context(
             f,
@@ -514,6 +574,7 @@ def apply_grid_point_assigned(
             diagnostics=diagnostics,
             blos_reference=blos_reference,
             psf_kernel=psf_kernel,
+            ensure_slice_common=ensure_slice_common,
         )
         grid_root = search_group[GRID_POINTS_GROUP]
         if not event.force_new_point_id:
@@ -602,6 +663,8 @@ def apply_grid_trial_committed(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     psf_kernel: np.ndarray | None = None,
+    map_store_artifact: Path | None = None,
+    ensure_slice_common: bool = True,
 ) -> None:
     with _H5PY_FILE(h5_path, "a") as f:
         _slice_group, search_group, _search_id = _ensure_search_context(
@@ -612,6 +675,7 @@ def apply_grid_trial_committed(
             diagnostics=diagnostics,
             blos_reference=blos_reference,
             psf_kernel=psf_kernel,
+            ensure_slice_common=ensure_slice_common,
         )
         point_group = _grid_point_group(search_group, str(event.point_id))
         header = read_grid_point_header(point_group)
@@ -636,7 +700,11 @@ def apply_grid_trial_committed(
         trial_group.attrs["rho2"] = float(rho2_value)
         trial_group.attrs["eta2"] = float(eta2_value)
         map_refs = _json_loads_or_empty(trial_group[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial_group else {}
-        if event.raw_modeled_map is not None:
+        linked_ref = str(event.raw_map_ref or "").strip()
+        if linked_ref:
+            _validate_linked_map_store_ref(f, linked_ref, map_store_artifact=map_store_artifact)
+            map_refs["raw_modeled"] = linked_ref
+        elif event.raw_modeled_map is not None:
             identity_source = {
                 **dict(diagnostics),
                 "a": float(header["a"]),
@@ -666,6 +734,13 @@ def apply_grid_trial_committed(
             trial_metadata["shift_valid"] = bool(event.shift_valid)
         _replace_text_dataset(trial_group, "trial_metadata_json", _json_dumps(trial_metadata))
         _replace_text_dataset(trial_group, MAP_REFS_DATASET, _json_dumps(map_refs))
+        q0_value = float(event.q0)
+        has_map = bool(str(map_refs.get("raw_modeled", "")).strip())
+        if np.isfinite(q0_value) and q0_value > 0.0 and not has_map:
+            raise ValueError(
+                "GridTrialCommittedEvent requires a stored map for finite Q0 trials "
+                f"(point_id={event.point_id}, trial_index={int(event.trial_index)}, q0={q0_value:g})"
+            )
         header["n_trials"] = max(int(header.get("n_trials", 0)), int(event.trial_index) + 1)
         header["best_trial_index"] = int(event.best_trial_index)
         header["status"] = GridPointStatus.RUNNING.value
@@ -688,7 +763,10 @@ def apply_grid_point_completed(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     psf_kernel: np.ndarray | None = None,
+    map_store_artifact: Path | None = None,
+    ensure_slice_common: bool = True,
 ) -> None:
+    _ = map_store_artifact
     with _H5PY_FILE(h5_path, "a") as f:
         _slice_group, search_group, _search_id = _ensure_search_context(
             f,
@@ -698,6 +776,7 @@ def apply_grid_point_completed(
             diagnostics=diagnostics,
             blos_reference=blos_reference,
             psf_kernel=psf_kernel,
+            ensure_slice_common=ensure_slice_common,
         )
         point_group = _grid_point_group(search_group, str(event.point_id))
         header = read_grid_point_header(point_group)
@@ -720,7 +799,10 @@ def apply_grid_point_failed(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     psf_kernel: np.ndarray | None = None,
+    map_store_artifact: Path | None = None,
+    ensure_slice_common: bool = True,
 ) -> None:
+    _ = map_store_artifact
     with _H5PY_FILE(h5_path, "a") as f:
         _slice_group, search_group, _search_id = _ensure_search_context(
             f,
@@ -730,6 +812,7 @@ def apply_grid_point_failed(
             diagnostics=diagnostics,
             blos_reference=blos_reference,
             psf_kernel=psf_kernel,
+            ensure_slice_common=ensure_slice_common,
         )
         point_group = _grid_point_group(search_group, str(event.point_id))
         header = read_grid_point_header(point_group)
@@ -743,7 +826,176 @@ def apply_grid_point_failed(
         _update_search_counts(search_group, diagnostics=diagnostics)
 
 
-def _load_grid_point_trials(point_group: h5py.Group, *, include_maps: bool) -> list[dict[str, Any]]:
+def select_fit_trials_for_viewer(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only optimizer Q0 trials (finite q0); drop mask/diagnostic rows with NaN q0."""
+    selected: list[dict[str, Any]] = []
+    for item in trials:
+        try:
+            q0_value = float(item["q0"])
+        except Exception:
+            continue
+        if np.isfinite(q0_value) and q0_value > 0.0:
+            selected.append(item)
+    return selected
+
+
+def _grid_point_finite_q0_trials_have_map_store_links_on_group(
+    root_file: h5py.File,
+    point_group: h5py.Group,
+) -> bool:
+    """True when every finite-Q0 trial row resolves to a readable map_store dataset."""
+    trials = select_fit_trials_for_viewer(_load_grid_point_trials(point_group, include_maps=False))
+    if not trials:
+        return True
+    for trial in trials:
+        raw_ref = str(trial.get("raw_map_ref", "") or "").strip()
+        if not raw_ref:
+            return False
+        if _read_map_store_ref_array(root_file, raw_ref) is None:
+            return False
+    return True
+
+
+def grid_point_finite_q0_trials_have_map_store_links(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    search_id: str,
+    point_id: str,
+) -> bool:
+    """True when every finite-Q0 trial row resolves to a readable map_store dataset."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, _SPARSE_APPEND_RETRY_ATTEMPTS + 1):
+        try:
+            with _H5PY_FILE(h5_path, "r") as f:
+                if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
+                    return True
+                slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+                if SEARCHES_GROUP not in slice_group or search_id not in slice_group[SEARCHES_GROUP]:
+                    return True
+                search_group = slice_group[SEARCHES_GROUP][search_id]
+                if GRID_POINTS_GROUP not in search_group or point_id not in search_group[GRID_POINTS_GROUP]:
+                    return True
+                point_group = search_group[GRID_POINTS_GROUP][point_id]
+                return _grid_point_finite_q0_trials_have_map_store_links_on_group(f, point_group)
+        except (OSError, RuntimeError, KeyError) as exc:
+            if not is_h5_transient_read_error(exc):
+                raise
+            last_exc = exc
+            import time
+
+            time.sleep(_SPARSE_APPEND_RETRY_DELAY_S)
+    if last_exc is not None:
+        raise last_exc
+    return True
+
+
+def _mark_grid_point_storage_corrupt(point_group: h5py.Group, *, point_id: str) -> None:
+    """Quarantine a grid point whose HDF5 trial subtree cannot be read or deleted."""
+    point_group.attrs[GRID_POINT_STORAGE_CORRUPT_ATTR] = 1
+    point_group.attrs["storage_corrupt_utc"] = _utc_now()
+    point_group.attrs["storage_corrupt_point_id"] = str(point_id)
+
+
+def _reset_grid_point_on_group(
+    point_group: h5py.Group,
+    *,
+    point_id: str,
+    q0_start: float,
+    next_q0: float,
+    metric_name: str,
+) -> None:
+    """Clear invalid trial rows and reset header (caller holds the artifact file open)."""
+    if GRID_POINTS_TRIALS_GROUP in point_group:
+        try:
+            del point_group[GRID_POINTS_TRIALS_GROUP]
+        except (OSError, RuntimeError, KeyError):
+            _mark_grid_point_storage_corrupt(point_group, point_id=str(point_id))
+            return
+    point_group.create_group(GRID_POINTS_TRIALS_GROUP)
+    existing = read_grid_point_header(point_group)
+    now = _utc_now()
+    header = {
+        "point_id": str(point_id),
+        "a": float(existing["a"]),
+        "b": float(existing["b"]),
+        "status": GridPointStatus.ASSIGNED.value,
+        "q0_start": float(q0_start),
+        "next_q0": float(next_q0),
+        "best_trial_index": -1,
+        "n_trials": 0,
+        "metric_name": str(metric_name),
+        "created_utc": str(existing.get("created_utc", now)),
+        "updated_utc": now,
+    }
+    _write_header_attrs(point_group, header)
+
+
+def reset_grid_point_for_rerun(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    search_id: str,
+    point_id: str,
+    q0_start: float,
+    next_q0: float,
+    metric_name: str,
+) -> None:
+    """Clear invalid trial rows and reset header so the point is recomputed with map-linked trials only."""
+    with _H5PY_FILE(h5_path, "r+") as f:
+        point_group = f[SLICE_CONTAINER_GROUP][slice_key][SEARCHES_GROUP][search_id][GRID_POINTS_GROUP][point_id]
+        _reset_grid_point_on_group(
+            point_group,
+            point_id=str(point_id),
+            q0_start=float(q0_start),
+            next_q0=float(next_q0),
+            metric_name=str(metric_name),
+        )
+
+
+def repair_invalid_grid_points_in_search(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    search_id: str,
+) -> int:
+    """Reset only grid points whose finite-Q0 trials lack valid map_store links."""
+    reset_count = 0
+    with _H5PY_FILE(h5_path, "r+") as f:
+        if SLICE_CONTAINER_GROUP not in f or slice_key not in f[SLICE_CONTAINER_GROUP]:
+            return 0
+        slice_group = f[SLICE_CONTAINER_GROUP][slice_key]
+        if SEARCHES_GROUP not in slice_group or search_id not in slice_group[SEARCHES_GROUP]:
+            return 0
+        search_group = slice_group[SEARCHES_GROUP][search_id]
+        if GRID_POINTS_GROUP not in search_group:
+            return 0
+        for point_name in sorted(search_group[GRID_POINTS_GROUP].keys()):
+            point_group = search_group[GRID_POINTS_GROUP][point_name]
+            try:
+                valid_links = _grid_point_finite_q0_trials_have_map_store_links_on_group(f, point_group)
+            except (OSError, RuntimeError):
+                valid_links = False
+            if valid_links or grid_point_storage_corrupt(point_group):
+                continue
+            existing = read_grid_point_header(point_group)
+            resume_q0 = float(existing.get("next_q0", existing.get("q0_start", np.nan)))
+            if not np.isfinite(resume_q0):
+                resume_q0 = float(existing.get("q0_start", np.nan))
+            if not np.isfinite(resume_q0):
+                continue
+            _reset_grid_point_on_group(
+                point_group,
+                point_id=str(point_name),
+                q0_start=float(resume_q0),
+                next_q0=float(resume_q0),
+                metric_name=str(existing.get("metric_name", "chi2")),
+            )
+            reset_count += 1
+    return reset_count
+
+
+def _load_grid_point_trials_once(point_group: h5py.Group, *, include_maps: bool) -> list[dict[str, Any]]:
     if GRID_POINTS_TRIALS_GROUP not in point_group:
         return []
     trials: list[dict[str, Any]] = []
@@ -771,16 +1023,34 @@ def _load_grid_point_trials(point_group: h5py.Group, *, include_maps: bool) -> l
     return trials
 
 
+def _load_grid_point_trials(point_group: h5py.Group, *, include_maps: bool) -> list[dict[str, Any]]:
+    last_exc: BaseException | None = None
+    for attempt in range(1, _SPARSE_APPEND_RETRY_ATTEMPTS + 1):
+        try:
+            return _load_grid_point_trials_once(point_group, include_maps=include_maps)
+        except (OSError, RuntimeError, KeyError) as exc:
+            if not is_h5_transient_read_error(exc):
+                raise
+            last_exc = exc
+            import time
+
+            time.sleep(_SPARSE_APPEND_RETRY_DELAY_S)
+    if last_exc is not None:
+        raise last_exc
+    return []
+
+
 def grid_point_header_to_viewer_record(
     header: dict[str, Any],
     trials: list[dict[str, Any]],
     *,
     include_maps: bool,
 ) -> dict[str, Any]:
-    fit_q0_trials = tuple(float(item["q0"]) for item in trials)
+    fit_trials = select_fit_trials_for_viewer(trials)
+    fit_q0_trials = tuple(float(item["q0"]) for item in fit_trials)
     target_metric = str(header.get("metric_name", "chi2"))
     fit_metric_trials, fit_chi2_trials, fit_rho2_trials, fit_eta2_trials = _assemble_trial_metric_arrays(
-        trials,
+        fit_trials,
         target_metric=target_metric,
     )
     trial_history = [
@@ -790,14 +1060,18 @@ def grid_point_header_to_viewer_record(
             "target_metric_value": float(item.get("target_metric_value", np.nan)),
             "raw_map_ref": str(item.get("raw_map_ref", "")),
         }
-        for item in trials
+        for item in fit_trials
     ]
     best_trial_index = int(header.get("best_trial_index", -1))
-    if best_trial_index < 0 and trials:
-        best_trial_index = int(max(trials, key=lambda item: int(item["trial_index"]))["trial_index"])
+    if best_trial_index < 0 and fit_trials:
+        best_trial_index = int(max(fit_trials, key=lambda item: int(item["trial_index"]))["trial_index"])
     best_q0 = float(header.get("q0_start", np.nan))
-    if 0 <= best_trial_index < len(fit_q0_trials):
-        best_q0 = float(fit_q0_trials[best_trial_index])
+    best_array_index = next(
+        (idx for idx, item in enumerate(fit_trials) if int(item["trial_index"]) == int(best_trial_index)),
+        None,
+    )
+    if best_array_index is not None:
+        best_q0 = float(fit_q0_trials[int(best_array_index)])
     status = "computed" if classify_grid_point_state(header) == "complete" else "pending"
     if str(header.get("status", "")).upper() == GridPointStatus.FAILED.value:
         status = "failed"
@@ -813,12 +1087,12 @@ def grid_point_header_to_viewer_record(
     raw_modeled_best = None
     trial_raw_maps = []
     if include_maps:
-        for item in trials:
+        for item in fit_trials:
             raw_map = item.get("raw_modeled_map")
             if raw_map is not None:
                 trial_raw_maps.append(np.asarray(raw_map, dtype=float))
-        if 0 <= best_trial_index < len(trial_raw_maps):
-            raw_modeled_best = trial_raw_maps[best_trial_index]
+        if best_array_index is not None and 0 <= int(best_array_index) < len(trial_raw_maps):
+            raw_modeled_best = trial_raw_maps[int(best_array_index)]
     trial_raw_stack = None
     if trial_raw_maps:
         trial_raw_stack = np.stack(trial_raw_maps, axis=0)
@@ -836,16 +1110,16 @@ def grid_point_header_to_viewer_record(
         "fit_eta2_trials": fit_eta2_trials,
         "metrics": metrics,
         "fit_shift_x_trials": tuple(
-            float(item.get("trial_metadata", {}).get("shift_x_arcsec", np.nan)) for item in trials
+            float(item.get("trial_metadata", {}).get("shift_x_arcsec", np.nan)) for item in fit_trials
         ),
         "fit_shift_y_trials": tuple(
-            float(item.get("trial_metadata", {}).get("shift_y_arcsec", np.nan)) for item in trials
+            float(item.get("trial_metadata", {}).get("shift_y_arcsec", np.nan)) for item in fit_trials
         ),
         "fit_find_shift_valid_trials": tuple(
-            bool(item.get("trial_metadata", {}).get("shift_valid", False)) for item in trials
+            bool(item.get("trial_metadata", {}).get("shift_valid", False)) for item in fit_trials
         ),
         "fit_trial_mask_stages": tuple(
-            str(item.get("trial_metadata", {}).get("stage", "")) for item in trials
+            str(item.get("trial_metadata", {}).get("stage", "")) for item in fit_trials
         ),
         "trial_history": trial_history,
         "best_trial_index": None if best_trial_index < 0 else int(best_trial_index),
@@ -879,10 +1153,52 @@ def load_grid_points_as_viewer_records(
     grid_group = search_group[GRID_POINTS_GROUP]
     for name in sorted(grid_group.keys()):
         point_group = grid_group[name]
-        header = read_grid_point_header(point_group)
-        trials = _load_grid_point_trials(point_group, include_maps=include_maps)
-        records.append(grid_point_header_to_viewer_record(header, trials, include_maps=include_maps))
+        if grid_point_storage_corrupt(point_group):
+            continue
+        try:
+            header = read_grid_point_header(point_group)
+            trials = _load_grid_point_trials(point_group, include_maps=include_maps)
+            records.append(grid_point_header_to_viewer_record(header, trials, include_maps=include_maps))
+        except (OSError, RuntimeError, KeyError) as exc:
+            if is_h5_transient_read_error(exc):
+                raise
+            continue
     return records
+
+
+def _resolve_grid_point_trial_raw_map_ref(
+    trials: list[dict[str, Any]],
+    *,
+    requested_trial_index: int | None,
+    header: dict[str, Any],
+    use_array_index: bool = False,
+) -> tuple[str, int | None]:
+    fit_trials = select_fit_trials_for_viewer(trials)
+    indexed: list[tuple[int, str]] = []
+    for item in fit_trials:
+        ref = str(item.get("raw_map_ref", "") or "").strip()
+        if ref:
+            indexed.append((int(item["trial_index"]), ref))
+    if not indexed:
+        return "", None
+    if requested_trial_index is not None:
+        requested = int(requested_trial_index)
+        if use_array_index:
+            if 0 <= requested < len(fit_trials):
+                ref = str(fit_trials[requested].get("raw_map_ref", "") or "").strip()
+                if ref:
+                    return ref, int(fit_trials[requested]["trial_index"])
+        else:
+            for trial_idx, ref in indexed:
+                if trial_idx == requested:
+                    return ref, requested
+    best_trial_index = int(header.get("best_trial_index", -1))
+    if best_trial_index >= 0:
+        for trial_idx, ref in indexed:
+            if trial_idx == best_trial_index:
+                return ref, best_trial_index
+    trial_idx, ref = indexed[-1]
+    return ref, trial_idx
 
 
 def load_grid_point_trial_plot_payload(
@@ -917,25 +1233,36 @@ def load_grid_point_trial_plot_payload(
         _point_id, point_group = found
         header = read_grid_point_header(point_group)
         trials = _load_grid_point_trials(point_group, include_maps=False)
-        fit_q0_trials = np.asarray([float(item["q0"]) for item in trials], dtype=float)
+        fit_trials = select_fit_trials_for_viewer(trials)
+        fit_q0_trials = np.asarray([float(item["q0"]) for item in fit_trials], dtype=float)
         if fit_q0_trials.size == 0:
             return None
-        chosen_trial_index = None if trial_index is None else int(trial_index)
-        if chosen_trial_index is None:
+        chosen_array_index = None if trial_index is None else int(trial_index)
+        if chosen_array_index is None:
             best_trial_index = header.get("best_trial_index")
             if best_trial_index is not None:
-                chosen_trial_index = int(np.clip(int(best_trial_index), 0, int(fit_q0_trials.size) - 1))
+                best_array_index = next(
+                    (
+                        idx
+                        for idx, item in enumerate(fit_trials)
+                        if int(item["trial_index"]) == int(best_trial_index)
+                    ),
+                    None,
+                )
+                chosen_array_index = 0 if best_array_index is None else int(best_array_index)
             else:
-                chosen_trial_index = int(fit_q0_trials.size - 1)
+                chosen_array_index = int(fit_q0_trials.size - 1)
         else:
-            chosen_trial_index = int(np.clip(chosen_trial_index, 0, int(fit_q0_trials.size) - 1))
-        raw_map_ref = ""
-        for item in trials:
-            if int(item["trial_index"]) == int(chosen_trial_index):
-                raw_map_ref = str(item.get("raw_map_ref", "") or "").strip()
-                break
-        if not raw_map_ref:
+            chosen_array_index = int(np.clip(chosen_array_index, 0, int(fit_q0_trials.size) - 1))
+        raw_map_ref, resolved_trial_index = _resolve_grid_point_trial_raw_map_ref(
+            trials,
+            requested_trial_index=chosen_array_index,
+            header=header,
+            use_array_index=True,
+        )
+        if not raw_map_ref or resolved_trial_index is None:
             return None
+        storage_trial_index = int(resolved_trial_index)
         raw_modeled = _read_map_store_ref_array(f, raw_map_ref)
         if raw_modeled is None:
             return None
@@ -952,7 +1279,8 @@ def load_grid_point_trial_plot_payload(
         return {
             "a": float(a),
             "b": float(b),
-            "trial_index": chosen_trial_index,
+            "trial_index": int(chosen_array_index),
+            "storage_trial_index": storage_trial_index,
             "fit_q0_trials": fit_q0_trials,
             "raw_modeled_best": np.asarray(raw_display, dtype=float),
             "modeled_best": np.asarray(modeled, dtype=float),
@@ -1093,68 +1421,39 @@ def apply_grid_point_event_with_retry(
     diagnostics: dict[str, Any],
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
     psf_kernel: np.ndarray | None = None,
+    map_store_artifact: Path | None = None,
+    ensure_slice_common: bool = True,
 ) -> str | None:
     last_exc: Exception | None = None
     for attempt in range(1, _SPARSE_APPEND_RETRY_ATTEMPTS + 1):
         try:
+            context_kwargs = {
+                "observed": observed,
+                "sigma_map": sigma_map,
+                "wcs_header": wcs_header,
+                "diagnostics": diagnostics,
+                "blos_reference": blos_reference,
+                "psf_kernel": psf_kernel,
+                "map_store_artifact": map_store_artifact,
+                "ensure_slice_common": ensure_slice_common,
+            }
             if isinstance(event, GridPointAssignedEvent):
-                return apply_grid_point_assigned(
-                    h5_path,
-                    event,
-                    observed=observed,
-                    sigma_map=sigma_map,
-                    wcs_header=wcs_header,
-                    diagnostics=diagnostics,
-                    blos_reference=blos_reference,
-                    psf_kernel=psf_kernel,
-                )
+                return apply_grid_point_assigned(h5_path, event, **context_kwargs)
             if isinstance(event, GridTrialCommittedEvent):
-                apply_grid_trial_committed(
-                    h5_path,
-                    event,
-                    observed=observed,
-                    sigma_map=sigma_map,
-                    wcs_header=wcs_header,
-                    diagnostics=diagnostics,
-                    blos_reference=blos_reference,
-                    psf_kernel=psf_kernel,
-                )
+                apply_grid_trial_committed(h5_path, event, **context_kwargs)
                 return None
             if isinstance(event, GridPointCompletedEvent):
-                apply_grid_point_completed(
-                    h5_path,
-                    event,
-                    observed=observed,
-                    sigma_map=sigma_map,
-                    wcs_header=wcs_header,
-                    diagnostics=diagnostics,
-                    blos_reference=blos_reference,
-                    psf_kernel=psf_kernel,
-                )
+                apply_grid_point_completed(h5_path, event, **context_kwargs)
                 return None
             if isinstance(event, GridPointFailedEvent):
-                apply_grid_point_failed(
-                    h5_path,
-                    event,
-                    observed=observed,
-                    sigma_map=sigma_map,
-                    wcs_header=wcs_header,
-                    diagnostics=diagnostics,
-                    blos_reference=blos_reference,
-                    psf_kernel=psf_kernel,
-                )
+                apply_grid_point_failed(h5_path, event, **context_kwargs)
                 return None
             if isinstance(event, GridPointActiveQ0Event):
                 apply_grid_point_active_q0(
                     h5_path,
                     point_id=str(event.point_id),
                     next_q0=float(event.next_q0),
-                    observed=observed,
-                    sigma_map=sigma_map,
-                    wcs_header=wcs_header,
-                    diagnostics=diagnostics,
-                    blos_reference=blos_reference,
-                    psf_kernel=psf_kernel,
+                    **context_kwargs,
                 )
                 return None
             raise TypeError(f"unsupported grid point event: {type(event)!r}")

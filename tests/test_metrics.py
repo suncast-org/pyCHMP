@@ -1,7 +1,27 @@
 import numpy as np
 import pytest
 
-from pychmp.metrics import compute_metrics, threshold_union_mask
+from pychmp.metrics import compute_display_residual, compute_metrics, normalize_residual_display_mode, threshold_union_mask
+
+
+def test_compute_display_residual_tb_and_normalized() -> None:
+    observed = np.array([[10.0, 0.0], [30.0, 40.0]])
+    modeled = np.array([[12.0, 0.0], [27.0, 44.0]])
+
+    tb = compute_display_residual(modeled, observed, mode="tb")
+    assert tb[0, 0] == pytest.approx(2.0)
+    assert tb[0, 1] == pytest.approx(0.0)
+
+    norm = compute_display_residual(modeled, observed, mode="normalized")
+    assert norm[0, 0] == pytest.approx((12.0 - 10.0) / (12.0 + 10.0))
+    assert np.isnan(norm[0, 1])
+    assert norm[1, 0] == pytest.approx((27.0 - 30.0) / (27.0 + 30.0))
+    assert np.all(np.abs(norm[np.isfinite(norm)]) <= 1.0)
+
+
+def test_normalize_residual_display_mode_aliases() -> None:
+    assert normalize_residual_display_mode("Normalized (M−O)/(M+O)") == "normalized"
+    assert normalize_residual_display_mode("Tb (M−O)") == "tb"
 
 
 def test_threshold_union_mask_selects_union() -> None:

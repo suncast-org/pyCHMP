@@ -56,7 +56,7 @@ Make pyCHMP’s **default** behavior a faithful CHMP migration (safeguards + aut
 
 - Auto mode: FindShift + extract every metric evaluation
 - Per-trial: `shift_x_arcsec`, `shift_y_arcsec`, `find_shift_valid`
-- Optimizer: scipy bounded (documented difference from CHMP golden/Brent)
+- Optimizer: CHMP IDL ``FindBestFitQ`` bracket + golden/Brent when ``adaptive_bracketing``; SciPy bounded for non-adaptive
 
 ## Phase 2 — Artifact schema
 

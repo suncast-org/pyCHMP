@@ -116,6 +116,7 @@ def _run_single_stage_q0_fit(
     progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
     initial_evaluations: InitialQ0Evaluations | None,
+    emthreshold: float = 0.1,
 ) -> Q0OptimizationResult:
     def metric_function(q0: float) -> Q0MetricEvaluation:
         modeled_arr = np.asarray(renderer.render(float(q0)), dtype=float)
@@ -161,6 +162,7 @@ def _run_single_stage_q0_fit(
         progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
         initial_evaluations=initial_evaluations,
+        emthreshold=emthreshold,
     )
 
 
@@ -291,6 +293,7 @@ def fit_q0_to_observation(
             progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
             initial_evaluations=stage_initial_evaluations if stage_index == 0 else None,
+            emthreshold=emthreshold,
         )
         stage_results.append(stage_result)
         stage_q0_start = _clamp_q0_start_for_interval(

@@ -1631,6 +1631,62 @@ def test_sync_live_trial_state_from_artifact_clears_state_when_artifact_has_no_l
     assert app._refresh_signal_live_trials is None
 
 
+def test_on_navigation_mode_changed_free_preserves_best_selection() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("free")
+    app.status_var = _Var("")
+    app.payload = {
+        "a_values": [-0.75, -0.25, 0.25],
+        "b_values": [2.5, 3.0, 3.5, 4.0],
+        "points": {
+            (1, 2): {
+                "status": "computed",
+                "a": -0.25,
+                "b": 3.5,
+                "metrics": {"eta2": 0.9},
+                "fit_q0_trials": (1e-4, 1e-3),
+                "fit_eta2_trials": (0.9, 0.5),
+            },
+            (0, 0): {
+                "status": "computed",
+                "a": -0.75,
+                "b": 2.5,
+                "metrics": {"eta2": 0.4},
+                "fit_q0_trials": (1e-4,),
+                "fit_eta2_trials": (0.4,),
+            },
+        },
+    }
+    app.a_values = np.asarray([-0.75, -0.25, 0.25], dtype=float)
+    app.b_values = np.asarray([2.5, 3.0, 3.5, 4.0], dtype=float)
+    app.run_target_metric = "eta2"
+    app.metric_var = _Var("eta2")
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(2)
+    app._free_selection_ab = (-0.75, 2.5)
+    app._live_navigation_available = lambda: False
+    app._active_navigation_mode_available = lambda: False
+    app._best_navigation_available = lambda: True
+    app._coerce_navigation_mode_to_availability = lambda: None
+    app._navigation_mode_radios = {}
+    app._refresh_navigation_control_states = lambda: None
+    app._apply_locked_navigation_selection = lambda **_kwargs: False
+    app._selected_slice_key = lambda: "mw_2874"
+    app._selected_search_id = lambda: "search_a"
+    app._refresh_selector_values = lambda: None
+    app._applying_navigation_selection = False
+    refresh_calls = {"count": 0}
+    app._refresh_all = lambda **_kwargs: refresh_calls.__setitem__("count", refresh_calls["count"] + 1)
+
+    app._on_navigation_mode_changed()
+
+    assert app.navigation_mode_var.get() == "free"
+    assert app.a_index_var.get() == 1
+    assert app.b_index_var.get() == 2
+    assert app._free_selection_ab == (-0.25, 3.5)
+    assert refresh_calls["count"] == 1
+
+
 def test_on_navigation_mode_changed_best_refreshes_immediately() -> None:
     app = object.__new__(PychmpViewApp)
     app.navigation_mode_var = _Var("best")
@@ -1639,8 +1695,20 @@ def test_on_navigation_mode_changed_best_refreshes_immediately() -> None:
         "a_values": [0.0, 0.3],
         "b_values": [2.4, 2.7],
         "points": {
-            (0, 0): {"status": "computed", "a": 0.0, "b": 2.4, "metrics": {"eta2": 1.0}, "diagnostics": {"eta2": 1.0}},
-            (1, 1): {"status": "computed", "a": 0.3, "b": 2.7, "metrics": {"eta2": 2.0}, "diagnostics": {"eta2": 2.0}},
+            (0, 0): {
+                "status": "computed",
+                "a": 0.0,
+                "b": 2.4,
+                "metrics": {"eta2": 1.0, "chi2": 9.0},
+                "diagnostics": {"eta2": 1.0, "chi2": 9.0},
+            },
+            (1, 1): {
+                "status": "computed",
+                "a": 0.3,
+                "b": 2.7,
+                "metrics": {"eta2": 2.0, "chi2": 2.0},
+                "diagnostics": {"eta2": 2.0, "chi2": 2.0},
+            },
         },
     }
     app.a_values = np.asarray([0.0, 0.3], dtype=float)
@@ -1665,8 +1733,8 @@ def test_on_navigation_mode_changed_best_refreshes_immediately() -> None:
     app._on_navigation_mode_changed()
 
     assert app.navigation_mode_var.get() == "best"
-    assert app.a_index_var.get() == 0
-    assert app.b_index_var.get() == 0
+    assert app.a_index_var.get() == 1
+    assert app.b_index_var.get() == 1
     assert refresh_calls["count"] == 1
 
 
@@ -1736,8 +1804,20 @@ def test_apply_locked_navigation_best_follows_slice_local_best() -> None:
         "a_values": [0.0, 0.3],
         "b_values": [2.4, 2.7],
         "points": {
-            (0, 0): {"status": "computed", "a": 0.0, "b": 2.4, "metrics": {"eta2": 9.0}, "diagnostics": {"eta2": 9.0}},
-            (1, 1): {"status": "computed", "a": 0.3, "b": 2.7, "metrics": {"eta2": 2.0}, "diagnostics": {"eta2": 2.0}},
+            (0, 0): {
+                "status": "computed",
+                "a": 0.0,
+                "b": 2.4,
+                "metrics": {"eta2": 9.0, "chi2": 9.0},
+                "diagnostics": {"eta2": 9.0, "chi2": 9.0},
+            },
+            (1, 1): {
+                "status": "computed",
+                "a": 0.3,
+                "b": 2.7,
+                "metrics": {"eta2": 2.0, "chi2": 2.0},
+                "diagnostics": {"eta2": 2.0, "chi2": 2.0},
+            },
         },
     }
     app._best_navigation_available = lambda: True
@@ -3086,7 +3166,7 @@ def test_selected_trial_index_preserves_manual_selection_when_trial_count_change
     assert app._selected_trial_token == (1, 2, "eta2", 3)
 
 
-def test_selected_trial_index_resets_to_search_optimum_when_context_changes() -> None:
+def test_selected_trial_index_resets_to_display_metric_best_when_context_changes() -> None:
     app = object.__new__(PychmpViewApp)
     app.a_index_var = _Var(1)
     app.b_index_var = _Var(2)
@@ -3108,6 +3188,7 @@ def test_selected_trial_index_resets_to_search_optimum_when_context_changes() ->
 
 def test_selected_trial_index_preserves_q0_when_display_metric_changes() -> None:
     app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("free")
     app.a_index_var = _Var(1)
     app.b_index_var = _Var(1)
     app.trial_index_var = _Var(3)
@@ -3127,7 +3208,54 @@ def test_selected_trial_index_preserves_q0_when_display_metric_changes() -> None
     assert app.trial_index_var.get() == 3
 
 
-def test_selected_trial_index_defaults_to_search_q0_not_display_metric_best() -> None:
+def test_free_mode_metric_change_keeps_trial_selection() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("free")
+    app.metric_var = _Var("chi2")
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(1)
+    app.trial_index_var = _Var(3)
+    app._selected_trial_token = (1, 1, "eta2", 4)
+    app._last_rendered_metric = "eta2"
+    app._metric_selection_locked = lambda: False
+    app._capture_current_slice_view_state = lambda _metric: None
+    app._restore_trials_controls_for_metric = lambda _metric: None
+    app._refresh_all = lambda **_kwargs: None
+
+    app._on_metric_changed()
+
+    assert app.trial_index_var.get() == 3
+    assert app._selected_trial_token == (1, 1, "eta2", 4)
+
+
+def test_free_mode_grid_change_defaults_trial_to_display_metric_best() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("free")
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+    app.trial_index_var = _Var(3)
+    app._selected_trial_token = (0, 0, "chi2", 4)
+    app.run_target_metric = "eta2"
+    q0_trials = np.asarray([1.0e-5, 1.0e-4, 2.0e-3, 1.0e-3], dtype=float)
+    chi2_trials = np.asarray([240.0, 183.0, 190.0, 210.0], dtype=float)
+    point = {
+        "target_metric": "eta2",
+        "q0": 2.0e-3,
+        "fit_q0_trials": q0_trials.tolist(),
+        "fit_chi2_trials": chi2_trials.tolist(),
+    }
+
+    app.a_index_var.set(1)
+    app.b_index_var.set(1)
+    app._selected_trial_token = None
+
+    selected = app._selected_trial_index_for_point(point, q0_trials, chi2_trials, "chi2")
+
+    assert selected == 1
+    assert app.trial_index_var.get() == 1
+
+
+def test_selected_trial_index_defaults_to_display_metric_best() -> None:
     app = object.__new__(PychmpViewApp)
     app.a_index_var = _Var(1)
     app.b_index_var = _Var(1)
@@ -3146,8 +3274,8 @@ def test_selected_trial_index_defaults_to_search_q0_not_display_metric_best() ->
 
     selected = app._selected_trial_index_for_point(point, q0_trials, chi2_trials, "chi2")
 
-    assert selected == 2
-    assert app.trial_index_var.get() == 2
+    assert selected == 1
+    assert app.trial_index_var.get() == 1
 
 
 def test_slice_change_schedules_deferred_reload() -> None:
@@ -3190,6 +3318,66 @@ def test_search_change_schedules_deferred_reload() -> None:
     assert app.search_id_var.get() == "search-2"
     assert app._selected_trial_token is None
     assert calls == ["Loading selected search..."]
+
+
+def test_refresh_search_controls_prefers_ui_search_over_stale_payload() -> None:
+    app = object().__new__(PychmpViewApp)
+    app.payload = {"selected_search_id": "search_old", "selected_slice_key": "mw_2p873584ghz"}
+    app.available_searches = [
+        {"search_id": "search_old"},
+        {"search_id": "search_new"},
+    ]
+    app.search_id_var = _Var("search_new")
+    app.search_display_var = _Var("")
+    app.search_menu = type("_Menu", (), {"configure": lambda *a, **k: None, "current": lambda self, index=0: None, "grid": lambda *a, **k: None, "grid_remove": lambda *a, **k: None})()
+    app.search_display_label = None
+    app._search_label = PychmpViewApp._search_label.__get__(app, PychmpViewApp)
+    app._unique_menu_labels = lambda labels, keys: labels
+
+    app._refresh_search_controls()
+
+    assert app.search_id_var.get() == "search_new"
+
+
+def test_refresh_all_schedules_reload_when_payload_search_is_stale() -> None:
+    app = object().__new__(PychmpViewApp)
+    app.payload = {
+        "selected_search_id": "search_old",
+        "selected_slice_key": "mw_2p873584ghz",
+        "point_records": [{"a": 0.25, "b": 2.75, "a_index": 0, "b_index": 0, "status": "computed", "metrics": {"eta2": 0.2}}],
+        "a_values": [0.25],
+        "b_values": [2.75],
+        "target_metric": "eta2",
+    }
+    app.display_model = {"records": [{"a": 0.25, "b": 2.75, "a_index": 0, "b_index": 0, "status": "computed", "metrics": {"eta2": 0.2}, "a0": 0.0, "a1": 1.0, "b0": 0.0, "b1": 1.0}]}
+    app.search_id_var = _Var("search_new")
+    app.artifact_h5 = Path("/tmp/adaptive.h5")
+    app.metric_var = _Var("eta2")
+    app.navigation_mode_var = _Var("free")
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+    app.a_values = np.asarray([0.25], dtype=float)
+    app.b_values = np.asarray([2.75], dtype=float)
+    app._selected_search_id = lambda: str(app.search_id_var.get())
+    app._navigation_mode = lambda: "free"
+    app._ensure_selected_point_exists = lambda **kwargs: True
+    app._payload_has_computed_grid = lambda: True
+    app._live_trial_state = lambda: None
+    app._has_selected_point = lambda: True
+    app._refresh_action_states = lambda: None
+    app._refresh_scan_state_display = lambda: None
+    app._draw_heatmap = lambda: (_ for _ in ()).throw(AssertionError("heatmap should not draw"))
+    app._draw_trials = lambda: None
+    app._refresh_summary = lambda: None
+    app._refresh_info_text = lambda: None
+    app.heatmap_canvas = type("_Canvas", (), {"draw_idle": lambda self: None})()
+    app.trials_canvas = type("_Canvas", (), {"draw_idle": lambda self: None})()
+    scheduled: list[str] = []
+    app._schedule_payload_reload = lambda *, status_text=None: scheduled.append(str(status_text or ""))
+
+    app._refresh_all(update_selected_solution=False)
+
+    assert scheduled == ["Loading selected search..."]
 
 
 def test_refresh_selector_controls_tolerates_missing_available_lists() -> None:

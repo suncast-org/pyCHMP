@@ -10,9 +10,12 @@ FOV. This module performs pure pixel-wise comparisons on already aligned arrays.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+ResidualDisplayMode = Literal["tb", "normalized"]
 
 import numpy as np
 from astropy.io import fits
@@ -25,6 +28,48 @@ class MetricValues:
     chi2: float
     rho2: float
     eta2: float
+
+
+def normalize_residual_display_mode(mode: str | None) -> ResidualDisplayMode:
+    """Map UI / CLI labels to a residual display mode."""
+    text = str(mode or "tb").strip().lower()
+    if text in {"normalized", "norm", "relative", "fraction"}:
+        return "normalized"
+    if "norm" in text and "tb" not in text:
+        return "normalized"
+    return "tb"
+
+
+def compute_display_residual(
+    modeled: np.ndarray,
+    observed: np.ndarray,
+    *,
+    mode: str = "tb",
+) -> np.ndarray:
+    """Build a 2D residual map for viewer display.
+
+    Modes:
+    - ``tb`` (default): ``modeled - observed`` (brightness temperature difference).
+    - ``normalized``: ``(modeled - observed) / (modeled + observed)``, NaN where
+      the sum is zero or non-finite. Finite values are clipped to ``[-1, 1]``.
+    """
+    mod = np.asarray(modeled, dtype=float)
+    obs = np.asarray(observed, dtype=float)
+    if mod.shape != obs.shape:
+        raise ValueError("modeled and observed must have identical shapes")
+
+    display_mode = normalize_residual_display_mode(mode)
+    if display_mode == "tb":
+        return np.asarray(mod - obs, dtype=float)
+
+    diff = mod - obs
+    denom = mod + obs
+    out = np.full(diff.shape, np.nan, dtype=float)
+    valid = np.isfinite(diff) & np.isfinite(denom) & (np.abs(denom) > 0.0)
+    if np.any(valid):
+        ratio = diff[valid] / denom[valid]
+        out[valid] = np.clip(ratio, -1.0, 1.0)
+    return out
 
 
 def _validate_mask_inputs(
@@ -145,6 +190,25 @@ def smoothed_observation_max(
         return peak_value
 
 
+def union_mask_flux_totals(
+    observed: np.ndarray,
+    modeled: np.ndarray,
+    mask: np.ndarray,
+    *,
+    pixel_scale_x_arcsec: float,
+    pixel_scale_y_arcsec: float,
+) -> tuple[float, float]:
+    """Integrated flux on the union mask, matching CHMP ``FindBestFitQ`` (``ItotalObs`` / ``ItotalMod``)."""
+    observed_arr, modeled_arr = _validate_mask_inputs(observed, modeled, 0.0)
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.shape != observed_arr.shape:
+        raise ValueError("mask must have identical shape to observed and modeled")
+    pixel_area = abs(float(pixel_scale_x_arcsec) * float(pixel_scale_y_arcsec))
+    obs_total = float(np.sum(observed_arr[mask_arr], dtype=float)) * pixel_area
+    mod_total = float(np.sum(modeled_arr[mask_arr], dtype=float)) * pixel_area
+    return obs_total, mod_total
+
+
 def mask_area_fractions(
     observed: np.ndarray,
     modeled: np.ndarray,
@@ -162,6 +226,33 @@ def mask_area_fractions(
     mask_obs = float(np.count_nonzero(observed_arr > (obs_peak * threshold))) / total
     mask_mod = float(np.count_nonzero(modeled_arr > (mod_max * threshold))) / total
     return mask_obs, mask_mod
+
+
+def should_prefer_data_mask_over_union(
+    *,
+    mask_obs_fraction: float,
+    mask_mod_fraction: float,
+    total_observed_flux: float | None,
+    total_modeled_flux: float | None,
+) -> bool:
+    """Use data-only mask when union is inflated by modeled flux underestimation."""
+    if not (
+        math.isfinite(float(mask_obs_fraction))
+        and math.isfinite(float(mask_mod_fraction))
+        and mask_obs_fraction > 0.0
+    ):
+        return False
+    mod_over_obs = float(mask_mod_fraction) / float(mask_obs_fraction)
+    if mod_over_obs <= 2.0:
+        return False
+    if total_observed_flux is None or total_modeled_flux is None:
+        return mod_over_obs > 3.0
+    obs_flux = float(total_observed_flux)
+    mod_flux = float(total_modeled_flux)
+    if not (math.isfinite(obs_flux) and math.isfinite(mod_flux) and obs_flux > 0.0):
+        return mod_over_obs > 3.0
+    flux_ratio = mod_flux / obs_flux
+    return flux_ratio < 0.85 and mod_over_obs > 2.0
 
 
 def chmp_mask_valid(mask_obs_fraction: float, mask_mod_fraction: float) -> tuple[bool, str]:

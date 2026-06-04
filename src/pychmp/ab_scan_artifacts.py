@@ -18,6 +18,7 @@ from .search_contract import (
     OBSERVATION_REF_GROUP,
     _observation_ref_diagnostics_from_full,
     build_search_evaluation_config,
+    search_evaluation_signature,
     search_id_from_evaluation_config,
 )
 from .obs_preprocessing import compute_array_content_sha256
@@ -102,7 +103,6 @@ PREFLIGHT_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "forward_model_sha256",
     "forward_model_identity_version",
     "artifact_geometry_sha256",
-    "fits_sha256",
     "ebtel_sha256",
     "euv_response_identity_version",
     "euv_response_sha256",
@@ -122,7 +122,6 @@ PREFLIGHT_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "observer_lonc_deg",
     "observer_b0sun_deg",
     "observer_dsun_cm",
-    "observer_obs_time",
 )
 GEOMETRY_COMPATIBILITY_DIAGNOSTIC_KEYS = (
     "map_xc_arcsec",
@@ -166,20 +165,47 @@ _SPARSE_APPEND_RETRY_ATTEMPTS = 40
 _SPARSE_APPEND_RETRY_DELAY_S = 0.25
 
 
+def _is_h5_locking_flag_mismatch(exc: BaseException) -> bool:
+    if not isinstance(exc, OSError):
+        return False
+    message = str(exc).lower()
+    return "locking" in message and ("don't match" in message or "do not match" in message)
+
+
+def is_h5_transient_read_error(exc: BaseException) -> bool:
+    """True for HDF5 read races (viewer + writer, Dropbox) that may succeed on retry."""
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return "bad symbol table" in message or "symbol table node" in message
+    if isinstance(exc, OSError):
+        message = str(exc).lower()
+        return (
+            "unable to synchronously" in message
+            or "resource temporarily unavailable" in message
+            or _is_h5_locking_flag_mismatch(exc)
+        )
+    return False
+
+
 def _open_h5_with_lock_tolerance(path: Path | str, mode: str = "r", *args: Any, **kwargs: Any) -> h5py.File:
+    if "locking" in kwargs:
+        return h5py.File(path, mode, *args, **kwargs)
+
     text_mode = str(mode)
-    read_only = (
-        "r" in text_mode
-        and "+" not in text_mode
-        and "w" not in text_mode
-        and "a" not in text_mode
-        and "x" not in text_mode
-    )
-    if read_only and "locking" not in kwargs:
-        try:
-            return h5py.File(path, mode, *args, locking=False, **kwargs)
-        except TypeError:
-            pass
+    if text_mode in {"r", "r+"}:
+        last_exc: OSError | None = None
+        for locking in (False, True):
+            try:
+                return h5py.File(path, mode, *args, locking=locking, **kwargs)
+            except TypeError:
+                return h5py.File(path, mode, *args, **kwargs)
+            except OSError as exc:
+                if _is_h5_locking_flag_mismatch(exc):
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
     return h5py.File(path, mode, *args, **kwargs)
 
 
@@ -1107,14 +1133,18 @@ def _search_request_from_group(search_group: h5py.Group) -> dict[str, Any]:
 
 
 def _matching_search_id_for_request(searches_group: h5py.Group, request: dict[str, Any]) -> str | None:
-    target = _json_dumps(request)
+    target_signature = search_evaluation_signature(request)
     matches: list[tuple[int, str]] = []
     for search_id in searches_group.keys():
         search_group = searches_group[search_id]
         existing_request = _search_request_from_group(search_group)
-        if _json_dumps(existing_request) != target:
+        if search_evaluation_signature(existing_request) != target_signature:
             continue
         point_count = len(search_group["point_records"]) if "point_records" in search_group else 0
+        from .grid_points import GRID_POINTS_GROUP
+
+        if GRID_POINTS_GROUP in search_group:
+            point_count = max(int(point_count), int(len(search_group[GRID_POINTS_GROUP])))
         matches.append((int(point_count), str(search_id)))
     if not matches:
         return None
@@ -1140,7 +1170,10 @@ def _search_lifecycle_payload(
         or previous.get("started_at")
         or created_at
     )
-    completed_at = diagnostics.get("search_completed_at", previous.get("completed_at"))
+    if bool(diagnostics.get("search_active")):
+        completed_at = None
+    else:
+        completed_at = diagnostics.get("search_completed_at", previous.get("completed_at"))
     in_progress = status in {"empty", "in_progress", "partial"}
     if "search_active" in diagnostics:
         active = bool(diagnostics.get("search_active"))
@@ -1325,16 +1358,16 @@ def _resolve_observation_reference_payload(
     *,
     search_group: h5py.Group | None = None,
 ) -> dict[str, Any] | None:
+    if search_group is not None and OBSERVATION_REF_GROUP in search_group:
+        search_payload = _read_observation_ref_group(search_group[OBSERVATION_REF_GROUP])
+        if search_payload.get("observed") is not None or search_payload.get("observation_canvas") is not None:
+            return search_payload
     payload = _observation_ref_payload_from_common(common)
     if payload is not None and (
         payload.get("observed") is not None
         or payload.get("observation_canvas") is not None
     ):
         return payload
-    if search_group is not None and OBSERVATION_REF_GROUP in search_group:
-        legacy_payload = _read_observation_ref_group(search_group[OBSERVATION_REF_GROUP])
-        if legacy_payload.get("observed") is not None or legacy_payload.get("observation_canvas") is not None:
-            return legacy_payload
     return payload
 
 def load_slice_observation_reference_payload(
@@ -1396,6 +1429,7 @@ def _write_search_group(
     point_records: list[dict[str, Any]],
     run_history: list[dict[str, Any]] | None,
     layout: dict[str, Any] | None = None,
+    observation_ref: dict[str, Any] | None = None,
 ) -> None:
     if search_id in searches_group:
         del searches_group[search_id]
@@ -1419,6 +1453,20 @@ def _write_search_group(
     lifecycle = _search_lifecycle_payload(status=status, diagnostics=diagnostics_out)
     _create_text_dataset(search_group, SEARCH_REQUEST_DATASET, _json_dumps(request))
     _write_search_lifecycle_dataset(search_group, lifecycle=lifecycle)
+    if observation_ref is not None:
+        ref_group = search_group.create_group(OBSERVATION_REF_GROUP)
+        ref_diag = dict(observation_ref.get("diagnostics") or diagnostics_out)
+        ref_diag.update(_observation_ref_diagnostics_from_full(ref_diag))
+        _write_observation_ref_group(
+            ref_group,
+            observed=np.asarray(observation_ref["observed"], dtype=float),
+            sigma_map=np.asarray(observation_ref["sigma_map"], dtype=float),
+            wcs_header=observation_ref["wcs_header"],
+            diagnostics=ref_diag,
+            observation_canvas=observation_ref.get("observation_canvas"),
+            sigma_canvas=observation_ref.get("sigma_canvas"),
+            canvas_wcs_header=observation_ref.get("canvas_wcs_header"),
+        )
 
 
 def _read_search_records(group: h5py.Group) -> list[dict[str, Any]]:
@@ -1487,6 +1535,696 @@ def read_slice_active_search_id(h5_path: Path, *, slice_key: str) -> str | None:
         return _selected_search_id(f[SLICE_CONTAINER_GROUP][str(slice_key)])
 
 
+def purge_search_from_artifact(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    search_id: str,
+) -> dict[str, Any]:
+    """Remove one search metadata branch from a slice without touching ``map_store``.
+
+    Deletes ``slices/<slice>/searches/<search_id>`` and clears ``active_search_id`` when
+    it pointed at the purged search. Shared slice ``common/`` data is left intact.
+    """
+    resolved_slice = str(slice_key).strip()
+    resolved_search = str(search_id).strip()
+    if not resolved_slice or not resolved_search:
+        raise ValueError("slice_key and search_id are required")
+    with _H5PY_FILE(h5_path, "a") as f:
+        if SLICE_CONTAINER_GROUP not in f or resolved_slice not in f[SLICE_CONTAINER_GROUP]:
+            raise KeyError(f"slice not found: {resolved_slice}")
+        slice_group = f[SLICE_CONTAINER_GROUP][resolved_slice]
+        if SEARCHES_GROUP not in slice_group or resolved_search not in slice_group[SEARCHES_GROUP]:
+            raise KeyError(f"search not found: {resolved_search}")
+        del slice_group[SEARCHES_GROUP][resolved_search]
+        cleared_active = False
+        if ACTIVE_SEARCH_ID_DATASET in slice_group:
+            active = decode_scalar(slice_group[ACTIVE_SEARCH_ID_DATASET][()]).strip()
+            if active == resolved_search:
+                del slice_group[ACTIVE_SEARCH_ID_DATASET]
+                cleared_active = True
+        remaining = (
+            sorted(slice_group[SEARCHES_GROUP].keys())
+            if SEARCHES_GROUP in slice_group
+            else []
+        )
+    return {
+        "slice_key": resolved_slice,
+        "purged_search_id": resolved_search,
+        "cleared_active_search_id": cleared_active,
+        "remaining_search_ids": remaining,
+    }
+
+
+def matching_search_id_for_slice(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    request: dict[str, Any],
+) -> str | None:
+    """Return an existing search id whose evaluation request matches ``request``."""
+    with _H5PY_FILE(h5_path, "r") as f:
+        if SLICE_CONTAINER_GROUP not in f or str(slice_key) not in f[SLICE_CONTAINER_GROUP]:
+            return None
+        slice_group = f[SLICE_CONTAINER_GROUP][str(slice_key)]
+        if SEARCHES_GROUP not in slice_group:
+            return None
+        return _matching_search_id_for_request(slice_group[SEARCHES_GROUP], request)
+
+
+def resolve_search_location(
+    h5_path: Path,
+    *,
+    search_id: str,
+) -> tuple[str, str]:
+    """Return ``(slice_key, search_id)`` when ``search_id`` exists in ``h5_path``."""
+    resolved_search_id = str(search_id or "").strip()
+    if not resolved_search_id:
+        raise ValueError("search_id is required")
+    with _H5PY_FILE(h5_path, "r") as f:
+        if SLICE_CONTAINER_GROUP not in f:
+            raise KeyError(f"No slice container in artifact {h5_path}")
+        for slice_key in f[SLICE_CONTAINER_GROUP].keys():
+            slice_group = f[SLICE_CONTAINER_GROUP][str(slice_key)]
+            if SEARCHES_GROUP not in slice_group:
+                continue
+            if resolved_search_id in slice_group[SEARCHES_GROUP]:
+                return str(slice_key), resolved_search_id
+    raise KeyError(f"Search {resolved_search_id!r} not found in {h5_path}")
+
+
+RECOMPUTE_SEARCH_FORBIDDEN_CLI_FLAGS: frozenset[str] = frozenset(
+    {
+        "--target-metric",
+        "--metrics-mask-threshold",
+        "--threshold",
+        "--metrics-mask-fits",
+        "--mask-type",
+        "--tr-mask-bmin-gauss",
+        "--shift-policy",
+        "--max-shift-arcsec",
+        "--use-smoothed-obs-max",
+        "--no-use-smoothed-obs-max",
+        "--use-emthreshold",
+        "--no-use-emthreshold",
+        "--emthreshold",
+        "--observation-time",
+        "--obs-domain",
+        "--obs-frequency-ghz",
+        "--obs-wavelength-angstrom",
+        "--recompute-existing",
+        "--new-search-identity",
+        "--a-start",
+        "--b-start",
+        "--da",
+        "--db",
+        "--a-min",
+        "--a-max",
+        "--b-min",
+        "--b-max",
+        "--q0-min",
+        "--q0-max",
+        "--q0-start",
+        "--hard-q0-min",
+        "--hard-q0-max",
+        "--q0-step",
+        "--xatol",
+        "--maxiter",
+        "--max-bracket-steps",
+        "--threshold-metric",
+        "--no-area",
+        "--adaptive-bracketing",
+        "--no-adaptive-bracketing",
+        "--pixel-scale-arcsec",
+        "--override-header-psf",
+        "--no-override-header-psf",
+        "--psf-bmaj-arcsec",
+        "--psf-bmin-arcsec",
+        "--psf-bpa-deg",
+        "--psf-ref-frequency-ghz",
+        "--psf-scale-inverse-frequency",
+        "--no-psf-scale-inverse-frequency",
+        "--tbase",
+        "--nbase",
+        "--observer",
+        "--dsun-cm",
+        "--lonc-deg",
+        "--b0sun-deg",
+        "--all-channels",
+        "--render-channels",
+        "--render-frequencies-ghz",
+        "--render-obs-fits-dir",
+        "--euv-instrument",
+        "--euv-response-sav",
+    }
+)
+
+
+EXPAND_GRID_SEARCH_BOUNDS_CLI_FLAGS: frozenset[str] = frozenset(
+    {"--a-min", "--a-max", "--b-min", "--b-max"}
+)
+
+RECOMPUTE_SEARCH_ALLOWED_CLI_FLAGS: frozenset[str] = frozenset(
+    {
+        "--artifact-h5",
+        "--recompute-search-id",
+        "--no-viewer",
+        "--dry-run",
+    }
+)
+
+EXPAND_GRID_SEARCH_ALLOWED_CLI_FLAGS: frozenset[str] = (
+    RECOMPUTE_SEARCH_ALLOWED_CLI_FLAGS
+    - {"--recompute-search-id"}
+    | {"--expand-grid-search-id"}
+    | EXPAND_GRID_SEARCH_BOUNDS_CLI_FLAGS
+)
+
+
+def _argv_token_is_numeric_value(token: str) -> bool:
+    try:
+        float(token)
+    except ValueError:
+        return False
+    return True
+
+
+def _cli_flags_not_in_allowlist(argv: list[str], allowed: frozenset[str]) -> list[str]:
+    hits: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token in {"-h", "--help"}:
+            index += 1
+            continue
+        if not token.startswith("--") or _argv_token_is_numeric_value(token):
+            index += 1
+            continue
+        flag = token.split("=", 1)[0].strip().lower()
+        if flag not in allowed:
+            hits.append(flag)
+        index += 1
+    return hits
+
+
+def assert_recompute_search_cli_argv_allowed(argv: list[str]) -> None:
+    """Only --artifact-h5, --recompute-search-id, and optional --no-viewer/--dry-run."""
+    disallowed = _cli_flags_not_in_allowlist(argv, RECOMPUTE_SEARCH_ALLOWED_CLI_FLAGS)
+    if disallowed:
+        joined = ", ".join(sorted(set(disallowed)))
+        raise SystemExit(
+            "--recompute-search-id uses the stored scoring recipe from artifact metadata only. "
+            f"Allowed flags: --artifact-h5, --recompute-search-id, --no-viewer. Disallowed: {joined}"
+        )
+
+
+def build_recompute_search_guard_argv(
+    *,
+    artifact_h5: Path | str,
+    recompute_search_id: str,
+    no_viewer: bool = False,
+    dry_run: bool = False,
+) -> list[str]:
+    """Synthetic argv for CLI allowlist checks (avoids pytest runner flags in ``sys.argv``)."""
+    argv = [
+        "adaptive_ab_search_single_observation.py",
+        "--artifact-h5",
+        str(artifact_h5),
+        "--recompute-search-id",
+        str(recompute_search_id),
+    ]
+    if no_viewer:
+        argv.append("--no-viewer")
+    if dry_run:
+        argv.append("--dry-run")
+    return argv
+
+
+def build_expand_grid_search_guard_argv(
+    *,
+    artifact_h5: Path | str,
+    expand_search_id: str,
+    bounds_overrides: dict[str, float],
+    no_viewer: bool = False,
+    dry_run: bool = False,
+) -> list[str]:
+    """Synthetic argv for expand-mode CLI allowlist checks."""
+    argv = [
+        "adaptive_ab_search_single_observation.py",
+        "--artifact-h5",
+        str(artifact_h5),
+        "--expand-grid-search-id",
+        str(expand_search_id),
+    ]
+    field_flags = {
+        "a_min": "--a-min",
+        "a_max": "--a-max",
+        "b_min": "--b-min",
+        "b_max": "--b-max",
+    }
+    for field_name, flag in field_flags.items():
+        if field_name in bounds_overrides:
+            argv.extend([flag, str(bounds_overrides[field_name])])
+    if no_viewer:
+        argv.append("--no-viewer")
+    if dry_run:
+        argv.append("--dry-run")
+    return argv
+
+
+def parse_expand_grid_bounds_from_argv(argv: list[str]) -> dict[str, float]:
+    """Return explicit a/b bound overrides present on the command line."""
+    overrides: dict[str, float] = {}
+    key_map = {
+        "--a-min": "a_min",
+        "--a-max": "a_max",
+        "--b-min": "b_min",
+        "--b-max": "b_max",
+    }
+    index = 1
+    while index < len(argv):
+        token = str(argv[index]).split("=", 1)[0].strip().lower()
+        if token not in key_map:
+            index += 1
+            continue
+        if "=" in str(argv[index]):
+            raw_value = str(argv[index]).split("=", 1)[1]
+        elif index + 1 < len(argv):
+            next_token = str(argv[index + 1])
+            try:
+                float(next_token)
+            except ValueError:
+                raise SystemExit(f"{token} requires a numeric value") from None
+            raw_value = next_token
+            index += 1
+        else:
+            raise SystemExit(f"{token} requires a numeric value")
+        try:
+            overrides[key_map[token]] = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise SystemExit(f"{token} requires a numeric value") from exc
+        index += 1
+    return overrides
+
+
+def validate_expanded_ab_bounds(
+    *,
+    stored_a_range: tuple[float, float],
+    stored_b_range: tuple[float, float],
+    new_a_range: tuple[float, float],
+    new_b_range: tuple[float, float],
+) -> None:
+    """Require new bounds to be a strict superset (expansion only) of the stored search footprint."""
+    stored_a_min, stored_a_max = (float(stored_a_range[0]), float(stored_a_range[1]))
+    stored_b_min, stored_b_max = (float(stored_b_range[0]), float(stored_b_range[1]))
+    new_a_min, new_a_max = (float(new_a_range[0]), float(new_a_range[1]))
+    new_b_min, new_b_max = (float(new_b_range[0]), float(new_b_range[1]))
+    if new_a_min > stored_a_min + 1e-12:
+        raise SystemExit(
+            f"--a-min ({new_a_min:g}) must not shrink below stored search minimum ({stored_a_min:g})"
+        )
+    if new_a_max < stored_a_max - 1e-12:
+        raise SystemExit(
+            f"--a-max ({new_a_max:g}) must not shrink below stored search maximum ({stored_a_max:g})"
+        )
+    if new_b_min > stored_b_min + 1e-12:
+        raise SystemExit(
+            f"--b-min ({new_b_min:g}) must not shrink below stored search minimum ({stored_b_min:g})"
+        )
+    if new_b_max < stored_b_max - 1e-12:
+        raise SystemExit(
+            f"--b-max ({new_b_max:g}) must not shrink below stored search maximum ({stored_b_max:g})"
+        )
+    if new_a_min >= new_a_max - 1e-12:
+        raise SystemExit(f"Invalid a bounds: --a-min ({new_a_min:g}) must be < --a-max ({new_a_max:g})")
+    if new_b_min >= new_b_max - 1e-12:
+        raise SystemExit(f"Invalid b bounds: --b-min ({new_b_min:g}) must be < --b-max ({new_b_max:g})")
+    expanded = (
+        new_a_min < stored_a_min - 1e-12
+        or new_a_max > stored_a_max + 1e-12
+        or new_b_min < stored_b_min - 1e-12
+        or new_b_max > stored_b_max + 1e-12
+    )
+    if not expanded:
+        raise SystemExit(
+            "Expanded bounds must widen at least one edge of the stored search footprint "
+            f"(stored a=({stored_a_min:g}, {stored_a_max:g}) b=({stored_b_min:g}, {stored_b_max:g}); "
+            f"requested a=({new_a_min:g}, {new_a_max:g}) b=({new_b_min:g}, {new_b_max:g}))"
+        )
+
+
+def assert_expand_grid_search_cli_argv_allowed(argv: list[str]) -> None:
+    """Stored recipe plus widened a/b bounds and optional --no-viewer/--dry-run only."""
+    disallowed = _cli_flags_not_in_allowlist(argv, EXPAND_GRID_SEARCH_ALLOWED_CLI_FLAGS)
+    if disallowed:
+        joined = ", ".join(sorted(set(disallowed)))
+        raise SystemExit(
+            "--expand-grid-search-id uses the stored scoring recipe plus widened "
+            "--a-min/--a-max/--b-min/--b-max only. "
+            f"Also allowed: --artifact-h5, --expand-grid-search-id, --no-viewer. Disallowed: {joined}"
+        )
+
+
+def load_search_run_profile(
+    h5_path: Path,
+    *,
+    search_id: str,
+) -> dict[str, Any]:
+    """Load stored diagnostics and evaluation request for a specific search identity."""
+    slice_key, resolved_search_id = resolve_search_location(h5_path, search_id=search_id)
+    with _H5PY_FILE(h5_path, "r") as f:
+        search_group = f[SLICE_CONTAINER_GROUP][slice_key][SEARCHES_GROUP][resolved_search_id]
+        diagnostics = (
+            _json_loads_or_empty(search_group["diagnostics_json"][()])
+            if "diagnostics_json" in search_group
+            else {}
+        )
+        request = _search_request_from_group(search_group)
+    return {
+        "search_id": resolved_search_id,
+        "slice_key": slice_key,
+        "diagnostics": diagnostics,
+        "request": request,
+    }
+
+
+def _profile_optional_float(diagnostics: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = diagnostics.get(key)
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _profile_optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return bool(value)
+
+
+def apply_search_run_profile_to_namespace(
+    args: Any,
+    profile: dict[str, Any],
+) -> None:
+    """Patch argparse ``Namespace`` fields from a stored search profile."""
+    diagnostics = dict(profile.get("diagnostics") or {})
+    request = dict(profile.get("request") or {})
+    optimizer = dict(request.get("optimizer") or {})
+
+    def _opt_or_diag(name: str) -> Any:
+        value = optimizer.get(name)
+        if value is not None:
+            return value
+        return diagnostics.get(name)
+
+    fits_path = str(diagnostics.get("fits_file") or diagnostics.get("observation_source_path") or "").strip()
+    if fits_path:
+        args.fits_file = Path(fits_path)
+    source_mode = str(diagnostics.get("observation_source_mode") or "").strip().lower()
+    if source_mode in {"external_fits", "model_refmap"}:
+        args.obs_source = source_mode
+    if source_mode == "external_fits" and fits_path:
+        args.obs_path = Path(fits_path)
+    map_id = diagnostics.get("observation_source_map_id")
+    if map_id not in {None, ""}:
+        args.obs_map_id = str(map_id)
+
+    model_path = str(diagnostics.get("model_path") or "").strip()
+    if model_path:
+        model_path_obj = Path(model_path)
+        args.model_h5 = model_path_obj
+        if hasattr(args, "model_h5_override"):
+            args.model_h5_override = model_path_obj
+
+    ebtel_path = str(diagnostics.get("ebtel_path") or "").strip()
+    if ebtel_path:
+        args.ebtel_path = Path(ebtel_path)
+
+    spectral_domain = str(diagnostics.get("spectral_domain") or "").strip().lower()
+    if spectral_domain in {"mw", "euv", "uv", "generic"}:
+        args.obs_domain = spectral_domain
+    frequency_ghz = _profile_optional_float(diagnostics, "frequency_ghz", "active_frequency_ghz")
+    if frequency_ghz is not None:
+        args.obs_frequency_ghz = frequency_ghz
+    wavelength = diagnostics.get("wavelength_angstrom")
+    if wavelength is not None:
+        try:
+            args.obs_wavelength_angstrom = float(wavelength)
+        except (TypeError, ValueError):
+            pass
+
+    for field in ("a_start", "b_start", "da", "db"):
+        value = diagnostics.get(field)
+        if value is not None:
+            setattr(args, field, float(value))
+    a_range = diagnostics.get("a_range")
+    if isinstance(a_range, (list, tuple)) and len(a_range) == 2:
+        args.a_min = float(a_range[0])
+        args.a_max = float(a_range[1])
+    b_range = diagnostics.get("b_range")
+    if isinstance(b_range, (list, tuple)) and len(b_range) == 2:
+        args.b_min = float(b_range[0])
+        args.b_max = float(b_range[1])
+
+    target_metric = str(diagnostics.get("target_metric") or "").strip().lower()
+    if target_metric in {"chi2", "rho2", "eta2"}:
+        args.target_metric = target_metric
+
+    threshold = diagnostics.get("metrics_mask_threshold", diagnostics.get("threshold"))
+    if threshold is not None:
+        args.metrics_mask_threshold = float(threshold)
+    mask_fits = diagnostics.get("metrics_mask_fits")
+    if mask_fits not in {None, ""}:
+        args.metrics_mask_fits = Path(str(mask_fits))
+    threshold_metric = _opt_or_diag("threshold_metric")
+    if threshold_metric is not None:
+        args.threshold_metric = float(threshold_metric)
+    tr_mask = diagnostics.get("tr_mask_bmin_gauss")
+    if tr_mask is not None:
+        args.tr_mask_bmin_gauss = float(tr_mask)
+    no_area = _profile_optional_bool(_opt_or_diag("no_area"))
+    if no_area is not None:
+        args.no_area = no_area
+
+    execution_policy = str(diagnostics.get("execution_policy") or "").strip()
+    if execution_policy in {"serial", "process-pool", "auto"}:
+        args.execution_policy = execution_policy
+    max_workers = diagnostics.get("execution_max_workers")
+    if max_workers is not None:
+        args.max_workers = int(max_workers)
+
+    render_freqs = diagnostics.get("render_frequencies_ghz")
+    if isinstance(render_freqs, (list, tuple)) and render_freqs:
+        target_freq = frequency_ghz
+        extras: list[float] = []
+        for item in render_freqs:
+            try:
+                freq = float(item)
+            except (TypeError, ValueError):
+                continue
+            if target_freq is not None and np.isclose(freq, float(target_freq), rtol=0.0, atol=1e-12):
+                continue
+            extras.append(freq)
+        if extras:
+            args.render_frequencies_ghz = ",".join(f"{value:g}" for value in extras)
+
+    render_channels = diagnostics.get("render_channels")
+    if isinstance(render_channels, (list, tuple)) and render_channels:
+        args.render_channels = ",".join(str(item) for item in render_channels)
+    render_obs_fits_dir = diagnostics.get("render_obs_fits_dir")
+    if render_obs_fits_dir not in {None, ""}:
+        args.render_obs_fits_dir = Path(str(render_obs_fits_dir))
+    euv_channel = diagnostics.get("euv_channel")
+    if euv_channel not in {None, ""}:
+        args.euv_channel = str(euv_channel)
+    euv_instrument = diagnostics.get("euv_instrument")
+    if euv_instrument not in {None, ""}:
+        args.euv_instrument = str(euv_instrument)
+    euv_response = diagnostics.get("euv_response_override_path")
+    if euv_response not in {None, ""}:
+        args.euv_response_sav = Path(str(euv_response))
+
+    pixel_scale = _profile_optional_float(diagnostics, "map_dx_arcsec")
+    if pixel_scale is not None and hasattr(args, "pixel_scale_arcsec"):
+        args.pixel_scale_arcsec = pixel_scale
+
+    for field in (
+        "q0_min",
+        "q0_max",
+        "hard_q0_min",
+        "hard_q0_max",
+        "q0_start",
+        "q0_step",
+        "max_bracket_steps",
+    ):
+        value = _opt_or_diag(field)
+        if value is not None and hasattr(args, field):
+            setattr(args, field, float(value) if field != "max_bracket_steps" else int(value))
+    adaptive_bracketing = _profile_optional_bool(_opt_or_diag("adaptive_bracketing"))
+    if adaptive_bracketing is not None and hasattr(args, "adaptive_bracketing"):
+        args.adaptive_bracketing = adaptive_bracketing
+
+    shift_policy = str(diagnostics.get("shift_policy") or "").strip().lower()
+    if shift_policy in {"auto", "fixed"} and hasattr(args, "shift_policy"):
+        args.shift_policy = shift_policy
+    max_shift = diagnostics.get("max_shift_arcsec")
+    if max_shift is not None and hasattr(args, "max_shift_arcsec"):
+        args.max_shift_arcsec = float(max_shift)
+    xy_shift = diagnostics.get("xy_shift_arcsec")
+    if (
+        isinstance(xy_shift, (list, tuple))
+        and len(xy_shift) == 2
+        and hasattr(args, "xy_shift_arcsec")
+        and any(abs(float(item)) > 0.0 for item in xy_shift)
+    ):
+        args.xy_shift_arcsec = f"{float(xy_shift[0]):g},{float(xy_shift[1]):g}"
+
+    use_smoothed = _profile_optional_bool(diagnostics.get("use_smoothed_obs_max"))
+    if use_smoothed is not None and hasattr(args, "use_smoothed_obs_max"):
+        args.use_smoothed_obs_max = use_smoothed
+    use_emthreshold = _profile_optional_bool(diagnostics.get("use_emthreshold"))
+    if use_emthreshold is not None and hasattr(args, "use_emthreshold"):
+        args.use_emthreshold = use_emthreshold
+    emthreshold = diagnostics.get("emthreshold")
+    if emthreshold is not None and hasattr(args, "emthreshold"):
+        args.emthreshold = float(emthreshold)
+    q0_stages = diagnostics.get("q0_search_stages")
+    if isinstance(q0_stages, (list, tuple)) and q0_stages and hasattr(args, "q0_search_stages"):
+        args.q0_search_stages = ",".join(str(item) for item in q0_stages)
+
+
+def register_sparse_search_in_artifact(
+    out_h5: Path,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    wcs_header: fits.Header,
+    diagnostics: dict[str, Any],
+    search_id: str | None = None,
+    reset_search_points: bool = False,
+    point_records: list[dict[str, Any]] | None = None,
+    observation_canvas: np.ndarray | None = None,
+    sigma_canvas: np.ndarray | None = None,
+    canvas_wcs_header: fits.Header | None = None,
+    blos_reference: tuple[np.ndarray, fits.Header] | None = None,
+    psf_kernel: np.ndarray | None = None,
+) -> str:
+    """Register or reset a sparse search without rewriting other slice searches or ``common``."""
+    diagnostics_out = dict(diagnostics)
+    diagnostics_out["artifact_kind"] = UNIFIED_ARTIFACT_KIND
+    if "mask_type" not in diagnostics_out:
+        diagnostics_out["mask_type"] = diagnostics.get("mask_type", "union")
+    layout_payload = {"kind": "point_list"}
+    request_payload = _search_request_from_diagnostics(diagnostics_out, layout=layout_payload)
+    out_h5.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if out_h5.exists() else "w"
+    resolved_search_id = ""
+    with _H5PY_FILE(out_h5, mode) as f:
+        descriptor = target_slice_descriptor_from_diagnostics(diagnostics_out, fallback_key="default")
+        resolved_slice_key = str(descriptor["key"] or "default")
+        slices_group = f.require_group(SLICE_CONTAINER_GROUP)
+        if resolved_slice_key not in slices_group:
+            _validate_new_slice_geometry_compatibility(
+                slices_group,
+                diagnostics=diagnostics_out,
+                slice_key=resolved_slice_key,
+                artifact_path=out_h5,
+            )
+            slice_group = slices_group.create_group(resolved_slice_key)
+            _set_slice_group_attrs(slice_group, descriptor)
+            if "common" in f:
+                _copy_legacy_root_layout_to_slice(f, slice_group)
+        else:
+            slice_group = slices_group[resolved_slice_key]
+            _set_slice_group_attrs(slice_group, descriptor)
+        if "common" not in slice_group:
+            common = slice_group.create_group("common")
+            _write_common_group(
+                common,
+                observed=observed,
+                sigma_map=sigma_map,
+                wcs_header=wcs_header,
+                diagnostics=diagnostics_out,
+                blos_reference=blos_reference,
+                psf_kernel=psf_kernel,
+                run_history=None,
+                observation_canvas=observation_canvas,
+                sigma_canvas=sigma_canvas,
+                canvas_wcs_header=canvas_wcs_header,
+            )
+            _write_auxiliary_slice_shells(
+                slices_group,
+                observed_template=observed,
+                sigma_template=sigma_map,
+                wcs_header=wcs_header,
+                diagnostics=diagnostics_out,
+                blos_reference=blos_reference,
+                existing_names=set(slices_group.keys()),
+            )
+        elif blos_reference is not None and "refmaps" not in slice_group["common"]:
+            refmaps = slice_group["common"].create_group("refmaps")
+            blos_data, blos_header = blos_reference
+            _write_reference_map_group(
+                refmaps,
+                group_name="Bz_reference",
+                data=np.asarray(blos_data, dtype=float),
+                wcs_header=blos_header,
+            )
+        searches_group = slice_group.require_group(SEARCHES_GROUP)
+        resolved_search_id = str(search_id or "").strip()
+        if not resolved_search_id:
+            resolved_search_id = _matching_search_id_for_request(searches_group, request_payload) or ""
+        if not resolved_search_id:
+            resolved_search_id = _search_id_from_diagnostics(diagnostics_out, layout=layout_payload)
+        ref_diag = dict(diagnostics_out)
+        ref_diag.update(_observation_ref_diagnostics_from_full(diagnostics_out))
+        observation_ref_payload = {
+            "observed": observed,
+            "sigma_map": sigma_map,
+            "wcs_header": wcs_header,
+            "diagnostics": ref_diag,
+            "observation_canvas": observation_canvas,
+            "sigma_canvas": sigma_canvas,
+            "canvas_wcs_header": canvas_wcs_header,
+        }
+        records = list(point_records or [])
+        if bool(reset_search_points):
+            records = []
+        if resolved_search_id in searches_group and not bool(reset_search_points):
+            search_group = searches_group[resolved_search_id]
+            if OBSERVATION_REF_GROUP in search_group:
+                del search_group[OBSERVATION_REF_GROUP]
+            ref_group = search_group.create_group(OBSERVATION_REF_GROUP)
+            _write_observation_ref_group(
+                ref_group,
+                observed=np.asarray(observed, dtype=float),
+                sigma_map=np.asarray(sigma_map, dtype=float),
+                wcs_header=wcs_header,
+                diagnostics=ref_diag,
+                observation_canvas=observation_canvas,
+                sigma_canvas=sigma_canvas,
+                canvas_wcs_header=canvas_wcs_header,
+            )
+        else:
+            _write_search_group(
+                searches_group,
+                search_id=resolved_search_id,
+                diagnostics=diagnostics_out,
+                point_records=records,
+                run_history=[],
+                layout=layout_payload,
+                observation_ref=observation_ref_payload,
+            )
+        if ACTIVE_SEARCH_ID_DATASET in slice_group:
+            del slice_group[ACTIVE_SEARCH_ID_DATASET]
+        _create_text_dataset(slice_group, ACTIVE_SEARCH_ID_DATASET, resolved_search_id)
+    return str(resolved_search_id)
+
+
 def _iter_slice_search_lifecycles(h5_path: Path) -> list[tuple[str, str, dict[str, Any]]]:
     records: list[tuple[str, str, dict[str, Any]]] = []
     with _H5PY_FILE(h5_path, "r") as f:
@@ -1519,18 +2257,21 @@ def _iter_slice_search_lifecycles(h5_path: Path) -> list[tuple[str, str, dict[st
 def search_lifecycle_is_in_progress(lifecycle: dict[str, Any] | None) -> bool:
     """True only for searches that are genuinely running, not stale active flags."""
     data = dict(lifecycle or {})
-    if bool(data.get("in_progress", False)):
-        return True
     status = str(data.get("status", "") or "").strip().lower()
     if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
         return False
     if str(data.get("completed_at") or "").strip():
         return False
+    if bool(data.get("in_progress", False)):
+        return True
     return bool(data.get("active", False))
 
 
 def find_in_progress_slice_search(h5_path: Path) -> tuple[str | None, str | None]:
-    """Return the first slice/search pair whose lifecycle is still in progress."""
+    """Return the first slice/search pair whose lifecycle is still in progress.
+
+    Search iteration order prefers each slice's ``active_search_id`` entry first.
+    """
     for slice_key, search_id, lifecycle in _iter_slice_search_lifecycles(h5_path):
         if search_lifecycle_is_in_progress(lifecycle):
             return slice_key, search_id
@@ -3638,10 +4379,13 @@ def _read_point_map_array(grp: h5py.Group, name: str, refs: dict[str, Any]) -> n
 
 def _read_map_store_ref_array(h5_file: h5py.File, ref_path: Any) -> np.ndarray | None:
     ref_text = str(ref_path or "").strip()
-    if not ref_text:
+    if not ref_text or ref_text not in h5_file:
         return None
-    if ref_text in h5_file and "data" in h5_file[ref_text]:
-        return np.asarray(h5_file[ref_text]["data"], dtype=float)
+    node = h5_file[ref_text]
+    if isinstance(node, h5py.Dataset):
+        return np.asarray(node[()], dtype=float)
+    if isinstance(node, h5py.Group) and "data" in node:
+        return np.asarray(node["data"][()], dtype=float)
     return None
 
 
@@ -5048,6 +5792,63 @@ def extend_patch_grid_model_with_pending_point(
     }
 
 
+def reopen_search_runner_state(
+    h5_path: Path,
+    *,
+    slice_key: str | None = None,
+    search_id: str | None = None,
+) -> None:
+    """Mark a resumed expand/recompute search active again (clears stale completion metadata)."""
+    with _H5PY_FILE(h5_path, "a") as f:
+        group, _descriptors, _selected_key = _resolve_slice_group(
+            f,
+            slice_key=slice_key,
+            allow_missing=True,
+        )
+        if group is None or SEARCHES_GROUP not in group:
+            return
+        selected_search_id = _selected_search_id(group, requested_search_id=search_id)
+        if selected_search_id is None or selected_search_id not in group[SEARCHES_GROUP]:
+            return
+        search_group = group[SEARCHES_GROUP][selected_search_id]
+        counts = {
+            "total": int(search_group.attrs.get("total_point_count", 0)),
+            "pending": int(search_group.attrs.get("pending_point_count", 0)),
+            "missing": int(search_group.attrs.get("missing_point_count", 0)),
+            "failed": int(search_group.attrs.get("failed_point_count", 0)),
+            "computed": int(search_group.attrs.get("computed_point_count", 0)),
+            "other": int(search_group.attrs.get("other_point_count", 0)),
+        }
+        diagnostics_out = (
+            _json_loads_or_empty(search_group["diagnostics_json"][()])
+            if "diagnostics_json" in search_group
+            else {}
+        )
+        diagnostics_out["search_active"] = True
+        diagnostics_out.pop("search_completed_at", None)
+        _replace_text_dataset(search_group, "diagnostics_json", _json_dumps(diagnostics_out))
+        existing_lifecycle = (
+            _json_loads_or_empty(search_group[SEARCH_LIFECYCLE_DATASET][()])
+            if SEARCH_LIFECYCLE_DATASET in search_group
+            else {}
+        )
+        status = _write_search_status_attrs(
+            search_group,
+            counts,
+            diagnostics=diagnostics_out,
+            remain_in_progress=True,
+        )
+        lifecycle = _search_lifecycle_payload(
+            status=status,
+            diagnostics=diagnostics_out,
+            existing=existing_lifecycle,
+        )
+        lifecycle["active"] = True
+        lifecycle["in_progress"] = True
+        lifecycle["completed_at"] = None
+        _write_search_lifecycle_dataset(search_group, lifecycle=lifecycle)
+
+
 def finalize_search_runner_state(
     h5_path: Path,
     *,
@@ -5127,6 +5928,44 @@ def grid_extents_from_ab_values(a_values: Any, b_values: Any) -> dict[str, float
     }
 
 
+def grid_extents_from_search_diagnostics(diagnostics: dict[str, Any] | None) -> dict[str, float] | None:
+    """Return declared adaptive (a, b) bounds when stored on a search."""
+    diag = dict(diagnostics or {})
+    a_range = diag.get("a_range")
+    b_range = diag.get("b_range")
+    if not isinstance(a_range, (list, tuple)) or len(a_range) < 2:
+        return None
+    if not isinstance(b_range, (list, tuple)) or len(b_range) < 2:
+        return None
+    try:
+        a_lo = float(min(a_range[0], a_range[1]))
+        a_hi = float(max(a_range[0], a_range[1]))
+        b_lo = float(min(b_range[0], b_range[1]))
+        b_hi = float(max(b_range[0], b_range[1]))
+    except Exception:
+        return None
+    if not (np.isfinite(a_lo) and np.isfinite(a_hi) and np.isfinite(b_lo) and np.isfinite(b_hi)):
+        return None
+    if a_lo >= a_hi or b_lo >= b_hi:
+        return None
+    return {"a_min": a_lo, "a_max": a_hi, "b_min": b_lo, "b_max": b_hi}
+
+
+def merge_grid_extents(*candidates: dict[str, float] | None) -> dict[str, float] | None:
+    merged: dict[str, float] | None = None
+    for extents in candidates:
+        if not isinstance(extents, dict):
+            continue
+        if merged is None:
+            merged = dict(extents)
+            continue
+        merged["a_min"] = float(min(merged["a_min"], extents["a_min"]))
+        merged["a_max"] = float(max(merged["a_max"], extents["a_max"]))
+        merged["b_min"] = float(min(merged["b_min"], extents["b_min"]))
+        merged["b_max"] = float(max(merged["b_max"], extents["b_max"]))
+    return merged
+
+
 def load_slice_grid_extents(
     h5_path: Path,
     *,
@@ -5148,22 +5987,28 @@ def load_slice_grid_extents(
         if selected_search_id not in searches_group:
             return None
         search_group = searches_group[selected_search_id]
+        diagnostics = (
+            _json_loads_or_empty(search_group["diagnostics_json"][()])
+            if "diagnostics_json" in search_group
+            else {}
+        )
         layout = _json_loads_or_empty(search_group["layout_json"][()]) if "layout_json" in search_group else {}
+        point_extents: dict[str, float] | None = None
         if str(layout.get("kind", "")).strip().lower() == "rectangular_grid":
             a_values = layout.get("a_values", [])
             b_values = layout.get("b_values", [])
             if a_values and b_values:
-                return grid_extents_from_ab_values(a_values, b_values)
+                point_extents = grid_extents_from_ab_values(a_values, b_values)
         from .grid_points import GRID_POINTS_GROUP, list_grid_point_headers
 
-        if GRID_POINTS_GROUP in search_group:
+        if point_extents is None and GRID_POINTS_GROUP in search_group:
             headers = list_grid_point_headers(search_group)
             if headers:
                 unique_a = np.unique([float(item["a"]) for item in headers])
                 unique_b = np.unique([float(item["b"]) for item in headers])
                 if unique_a.size and unique_b.size:
-                    return grid_extents_from_ab_values(unique_a, unique_b)
-        if "point_records" in search_group:
+                    point_extents = grid_extents_from_ab_values(unique_a, unique_b)
+        if point_extents is None and "point_records" in search_group:
             records = _load_sparse_point_records(search_group["point_records"], include_maps=False)
             active_records = [
                 record for record in records if str(record.get("status", "computed")).strip().lower() != "missing"
@@ -5172,22 +6017,23 @@ def load_slice_grid_extents(
                 unique_a = np.unique([float(record["a"]) for record in active_records])
                 unique_b = np.unique([float(record["b"]) for record in active_records])
                 if unique_a.size and unique_b.size:
-                    return grid_extents_from_ab_values(unique_a, unique_b)
-        try:
-            payload = load_scan_file(
-                h5_path,
-                slice_key=slice_key,
-                search_id=selected_search_id,
-                include_maps=False,
-            )
-        except Exception:
-            payload = None
-        if isinstance(payload, dict):
-            a_values = np.asarray(payload.get("a_values", ()), dtype=float)
-            b_values = np.asarray(payload.get("b_values", ()), dtype=float)
-            if a_values.size and b_values.size:
-                return grid_extents_from_ab_values(a_values, b_values)
-        return None
+                    point_extents = grid_extents_from_ab_values(unique_a, unique_b)
+        if point_extents is None:
+            try:
+                payload = load_scan_file(
+                    h5_path,
+                    slice_key=slice_key,
+                    search_id=selected_search_id,
+                    include_maps=False,
+                )
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                a_values = np.asarray(payload.get("a_values", ()), dtype=float)
+                b_values = np.asarray(payload.get("b_values", ()), dtype=float)
+                if a_values.size and b_values.size:
+                    point_extents = grid_extents_from_ab_values(a_values, b_values)
+        return merge_grid_extents(point_extents, grid_extents_from_search_diagnostics(diagnostics))
 
 
 def load_shared_grid_extents(

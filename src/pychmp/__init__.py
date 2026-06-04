@@ -6,7 +6,19 @@ Algorithmic provenance:
   https://github.com/kuznetsov-radio/gxmodelfitting
 """
 
-from .ab_search import ABLocalSearchResult, ABPointResult, ABScanResult, ABRendererFactory, evaluate_ab_point, idl_q0_start_heuristic, multi_scan_ab, search_local_minimum_ab
+from .ab_search import (
+    ABLocalSearchResult,
+    ABPointResult,
+    ABScanResult,
+    ABRendererFactory,
+    ExpandResumeContext,
+    evaluate_ab_point,
+    idl_q0_start_heuristic,
+    multi_scan_ab,
+    search_local_minimum_ab,
+    select_expand_frontier_seed,
+    widened_boundary_axes,
+)
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .gxrender_adapter import EUVResponseIdentity, EUV_RESPONSE_IDENTITY_VERSION, ForwardModelIdentity, FORWARD_MODEL_IDENTITY_VERSION, GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWContext, ResolvedRenderGeometry, build_tr_region_mask_from_blos, compute_euv_response_identity, compute_forward_model_identity_placeholder, recombine_euv_components, resolve_euv_response_identity, resolve_render_geometry_via_gxrender
@@ -53,6 +65,9 @@ __all__ = [
   "idl_q0_start_heuristic",
   "multi_scan_ab",
   "search_local_minimum_ab",
+  "ExpandResumeContext",
+  "select_expand_frontier_seed",
+  "widened_boundary_axes",
   "GXRenderMWAdapter",
   "GXRenderMWContext",
   "GXRenderEUVAdapter",

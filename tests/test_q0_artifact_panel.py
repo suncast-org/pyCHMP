@@ -5,12 +5,40 @@ import pytest
 from matplotlib.colors import LogNorm, Normalize, SymLogNorm
 
 from pychmp.q0_artifact_panel import (
+    _beam_overlay_corner_center,
     _euv_channel_from_diagnostics,
     _euv_channel_token,
     _intensity_colormap_for_panel,
     _resolve_image_render_state,
     _sunpy_euv_colormap_name,
+    normalize_common_map_link_mode,
+    resolve_common_map_color_limits,
 )
+
+
+def test_beam_overlay_corner_center_upper_left_origin_lower() -> None:
+    cx, cy = _beam_overlay_corner_center((100, 80), bmaj_px=10.0, bmin_px=6.0)
+    assert cx == pytest.approx(11.0)
+    assert cy == pytest.approx(89.0)
+
+
+def test_resolve_common_map_color_limits_link_to_observed() -> None:
+    observed = np.array([[1.0, 5.0], [3.0, 7.0]], dtype=float)
+    modeled = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float)
+    vmin, vmax = resolve_common_map_color_limits(
+        observed=observed,
+        modeled=modeled,
+        scale="linear",
+        link_mode="Lock to observed",
+    )
+    assert vmin == pytest.approx(1.0)
+    assert vmax == pytest.approx(7.0)
+
+
+def test_normalize_common_map_link_mode_aliases() -> None:
+    assert normalize_common_map_link_mode("Lock to observed") == "observed"
+    assert normalize_common_map_link_mode("Lock to modeled") == "modeled"
+    assert normalize_common_map_link_mode("Auto (each panel)") == "auto"
 
 
 def test_resolve_image_render_state_linear_common_map() -> None:

@@ -11,7 +11,8 @@ from astropy.wcs import FITSFixedWarning, WCS
 from matplotlib.patches import Ellipse
 from matplotlib.figure import Figure
 from matplotlib.colors import LogNorm, Normalize, SymLogNorm
-from .metrics import resolve_metrics_threshold_mask
+from .metrics import compute_display_residual, normalize_residual_display_mode, resolve_metrics_threshold_mask
+from .psf import beam_fwhm_from_kernel
 from .obs_preprocessing import format_observation_shift_label
 from .viewer_plot_style import (
     apply_q0_panel_trials_axis_style,
@@ -286,6 +287,9 @@ def _resolved_psf_summary(diagnostics: dict[str, Any] | None) -> tuple[str, dict
         )
 
     if kind == "kernel":
+        beam_text, beam_payload = _beam_payload(source, resolved_psf)
+        if beam_payload is not None:
+            return beam_text, beam_payload
         kernel_shape = resolved_psf.get("psf_kernel_shape")
         kernel_text = ""
         if isinstance(kernel_shape, (list, tuple)) and len(kernel_shape) == 2:
@@ -304,6 +308,39 @@ def _resolved_psf_summary(diagnostics: dict[str, Any] | None) -> tuple[str, dict
         "psf_bpa_deg": diag.get("psf_bpa_deg"),
     }
     return _beam_payload(source, legacy_payload)
+
+
+_BEAM_OVERLAY_PANELS = frozenset({"observed", "modeled"})
+
+
+def resolve_beam_overlay_payload(
+    diagnostics: dict[str, Any] | None,
+    *,
+    psf_kernel: np.ndarray | None,
+    dx_arcsec: float,
+    dy_arcsec: float,
+) -> dict[str, float] | None:
+    """Resolve FWHM beam parameters for map corner overlays."""
+    _legend, payload = _resolved_psf_summary(diagnostics)
+    if payload is not None:
+        return payload
+    if psf_kernel is None:
+        return None
+    return beam_fwhm_from_kernel(psf_kernel, dx_arcsec=dx_arcsec, dy_arcsec=dy_arcsec)
+
+
+def _beam_overlay_corner_center(
+    shape: tuple[int, int],
+    *,
+    bmaj_px: float,
+    bmin_px: float,
+) -> tuple[float, float]:
+    """Return ellipse center (x, y) in data coords for upper-left with origin='lower'."""
+    ny, nx = int(shape[0]), int(shape[1])
+    pad = max(0.5 * max(float(bmaj_px), float(bmin_px)) + 6.0, 8.0)
+    center_x = pad
+    center_y = max(float(ny) - pad, pad)
+    return center_x, center_y
 
 
 def _load_embedded_blos_reference(f: h5py.File) -> tuple[np.ndarray, fits.Header] | None:
@@ -558,6 +595,38 @@ def _format_scalar(value: Any, pattern: str) -> str:
     return format(numeric, pattern)
 
 
+def normalize_common_map_link_mode(mode: str | None) -> str:
+    """Map toolbar labels to a common-map intensity link mode."""
+    text = str(mode or "auto").strip().lower()
+    if "obs" in text:
+        return "observed"
+    if "mod" in text:
+        return "modeled"
+    return "auto"
+
+
+def resolve_common_map_color_limits(
+    *,
+    observed: np.ndarray,
+    modeled: np.ndarray,
+    scale: str | None,
+    link_mode: str | None,
+) -> tuple[float | None, float | None]:
+    """Resolve shared vmin/vmax for observed / raw / modeled panels."""
+    mode = normalize_common_map_link_mode(link_mode)
+    if mode == "auto":
+        return None, None
+
+    reference = np.asarray(observed if mode == "observed" else modeled, dtype=float)
+    scale_name = str(scale or "linear").strip().lower()
+    if scale_name == "log":
+        limits = _positive_color_limits(reference)
+        if limits is None:
+            return None, None
+        return limits
+    return _color_limits(reference, symmetric=False)
+
+
 def _coerce_axis_limit(value: Any) -> float | None:
     if value is None:
         return None
@@ -800,45 +869,70 @@ class Q0ArtifactPanelFigure:
         _style_map_axis(axis, title=title, grid_row=grid_row, grid_col=grid_col)
         self._common_notes[name].set_text(note)
 
-    def _update_psf_overlay(self, *, name: str, diagnostics: dict[str, Any], header: fits.Header) -> None:
+    def _update_psf_overlay(
+        self,
+        *,
+        name: str,
+        diagnostics: dict[str, Any],
+        header: fits.Header,
+        psf_kernel: np.ndarray | None = None,
+    ) -> None:
         axis = self._common_axes.get(name)
         if axis is None:
             return
         previous = getattr(axis, "_psf_overlay", None)
         if previous is not None:
-            try:
-                previous.remove()
-            except Exception:
-                pass
+            patches = previous if isinstance(previous, (list, tuple)) else (previous,)
+            for patch in patches:
+                try:
+                    patch.remove()
+                except Exception:
+                    pass
             axis._psf_overlay = None
-        if name != "modeled":
-            return
-        _legend, beam_payload = _resolved_psf_summary(diagnostics)
-        if beam_payload is None:
+        if name not in _BEAM_OVERLAY_PANELS:
             return
         dx_arcsec = abs(_optional_float(header.get("CDELT1")) or 0.0)
         dy_arcsec = abs(_optional_float(header.get("CDELT2")) or 0.0)
         if dx_arcsec <= 0.0 or dy_arcsec <= 0.0:
             return
+        beam_payload = resolve_beam_overlay_payload(
+            diagnostics,
+            psf_kernel=psf_kernel,
+            dx_arcsec=dx_arcsec,
+            dy_arcsec=dy_arcsec,
+        )
+        if beam_payload is None:
+            return
         bmaj_px = float(beam_payload["bmaj_arcsec"]) / dx_arcsec
         bmin_px = float(beam_payload["bmin_arcsec"]) / dy_arcsec
         if not np.isfinite(bmaj_px) or not np.isfinite(bmin_px) or bmaj_px <= 0.0 or bmin_px <= 0.0:
             return
-        ny, nx = self._shape
-        center_x = max(0.15 * float(nx), 0.5 * bmaj_px + 4.0)
-        center_y = max(0.15 * float(ny), 0.5 * bmin_px + 4.0)
-        overlay = Ellipse(
-            (center_x, center_y),
+        center_x, center_y = _beam_overlay_corner_center(
+            self._shape,
+            bmaj_px=bmaj_px,
+            bmin_px=bmin_px,
+        )
+        try:
+            transform = axis.get_transform("pixel")
+        except Exception:
+            transform = None
+        ellipse_kw = dict(
+            xy=(center_x, center_y),
             width=bmaj_px,
             height=bmin_px,
             angle=float(beam_payload["bpa_deg"]),
             facecolor="none",
-            edgecolor="white",
-            linewidth=1.6,
-            alpha=0.95,
+            transform=transform,
+            clip_on=False,
+            zorder=20,
         )
-        axis.add_patch(overlay)
-        axis._psf_overlay = overlay
+        overlays = (
+            Ellipse(**ellipse_kw, edgecolor="white", linewidth=1.8, alpha=0.98),
+            Ellipse(**ellipse_kw, edgecolor="black", linewidth=1.0, alpha=0.65),
+        )
+        for patch in overlays:
+            axis.add_patch(patch)
+        axis._psf_overlay = overlays
 
     def _show_blos_placeholder(self, *, a_text: str, b_text: str, message: str) -> None:
         if self._blos_colorbar is not None:
@@ -1216,14 +1310,13 @@ class Q0ArtifactPanelFigure:
         trials_ylim: tuple[float, float] | None = None,
         trials_match_parent_view: bool = False,
         common_map_scale: str | None = None,
-        common_map_vmin: float | None = None,
-        common_map_vmax: float | None = None,
+        common_map_link: str | None = None,
         residual_map_scale: str | None = None,
-        residual_map_vmin: float | None = None,
-        residual_map_vmax: float | None = None,
+        residual_map_mode: str | None = None,
         wcs_header_transform: Callable[[fits.Header], fits.Header] | None = None,
         load_blos: bool = False,
         blos_reference: tuple[np.ndarray, fits.Header] | None = None,
+        psf_kernel: np.ndarray | None = None,
         out_png: Path | None = None,
     ) -> None:
         diag = diagnostics or {}
@@ -1298,14 +1391,22 @@ class Q0ArtifactPanelFigure:
         if shift_label:
             observed_note = f"{observed_note}\n{shift_label}"
 
+        modeled_arr = np.asarray(modeled_best, dtype=float)
+        common_vmin, common_vmax = resolve_common_map_color_limits(
+            observed=observed_arr,
+            modeled=modeled_arr,
+            scale=common_map_scale,
+            link_mode=common_map_link,
+        )
+
         self._update_common_panel(
             "observed",
             observed_arr,
             title=observed_title,
             note=observed_note,
             scale=common_map_scale,
-            vmin=_coerce_axis_limit(common_map_vmin),
-            vmax=_coerce_axis_limit(common_map_vmax),
+            vmin=common_vmin,
+            vmax=common_vmax,
         )
         self._update_common_panel(
             "raw_modeled",
@@ -1313,29 +1414,46 @@ class Q0ArtifactPanelFigure:
             title=_compact_map_title("Modeled Raw", spectral_label, trial_title=trial_title),
             note=f"a={a_text}  b={b_text}\nq0={fmt(display_q0, '.6f')}{map_suffix}",
             scale=common_map_scale,
-            vmin=_coerce_axis_limit(common_map_vmin),
-            vmax=_coerce_axis_limit(common_map_vmax),
+            vmin=common_vmin,
+            vmax=common_vmax,
         )
         self._update_common_panel(
             "modeled",
-            np.asarray(modeled_best, dtype=float),
+            modeled_arr,
             title=_compact_map_title("Modeled", spectral_label, trial_title=trial_title),
             note=f"a={a_text}  b={b_text}\nq0={fmt(display_q0, '.6f')}{psf_legend}{map_suffix}",
             scale=common_map_scale,
-            vmin=_coerce_axis_limit(common_map_vmin),
-            vmax=_coerce_axis_limit(common_map_vmax),
+            vmin=common_vmin,
+            vmax=common_vmax,
         )
+        residual_mode = normalize_residual_display_mode(residual_map_mode)
+        residual_display = compute_display_residual(
+            modeled_arr,
+            observed_arr,
+            mode=residual_mode,
+        )
+        residual_title = "Residual" if residual_mode == "tb" else "Residual (norm)"
+        if residual_mode == "normalized":
+            residual_vmin, residual_vmax = -1.0, 1.0
+        else:
+            residual_vmin, residual_vmax = None, None
         self._update_common_panel(
             "residual",
-            np.asarray(residual, dtype=float),
-            title=_compact_map_title("Residual", spectral_label, trial_title=trial_title),
+            residual_display,
+            title=_compact_map_title(residual_title, spectral_label, trial_title=trial_title),
             note=f"a={a_text}  b={b_text}\nq0=true:{fmt(q0_true, '.6f')} selected:{fmt(display_q0, '.6f')} best:{fmt(q0_best, '.6f')}{psf_legend}{map_suffix}",
             scale=residual_map_scale,
-            vmin=_coerce_axis_limit(residual_map_vmin),
-            vmax=_coerce_axis_limit(residual_map_vmax),
+            vmin=residual_vmin,
+            vmax=residual_vmax,
         )
-        for panel_name in ("observed", "raw_modeled", "modeled", "residual"):
-            self._update_psf_overlay(name=panel_name, diagnostics=diag, header=header)
+        kernel_arr = None if psf_kernel is None else np.asarray(psf_kernel, dtype=float)
+        for panel_name in _BEAM_OVERLAY_PANELS:
+            self._update_psf_overlay(
+                name=panel_name,
+                diagnostics=diag,
+                header=header,
+                psf_kernel=kernel_arr,
+            )
 
         self._update_blos_panel(
             model_path=model_path,
@@ -1375,8 +1493,6 @@ class Q0ArtifactPanelFigure:
             diagnostics=diag,
         )
 
-        observed_arr = np.asarray(observed_noisy, dtype=float)
-        modeled_arr = np.asarray(modeled_best, dtype=float)
         self._draw_mask_contours(self._show_mask_contours, observed_arr, modeled_arr, diag)
         self.apply_autolayout()
 
@@ -1405,16 +1521,15 @@ def plot_q0_artifact_panel(
     trials_xscale: str | None = None,
     trials_yscale: str | None = None,
     common_map_scale: str | None = None,
-    common_map_vmin: float | None = None,
-    common_map_vmax: float | None = None,
+    common_map_link: str | None = None,
     residual_map_scale: str | None = None,
-    residual_map_vmin: float | None = None,
-    residual_map_vmax: float | None = None,
+    residual_map_mode: str | None = None,
     show_plot: bool = False,
     defer_show: bool = False,
     wcs_header_transform: Callable[[fits.Header], fits.Header] | None = None,
     load_blos: bool = False,
     blos_reference: tuple[np.ndarray, fits.Header] | None = None,
+    psf_kernel: np.ndarray | None = None,
 ) -> Figure:
     """Render the legacy Q0 artifact panel and optionally save/show it.
 
@@ -1451,14 +1566,13 @@ def plot_q0_artifact_panel(
         trials_xscale=trials_xscale,
         trials_yscale=trials_yscale,
         common_map_scale=common_map_scale,
-        common_map_vmin=common_map_vmin,
-        common_map_vmax=common_map_vmax,
+        common_map_link=common_map_link,
         residual_map_scale=residual_map_scale,
-        residual_map_vmin=residual_map_vmin,
-        residual_map_vmax=residual_map_vmax,
+        residual_map_mode=residual_map_mode,
         wcs_header_transform=wcs_header_transform,
         load_blos=bool(load_blos),
         blos_reference=blos_reference,
+        psf_kernel=psf_kernel,
         out_png=output_path,
     )
 

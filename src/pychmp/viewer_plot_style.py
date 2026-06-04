@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+from matplotlib.colors import LogNorm, Normalize
 
 from .ab_scan_artifacts import grid_extents_from_ab_values
 
@@ -93,6 +94,69 @@ def apply_q0_solution_panel_layout(figure: Any) -> None:
         )
     except Exception:
         pass
+
+
+def heatmap_facecolors_from_values(
+    values: np.ndarray,
+    *,
+    norm: Normalize,
+    cmap: Any,
+) -> np.ndarray:
+    """Map metric samples to RGBA face colors using the active norm (linear or log)."""
+    arr = np.ma.masked_invalid(np.asarray(values, dtype=float))
+    colors = np.asarray(cmap(norm(arr)), dtype=float)
+    if np.ma.is_masked(arr):
+        colors = np.array(colors, copy=True)
+        colors[arr.mask] = (0.0, 0.0, 0.0, 0.0)
+    return colors
+
+
+def configure_heatmap_colorbar(colorbar: Any, *, norm: Normalize) -> None:
+    """Use log tick formatting when the heatmap norm is logarithmic."""
+    if not isinstance(norm, LogNorm):
+        return
+    from matplotlib.ticker import LogFormatterSciNotation, LogLocator
+
+    axis = colorbar.ax
+    axis.yaxis.set_major_locator(LogLocator())
+    axis.yaxis.set_major_formatter(LogFormatterSciNotation())
+
+
+def apply_heatmap_figure_layout(figure: Any, *, has_colorbar: bool) -> None:
+    """Keep the heatmap axes width stable when a colorbar is present."""
+    try:
+        figure.set_layout_engine(None)
+    except Exception:
+        pass
+    right = 0.84 if has_colorbar else 0.96
+    try:
+        figure.subplots_adjust(left=0.14, right=right, bottom=0.14, top=0.90)
+    except Exception:
+        pass
+
+
+def resolve_heatmap_color_norm(
+    values: np.ndarray,
+    *,
+    log_scale: bool,
+) -> tuple[Normalize, float, float]:
+    """Return a matplotlib norm and (vmin, vmax) for heatmap cell coloring."""
+    arr = np.asarray(values, dtype=float)
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return Normalize(vmin=0.0, vmax=1.0), 0.0, 1.0
+    if log_scale:
+        positive = arr[finite & (arr > 0.0)]
+        if positive.size:
+            vmin = float(np.min(positive))
+            vmax = float(np.max(positive))
+            if vmin < vmax:
+                return LogNorm(vmin=vmin, vmax=vmax), vmin, vmax
+    vmin = float(np.nanmin(arr[finite]))
+    vmax = float(np.nanmax(arr[finite]))
+    if vmin >= vmax:
+        vmax = vmin + 1.0
+    return Normalize(vmin=vmin, vmax=vmax), vmin, vmax
 
 
 def apply_heatmap_data_limits(

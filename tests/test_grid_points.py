@@ -18,9 +18,14 @@ from pychmp.grid_points import (
     apply_grid_point_event_with_retry,
     classify_grid_point_state,
     list_grid_point_headers,
+    GRID_POINT_STORAGE_CORRUPT_ATTR,
+    find_grid_point_group,
+    grid_point_finite_q0_trials_have_map_store_links,
     load_grid_point_live_state,
+    load_grid_point_trial_plot_payload,
     load_grid_points_as_viewer_records,
     read_grid_point_header,
+    reset_grid_point_for_rerun,
 )
 from pychmp.refresh_signal import REFRESH_V2_VERSION, RefreshSignalWriter
 from pychmp.search_contract import search_id_from_evaluation_config
@@ -279,9 +284,253 @@ def test_refresh_signal_v2_writer(tmp_path: Path) -> None:
     assert payload["search_id"] == "search0001"
 
 
+def test_grid_writes_use_explicit_selected_search_id_over_contract_match(tmp_path: Path) -> None:
+    """Parallel searches with the same contract must not redirect grid events to another search."""
+    observed = np.array([[0.0, 2.0], [0.0, 0.0]], dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    header = _make_header()
+    slice_key = "mw_5p700000ghz"
+    base_diag = _make_diagnostics(slice_key=slice_key)
+    layout = {"kind": "point_list"}
+    legacy_id = search_id_from_evaluation_config(base_diag, layout=layout)
+    parallel_diag = {
+        **base_diag,
+        "search_instance_id": "parallel_test_instance",
+        "search_id": search_id_from_evaluation_config(
+            {**base_diag, "search_instance_id": "parallel_test_instance"},
+            layout=layout,
+        ),
+        "selected_search_id": search_id_from_evaluation_config(
+            {**base_diag, "search_instance_id": "parallel_test_instance"},
+            layout=layout,
+        ),
+    }
+    parallel_id = str(parallel_diag["selected_search_id"])
+    assert parallel_id != legacy_id
+
+    artifact_h5 = tmp_path / "parallel_search_routing.h5"
+    for search_id, diag in ((legacy_id, base_diag), (parallel_id, parallel_diag)):
+        apply_grid_point_event_with_retry(
+            artifact_h5,
+            GridPointAssignedEvent(a=0.1, b=1.0, q0_start=1e-4, next_q0=1e-4, metric_name="chi2"),
+            observed=observed,
+            sigma_map=sigma,
+            wcs_header=header,
+            diagnostics={**diag, "search_id": search_id, "selected_search_id": search_id},
+        )
+
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id="p000000",
+            trial_index=0,
+            q0=1e-4,
+            metric=0.5,
+            next_q0=1e-4,
+            best_trial_index=0,
+            best_metric=0.5,
+            raw_modeled_map=observed.copy(),
+            chi2=1.0,
+            rho2=0.5,
+            eta2=0.5,
+        ),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=parallel_diag,
+    )
+
+    with h5py.File(artifact_h5, "r") as f:
+        parallel_group = f["slices"][slice_key]["searches"][parallel_id]
+        legacy_group = f["slices"][slice_key]["searches"][legacy_id]
+        assert GRID_POINTS_GROUP in parallel_group
+        assert "p000000" in parallel_group[GRID_POINTS_GROUP]
+        assert "trials" in parallel_group[GRID_POINTS_GROUP]["p000000"]
+        assert "t000000" in parallel_group[GRID_POINTS_GROUP]["p000000"]["trials"]
+        if GRID_POINTS_GROUP in legacy_group and "p000000" in legacy_group[GRID_POINTS_GROUP]:
+            legacy_point = legacy_group[GRID_POINTS_GROUP]["p000000"]
+            assert "trials" not in legacy_point or len(legacy_point["trials"]) == 0
+
+
+def test_load_grid_point_trial_plot_payload_falls_back_when_trial_has_no_map(tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "grid_trial_map_fallback.h5"
+    observed = np.ones((2, 2), dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    header = _make_header()
+    diagnostics = _make_diagnostics()
+    raw_map = np.full((2, 2), 3.0, dtype=np.float32)
+
+    point_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(a=-0.3, b=2.1, q0_start=1e-4, next_q0=1e-4, metric_name="chi2"),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id=str(point_id),
+            trial_index=0,
+            q0=1.0e-4,
+            metric=0.42,
+            next_q0=1.618e-4,
+            best_trial_index=0,
+            best_metric=0.42,
+            raw_modeled_map=raw_map,
+        ),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointCompletedEvent(
+            point_id=str(point_id),
+            best_trial_index=0,
+            best_metric=0.42,
+            best_q0=1.0e-4,
+        ),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+
+    payload = load_grid_point_trial_plot_payload(
+        artifact_h5,
+        a=-0.3,
+        b=2.1,
+        trial_index=1,
+        slice_key="mw_5p700000ghz",
+        search_id="search0001",
+    )
+
+    assert payload is not None
+    assert int(payload["trial_index"]) == 0
+    assert int(payload["storage_trial_index"]) == 0
+    np.testing.assert_allclose(np.asarray(payload["raw_modeled_best"], dtype=float), raw_map)
+
+
+def test_reset_grid_point_when_restored_trials_lack_map_store_links(tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "contract_reset.h5"
+    observed = np.ones((2, 2), dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    header = _make_header()
+    diagnostics = _make_diagnostics()
+    raw_map = np.full((2, 2), 3.0, dtype=np.float32)
+
+    point_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(a=-0.3, b=2.7, q0_start=1e-4, next_q0=1e-4, metric_name="eta2"),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id=str(point_id),
+            trial_index=0,
+            q0=1.0e-4,
+            metric=0.42,
+            next_q0=1.618e-4,
+            best_trial_index=0,
+            best_metric=0.42,
+            raw_modeled_map=raw_map,
+        ),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    from pychmp.ab_scan_artifacts import MAP_REFS_DATASET, _create_text_dataset, _json_dumps
+
+    with h5py.File(artifact_h5, "a") as f:
+        trials_group = f["slices"]["mw_5p700000ghz"]["searches"]["search0001"]["grid_points"][str(point_id)][
+            "trials"
+        ]
+        broken = trials_group.create_group("t000001")
+        broken.attrs["trial_index"] = 1
+        broken.attrs["q0"] = 1.618e-4
+        broken.attrs["metric"] = 0.40
+        broken.attrs["target_metric"] = np.bytes_("eta2")
+        broken.attrs["chi2"] = 1.0
+        broken.attrs["rho2"] = 0.5
+        broken.attrs["eta2"] = 0.40
+        _create_text_dataset(broken, MAP_REFS_DATASET, _json_dumps({}))
+
+    assert not grid_point_finite_q0_trials_have_map_store_links(
+        artifact_h5,
+        slice_key="mw_5p700000ghz",
+        search_id="search0001",
+        point_id=str(point_id),
+    )
+
+    reset_grid_point_for_rerun(
+        artifact_h5,
+        slice_key="mw_5p700000ghz",
+        search_id="search0001",
+        point_id=str(point_id),
+        q0_start=1.0e-4,
+        next_q0=1.0e-4,
+        metric_name="eta2",
+    )
+
+    assert grid_point_finite_q0_trials_have_map_store_links(
+        artifact_h5,
+        slice_key="mw_5p700000ghz",
+        search_id="search0001",
+        point_id=str(point_id),
+    )
+    with h5py.File(artifact_h5, "r") as f:
+        trials_group = f["slices"]["mw_5p700000ghz"]["searches"]["search0001"]["grid_points"][str(point_id)]["trials"]
+        assert len(trials_group.keys()) == 0
+
+
+def test_find_grid_point_ignores_storage_corrupt_point(tmp_path: Path) -> None:
+    artifact_h5 = tmp_path / "corrupt_skip.h5"
+    observed = np.ones((2, 2), dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    header = _make_header()
+    diagnostics = _make_diagnostics()
+    point_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(a=0.25, b=4.5, q0_start=1e-4, next_q0=1e-4, metric_name="eta2"),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    with h5py.File(artifact_h5, "a") as f:
+        group = f["slices"]["mw_5p700000ghz"]["searches"]["search0001"]["grid_points"][str(point_id)]
+        group.attrs[GRID_POINT_STORAGE_CORRUPT_ATTR] = 1
+        search_group = f["slices"]["mw_5p700000ghz"]["searches"]["search0001"]
+        assert find_grid_point_group(search_group, a=0.25, b=4.5) is None
+    new_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(a=0.25, b=4.5, q0_start=2e-4, next_q0=2e-4, metric_name="eta2"),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    assert str(new_id) != str(point_id)
+
+
+def test_classify_grid_point_state_completed_with_stale_next_q0() -> None:
+    assert (
+        classify_grid_point_state({"status": "COMPLETED", "n_trials": 2, "next_q0": 1e-4})
+        == "complete"
+    )
+
+
 def test_classify_grid_point_state() -> None:
     assert classify_grid_point_state({"status": "COMPLETED", "n_trials": 2}) == "complete"
-    assert classify_grid_point_state({"status": "COMPLETED", "n_trials": 1, "next_q0": 1.0}) == "running_partial"
+    assert classify_grid_point_state({"status": "COMPLETED", "n_trials": 1, "next_q0": 1.0}) == "complete"
     assert classify_grid_point_state({"status": "ASSIGNED", "n_trials": 0, "next_q0": 1e-4}) == "assigned_no_trials"
     assert classify_grid_point_state({"status": "RUNNING", "n_trials": 2, "next_q0": 1e-4}) == "running_partial"
     assert classify_grid_point_state({"status": "FAILED", "next_q0": 1e-4}) == "failed"
