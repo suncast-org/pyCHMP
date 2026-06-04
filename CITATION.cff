@@ -2,6 +2,7 @@ cff-version: 1.2.0
 title: "pyCHMP"
 version: 0.1.0
 date-released: 2026-06-04
+doi: "10.5281/zenodo.20549272"
 message: "If you use this software, please cite it using the metadata below."
 type: software
 authors:

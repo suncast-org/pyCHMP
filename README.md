@@ -1,5 +1,7 @@
 # pyCHMP
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20549272.svg)](https://doi.org/10.5281/zenodo.20549272)
+
 Python Coronal Heating Modeling Pipeline for data-constrained fitting of GX Simulator active-region models.
 
 ## Overview
@@ -247,8 +249,11 @@ python -m bumpver show
 
 ## Citation
 
-Please cite using [CITATION.cff](CITATION.cff) (version **0.1.0**) and the Zenodo record
-created from the matching GitHub release tag. See also `.zenodo.json` for archive metadata.
+Please cite using [CITATION.cff](CITATION.cff) (version **0.1.0**) and the Zenodo
+record DOI [10.5281/zenodo.20549272](https://doi.org/10.5281/zenodo.20549272).
+The all-versions concept DOI is
+[10.5281/zenodo.20549271](https://doi.org/10.5281/zenodo.20549271). See also
+`.zenodo.json` for archive metadata.
 
 ## License
 
