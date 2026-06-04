@@ -53,6 +53,54 @@ Design Principles
    present. It should not require a different file type for single-point versus
    scan artifacts.
 
+6. ``map_store`` is append-only evidence.
+
+   Search maintenance (purge search, slice reset, repair utilities) must never
+   delete datasets under the root ``map_store`` group. Orphaned map datasets are
+   acceptable; missing links from trial rows to ``map_store`` are not.
+
+7. Every finite-Q₀ trial row must link ``map_store``.
+
+   Metrics are derived from stored maps. A committed grid trial with finite
+   ``q0 > 0`` must persist ``map_refs_json`` with a non-empty ``raw_modeled``
+   path that resolves to a readable ``map_store`` array in the same artifact (or
+   linked map-store file). Trial rows with metrics only, broken refs, or
+   non-finite ``q0`` (phantom index rows) violate the contract.
+
+8. Warm start and repair enforce the contract.
+
+   Optimizer warm start must not trust metrics-only restored rows; it rescored
+   only from ``map_store``. When on-disk trial metadata for a grid point lacks
+   valid map links, the adaptive workflow resets that point and rebuilds trials
+   from ``map_store`` or reruns Q₀ as needed. The CLI
+   ``pychmp-repair-grid-trial-maps`` purges invalid trial HDF5 groups and
+   rebuilds grid-point headers without touching ``map_store``.
+
+9. Targeted search repair preserves valid trials.
+
+   ``--recompute-search-id`` repairs an existing search identity using the
+   stored scoring recipe only (CLI overrides that would change metric, mask,
+   grid, Q₀, observation, or render settings are rejected). Valid finite-Q₀
+   trial rows with readable ``map_store`` links are kept without rescoring;
+   only incomplete or contract-broken grid points are reset and completed.
+
+10. Grid expansion reuses the same search identity.
+
+    ``--expand-grid-search-id`` keeps the stored scoring recipe and search id,
+    accepts only widened ``a``/``b`` bounds (superset of the stored footprint),
+    preserves valid trials without rescoring, hydrates completed ``(a,b)`` cells,
+    and evaluates only cells that were not already completed inside the expanded
+    domain. Phase‑1 resume seeds from the prior footprint wall toward the widened
+    bound (not the original interior ``(a_start, b_start)``).
+
+11. Per-point repair utility (planned, not implemented).
+
+    Cherry-picked refit of selected ``grid_points`` under an existing ``search_id``
+    (optional cold ``map_store`` purge) is specified in
+    ``future-implementation-notes/pyCHMP/2026-06-01-pyCHMP-point-repair-utility-handoff.md``.
+    Until then use ``--recompute-search-id``, ``pychmp-repair-grid-trial-maps``, or
+    ``pychmp-rescore`` as appropriate.
+
 
 Canonical Architecture
 ----------------------
@@ -98,6 +146,40 @@ Optional domain-specific fields:
 The designated optimization slice is stored separately as ``target_slice_key``.
 This allows an artifact to log multiple rendered slices while optimizing only
 one of them.
+
+Auxiliary Render Slices
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A search may optimize one observational slice while asking pyGXrender to render
+additional channels or frequencies on the same LOS, FOV, pixel scale, and image
+geometry. These extra slices are auxiliary render slices, not independent
+searches. They must use the same physical geometry signature as the target
+slice, so a later search can reuse the same rendered-map database only when its
+observer/FOV/resolution request is compatible.
+
+Current implementation status:
+
+- pyCHMP records the requested render-slice descriptors in the common metadata.
+- The adaptive single-observation workflow accepts ``--all-channels`` for known
+  fixed-channel EUV/UV instruments, ``--render-channels`` for explicit EUV/UV
+  channel lists, and ``--render-frequencies-ghz`` for explicit MW frequency
+  lists.
+- The gxrender adapters request and retain multi-channel/frequency cubes from
+  pyGXrender while the optimizer still evaluates the selected target slice.
+- The artifact writer creates ``slices/<slice_key>`` shells for auxiliary
+  render slices so the viewer and downstream tools can discover them under the
+  unified layout.
+- Auxiliary rendered arrays are stored in the root ``map_store`` and referenced
+  from the target search point records via ``map_refs_json``. Per-trial auxiliary
+  maps are always persisted (not a CLI option) so a later search can rescore the
+  full Q0 trial curve for that channel or frequency. Auxiliary slice shells
+  remain render-only until a later search promotes one of those slices into an
+  active rescored search.
+- When an adaptive single-observation run targets a compatible slice that
+  already has saved trial maps, pyCHMP rescoring can seed the new search from
+  stored maps instead of starting cold. This applies both to prior searches on
+  the same slice and to auxiliary render slices produced by another channel or
+  frequency search.
 
 Trial Layer
 ~~~~~~~~~~~
@@ -318,3 +400,25 @@ As of the current canonical single-point writer slice:
 - per-trial scalar histories are persisted in the canonical point record
 - optional per-trial raw modeled maps, convolved modeled maps, and residual
   maps are persisted when available from the one-point fitting workflow
+
+As of the canonical search point-store slice:
+
+- new grid, sparse, and adaptive artifacts write point records canonically under
+  ``slices/<slice_key>/searches/<search_id>/point_records``
+- new artifacts no longer duplicate those records under slice-level
+  ``point_records`` or rectangular ``points`` groups
+- summary grids are derived by the loader from canonical search point records
+- legacy root-level and slice-level ``point_records``/``points``/``summary``
+  layouts remain readable
+- each new search persists ``request_json`` and ``lifecycle_json`` alongside
+  its point records, including target metric, mask settings, optimizer settings,
+  requested point layout when known, active/in-progress state, status, and
+  created/started/completed timestamps
+- point records in new artifacts reference arrays in the root ``map_store``
+  instead of embedding modeled/residual map arrays directly; the loader resolves
+  these references transparently and still reads older direct-array records
+- compatible adaptive searches can promote stored map references into a new
+  search by rescoring the saved trial maps under the current metric/mask request
+- new slices added to an existing artifact are rejected when observer identity,
+  observer geometry, FOV, pixel scale, or image resolution metadata differs from
+  the existing artifact slices

@@ -5,7 +5,8 @@ import numpy as np
 from astropy.io import fits
 import pytest
 
-from pychmp import estimate_obs_map_noise, load_obs_map, validate_obs_map_identity
+from pychmp import estimate_obs_map_noise, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity
+from pychmp.obs_maps import infer_effective_observation_time
 
 
 def test_load_obs_map_mw_external_fits_extracts_frequency(tmp_path) -> None:
@@ -30,6 +31,52 @@ def test_load_obs_map_mw_external_fits_extracts_frequency(tmp_path) -> None:
     np.testing.assert_allclose(obs_map.data, data)
 
 
+@pytest.mark.parametrize(
+    ("cards", "expected"),
+    [
+        ({"CUNIT3": "GHz", "CRVAL3": 5.7}, 5.7),
+        ({"CTYPE4": "FREQ", "CUNIT4": "MHz", "CRVAL4": 5700.0}, 5.7),
+        ({"RESTFRQ": 5.7e9}, 5.7),
+        ({"RESTFREQ": 5.7e9}, 5.7),
+        ({"OBSFREQ": 5700.0, "FREQUNIT": "MHz"}, 5.7),
+        ({"FREQ": 5.7}, 5.7),
+    ],
+)
+def test_load_obs_map_mw_external_fits_extracts_common_radio_frequency_metadata(
+    tmp_path,
+    cards: dict[str, object],
+    expected: float,
+) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    for key, value in cards.items():
+        header[key] = value
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="mw")
+
+    assert obs_map.frequency_ghz == pytest.approx(expected)
+    assert obs_map.spectral_label == f"{expected:.3f} GHz"
+
+
+def test_load_obs_map_mw_external_fits_rejects_non_frequency_wcs_axis(tmp_path) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CTYPE3"] = "STOKES"
+    header["CRVAL3"] = 1
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    with pytest.raises(ValueError, match="extract frequency"):
+        load_obs_map(obs_path=fits_path, domain="mw")
+
+
+def test_load_obs_map_external_fits_rejects_directory_path(tmp_path) -> None:
+    with pytest.raises(ValueError, match="must point to a FITS file, but got a directory"):
+        load_obs_map(obs_path=tmp_path, domain="mw", source_mode="external_fits")
+
+
 def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     fits_path = tmp_path / "aia_171.fits"
     data = np.ones((3, 5), dtype=np.float32)
@@ -38,6 +85,9 @@ def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     header["WAVEUNIT"] = "angstrom"
     header["INSTRUME"] = "AIA"
     header["DATE-OBS"] = "2020-11-26T20:00:00"
+    header["BMAJ"] = 2.0 / 3600.0
+    header["BMIN"] = 1.0 / 3600.0
+    header["BPA"] = 12.0
     fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
 
     obs_map = load_obs_map(obs_path=fits_path, domain="euv")
@@ -47,6 +97,12 @@ def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:
     assert obs_map.frequency_ghz is None
     assert obs_map.wavelength_angstrom == 171.0
     assert obs_map.spectral_label == "171 A"
+    assert obs_map.psf_metadata is not None
+    assert obs_map.psf_metadata["source"] == "fits_header"
+    assert obs_map.psf_metadata["kind"] == "gaussian"
+    assert obs_map.psf_metadata["psf_bmaj_arcsec"] == pytest.approx(2.0)
+    assert obs_map.psf_metadata["psf_bmin_arcsec"] == pytest.approx(1.0)
+    assert obs_map.psf_metadata["psf_bpa_deg"] == pytest.approx(12.0)
     np.testing.assert_allclose(obs_map.data, data)
 
 
@@ -89,6 +145,28 @@ def test_load_obs_map_model_refmap_requires_map_id(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="map_id is required"):
         load_obs_map(model_h5=model_h5, source_mode="model_refmap")
+
+
+def test_load_obs_map_rejects_map_id_with_external_source(tmp_path) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CUNIT3"] = "Hz"
+    header["CRVAL3"] = 2.874e9
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    with pytest.raises(ValueError, match="map_id cannot be used"):
+        load_obs_map(obs_path=fits_path, map_id="AIA_171", source_mode="external_fits")
+
+
+def test_load_obs_map_rejects_obs_path_with_model_refmap_source(tmp_path) -> None:
+    with pytest.raises(ValueError, match="obs_path cannot be used"):
+        load_obs_map(
+            obs_path=tmp_path / "obs.fits",
+            model_h5=tmp_path / "model.h5",
+            map_id="AIA_171",
+            source_mode="model_refmap",
+        )
 
 
 def test_estimate_obs_map_noise_falls_back_to_uniform_std_for_invalid_map(tmp_path) -> None:
@@ -152,3 +230,106 @@ def test_validate_obs_map_identity_rejects_euv_map_with_mw_hint(tmp_path) -> Non
 
     with pytest.raises(ValueError, match="requests MW"):
         validate_obs_map_identity(obs_map, frequency_ghz_hint=5.7)
+
+
+def test_obs_map_noise_unit_label_uses_kelvin_for_mw(tmp_path) -> None:
+    fits_path = tmp_path / "mw_map.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CUNIT3"] = "Hz"
+    header["CRVAL3"] = 2.874e9
+    header["BUNIT"] = "sfu"
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="mw")
+
+    assert obs_map_noise_unit_label(obs_map) == "K"
+
+
+def test_obs_map_noise_unit_label_uses_bunit_for_euv(tmp_path) -> None:
+    fits_path = tmp_path / "aia_171.fits"
+    data = np.ones((3, 5), dtype=np.float32)
+    header = fits.Header()
+    header["WAVELNTH"] = 171
+    header["WAVEUNIT"] = "angstrom"
+    header["BUNIT"] = "DN/s"
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="euv")
+
+    assert obs_map_noise_unit_label(obs_map) == "DN/s"
+
+
+def test_infer_effective_observation_time_uses_date_obs_date_midpoint_for_one_hour() -> None:
+    header = fits.Header()
+    header["DATE-OBS"] = "2026-04-03T18:30:00"
+    header["DATE"] = "2026-04-03T19:30:00"
+
+    effective, diagnostics = infer_effective_observation_time(header)
+
+    assert effective == "2026-04-03T19:00:00.000"
+    assert diagnostics["observation_time_source"] == "date_obs_date_midpoint"
+    assert diagnostics["observation_time_integration_seconds"] == pytest.approx(3600.0)
+
+
+def test_infer_effective_observation_time_eovsa_uses_date_obs_as_integration_end() -> None:
+    header = fits.Header()
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE_OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE"] = "2026-04-03 19:32:00.000"
+
+    effective, diagnostics = infer_effective_observation_time(header)
+
+    assert effective == "2026-04-03T19:30:00.000"
+    assert diagnostics["observation_time_source"] == "eovsa_integration_midpoint"
+    assert diagnostics["observation_time_end_source"] == "DATE-OBS"
+    assert diagnostics["observation_time_end"] == "2026-04-03T20:00:00.000"
+
+
+def test_infer_effective_observation_time_eovsa_prefers_date_obs_over_stale_date_obs(tmp_path) -> None:
+    header = fits.Header()
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T14:38:29"
+    header["DATE_OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE"] = "2026-04-03 19:32:00"
+
+    effective, diagnostics = infer_effective_observation_time(header)
+
+    assert effective == "2026-04-03T19:30:00.000"
+    assert diagnostics["observation_time_end_source"] == "DATE_OBS"
+    assert diagnostics["observation_time_date_obs_ignored"] == "2026-04-03T14:38:29.000"
+
+
+def test_infer_effective_observation_time_eovsa_uses_filename_stamp_when_date_obs_stale(
+    tmp_path,
+) -> None:
+    header = fits.Header()
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T14:38:29"
+    header["DATE"] = "2026-04-03 19:32:00"
+    fits_path = tmp_path / "eovsa.synoptic_daily.calwidget.20260403T200000Z.s02-04.tb.disk.fits"
+
+    effective, diagnostics = infer_effective_observation_time(header, source_path=fits_path)
+
+    assert effective == "2026-04-03T19:30:00.000"
+    assert diagnostics["observation_time_end_source"] == "filename_synoptic_stamp"
+    assert diagnostics["observation_time_date_obs_ignored"] == "2026-04-03T14:38:29.000"
+
+
+def test_load_obs_map_mw_uses_effective_observation_time(tmp_path) -> None:
+    fits_path = tmp_path / "eovsa_20260403_200000_f2.874GHz.fits"
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header()
+    header["CUNIT3"] = "Hz"
+    header["CRVAL3"] = 2.874e9
+    header["OBSERVER"] = "EOVSA team"
+    header["DATE-OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE_OBS"] = "2026-04-03T20:00:00.000"
+    header["DATE"] = "2026-04-03 19:32:00"
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path, domain="mw")
+
+    assert obs_map.date_obs == "2026-04-03T19:30:00.000"
+    assert obs_map.wcs_metadata["observation_time_end_source"] == "DATE-OBS"

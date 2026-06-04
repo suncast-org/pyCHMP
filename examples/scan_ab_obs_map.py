@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Scan a rectangular `(a, b)` grid against a real observational map.
 
-This is the first usable single-frequency `MultiScanAB`-style workflow for
+This is the first usable target-observation `MultiScanAB`-style workflow for
 pyCHMP. It reuses the validated observational preprocessing path from
 `fit_q0_obs_map.py`, then fits one best `q0` per `(a, b)` point and stores all
 results in one consolidated HDF5 file.
@@ -28,27 +28,32 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
-from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_obs_map, validate_obs_map_identity
+from pychmp import GXRenderMWContext, estimate_obs_map_noise, fit_q0_to_observation, load_model_obs_time_text, load_obs_map, obs_map_noise_unit_label, resolve_euv_response_identity, resolve_slice_observation_reference, SliceObservationReferenceError, validate_obs_map_identity
 from pychmp.ab_scan_artifacts import (
     COMPATIBILITY_SIGNATURE_KEY,
     SPARSE_ARTIFACT_KIND,
     UNIFIED_ARTIFACT_KIND,
     ScanArtifactCompatibilityError,
     append_point_record,
+    artifact_geometry_sha256,
+    build_artifact_geometry_block,
     build_computed_point_payload,
     detect_scan_artifact_format,
     load_scan_file,
     load_run_history,
     point_record_matches_compatibility_signature,
-    save_rectangular_scan_file,
+    write_grid_scan_artifact,
     slice_descriptor_from_diagnostics,
     validate_scan_artifact_compatibility,
-    write_sparse_scan_file,
+    write_point_scan_artifact,
 )
 from pychmp.ab_scan_execution import ABExecutionSettings, iter_execute_tasks, resolve_execution_plan
 from pychmp.ab_scan_tasks import ABSliceTaskDescriptor, compile_rectangular_point_tasks, compile_sparse_point_tasks
 from pychmp.ab_search import idl_q0_start_heuristic
+from pychmp import resolve_render_geometry_via_gxrender
+from pychmp.geometry_policy import resolve_geometry_policy
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
+from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
 
 
 def _build_command_compatibility_signature(argv: list[str]) -> str:
@@ -94,6 +99,8 @@ try:
         DEFAULT_A,
         DEFAULT_B,
         DEFAULT_NBASE,
+        DEFAULT_Q0_MAXITER,
+        DEFAULT_Q0_XATOL,
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
         _load_explicit_metric_mask,
@@ -116,6 +123,7 @@ try:
         load_blos_reference_for_fov,
         _regrid_full_disk_to_target,
         _resolve_observer_overrides,
+        _resolve_selected_psf_metadata,
         _run_stage,
         save_prepared_observation_bundle,
         save_q0_artifact,
@@ -126,6 +134,8 @@ except ModuleNotFoundError:
         DEFAULT_A,
         DEFAULT_B,
         DEFAULT_NBASE,
+        DEFAULT_Q0_MAXITER,
+        DEFAULT_Q0_XATOL,
         DEFAULT_TBASE,
         PSFConvolvedRenderer,
         _load_explicit_metric_mask,
@@ -148,6 +158,7 @@ except ModuleNotFoundError:
         load_blos_reference_for_fov,
         _regrid_full_disk_to_target,
         _resolve_observer_overrides,
+        _resolve_selected_psf_metadata,
         _run_stage,
         save_prepared_observation_bundle,
         save_q0_artifact,
@@ -507,6 +518,8 @@ def _build_rectangular_pending_requests(
     hard_q0_min: float | None,
     hard_q0_max: float | None,
     target_metric: str,
+    xatol: float = DEFAULT_Q0_XATOL,
+    maxiter: int = DEFAULT_Q0_MAXITER,
     adaptive_bracketing: bool,
     q0_step: float,
     max_bracket_steps: int,
@@ -545,6 +558,8 @@ def _build_rectangular_pending_requests(
                 hard_q0_min=hard_q0_min,
                 hard_q0_max=hard_q0_max,
                 target_metric=str(target_metric),
+                xatol=float(xatol),
+                maxiter=int(maxiter),
                 adaptive_bracketing=bool(adaptive_bracketing),
                 q0_step=float(q0_step),
                 max_bracket_steps=int(max_bracket_steps),
@@ -915,6 +930,8 @@ class _SparsePointEvaluationRequest:
     nx: int | None
     ny: int | None
     pixel_scale_arcsec: float | None
+    xatol: float
+    maxiter: int
 
 
 @dataclass(frozen=True)
@@ -956,6 +973,10 @@ def _evaluate_sparse_point_request(
         str(float(task.q0_max)),
         "--target-metric",
         str(request.target_metric),
+        "--xatol",
+        str(float(request.xatol)),
+        "--maxiter",
+        str(int(request.maxiter)),
         "--q0-step",
         str(float(request.q0_step)),
         "--max-bracket-steps",
@@ -1127,10 +1148,11 @@ def _save_ab_scan_h5(
     rho2: np.ndarray,
     eta2: np.ndarray,
     success: np.ndarray,
+    psf_kernel: np.ndarray | None,
     point_payloads: dict[tuple[int, int], dict[str, Any]],
     run_history: list[dict[str, Any]] | None = None,
 ) -> None:
-    save_rectangular_scan_file(
+    write_grid_scan_artifact(
         out_h5,
         observed=observed,
         sigma_map=sigma_map,
@@ -1145,6 +1167,7 @@ def _save_ab_scan_h5(
         rho2=rho2,
         eta2=eta2,
         success=success,
+        psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         point_payloads=point_payloads,
         slice_key=slice_descriptor_from_diagnostics(diagnostics)["key"],
         run_history=run_history,
@@ -1164,6 +1187,13 @@ class _RectangularWorkerBootstrap:
     observed: np.ndarray
     sigma: np.ndarray
     psf_kernel: np.ndarray | None
+    observation_reference: Any = None
+    threshold: float = 0.1
+    explicit_mask: np.ndarray | None = None
+    q0_search_stages: tuple[str, ...] = ("union",)
+    use_smoothed_obs_max: bool = True
+    use_emthreshold: bool = True
+    emthreshold: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -1175,6 +1205,13 @@ class _RectangularWorkerState:
     observed: np.ndarray
     sigma: np.ndarray
     psf_kernel: np.ndarray | None
+    observation_reference: Any = None
+    threshold: float = 0.1
+    explicit_mask: np.ndarray | None = None
+    q0_search_stages: tuple[str, ...] = ("union",)
+    use_smoothed_obs_max: bool = True
+    use_emthreshold: bool = True
+    emthreshold: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -1184,6 +1221,8 @@ class _RectangularPointEvaluationRequest:
     hard_q0_min: float | None
     hard_q0_max: float | None
     target_metric: str
+    xatol: float
+    maxiter: int
     adaptive_bracketing: bool
     q0_step: float
     max_bracket_steps: int
@@ -1311,6 +1350,15 @@ def _bootstrap_rectangular_worker(payload: _RectangularWorkerBootstrap) -> _Rect
         observed=np.asarray(payload.observed, dtype=float),
         sigma=np.asarray(payload.sigma, dtype=float),
         psf_kernel=None if payload.psf_kernel is None else np.asarray(payload.psf_kernel, dtype=float),
+        observation_reference=payload.observation_reference,
+        threshold=float(payload.threshold),
+        explicit_mask=(
+            None if payload.explicit_mask is None else np.asarray(payload.explicit_mask, dtype=bool)
+        ),
+        q0_search_stages=tuple(str(stage) for stage in payload.q0_search_stages),
+        use_smoothed_obs_max=bool(payload.use_smoothed_obs_max),
+        use_emthreshold=bool(payload.use_emthreshold),
+        emthreshold=float(payload.emthreshold),
     )
 
 
@@ -1383,12 +1431,21 @@ def _evaluate_rectangular_point_request(
             q0_max=float(task.q0_max),
             hard_q0_min=request.hard_q0_min,
             hard_q0_max=request.hard_q0_max,
+            threshold=float(worker_state.threshold),
+            explicit_mask=worker_state.explicit_mask,
             target_metric=str(request.target_metric),
+            xatol=float(request.xatol),
+            maxiter=int(request.maxiter),
             adaptive_bracketing=bool(request.adaptive_bracketing),
             q0_start=request.q0_start,
             q0_step=float(request.q0_step),
             max_bracket_steps=int(request.max_bracket_steps),
             initial_evaluations=initial_evaluations,
+            observation_reference=worker_state.observation_reference,
+            q0_search_stages=worker_state.q0_search_stages,
+            use_smoothed_obs_max=worker_state.use_smoothed_obs_max,
+            use_emthreshold=worker_state.use_emthreshold,
+            emthreshold=float(worker_state.emthreshold),
         )
 
         cached_best_pair = _lookup_cached_render_pair(render_cache, result.q0)
@@ -1542,6 +1599,8 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--use-idl-q0-start-heuristic", action=argparse.BooleanOptionalAction, default=False, help="Use the IDL empirical Q0_start(a,b) heuristic if no scalar start is given.")
     p.add_argument("--q0-step", type=float, default=1.61803398875, help="Multiplicative Q0 step for adaptive bracketing.")
     p.add_argument("--max-bracket-steps", type=int, default=12, help="Maximum adaptive bracketing expansion steps.")
+    p.add_argument("--xatol", type=float, default=DEFAULT_Q0_XATOL, help="Absolute q0 tolerance for bounded minimization.")
+    p.add_argument("--maxiter", type=int, default=DEFAULT_Q0_MAXITER, help="Maximum bounded-minimizer iterations.")
     p.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
     p.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     p.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
@@ -1563,9 +1622,6 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--psf-bmaj-arcsec", type=float, default=None, help="PSF major axis FWHM.")
     p.add_argument("--psf-bmin-arcsec", type=float, default=None, help="PSF minor axis FWHM.")
     p.add_argument("--psf-bpa-deg", type=float, default=None, help="PSF position angle in degrees.")
-    p.add_argument("--fallback-psf-bmaj-arcsec", type=float, default=None, help="Fallback PSF major axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied.")
-    p.add_argument("--fallback-psf-bmin-arcsec", type=float, default=None, help="Fallback PSF minor axis FWHM used only when the FITS header has no beam and no explicit PSF override is supplied.")
-    p.add_argument("--fallback-psf-bpa-deg", type=float, default=None, help="Fallback PSF position angle used only when the FITS header has no beam and no explicit PSF override is supplied.")
     p.add_argument("--psf-ref-frequency-ghz", type=float, default=None, help="Reference frequency for PSF axes values.")
     p.add_argument("--psf-scale-inverse-frequency", action="store_true", help="Scale PSF axes by (ref_freq / active_freq).")
 
@@ -1610,6 +1666,7 @@ def parse_args() -> tuple[argparse.ArgumentParser, argparse.Namespace]:
     p.add_argument("--spinner", action=argparse.BooleanOptionalAction, default=True, help="Show a spinner during long-running stages.")
     p.add_argument("--validate-only", action="store_true", help="Validate inputs and artifact compatibility, then exit before creating/updating artifacts or running scan points.")
     p.add_argument("--defaults", action="store_true", help="Print assumed defaults and exit.")
+    add_chmp_search_cli_arguments(p)
     return p, p.parse_args()
 
 
@@ -1651,6 +1708,8 @@ def main() -> int:
             "use_idl_q0_start_heuristic": False,
             "q0_step": 1.61803398875,
             "max_bracket_steps": 12,
+            "xatol": DEFAULT_Q0_XATOL,
+            "maxiter": DEFAULT_Q0_MAXITER,
             "tr_mask_bmin_gauss": 1000.0,
             "metrics_mask_threshold": 0.1,
             "metrics_mask_fits": None,
@@ -1715,8 +1774,6 @@ def main() -> int:
             name="b",
         )
 
-    if obs_request.obs_path is not None and not obs_request.obs_path.exists():
-        parser.error(f"observational FITS file not found: {obs_request.obs_path}")
     if not args.model_h5.exists() or args.ebtel_path is None or not args.ebtel_path.exists():
         parser.error("model_h5 and --ebtel-path must both exist")
 
@@ -1742,9 +1799,6 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    if obs_map.domain == "mw" and obs_map.frequency_ghz is None:
-        parser.error("could not extract MW observing frequency from the selected observation")
-
     obs_source_detail = (
         str(obs_request.obs_path)
         if obs_request.obs_path is not None
@@ -1768,15 +1822,8 @@ def main() -> int:
         print(f"  Frequency: {freq_ghz:.3f} GHz")
     print(f"  Data range: [{observed.min():.2f}, {observed.max():.2f}]")
 
-    print("\nEstimating noise from map...")
-    noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
-    sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
-    noise_diag = noise_result.diagnostics
-    if str(noise_result.method_used) == "fallback_std":
-        print(f"  Noise estimate unavailable; using sigma={float(noise_result.sigma):.2f} K")
-    else:
-        print(f"  Estimated sigma: {noise_result.sigma:.2f} K")
-        print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
+    sigma_map: np.ndarray | None = None
+    noise_diag: dict[str, Any] = {}
 
     sdk = import_module("gxrender.sdk")
 
@@ -1787,27 +1834,27 @@ def main() -> int:
     psf_bmaj_arcsec = float(args.psf_bmaj_arcsec) if args.psf_bmaj_arcsec is not None else None
     psf_bmin_arcsec = float(args.psf_bmin_arcsec) if args.psf_bmin_arcsec is not None else None
     psf_bpa_deg = float(args.psf_bpa_deg) if args.psf_bpa_deg is not None else None
-    fallback_psf_bmaj_arcsec = float(args.fallback_psf_bmaj_arcsec) if args.fallback_psf_bmaj_arcsec is not None else None
-    fallback_psf_bmin_arcsec = float(args.fallback_psf_bmin_arcsec) if args.fallback_psf_bmin_arcsec is not None else None
-    fallback_psf_bpa_deg = float(args.fallback_psf_bpa_deg) if args.fallback_psf_bpa_deg is not None else None
-    has_cli_psf_override = any(value is not None for value in (args.psf_bmaj_arcsec, args.psf_bmin_arcsec, args.psf_bpa_deg))
-    has_cli_psf_fallback = any(
-        value is not None for value in (args.fallback_psf_bmaj_arcsec, args.fallback_psf_bmin_arcsec, args.fallback_psf_bpa_deg)
+    selected_psf_metadata = _resolve_selected_psf_metadata(
+        header_psf=header_psf,
+        header_psf_source=header_psf_source,
+        domain=str(obs_map.domain),
+        instrument_name=str(obs_map.instrument) if obs_map.instrument is not None else None,
+        wavelength_angstrom=None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        date_obs=obs_map.date_obs,
+        cli_psf_bmaj_arcsec=psf_bmaj_arcsec,
+        cli_psf_bmin_arcsec=psf_bmin_arcsec,
+        cli_psf_bpa_deg=psf_bpa_deg,
+        override_header_psf=False,
     )
-    if header_psf is not None and not has_cli_psf_override:
-        psf_bmaj_arcsec = float(header_psf["psf_bmaj_arcsec"])
-        psf_bmin_arcsec = float(header_psf["psf_bmin_arcsec"])
-        psf_bpa_deg = float(header_psf["psf_bpa_deg"])
-        psf_source = header_psf_source
-    elif has_cli_psf_override:
-        psf_source = "cli_override"
-    elif has_cli_psf_fallback:
-        psf_bmaj_arcsec = fallback_psf_bmaj_arcsec
-        psf_bmin_arcsec = fallback_psf_bmin_arcsec
-        psf_bpa_deg = fallback_psf_bpa_deg
-        psf_source = "cli_fallback"
+    psf_source = "none" if selected_psf_metadata is None else str(selected_psf_metadata.source)
+    if selected_psf_metadata is not None and selected_psf_metadata.kind == "gaussian":
+        psf_bmaj_arcsec = selected_psf_metadata.bmaj_arcsec
+        psf_bmin_arcsec = selected_psf_metadata.bmin_arcsec
+        psf_bpa_deg = selected_psf_metadata.bpa_deg
     else:
-        psf_source = "none"
+        psf_bmaj_arcsec = None
+        psf_bmin_arcsec = None
+        psf_bpa_deg = None
 
     observer_overrides, observer_source = _resolve_observer_overrides(
         sdk,
@@ -1820,27 +1867,67 @@ def main() -> int:
     model_observer_meta = _load_model_observer_metadata(args.model_h5)
 
     geometry_overrides_requested = any(v is not None for v in (args.xc, args.yc, args.dx, args.dy, args.nx, args.ny))
+    explicit_observer_requested = any(v is not None for v in (args.observer, args.dsun_cm, args.lonc_deg, args.b0sun_deg))
     saved_fov = None
     if geometry_overrides_requested:
         geometry = sdk.MapGeometry(xc=args.xc, yc=args.yc, dx=args.dx, dy=args.dy, nx=args.nx, ny=args.ny)
-        geometry_mode = "explicit"
+        geometry_policy = resolve_geometry_policy(
+            obs_map=obs_map,
+            model_observer_meta=model_observer_meta,
+            saved_fov=None,
+            geometry_overrides_requested=True,
+            explicit_observer_requested=explicit_observer_requested,
+        )
+        geometry_mode = geometry_policy.geometry_mode
     else:
         saved_fov = _load_saved_fov_from_model(args.model_h5)
-        if saved_fov is None:
-            parser.error("model does not expose a saved FOV; provide explicit geometry overrides")
-        dx_eff = float(args.pixel_scale_arcsec)
-        dy_eff = float(args.pixel_scale_arcsec)
-        nx_eff = max(16, int(round(float(saved_fov["xsize_arcsec"]) / abs(dx_eff))))
-        ny_eff = max(16, int(round(float(saved_fov["ysize_arcsec"]) / abs(dy_eff))))
-        geometry = sdk.MapGeometry(
-            xc=float(saved_fov["xc_arcsec"]),
-            yc=float(saved_fov["yc_arcsec"]),
-            dx=dx_eff,
-            dy=dy_eff,
-            nx=nx_eff,
-            ny=ny_eff,
+        geometry_policy = resolve_geometry_policy(
+            obs_map=obs_map,
+            model_observer_meta=model_observer_meta,
+            saved_fov=saved_fov,
+            geometry_overrides_requested=False,
+            explicit_observer_requested=explicit_observer_requested,
         )
-        geometry_mode = "saved_fov"
+        geometry_observer_name = (
+            None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+        )
+        geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
+        resolved_geometry = resolve_render_geometry_via_gxrender(
+            model_path=args.model_h5,
+            model_format="auto",
+            ebtel_path=str(args.ebtel_path) if args.ebtel_path is not None else None,
+            pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+            observer_name=geometry_observer_name,
+            observer=geometry_observer,
+            omp_threads=int(getattr(args, "omp_threads", 8)),
+            use_saved_fov=bool(geometry_policy.use_model_saved_fov),
+        )
+        geometry = resolved_geometry.geometry
+        geometry_mode = f"gxrender:{resolved_geometry.center_source}"
+
+    if not explicit_observer_requested:
+        observer_overrides = sdk.ObserverOverrides(
+            dsun_cm=float(geometry_policy.observer_dsun_cm),
+            lonc_deg=float(geometry_policy.observer_lonc_deg),
+            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
+        )
+        observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+    effective_observer_name = str(args.observer or geometry_policy.observer_name)
+    effective_observer_lonc_deg = float(
+        getattr(observer_overrides, "lonc_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "lonc_deg", None) is not None
+        else geometry_policy.observer_lonc_deg
+    )
+    effective_observer_b0sun_deg = float(
+        getattr(observer_overrides, "b0sun_deg", None)
+        if observer_overrides is not None and getattr(observer_overrides, "b0sun_deg", None) is not None
+        else geometry_policy.observer_b0sun_deg
+    )
+    effective_observer_dsun_cm = float(
+        getattr(observer_overrides, "dsun_cm", None)
+        if observer_overrides is not None and getattr(observer_overrides, "dsun_cm", None) is not None
+        else geometry_policy.observer_dsun_cm
+    )
 
     target_header = _build_target_header(
         nx=int(geometry.nx),
@@ -1853,23 +1940,134 @@ def main() -> int:
     )
     target_header = _with_observer_wcs_keywords(
         target_header,
-        observer_name=str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        hgln_obs_deg=float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        hglt_obs_deg=float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        dsun_obs_m=float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)) / 100.0,
+        observer_name=effective_observer_name,
+        hgln_obs_deg=effective_observer_lonc_deg,
+        hglt_obs_deg=effective_observer_b0sun_deg,
+        dsun_obs_m=effective_observer_dsun_cm / 100.0,
     )
-    observed_cropped = _regrid_full_disk_to_target(observed, header, target_header)
-    sigma_cropped = _regrid_full_disk_to_target(sigma_map, header, target_header)
-    if np.isnan(observed_cropped).any():
-        observed_cropped = np.nan_to_num(observed_cropped, nan=float(np.nanmedian(observed_cropped)))
-    if np.isnan(sigma_cropped).any():
-        fill_sigma = float(np.nanmedian(sigma_cropped))
-        if not np.isfinite(fill_sigma) or fill_sigma <= 0:
-            fill_sigma = float(np.nanmedian(sigma_map))
-        sigma_cropped = np.nan_to_num(sigma_cropped, nan=fill_sigma)
+    model_obs_time = str(
+        model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(args.model_h5) or ""
+    ).strip()
+    obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
+    pre_artifacts_dir = args.artifacts_dir or (Path(".").resolve() / "ab_scan_artifacts")
+    pre_stem = args.artifacts_stem or f"{observation_stem}_ab_scan_{args.target_metric}"
+    pre_out_h5 = Path(args.artifact_h5) if args.artifact_h5 is not None else pre_artifacts_dir / f"{pre_stem}.h5"
+    pre_slice_key = str(
+        slice_descriptor_from_diagnostics(
+            {
+                "spectral_domain": str(obs_map.domain),
+                "spectral_label": str(obs_map.spectral_label or (f"{float(freq_ghz):.3f} GHz" if freq_ghz is not None else "slice")),
+                "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
+                "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+            }
+        )["key"]
+    )
+    stored_slice_payload = None
+    if pre_out_h5.exists() and not bool(args.recompute_existing):
+        try:
+            stored_slice_payload = load_scan_file(pre_out_h5, slice_key=pre_slice_key, include_maps=True)
+        except KeyError:
+            stored_slice_payload = None
+    observation_source_path = obs_map.source_path
+    observation_source_file = _resolve_existing_file(observation_source_path)
+    observation_source_sha256 = (
+        _compute_file_sha256(observation_source_file)
+        if observation_source_file is not None and observation_source_file.is_file()
+        else None
+    )
+    artifact_geometry_sha256_value = artifact_geometry_sha256(
+        build_artifact_geometry_block(
+            {
+                "map_xc_arcsec": float(geometry.xc),
+                "map_yc_arcsec": float(geometry.yc),
+                "map_dx_arcsec": float(geometry.dx),
+                "map_dy_arcsec": float(geometry.dy),
+                "map_nx": int(geometry.nx),
+                "map_ny": int(geometry.ny),
+                "observer_name": effective_observer_name,
+                "observer_lonc_deg": effective_observer_lonc_deg,
+                "observer_b0sun_deg": effective_observer_b0sun_deg,
+                "observer_dsun_cm": effective_observer_dsun_cm,
+                "observer_obs_time": target_header.get("DATE-OBS", ""),
+            }
+        )
+    )
+    if stored_slice_payload is None:
+        print("\nEstimating noise from map...")
+        noise_result = estimate_obs_map_noise(obs_map, method="histogram_clip")
+        noise_unit = obs_map_noise_unit_label(obs_map)
+        sigma_map = np.asarray(noise_result.sigma_map, dtype=float)
+        noise_diag = dict(noise_result.diagnostics)
+        print(
+            f"  Estimated sigma: {noise_result.sigma:.2f} {noise_unit} "
+            f"(method={str(noise_result.method_used)})"
+        )
+        if np.isfinite(float(noise_result.mask_fraction)):
+            print(f"  Background fraction: {noise_result.mask_fraction:.1%}")
+    try:
+        shift_policy, max_shift_arcsec, xy_shift_arcsec = resolve_shift_policy_from_args(args)
+        slice_obs_ref = resolve_slice_observation_reference(
+            observed,
+            header,
+            target_header,
+            sigma=sigma_map,
+            observation_source_sha256=observation_source_sha256,
+            artifact_geometry_sha256=artifact_geometry_sha256_value,
+            model_time_text=model_obs_time or None,
+            observation_time_text=obs_time_text or None,
+            stored_slice_payload=stored_slice_payload,
+            force_recompute=bool(args.recompute_existing),
+            shift_policy=shift_policy,
+            max_shift_arcsec=max_shift_arcsec,
+            xy_shift_arcsec=xy_shift_arcsec,
+        )
+    except SliceObservationReferenceError as exc:
+        parser.error(str(exc))
+    observed_cropped = np.asarray(slice_obs_ref.observed, dtype=float)
+    sigma_cropped = np.asarray(slice_obs_ref.sigma, dtype=float)
+    obs_preprocess_diag = dict(slice_obs_ref.diagnostics)
+    if slice_obs_ref.restored_from_artifact:
+        stored_noise_diag = dict(dict(stored_slice_payload or {}).get("diagnostics") or {}).get("noise_diagnostics") or {}
+        if stored_noise_diag:
+            noise_diag = dict(stored_noise_diag)
+        finite_sigma = sigma_cropped[np.isfinite(sigma_cropped)]
+        restored_sigma = float(np.nanmedian(finite_sigma)) if finite_sigma.size else float("nan")
+        noise_unit = obs_map_noise_unit_label(obs_map)
+        print(
+            "  Slice observation reference: restored rotated+regridded observed/sigma maps "
+            f"from artifact slice metadata (median sigma={restored_sigma:.2f} {noise_unit})"
+        )
+    else:
+        for warning_line in obs_preprocess_diag.get("observation_time_warning_lines", ()):
+            print(warning_line)
+        if obs_preprocess_diag.get("observation_time_rotation_applied"):
+            print(f"  {obs_preprocess_diag.get('observation_time_alignment_message', '')}")
+        elif str(obs_preprocess_diag.get("observation_time_alignment", "")) not in {"exact", "unknown"}:
+            print(f"  {obs_preprocess_diag.get('observation_time_alignment_message', '')}")
+
+    explicit_metric_mask = None
+    if args.metrics_mask_fits is not None:
+        explicit_metric_mask = _load_explicit_metric_mask(
+            args.metrics_mask_fits,
+            expected_shape=tuple(np.asarray(observed_cropped, dtype=float).shape),
+        )
+    metrics_mask_type = "explicit_fits" if explicit_metric_mask is not None else "union"
+    chmp_settings = resolve_chmp_search_settings(
+        args,
+        mask_type=metrics_mask_type,
+        explicit_mask=explicit_metric_mask,
+    )
+    if len(chmp_settings.q0_search_stages) > 1:
+        print(f"  Q0 search stages: {', '.join(chmp_settings.q0_search_stages)}")
 
     print("\nPreparing model-aligned observational submap...")
     print(f"  Observer mode: {'saved metadata' if observer_overrides is None else 'overrides'} ({observer_source})")
+    print(
+        "  Geometry policy: "
+        f"obs_los={geometry_policy.observation_observer or '<unknown>'} "
+        f"model_los={geometry_policy.model_observer or '<unknown>'} "
+        f"aligned={geometry_policy.los_aligned}; render_geometry_resolver=gxrender"
+    )
     print(f"  Geometry mode: {geometry_mode} xc={float(geometry.xc):.3f} yc={float(geometry.yc):.3f} dx={float(geometry.dx):.3f} dy={float(geometry.dy):.3f} nx={int(geometry.nx)} ny={int(geometry.ny)}")
     print(f"  Observed submap grid: Ny={observed_cropped.shape[0]} Nx={observed_cropped.shape[1]}")
     print(f"  Model render grid: Ny={int(geometry.ny)} Nx={int(geometry.nx)}")
@@ -2101,14 +2299,33 @@ def main() -> int:
     }
 
     model_sha256 = _compute_file_sha256(args.model_h5)
-    observation_source_path = obs_map.source_path
-    observation_source_file = _resolve_existing_file(observation_source_path)
-    observation_source_sha256 = (
-        _compute_file_sha256(observation_source_file)
-        if observation_source_file is not None and observation_source_file.is_file()
-        else None
-    )
     ebtel_sha256 = _compute_file_sha256(args.ebtel_path)
+    euv_response_identity = None
+    resolved_euv_channel = None
+    if str(obs_map.domain).lower() in {"euv", "uv"} and obs_map.wavelength_angstrom is not None:
+        wavelength_value = float(obs_map.wavelength_angstrom)
+        rounded_wavelength = round(wavelength_value)
+        resolved_euv_channel = (
+            str(int(rounded_wavelength))
+            if np.isclose(wavelength_value, float(rounded_wavelength), rtol=0.0, atol=1e-9)
+            else f"{wavelength_value:g}"
+        )
+        euv_response_identity = resolve_euv_response_identity(
+            model_path=str(args.model_h5),
+            channel=str(resolved_euv_channel),
+            instrument=str(obs_map.instrument),
+            response_sav=args.euv_response_sav,
+            ebtel_path=str(args.ebtel_path),
+            tbase=float(args.tbase),
+            nbase=float(args.nbase),
+            a=float(a_values[0]),
+            b=float(b_values[0]),
+            geometry=geometry,
+            observer=observer_overrides,
+            observer_name=effective_observer_name,
+            tr_region_mask=euv_tr_mask,
+            pixel_scale_arcsec=float(args.pixel_scale_arcsec),
+        )
     root_diag = {
         "artifact_kind": UNIFIED_ARTIFACT_KIND,
         "spectral_domain": str(obs_map.domain),
@@ -2129,8 +2346,18 @@ def main() -> int:
         "target_metric": str(args.target_metric),
         "frequency_ghz": None if freq_ghz is None else float(freq_ghz),
         "wavelength_angstrom": None if obs_map.wavelength_angstrom is None else float(obs_map.wavelength_angstrom),
+        "euv_channel": resolved_euv_channel,
         "euv_instrument": obs_map.instrument,
         "euv_response_sav": None if args.euv_response_sav is None else str(args.euv_response_sav),
+        "euv_response_identity_version": None if euv_response_identity is None else str(euv_response_identity.version),
+        "euv_response_sha256": None if euv_response_identity is None else str(euv_response_identity.sha256),
+        "euv_response_source": (
+            None if euv_response_identity is None else euv_response_identity.summary.get("source")
+        ),
+        "euv_response_mode": None if euv_response_identity is None else euv_response_identity.summary.get("mode"),
+        "euv_response_identity_summary": (
+            None if euv_response_identity is None else dict(euv_response_identity.summary)
+        ),
         "tr_mask_bmin_gauss": abs(float(args.tr_mask_bmin_gauss)) if str(obs_map.domain).lower() in {"euv", "uv"} else None,
         "tr_mask_source": ("abs_blos_ge_bmin" if str(obs_map.domain).lower() in {"euv", "uv"} else None),
         "metrics_mask_threshold": float(args.metrics_mask_threshold),
@@ -2143,11 +2370,17 @@ def main() -> int:
         "map_nx": int(geometry.nx),
         "map_ny": int(geometry.ny),
         "noise_diagnostics": noise_diag,
-        "observer_name": str(model_observer_meta.get("observer_name", args.observer or "earth")),
-        "observer_lonc_deg": float(model_observer_meta.get("observer_lonc_deg", 0.0)),
-        "observer_b0sun_deg": float(model_observer_meta.get("observer_b0sun_deg", 0.0)),
-        "observer_dsun_cm": float(model_observer_meta.get("observer_dsun_cm", 1.495978707e13)),
+        "observer_name": effective_observer_name,
+        "observer_lonc_deg": effective_observer_lonc_deg,
+        "observer_b0sun_deg": effective_observer_b0sun_deg,
+        "observer_dsun_cm": effective_observer_dsun_cm,
         "observer_obs_time": target_header.get("DATE-OBS", ""),
+        **obs_preprocess_diag,
+        "geometry_policy_mode": geometry_mode,
+        "geometry_policy_reason": "resolved_by_gxrender_observer_fov_policy",
+        "geometry_policy_observation_los": geometry_policy.observation_observer,
+        "geometry_policy_model_los": geometry_policy.model_observer,
+        "geometry_policy_los_aligned": geometry_policy.los_aligned,
         "execution_policy_requested": str(args.execution_policy),
         "execution_policy_resolved": str(execution_plan.policy),
         "execution_max_workers": int(execution_plan.max_workers),
@@ -2171,6 +2404,11 @@ def main() -> int:
             "spectral_label": root_diag["spectral_label"],
             "ebtel_sha256": root_diag["ebtel_sha256"],
             "frequency_ghz": root_diag["frequency_ghz"],
+            "wavelength_angstrom": root_diag["wavelength_angstrom"],
+            "euv_channel": root_diag["euv_channel"],
+            "euv_instrument": root_diag["euv_instrument"],
+            "euv_response_identity_version": root_diag["euv_response_identity_version"],
+            "euv_response_sha256": root_diag["euv_response_sha256"],
             "map_xc_arcsec": root_diag["map_xc_arcsec"],
             "map_yc_arcsec": root_diag["map_yc_arcsec"],
             "map_dx_arcsec": root_diag["map_dx_arcsec"],
@@ -2182,6 +2420,9 @@ def main() -> int:
             "observer_b0sun_deg": root_diag["observer_b0sun_deg"],
             "observer_dsun_cm": root_diag["observer_dsun_cm"],
             "observer_obs_time": root_diag["observer_obs_time"],
+            "slice_observation_identity_sha256": root_diag.get("slice_observation_identity_sha256"),
+            "preprocessed_observation_sha256": root_diag.get("preprocessed_observation_sha256"),
+            "preprocessed_sigma_sha256": root_diag.get("preprocessed_sigma_sha256"),
             "psf_source": root_diag["psf_source"],
             "psf_bmaj_arcsec": root_diag["psf_bmaj_arcsec"],
             "psf_bmin_arcsec": root_diag["psf_bmin_arcsec"],
@@ -2208,13 +2449,14 @@ def main() -> int:
             )
 
         if not out_h5.exists() and not bool(args.validate_only):
-            write_sparse_scan_file(
+            write_point_scan_artifact(
                 out_h5,
                 observed=observed_cropped,
                 sigma_map=sigma_cropped,
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 blos_reference=common_blos_reference,
+                psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
                 point_records=[],
                 run_history=current_run_history,
             )
@@ -2391,6 +2633,8 @@ def main() -> int:
                     hard_q0_min=args.hard_q0_min,
                     hard_q0_max=args.hard_q0_max,
                     target_metric=str(args.target_metric),
+                    xatol=float(args.xatol),
+                    maxiter=int(args.maxiter),
                     adaptive_bracketing=bool(args.adaptive_bracketing),
                     q0_step=float(args.q0_step),
                     max_bracket_steps=int(args.max_bracket_steps),
@@ -2491,6 +2735,7 @@ def main() -> int:
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 blos_reference=common_blos_reference,
+                psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
                 point_payload=point_payload,
             )
             _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")
@@ -2623,6 +2868,7 @@ def main() -> int:
         rho2=rho2,
         eta2=eta2,
         success=success,
+        psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         point_payloads=point_payloads,
         run_history=current_run_history,
     )
@@ -2667,6 +2913,8 @@ def main() -> int:
         hard_q0_min=args.hard_q0_min,
         hard_q0_max=args.hard_q0_max,
         target_metric=str(args.target_metric),
+        xatol=float(args.xatol),
+        maxiter=int(args.maxiter),
         adaptive_bracketing=bool(args.adaptive_bracketing),
         q0_step=float(args.q0_step),
         max_bracket_steps=int(args.max_bracket_steps),
@@ -2714,6 +2962,13 @@ def main() -> int:
             observed=np.asarray(observed_cropped, dtype=float),
             sigma=np.asarray(sigma_cropped, dtype=float),
             psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
+            observation_reference=slice_obs_ref,
+            threshold=float(args.metrics_mask_threshold),
+            explicit_mask=explicit_metric_mask,
+            q0_search_stages=chmp_settings.q0_search_stages,
+            use_smoothed_obs_max=chmp_settings.use_smoothed_obs_max,
+            use_emthreshold=chmp_settings.use_emthreshold,
+            emthreshold=chmp_settings.emthreshold,
         )
         execution_settings = ABExecutionSettings(
             policy=execution_plan.policy,
@@ -2841,6 +3096,8 @@ def main() -> int:
                     "optimizer_message": str(response.message),
                     "nfev": int(response.nfev),
                     "nit": int(response.nit),
+                    "xatol": float(args.xatol),
+                    "maxiter": int(args.maxiter),
                     "used_adaptive_bracketing": bool(response.used_adaptive_bracketing),
                     "bracket_found": bool(response.bracket_found),
                     "bracket": [float(v) for v in response.bracket] if response.bracket is not None else None,
@@ -2940,6 +3197,7 @@ def main() -> int:
                 wcs_header=target_header,
                 diagnostics=root_diag,
                 blos_reference=common_blos_reference,
+                psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
                 point_payload=point_payloads[(int(i), int(j))],
             )
             _notify_viewer_refresh(f"point {point_counter}/{stage_total} saved")

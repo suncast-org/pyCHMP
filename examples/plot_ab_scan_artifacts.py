@@ -20,20 +20,30 @@ try:
         METRICS,
         best_grid_index,
         build_patch_grid_model,
+        default_point_index,
+        grid_patch_rectangle,
         load_scan_file,
         nearest_index,
+        resolve_point_index,
         with_observer_metadata,
     )
+    from pychmp.obs_preprocessing import resolve_trial_observation_for_display
+    from pychmp.search_contract import apply_search_shift_diagnostics
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from pychmp.ab_scan_artifacts import (
         METRICS,
         best_grid_index,
         build_patch_grid_model,
+        default_point_index,
+        grid_patch_rectangle,
         load_scan_file,
         nearest_index,
+        resolve_point_index,
         with_observer_metadata,
     )
+    from pychmp.obs_preprocessing import resolve_trial_observation_for_display
+    from pychmp.search_contract import apply_search_shift_diagnostics
 
 
 
@@ -67,6 +77,7 @@ def _plot_grid_summary(
 
     a_values = np.asarray(payload["a_values"], dtype=float)
     b_values = np.asarray(payload["b_values"], dtype=float)
+    a_index, b_index = resolve_point_index(payload, metric=str(payload.get("target_metric", "chi2")), a_index=a_index, b_index=b_index)
     grid_model = build_patch_grid_model(payload)
     records = list(grid_model["records"])
     record_lookup = {(int(record["a_index"]), int(record["b_index"])): record for record in records}
@@ -104,12 +115,9 @@ def _plot_grid_summary(
         else:
             values = np.asarray([float(record["metrics"].get(name, np.nan)) for record in records], dtype=float)
         patches = [
-            Rectangle(
-                (float(record["b0"]), float(record["a0"])),
-                float(record["b1"]) - float(record["b0"]),
-                float(record["a1"]) - float(record["a0"]),
-            )
+            Rectangle((x, y), width, height)
             for record in records
+            for x, y, width, height in (grid_patch_rectangle(record),)
         ]
         collection = PatchCollection(patches, cmap="viridis", edgecolor="none", linewidth=0.0)
         collection.set_array(values)
@@ -117,17 +125,17 @@ def _plot_grid_summary(
         if np.any(finite):
             collection.set_clim(float(np.nanmin(values[finite])), float(np.nanmax(values[finite])))
         ax.add_collection(collection)
-        ax.set_xlim(float(grid_model["b_min"]), float(grid_model["b_max"]))
-        ax.set_ylim(float(grid_model["a_min"]), float(grid_model["a_max"]))
+        ax.set_xlim(float(grid_model["a_min"]), float(grid_model["a_max"]))
+        ax.set_ylim(float(grid_model["b_min"]), float(grid_model["b_max"]))
         ax.set_aspect("equal", adjustable="box")
         ax.set_title(title)
-        ax.set_xlabel("b")
-        ax.set_ylabel("a")
+        ax.set_xlabel("a")
+        ax.set_ylabel("b")
         fig.colorbar(collection, ax=ax, fraction=0.046, pad=0.04)
         for metric_name, color, marker, _ai, _bi, a_center, b_center, _a_val, _b_val, _q0_best, _metric_value in best_points:
             ax.scatter(
-                [b_center],
                 [a_center],
+                [b_center],
                 s=80,
                 marker=marker,
                 facecolor="none",
@@ -139,8 +147,8 @@ def _plot_grid_summary(
         selected_b = float(selected_record["b_center"]) if selected_record is not None else float(b_values[b_index])
         selected_a = float(selected_record["a_center"]) if selected_record is not None else float(a_values[a_index])
         ax.scatter(
-            [selected_b],
             [selected_a],
+            [selected_b],
             s=120,
             marker="x",
             color="white",
@@ -204,17 +212,42 @@ def _plot_selected_point(
     show_plot: bool,
     defer_show: bool = False,
 ) -> None:
-    a_values = np.asarray(payload["a_values"], dtype=float)
-    b_values = np.asarray(payload["b_values"], dtype=float)
-    a_index = int(np.clip(int(a_index), 0, max(0, a_values.size - 1)))
-    b_index = int(np.clip(int(b_index), 0, max(0, b_values.size - 1)))
+    a_index, b_index = resolve_point_index(payload, metric=str(payload.get("target_metric", "chi2")), a_index=a_index, b_index=b_index)
     point = payload["points"][(a_index, b_index)]
     diagnostics = dict(payload["diagnostics"])
     diagnostics.update(point["diagnostics"])
+    diagnostics = apply_search_shift_diagnostics(
+        diagnostics,
+        search_request=dict(payload.get("selected_search") or {}).get("request") or {},
+    )
     diagnostics["fit_q0_trials"] = np.asarray(point["fit_q0_trials"], dtype=float).tolist()
     diagnostics["fit_metric_trials"] = np.asarray(point["fit_metric_trials"], dtype=float).tolist()
+    diagnostics["fit_shift_x_trials"] = list(point.get("fit_shift_x_trials") or ())
+    diagnostics["fit_shift_y_trials"] = list(point.get("fit_shift_y_trials") or ())
+    diagnostics["fit_find_shift_valid_trials"] = list(point.get("fit_find_shift_valid_trials") or ())
     diagnostics["q0_recovered"] = float(point["q0"])
     diagnostics["target_metric"] = str(point["target_metric"])
+    best_trial_index = point.get("best_trial_index")
+    if best_trial_index is None:
+        metric_trials = np.asarray(point["fit_metric_trials"], dtype=float)
+        if metric_trials.size:
+            best_trial_index = int(np.nanargmin(metric_trials))
+    if best_trial_index is not None:
+        diagnostics["selected_trial_index"] = int(best_trial_index)
+    display_observed, _display_sigma = resolve_trial_observation_for_display(
+        observed=np.asarray(payload["observed"], dtype=float),
+        sigma=payload.get("sigma_map"),
+        model_header=payload["wcs_header"],
+        diagnostics=diagnostics,
+        observation_canvas=payload.get("observation_canvas"),
+        sigma_canvas=payload.get("sigma_canvas"),
+        canvas_header=payload.get("canvas_wcs_header"),
+        trial_index=int(best_trial_index) if best_trial_index is not None else None,
+        fit_shift_x_trials=point.get("fit_shift_x_trials"),
+        fit_shift_y_trials=point.get("fit_shift_y_trials"),
+    )
+    modeled_best = np.asarray(point["modeled_best"], dtype=float)
+    residual = modeled_best - np.asarray(display_observed, dtype=float)
     frequency_ghz_raw = diagnostics.get("active_frequency_ghz", diagnostics.get("frequency_ghz"))
     frequency_ghz = None
     try:
@@ -223,13 +256,14 @@ def _plot_selected_point(
     except Exception:
         frequency_ghz = None
     out_path = out_png or Path("/tmp") / "pychmp_ab_scan_point.png"
+    # payload["observed"] is the slice-common rotated+regridded reference map, not the raw FITS.
     plot_q0_artifact_panel(
         out_path,
         model_path=Path(str(diagnostics.get("model_path", ""))),
-        observed_noisy=np.asarray(payload["observed"], dtype=float),
+        observed_noisy=np.asarray(display_observed, dtype=float),
         raw_modeled_best=np.asarray(point["raw_modeled_best"], dtype=float),
-        modeled_best=np.asarray(point["modeled_best"], dtype=float),
-        residual=np.asarray(point["residual"], dtype=float),
+        modeled_best=modeled_best,
+        residual=residual,
         wcs_header=payload["wcs_header"],
         frequency_ghz=frequency_ghz,
         diagnostics=diagnostics,
@@ -318,8 +352,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     payload = load_scan_file(args.artifact_h5, slice_key=args.slice_key)
-    a_index = int(args.a_index) if args.a_index is not None else 0
-    b_index = int(args.b_index) if args.b_index is not None else 0
+    default_a, default_b = default_point_index(payload, str(payload.get("target_metric", "chi2")))
+    a_index = int(args.a_index) if args.a_index is not None else int(default_a)
+    b_index = int(args.b_index) if args.b_index is not None else int(default_b)
     explicit_point_selection = any(
         [
             args.best_of_grid is not None,
@@ -333,11 +368,17 @@ def main() -> int:
     if args.best_of_grid is not None:
         a_index, b_index = best_grid_index(payload, str(args.best_of_grid))
     elif not explicit_point_selection:
-        a_index, b_index = best_grid_index(payload, str(payload.get("target_metric", "chi2")))
+        a_index, b_index = default_point_index(payload, str(payload.get("target_metric", "chi2")))
     if args.a_value is not None:
         a_index = nearest_index(np.asarray(payload["a_values"], dtype=float), float(args.a_value))
     if args.b_value is not None:
         b_index = nearest_index(np.asarray(payload["b_values"], dtype=float), float(args.b_value))
+    a_index, b_index = resolve_point_index(
+        payload,
+        metric=str(args.best_of_grid or payload.get("target_metric", "chi2")),
+        a_index=a_index,
+        b_index=b_index,
+    )
     show_point = (not bool(args.grid)) or explicit_point_selection
     show_plot = not bool(args.no_plot)
     plot_ab_scan_file(

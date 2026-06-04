@@ -97,7 +97,7 @@ def test_find_best_q0_adaptive_bracketing_moves_right_from_flux_deficit() -> Non
     assert result.bracket is not None
     assert result.bracket[0] < 4.0 < result.bracket[2]
     assert result.q0 == pytest.approx(4.0, abs=1e-2)
-    assert result.message.startswith("adaptive bracketing")
+    assert "CHMP q0 bracketing" in result.message
 
 
 def test_find_best_q0_adaptive_bracketing_moves_left_from_flux_excess() -> None:
@@ -157,12 +157,210 @@ def test_find_best_q0_adaptive_corrects_initial_flux_direction_from_metric_trend
 
     assert result.used_adaptive_bracketing
     assert result.success
+    assert result.trial_q0[0] == pytest.approx(0.001, abs=1e-12)
     assert result.q0 == pytest.approx(0.001, abs=1e-4)
-    assert result.trial_q0[:3] == pytest.approx((0.0001, 0.001, 0.01))
 
 
-def test_find_best_q0_adaptive_failure_falls_back_to_bounded_refinement() -> None:
-    """Fall back to bounded refinement when adaptive expansion stalls."""
+def test_find_best_q0_idl_first_expansion_up_on_flux_underestimate() -> None:
+    """After q0_start, grow upward when modeled flux is below observed (FindBestFitQ NQ eq 1)."""
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 4.0) ** 2,
+                rho2=(q0 - 4.0) ** 2,
+                eta2=(q0 - 4.0) ** 2,
+            ),
+            total_observed_flux=100.0,
+            total_modeled_flux=10.0,
+        )
+
+    find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=10.0,
+        adaptive_bracketing=True,
+        q0_start=1.0,
+        q0_step=2.0,
+        max_bracket_steps=1,
+    )
+
+    assert evaluated[0] == pytest.approx(1.0, abs=1e-15)
+    assert evaluated[1] == pytest.approx(2.0, abs=1e-15)
+    assert evaluated[1] > evaluated[0]
+
+
+def test_find_best_q0_idl_first_expansion_down_on_flux_overestimate() -> None:
+    """After q0_start, grow downward when modeled flux exceeds observed (FindBestFitQ NQ eq 1)."""
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 2.0) ** 2,
+                rho2=(q0 - 2.0) ** 2,
+                eta2=(q0 - 2.0) ** 2,
+            ),
+            total_observed_flux=10.0,
+            total_modeled_flux=100.0,
+        )
+
+    find_best_q0(
+        metric_function,
+        q0_min=0.25,
+        q0_max=12.0,
+        adaptive_bracketing=True,
+        q0_start=8.0,
+        q0_step=2.0,
+        max_bracket_steps=1,
+    )
+
+    assert evaluated[0] == pytest.approx(8.0, abs=1e-15)
+    assert evaluated[1] == pytest.approx(4.0, abs=1e-15)
+    assert evaluated[1] < evaluated[0]
+
+
+def test_find_best_q0_warm_start_refines_within_rescored_range_only() -> None:
+    """Warm start with one interior minimum must not expand outside the rescored q0 span."""
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 1.0) ** 2,
+                rho2=(q0 - 1.0) ** 2,
+                eta2=(q0 - 1.0) ** 2,
+            ),
+            total_observed_flux=10.0,
+            total_modeled_flux=5.0,
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=10.0,
+        adaptive_bracketing=True,
+        q0_start=1.0,
+        q0_step=2.0,
+        max_bracket_steps=6,
+        initial_evaluations={
+            0.5: MetricValues(chi2=2.0, rho2=2.0, eta2=2.0),
+            1.0: MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            2.0: MetricValues(chi2=1.0, rho2=1.0, eta2=1.0),
+        },
+    )
+
+    assert result.used_adaptive_bracketing
+    assert result.bracket_found
+    assert "warm-start" in result.message
+    assert min(evaluated) >= 0.5 - 1e-15
+    assert max(evaluated) <= 2.0 + 1e-15
+    assert result.q0 == pytest.approx(1.0, abs=0.05)
+
+
+def test_find_best_q0_warm_start_multiple_minima_idl_policy() -> None:
+    """IDL policy: more than one interior minimum skips refinement and marks failure."""
+    result = find_best_q0(
+        lambda q0: Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 0.5) ** 2 if q0 < 1.0 else (q0 - 1.5) ** 2,
+                rho2=1.0,
+                eta2=1.0,
+            )
+        ),
+        q0_min=0.1,
+        q0_max=10.0,
+        adaptive_bracketing=True,
+        q0_start=1.0,
+        initial_evaluations={
+            0.25: MetricValues(chi2=3.0, rho2=3.0, eta2=3.0),
+            0.5: MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            1.0: MetricValues(chi2=2.0, rho2=2.0, eta2=2.0),
+            1.5: MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            2.0: MetricValues(chi2=3.0, rho2=3.0, eta2=3.0),
+        },
+    )
+
+    assert not result.success
+    assert "more than one interior minimum" in result.message
+
+
+def test_find_best_q0_idl_first_expansion_from_flux_when_metric_invalid() -> None:
+    """Use union-mask flux for the first expansion even when the metric is invalid."""
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(chi2=float("nan"), rho2=float("nan"), eta2=float("nan")),
+            is_valid=False,
+            total_observed_flux=80.0,
+            total_modeled_flux=5.0,
+        )
+
+    find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=10.0,
+        adaptive_bracketing=True,
+        q0_start=0.5,
+        q0_step=1.5,
+        max_bracket_steps=1,
+    )
+
+    assert len(evaluated) == 2
+    assert evaluated[1] == pytest.approx(0.75, abs=1e-15)
+
+
+def test_find_best_q0_adaptive_skips_upward_expansion_when_q0_min_invalid_and_q0_max_worse() -> None:
+    """Do not march q0 upward when the low seed is invalid but start beats q0_max."""
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        if q0 <= 1.5e-6:
+            return Q0MetricEvaluation(
+                metrics=MetricValues(chi2=float("nan"), rho2=float("nan"), eta2=float("nan")),
+                is_valid=False,
+                total_observed_flux=100.0,
+                total_modeled_flux=1.0,
+            )
+        if abs(q0 - 5e-4) < 1e-12:
+            eta2 = 0.632
+        elif abs(q0 - 1e-3) < 1e-12:
+            eta2 = 0.651
+        else:
+            eta2 = 0.632 + 100.0 * (q0 - 5e-4)
+        return Q0MetricEvaluation(
+            metrics=MetricValues(chi2=eta2, rho2=eta2 + 0.1, eta2=eta2),
+            is_valid=True,
+            total_observed_flux=100.0,
+            total_modeled_flux=50.0 * q0,
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=1e-6,
+        q0_max=1e-3,
+        adaptive_bracketing=True,
+        q0_start=5e-4,
+        q0_step=1.61803398875,
+        max_bracket_steps=12,
+        target_metric="eta2",
+    )
+
+    assert result.used_adaptive_bracketing
+    assert 5e-4 in evaluated
+    assert max(evaluated) <= 1e-3 + 1e-15
+    assert not any(q > 1.001e-3 for q in evaluated)
+
+
+def test_find_best_q0_adaptive_idl_refines_toward_minimum() -> None:
+    """CHMP IDL golden/Brent refinement moves toward the true minimum after bracketing."""
     def metric_function(q0: float) -> Q0MetricEvaluation:
         return Q0MetricEvaluation(
             metrics=MetricValues(
@@ -181,15 +379,12 @@ def test_find_best_q0_adaptive_failure_falls_back_to_bounded_refinement() -> Non
         adaptive_bracketing=True,
         q0_start=0.91,
         q0_step=1.01,
-        max_bracket_steps=1,
+        max_bracket_steps=8,
     )
 
-    assert result.success
     assert result.used_adaptive_bracketing
-    assert result.bracket_found
-    assert result.bracket == pytest.approx((0.91, 1.0, 1.01))
-    assert "adaptive bracketing found a valid interior minimum" in result.message
-    assert result.q0 == pytest.approx(0.97, abs=1e-2)
+    assert result.q0 == pytest.approx(0.97, abs=5e-2)
+    assert "CHMP" in result.message
 
 
 def test_find_best_q0_soft_interval_expands_beyond_initial_upper_edge() -> None:
@@ -249,37 +444,36 @@ def test_find_best_q0_hard_upper_bound_stops_expansion() -> None:
     assert not result.success
     assert result.used_adaptive_bracketing
     assert not result.bracket_found
-    assert "upper safety bound" in result.message
+    assert "upper expansion limit" in result.message
     assert result.q0 == pytest.approx(1.0, abs=1e-12)
 
 
-def test_find_best_q0_reports_sampled_boundary_when_it_beats_local_bracket() -> None:
-    """Do not report a local bracket as success when an edge sample is better."""
+def test_find_best_q0_idl_starts_at_q0_start_not_q0_min() -> None:
+    """CHMP IDL search evaluates q0_start first, not the interval lower bound."""
+    evaluated: list[float] = []
 
     def metric_function(q0: float) -> MetricValues:
-        if q0 < 1.0e-5:
-            chi2 = 210.0
-        elif q0 <= 1.0e-5 * (1.0 + 1.0e-12):
-            chi2 = 198.0
-        else:
-            chi2 = 248.0 + ((q0 - 5.0e-4) / 1.0e-4) ** 2
-        return MetricValues(chi2=chi2, rho2=chi2, eta2=chi2)
+        evaluated.append(float(q0))
+        return MetricValues(
+            chi2=(q0 - 5.0e-4) ** 2,
+            rho2=(q0 - 5.0e-4) ** 2,
+            eta2=(q0 - 5.0e-4) ** 2,
+        )
 
     result = find_best_q0(
         metric_function,
-        q0_min=1.0e-5,
+        q0_min=1.0e-6,
         q0_max=1.0e-3,
         adaptive_bracketing=True,
-        q0_start=1.0e-4,
+        q0_start=5.0e-4,
         q0_step=1.61803398875,
-        max_bracket_steps=12,
+        max_bracket_steps=8,
     )
 
-    assert not result.success
-    assert result.boundary_constrained
-    assert result.q0 == pytest.approx(1.0e-5, abs=1e-15)
-    assert result.objective_value == pytest.approx(198.0)
-    assert "sampled" in result.message
+    assert result.used_adaptive_bracketing
+    assert evaluated[0] == pytest.approx(5.0e-4, abs=1e-15)
+    assert 1.0e-6 not in evaluated[:3]
+    assert result.q0 == pytest.approx(5.0e-4, abs=1e-5)
 
 
 def test_find_best_q0_skips_invalid_seeded_evaluations_in_sorted_order() -> None:

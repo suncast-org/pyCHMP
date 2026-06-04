@@ -9,7 +9,7 @@ WORKSPACE_ROOT="$(cd "$PYCHMP_REPO/.." && pwd)"
 TESTDATA_REPO="${PYCHMP_TESTDATA_REPO:-$WORKSPACE_ROOT/pyGXrender-test-data}"
 DRY_RUN=0
 EXTRA_ARGS=()
-OBS_SOURCE="external_fits"
+OBS_SOURCE="${OBS_SOURCE:-}"
 OBS_MAP_ID=""
 EUV_INSTRUMENT="${EUV_INSTRUMENT:-AIA}"
 EUV_RESPONSE_SAV="${EUV_RESPONSE_SAV:-}"
@@ -61,6 +61,22 @@ while (($#)); do
     --obs-map-id)
       OBS_MAP_ID="$2"
       shift 2
+      ;;
+    --obs-fits-path)
+      OBS_FITS_PATH="$2"
+      shift 2
+      ;;
+    --obs-fits-path=*)
+      OBS_FITS_PATH="${1#*=}"
+      shift
+      ;;
+    --obs-path)
+      OBS_FITS_PATH="$2"
+      shift 2
+      ;;
+    --obs-path=*)
+      OBS_FITS_PATH="${1#*=}"
+      shift
       ;;
     --euv-instrument)
       EUV_INSTRUMENT="$2"
@@ -149,19 +165,34 @@ MODELS_ROOT="$TESTDATA_REPO/raw/models"
 RESPONSES_ROOT="$TESTDATA_REPO/raw/responses"
 EBTEL_PATH="$TESTDATA_REPO/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav"
 [[ -d "$TESTDATA_REPO" ]] || { echo "ERROR: Test-data repository not found: $TESTDATA_REPO"; exit 1; }
-LATEST_EOVSA_DIR="$(named_fixture_dir "$EOVSA_MAPS_ROOT" "eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" || true)"
 LATEST_MODEL_DIR="$(named_fixture_dir "$MODELS_ROOT" "hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" || true)"
 LATEST_RESPONSE_DIR="$(find "$RESPONSES_ROOT" -maxdepth 1 -mindepth 1 -type d | sort | tail -n 1)"
-OBS_FITS_PATH="${OBS_FITS_PATH:-$LATEST_EOVSA_DIR/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits}"
+OBS_FITS_PATH="${OBS_FITS_PATH:-}"
 MODEL_H5_PATH="${MODEL_H5_PATH:-$LATEST_MODEL_DIR/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5}"
 BENCHMARK_CSV="${BENCHMARK_CSV:-/tmp/pychmp_scan_ab_obs_map_benchmark.csv}"
 
 [[ -n "$PYTHON_CMD" ]] || { echo "ERROR: Could not find a Python interpreter with the full scan dependency set."; exit 1; }
 [[ -f "$MODEL_H5_PATH" ]] || { echo "ERROR: Model H5 file not found: $MODEL_H5_PATH"; exit 1; }
 [[ -f "$EBTEL_PATH" ]] || { echo "ERROR: EBTEL .sav file not found: $EBTEL_PATH"; exit 1; }
+if [[ -z "$OBS_SOURCE" ]]; then
+  if [[ -n "$OBS_FITS_PATH" && -n "$OBS_MAP_ID" ]]; then
+    echo "ERROR: Use either an explicit external FITS path or --obs-map-id, not both." >&2
+    exit 1
+  elif [[ -n "$OBS_FITS_PATH" ]]; then
+    OBS_SOURCE="external_fits"
+  elif [[ -n "$OBS_MAP_ID" ]]; then
+    OBS_SOURCE="model_refmap"
+  else
+    echo "ERROR: Observation selection is required. Use --obs-fits-path /path/to/obs.fits for an external FITS map, or --obs-map-id MAP_ID for an internal model refmap." >&2
+    exit 1
+  fi
+fi
 if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  [[ -n "$OBS_FITS_PATH" ]] || { echo "ERROR: --obs-fits-path is required for --obs-source=external_fits"; exit 1; }
+  [[ -z "$OBS_MAP_ID" ]] || { echo "ERROR: --obs-map-id cannot be used with --obs-source=external_fits"; exit 1; }
   [[ -f "$OBS_FITS_PATH" ]] || { echo "ERROR: Observational FITS file not found: $OBS_FITS_PATH"; exit 1; }
 elif [[ "$OBS_SOURCE" == "model_refmap" ]]; then
+  [[ -z "$OBS_FITS_PATH" ]] || { echo "ERROR: External FITS paths cannot be used with --obs-source=model_refmap"; exit 1; }
   [[ -n "$OBS_MAP_ID" ]] || { echo "ERROR: --obs-map-id is required for --obs-source=model_refmap"; exit 1; }
   if [[ -n "$EUV_RESPONSE_SAV" ]]; then
     [[ -f "$EUV_RESPONSE_SAV" ]] || { echo "ERROR: EUV response SAV file not found: $EUV_RESPONSE_SAV"; exit 1; }
@@ -177,10 +208,12 @@ fi
 cd "$PYCHMP_REPO"
 echo "Using Python: $PYTHON_CMD"
 echo "Using test-data repo: $TESTDATA_REPO"
-echo "Using EOVSA folder: $LATEST_EOVSA_DIR"
 echo "Using model folder: $LATEST_MODEL_DIR"
+echo "Using observation source: $OBS_SOURCE"
+if [[ "$OBS_SOURCE" == "external_fits" ]]; then
+  echo "Using observation FITS: $OBS_FITS_PATH"
+fi
 if [[ "$OBS_SOURCE" == "model_refmap" ]]; then
-  echo "Using observation source: $OBS_SOURCE"
   echo "Using observation map id: $OBS_MAP_ID"
   [[ -n "$LATEST_RESPONSE_DIR" ]] && echo "Using response folder: $LATEST_RESPONSE_DIR"
   echo "Using EUV instrument: $EUV_INSTRUMENT"

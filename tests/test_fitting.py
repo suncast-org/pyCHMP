@@ -30,9 +30,16 @@ class RecordingRenderer(SyntheticRenderer):
         return super().render(q0)
 
 
+def _localized_peak_observed(*, size: int = 32, peak: float = 100.0) -> np.ndarray:
+    observed = np.zeros((size, size), dtype=float)
+    center = size // 2
+    observed[center - 2 : center + 2, center - 2 : center + 2] = peak
+    return observed
+
+
 def test_fit_q0_to_observation_recovers_true_q0() -> None:
     """Recover the true q0 from a synthetic observation."""
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]])
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     renderer = SyntheticRenderer(observed, true_q0=3.7)
 
@@ -81,7 +88,7 @@ def test_fit_q0_to_observation_validates_observed_sigma_shapes() -> None:
 
 
 def test_fit_q0_to_observation_seeds_saved_metric_evaluations() -> None:
-    observed = np.array([[10.0, 12.0], [14.0, 16.0]])
+    observed = _localized_peak_observed()
     sigma = np.ones_like(observed)
     renderer = RecordingRenderer(observed, true_q0=1.0)
 

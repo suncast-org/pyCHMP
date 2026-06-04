@@ -44,16 +44,17 @@ Python entry point locations:
   - Runs a serial-plus-process-pool 3x3 benchmark using the same resolved
     EOVSA/model/EBTEL inputs as the scan options-test launcher.
 
-- `unix/adaptive_ab_search_single_frequency_options_test.sh`
+- `unix/adaptive_ab_search_single_observation_options_test.sh`
   - Wraps `examples/python/adaptive_ab_search_single_observation.py`.
   - Runs the adaptive real-data single-slice `(a, b)` search against the
-    matching observation/model/EBTEL inputs and writes a sparse live-update artifact.
+    matching observation/model/EBTEL inputs and writes a live-updated unified
+    slice/search artifact.
 
 - `windows/fit_q0_obs_map_options_test.cmd`
 - `windows/validate_q0_recovery_options_test.cmd`
 - `windows/scan_ab_obs_map_options_test.cmd`
 - `windows/benchmark_scan_ab_obs_map.cmd`
-- `windows/adaptive_ab_search_single_frequency_options_test.cmd`
+- `windows/adaptive_ab_search_single_observation_options_test.cmd`
   - Windows counterparts of the Unix launchers, intended for `cmd.exe` and the
     viewer Run tab on Windows.
 
@@ -97,20 +98,20 @@ From a POSIX shell:
 pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh
 pyCHMP/scripts/unix/validate_q0_recovery_options_test.sh
 pyCHMP/scripts/unix/scan_ab_obs_map_options_test.sh
-pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh
+pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh
 ```
 
 Equivalent invocation from inside the `pyCHMP/` repository itself:
 
 ```bash
-./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh
+./scripts/unix/adaptive_ab_search_single_observation_options_test.sh
 ```
 
 If the script is not marked executable in your current checkout, invoke it
 explicitly through the shell:
 
 ```bash
-bash scripts/unix/adaptive_ab_search_single_frequency_options_test.sh --dry-run
+bash scripts/unix/adaptive_ab_search_single_observation_options_test.sh --dry-run
 ```
 
 From `cmd.exe` or PowerShell on Windows:
@@ -119,7 +120,7 @@ From `cmd.exe` or PowerShell on Windows:
 pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd
 pyCHMP\scripts\windows\validate_q0_recovery_options_test.cmd
 pyCHMP\scripts\windows\scan_ab_obs_map_options_test.cmd
-pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
+pyCHMP\scripts\windows\adaptive_ab_search_single_observation_options_test.cmd
 ```
 
 The `windows/*.cmd` launchers are intended for native Windows shells.
@@ -153,6 +154,27 @@ artifacts, and the benchmark-specific report generator:
 
 - `reports/parallel benchmark test/generate_scan_ab_obs_map_benchmark_report.py`
 
+## Adaptive Launcher Interface
+
+The adaptive launcher intentionally supports a small set of convenience aliases
+that differ from the underlying Python workflow:
+
+- `--obs-fits-path` is a launcher alias for selecting an external FITS
+  observation. The Python workflow itself uses positional
+  `fits_file model_h5` or `--obs-source external_fits --obs-path ...`.
+- `--model-h5-path` is a launcher alias for the model H5 path. The Python
+  workflow itself uses the positional `model_h5` argument or `--model-h5`.
+- `--obs-map-id` and `--obs-source model_refmap` are forwarded directly when
+  the observation is an internal model refmap such as `AIA_171`.
+- Search and optimizer controls such as `--artifact-h5`, `--a-min`, `--a-max`,
+  `--xatol`, `--maxiter`, and `--max-bracket-steps` are passed through to the
+  Python workflow unchanged.
+
+For adaptive searches, `--xatol` and `--maxiter` control the final bounded Q0
+minimization stage. `--max-bracket-steps` only limits additional adaptive
+bracket expansion attempts; it does not bound the total number of trial
+evaluations written to the artifact.
+
 ## `fit_q0_obs_map_options_test.sh`
 
 The Unix launcher:
@@ -168,6 +190,7 @@ both support:
 - MW fitting from an external observational FITS map
 - EUV/UV fitting from an internal model refmap such as `AIA_171`
 - `--obs-source external_fits|model_refmap`
+- `--obs-fits-path /path/to/obs.fits`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
 - `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
@@ -175,16 +198,18 @@ both support:
 - `--metrics-mask-threshold 0.5`
 - `--metrics-mask-fits /path/to/mask.fits`
 
-Example MW fit from the default external EOVSA FITS path:
+Example MW fit using an explicit EOVSA FITS path:
 
 ```bash
-bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/fit_q0_obs_map_options_test.sh \
+  --obs-fits-path /Users/gelu/code/SUNCAST-ORG/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20201126T200000Z/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits
 ```
 
 Equivalent Windows MW fit:
 
 ```bat
-pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd
+pyCHMP\scripts\windows\fit_q0_obs_map_options_test.cmd ^
+  --obs-fits-path C:\path\to\pyGXrender-test-data\raw\eovsa_maps\eovsa_maps_20201126T200000Z\eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits
 ```
 
 Example EUV fit against the internal `AIA_171` refmap:
@@ -274,11 +299,15 @@ and now supports both:
 - MW benchmark scans from an external observational FITS map
 - EUV/UV benchmark scans from an internal model refmap such as `AIA_171`
 
-The launcher resolves shared defaults from `pyGXrender-test-data`:
+The launcher does not choose an observation map implicitly. Select one of:
 
-- the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
-- the matching 2020-11-26 CHR model file found under `raw/models/`
-- fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
+- an explicit external FITS map with `--obs-fits-path /path/to/obs.fits`
+- an internal model refmap with `--obs-map-id MAP_ID`
+
+When `--obs-source` is omitted, the launcher infers it only from those explicit
+selectors: `--obs-fits-path` means `external_fits`, and `--obs-map-id` means
+`model_refmap`. The matching 2020-11-26 CHR model and fixed EBTEL file are still
+resolved from `pyGXrender-test-data` unless you override them.
 
 Legacy EUV response SAV files are only needed when you explicitly pin
 `--euv-response-sav`; supported instruments otherwise use the default
@@ -287,6 +316,7 @@ gximagecomputing / pyEUVTools provider path.
 Important benchmark-specific options:
 
 - `--obs-source external_fits|model_refmap`
+- `--obs-fits-path /path/to/obs.fits`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
 - `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
@@ -306,10 +336,11 @@ The Windows counterpart:
 
 accepts the same observation-selection and mask options.
 
-Example MW benchmark from the default external EOVSA FITS path:
+Example MW benchmark using an explicit EOVSA FITS path:
 
 ```bash
 bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/benchmark_scan_ab_obs_map.sh \
+  --obs-fits-path /Users/gelu/code/SUNCAST-ORG/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20201126T200000Z/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits \
   --repeats 1 \
   --worker-counts 1,2,4
 ```
@@ -404,11 +435,11 @@ and now supports both:
 - MW scans from an external observational FITS map
 - EUV/UV scans from an internal model refmap such as `AIA_171`
 
-The launcher resolves shared defaults from `pyGXrender-test-data`:
-
-- the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
-- the matching 2020-11-26 CHR model file found under `raw/models/`
-- fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
+The launcher does not choose an observation map implicitly. Use
+`--obs-fits-path /path/to/obs.fits` for an external FITS map, or
+`--obs-map-id MAP_ID` for an internal model refmap. The matching 2020-11-26 CHR
+model and fixed EBTEL file are still resolved from `pyGXrender-test-data` unless
+you override them.
 
 Legacy EUV response SAV files are only needed when you explicitly pin
 `--euv-response-sav`; supported instruments otherwise use the default
@@ -417,6 +448,7 @@ gximagecomputing / pyEUVTools provider path.
 Important scan-specific options:
 
 - `--obs-source external_fits|model_refmap`
+- `--obs-fits-path /path/to/obs.fits`
 - `--obs-map-id AIA_171`
 - `--euv-instrument AIA`
 - `--euv-response-sav /path/to/resp_aia_*.sav` (optional legacy override)
@@ -437,14 +469,14 @@ The Windows counterpart:
 
 accepts the same observation-selection and mask options.
 
-Example MW scan from the default external EOVSA FITS path:
+Example MW scan using an explicit EOVSA FITS path:
 
 - Prefer the explicit launcher flags:
   `--obs-fits-path`, `--model-h5-path`, and `--ebtel-path`.
 - `OBS_FITS_PATH`, `MODEL_H5_PATH`, and `EBTEL_PATH` remain supported as
   fallback environment overrides.
-- Precedence is: explicit launcher flag, then environment variable, then the
-  launcher's built-in default.
+- Precedence for paths is: explicit launcher flag, then environment variable,
+  then built-in defaults only for the model and EBTEL paths.
 
 Git Bash example with your own files:
 
@@ -513,11 +545,11 @@ pyCHMP\scripts\windows\scan_ab_obs_map_options_test.cmd ^
   --metrics-mask-threshold 0.5
 ```
 
-## `adaptive_ab_search_single_frequency_options_test.sh`
+## `adaptive_ab_search_single_observation_options_test.sh`
 
 The Unix launcher:
 
-- `scripts/unix/adaptive_ab_search_single_frequency_options_test.sh`
+- `scripts/unix/adaptive_ab_search_single_observation_options_test.sh`
 
 wraps:
 
@@ -528,11 +560,11 @@ and now supports both:
 - MW adaptive search from an external observational FITS map
 - EUV/UV adaptive search from an internal model refmap such as `AIA_171`
 
-The launcher resolves shared defaults from `pyGXrender-test-data`:
-
-- the canonical 2020-11-26 EOVSA fixture file found under `raw/eovsa_maps/`
-- the matching 2020-11-26 CHR model file found under `raw/models/`
-- fixed EBTEL path under `raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav`
+The launcher does not choose an observation map implicitly. Use
+`--obs-fits-path /path/to/obs.fits` for an external FITS map, or
+`--obs-map-id MAP_ID` for an internal model refmap. The matching 2020-11-26 CHR
+model and fixed EBTEL file are still resolved from `pyGXrender-test-data` unless
+you override them.
 
 Legacy EUV response SAV files are only needed when you explicitly pin
 `--euv-response-sav`; supported instruments otherwise use the default
@@ -550,6 +582,9 @@ Important adaptive-search options:
 - `--tr-mask-bmin-gauss 1000`
 - `--metrics-mask-threshold 0.5`
 - `--metrics-mask-fits /path/to/mask.fits`
+- `--all-channels` for supported fixed-channel EUV/UV instruments such as AIA
+- `--render-channels 94,131,193` for an explicit EUV/UV render-channel set
+- `--render-frequencies-ghz 3.2,5.8` for explicit additional MW render frequencies
 
 The launcher reuses the same sparse artifact path by default so reruns resume.
 For a fresh adaptive artifact:
@@ -557,6 +592,27 @@ For a fresh adaptive artifact:
 - set `ARTIFACTS_STEM=custom_name`
 - or set `PYCHMP_TIMESTAMP_ARTIFACTS=1`
 - or force a specific file with `ARTIFACT_H5=/path/to/adaptive.h5`
+
+To rerun the same adaptive search settings as a fresh search while still reusing
+the stored map products in the existing artifact, pass:
+
+- `--recompute-existing` (same search identity) or `--new-search-identity`
+  (parallel search for debugging). Both refit on a fresh grid and warm-start q0
+  from `map_store` without re-rendering compatible maps.
+
+Default behavior (no flags) resumes the compatible active search.
+
+Targeted artifact operations (same launcher + `--artifact-h5`):
+
+- `--recompute-search-id SEARCH_ID` — repair incomplete/contract-broken points using the
+  stored recipe only (no metric/mask/render CLI overrides).
+- `--expand-grid-search-id SEARCH_ID` — widen `--a-min`/`--a-max`/`--b-min`/`--b-max`
+  (strict superset of stored footprint); hydrates completed cells; explores new shell only.
+- `pychmp-rescore build|commit` — rescore `map_store` into a parallel `{root}_rN` search.
+- `pychmp-repair-grid-trial-maps` — purge invalid trial groups (metadata repair, not refit).
+
+Per-point cherry-pick refit is planned; see
+`future-implementation-notes/pyCHMP/2026-06-01-pyCHMP-point-repair-utility-handoff.md`.
 
 Adaptive launcher path-resolution notes:
 
@@ -569,30 +625,33 @@ Adaptive launcher path-resolution notes:
 - Precedence is:
   - explicit launcher flag
   - environment variable
-  - shared default resolved from `pyGXrender-test-data`
+  - for model and EBTEL paths only, shared default resolved from `pyGXrender-test-data`
 
 The Windows counterpart:
 
-- `scripts/windows/adaptive_ab_search_single_frequency_options_test.cmd`
+- `scripts/windows/adaptive_ab_search_single_observation_options_test.cmd`
 
 accepts the same observation-selection, adaptive-range, and mask options.
 
-Example MW adaptive search from the default external EOVSA FITS path:
+Example MW adaptive search using an explicit EOVSA FITS path:
 
 ```bash
-bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
+  --obs-fits-path /Users/gelu/code/SUNCAST-ORG/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20201126T200000Z/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits
 ```
 
 Equivalent Windows MW adaptive search:
 
 ```bat
-pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
+pyCHMP\scripts\windows\adaptive_ab_search_single_observation_options_test.cmd ^
+  --obs-fits-path C:\path\to\pyGXrender-test-data\raw\eovsa_maps\eovsa_maps_20201126T200000Z\eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits
 ```
 
 Example MW adaptive search with a tighter metrics mask:
 
 ```bash
-bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
+  --obs-fits-path /Users/gelu/code/SUNCAST-ORG/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20201126T200000Z/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits \
   --metrics-mask-threshold 0.5
 ```
 
@@ -600,18 +659,42 @@ Example EUV adaptive search against the internal `AIA_171` refmap:
 
 ```bash
 PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
-bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --obs-source model_refmap \
   --obs-map-id AIA_171 \
   --tr-mask-bmin-gauss 1000 \
   --metrics-mask-threshold 0.5
 ```
 
+Example EUV adaptive search that fits `AIA_171` but requests the full AIA EUV
+channel set from pyGXrender for the same geometry:
+
+```bash
+PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
+  --obs-source model_refmap \
+  --obs-map-id AIA_171 \
+  --euv-instrument AIA \
+  --all-channels \
+  --target-metric eta2 \
+  --metrics-mask-threshold 0.2 \
+  --artifacts-stem adaptive_ab_search_aia171_all_channels
+```
+
+MW extra frequencies are intentionally explicit because radio imaging channel
+sets are instrument/product dependent:
+
+```bash
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
+  --obs-fits-path /path/to/eovsa.fits \
+  --render-frequencies-ghz 3.2,5.8
+```
+
 Example EUV adaptive search using an explicit metrics-mask FITS file:
 
 ```bash
 PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
-bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --obs-source model_refmap \
   --obs-map-id AIA_171 \
   --tr-mask-bmin-gauss 1000 \
@@ -623,7 +706,7 @@ adaptive search:
 
 ```bash
 PYTHON_BIN=/Users/gelu/miniforge3/envs/suncast/bin/python \
-bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --dry-run \
   --obs-source model_refmap \
   --obs-map-id AIA_171 \
@@ -634,11 +717,11 @@ bash /Users/gelu/code/SUNCAST-ORG/pyCHMP/scripts/unix/adaptive_ab_search_single_
 Example adaptive-search invocation from a POSIX shell:
 
 ```bash
-bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash ./scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --obs-fits-path "/path/to/your_map.fits" \
   --model-h5-path "/path/to/your_model.h5" \
   --ebtel-path "/path/to/your_ebtel.sav" \
-  --artifact-h5 "/path/to/output/adaptive_ab_search_single_frequency.h5" \
+  --artifact-h5 "/path/to/output/adaptive_ab_search_single_observation.h5" \
   --a-min -4.5 \
   --a-max 3.0 \
   --b-min -3.0 \
@@ -652,11 +735,11 @@ bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
 `cmd.exe` example with your own files:
 
 ```bat
-scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
+scripts\windows\adaptive_ab_search_single_observation_options_test.cmd ^
   --obs-fits-path C:\path\to\your_map.fits ^
   --model-h5-path C:\path\to\your_model.h5 ^
   --ebtel-path C:\path\to\your_ebtel.sav ^
-  --artifact-h5 C:\path\to\output\adaptive_ab_search_single_frequency.h5 ^
+  --artifact-h5 C:\path\to\output\adaptive_ab_search_single_observation.h5 ^
   --a-min -4.5 ^
   --a-max 3.0 ^
   --b-min -3.0 ^
@@ -670,11 +753,11 @@ scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
 Tracked 2.874 GHz development-data example:
 
 ```bash
-bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
+bash ./scripts/unix/adaptive_ab_search_single_observation_options_test.sh \
   --obs-fits-path "/path/to/pyGXrender-test-data/raw/eovsa_maps/eovsa_maps_20201126T200000Z/eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits" \
   --model-h5-path "/path/to/pyGXrender-test-data/raw/models/models_20201126T195831/hmi.M_720s.20201126_195831.E18S19CR.CEA.NAS.GEN.CHR.h5" \
   --ebtel-path "/path/to/pyGXrender-test-data/raw/ebtel/ebtel_gxsimulator_euv/ebtel.sav" \
-  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_frequency.h5" \
+  --artifact-h5 "C:/Users/gelu_/AppData/Local/Temp/pychmp_adaptive_ab_runs/adaptive_ab_search_single_observation.h5" \
   --a-min -4.5 \
   --a-max 3.0 \
   --b-min -3.0 \
@@ -688,13 +771,14 @@ bash ./scripts/unix/adaptive_ab_search_single_frequency_options_test.sh \
 Equivalent Windows launcher:
 
 ```bat
-scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd
+scripts\windows\adaptive_ab_search_single_observation_options_test.cmd ^
+  --obs-fits-path C:\path\to\pyGXrender-test-data\raw\eovsa_maps\eovsa_maps_20201126T200000Z\eovsa.synoptic_daily.20201126T200000Z.f2.874GHz.tb.disk.fits
 ```
 
 Equivalent Windows EUV adaptive-search example:
 
 ```bat
-pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
+pyCHMP\scripts\windows\adaptive_ab_search_single_observation_options_test.cmd ^
   --obs-source model_refmap ^
   --obs-map-id AIA_171 ^
   --tr-mask-bmin-gauss 1000 ^
@@ -704,11 +788,9 @@ pyCHMP\scripts\windows\adaptive_ab_search_single_frequency_options_test.cmd ^
 ## Editing Model / Map Choices
 
 Each script is intentionally written with one option per line so the common
-workflow is simple:
-
-- comment or uncomment the default map/model selection lines
-- comment or uncomment optional CLI flags
-- rerun the launcher
+workflow is simple: pass the observation selector explicitly, add optional CLI
+flags, and rerun the launcher. The adaptive single-observation launcher no
+longer picks a default observation FITS file.
 
 For more targeted overrides, use environment variables such as:
 
