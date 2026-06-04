@@ -39,8 +39,8 @@ and [pyGXrender](https://pypi.org/project/pyGXrender/).
 
 - Artifacts produced with `0.1.0a2` may not resume cleanly; prefer a new search identity
   or `--recompute-search-id` / `--expand-grid-search-id` after validating compatibility.
-- Pin versions in publications: `pychmp==0.1.0` with your chosen `pyampp` and `pyGXrender`
-  releases and record model/observation provenance in the artifact.
+- Pin versions in publications: `pychmp==0.1.0`, `pyampp>=1.0.2`, and your chosen `pyGXrender`
+  release; record model/observation provenance in the artifact.
 
 ### Known limitations
 

@@ -36,11 +36,11 @@ pip install -e ".[dev]"
 ### SUNCAST fitting stack (pyAMPP → pyGXrender → pyCHMP)
 
 Observational fitting uses three installable packages. Pin versions in publications
-(for example `pyampp`, `pyGXrender`, and `pychmp==0.1.0`).
+(for example `pyampp==1.0.2`, your chosen `pyGXrender` release, and `pychmp==0.1.0`).
 
 ```bash
 pip install -U pip setuptools wheel
-pip install pyampp pyGXrender pychmp
+pip install "pyampp>=1.0.2" pyGXrender pychmp
 ```
 
 `pyGXrender` currently requires **Python 3.12+** on PyPI; `pychmp` supports **3.10+**.
