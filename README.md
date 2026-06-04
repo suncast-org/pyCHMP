@@ -21,9 +21,47 @@ pyCHMP is an independent Python implementation under SUNCAST-ORG. The intent is 
 
 ## Installation
 
+### pyCHMP only
+
 ```bash
-pip install -e .
+pip install pychmp
 ```
+
+For development:
+
+```bash
+pip install -e ".[dev]"
+```
+
+### SUNCAST fitting stack (pyAMPP → pyGXrender → pyCHMP)
+
+Observational fitting uses three installable packages. Pin versions in publications
+(for example `pyampp`, `pyGXrender`, and `pychmp==0.1.0`).
+
+```bash
+pip install -U pip setuptools wheel
+pip install pyampp pyGXrender pychmp
+```
+
+`pyGXrender` currently requires **Python 3.12+** on PyPI; `pychmp` supports **3.10+**.
+Use a 3.12 environment when installing the full stack.
+
+Packages alone do not include model cubes, EBTEL tables, or observation FITS. For
+runnable examples, clone [pyGXrender-test-data](https://github.com/suncast-org/pyGXrender-test-data)
+next to this repository (or set explicit `--model-h5`, `--ebtel-path`, and
+`--obs-fits-path` / `--obs-map-id` on the workflow scripts). See `examples/python/`
+and `scripts/README.md`.
+
+Console entry points after install:
+
+| Command | Role |
+|---------|------|
+| `pychmp` | Package CLI |
+| `pychmp-view` | Artifact viewer |
+| `pychmp-rescore` | Rescore `map_store` into a parallel search identity |
+| `pychmp-repair-grid-trial-maps` | Repair invalid trial HDF5 groups |
+
+Release history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick Start
 
@@ -209,7 +247,8 @@ python -m bumpver show
 
 ## Citation
 
-Please use repository citation metadata in `CITATION.cff` and release metadata in `.zenodo.json`.
+Please cite using [CITATION.cff](CITATION.cff) (version **0.1.0**) and the Zenodo record
+created from the matching GitHub release tag. See also `.zenodo.json` for archive metadata.
 
 ## License
 
