@@ -54,6 +54,78 @@ def resolve_q0_search_stages(
     return ("union",)
 
 
+def normalize_q0_search_stages_value(value: object | None) -> tuple[str, ...] | None:
+    """Normalize list/tuple profile or diagnostics values to stage tuples."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return parse_q0_search_stages(value)
+    if isinstance(value, (list, tuple)):
+        stages = tuple(str(item).strip().lower() for item in value if str(item).strip())
+        if not stages:
+            return None
+        unknown = [stage for stage in stages if stage not in Q0_MASK_STAGE_NAMES]
+        if unknown:
+            allowed = ", ".join(sorted(Q0_MASK_STAGE_NAMES))
+            raise ValueError(
+                f"unsupported q0 search stage(s): {', '.join(unknown)}; allowed values are {allowed}"
+            )
+        return stages
+    return None
+
+
+def canonical_q0_search_stages_from_profile(profile: dict[str, object]) -> tuple[str, ...] | None:
+    """Return the stored evaluation recipe stages (request wins over diagnostics)."""
+    request = dict(profile.get("request") or {})
+    diagnostics = dict(profile.get("diagnostics") or {})
+    return normalize_q0_search_stages_value(
+        request.get("q0_search_stages") or diagnostics.get("q0_search_stages")
+    )
+
+
+def resolve_warm_rescore_mask_type(
+    *,
+    q0_search_stages: tuple[str, ...] | list[str] | str | None = None,
+    mask_type: str = "union",
+    explicit_mask: object | None = None,
+) -> str:
+    """Mask type for warm-start map rescoring (first active Q0 stage)."""
+    parsed_stages = (
+        parse_q0_search_stages(q0_search_stages)
+        if isinstance(q0_search_stages, str)
+        else normalize_q0_search_stages_value(q0_search_stages)
+    )
+    stages = resolve_q0_search_stages(
+        q0_search_stages=parsed_stages,
+        mask_type=str(mask_type),
+        explicit_mask=explicit_mask,
+    )
+    stage = stages[0]
+    if stage == "explicit":
+        normalized = str(mask_type).strip().lower()
+        return normalized or "explicit_fits"
+    return str(stage)
+
+
+def point_record_trial_stages_match_recipe(
+    record: dict[str, object],
+    *,
+    q0_search_stages: tuple[str, ...],
+) -> bool:
+    """True when committed trial mask stages match a single-stage search recipe."""
+    if len(q0_search_stages) != 1:
+        return True
+    expected = str(q0_search_stages[0]).strip().lower()
+    stages = tuple(
+        str(value).strip().lower()
+        for value in record.get("fit_trial_mask_stages", ()) or ()
+        if str(value).strip()
+    )
+    if not stages:
+        return True
+    return all(stage == expected for stage in stages)
+
+
 def merge_q0_stage_results(
     stage_results: tuple[Q0OptimizationResult, ...],
     q0_search_stages: tuple[str, ...],

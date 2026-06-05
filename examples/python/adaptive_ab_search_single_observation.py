@@ -271,6 +271,7 @@ from pychmp.ab_scan_artifacts import (
     assert_expand_grid_search_cli_argv_allowed,
     assert_recompute_search_cli_argv_allowed,
     load_search_run_profile,
+    validate_pinned_search_evaluation_recipe,
     parse_expand_grid_bounds_from_argv,
     validate_expanded_ab_bounds,
     matching_search_id_for_slice,
@@ -2243,6 +2244,20 @@ def _target_metric_value(metrics: Any, target_metric: str) -> float:
     raise ValueError(f"unsupported target metric: {target_metric!r}")
 
 
+def _warm_rescore_mask_type_from_diagnostics(
+    diagnostics: dict[str, Any],
+    *,
+    explicit_mask: np.ndarray | None = None,
+) -> str:
+    from pychmp.q0_search import resolve_warm_rescore_mask_type
+
+    return resolve_warm_rescore_mask_type(
+        q0_search_stages=diagnostics.get("q0_search_stages"),
+        mask_type=str(diagnostics.get("mask_type", "union")),
+        explicit_mask=explicit_mask,
+    )
+
+
 def _rescore_record_to_warm_initial_evaluations(
     record: dict[str, Any],
     *,
@@ -2253,6 +2268,7 @@ def _rescore_record_to_warm_initial_evaluations(
     target_metric: str,
     psf_kernel: np.ndarray | None = None,
     evaluation_context: ObservationEvaluationContext | None = None,
+    mask_type: str = "union",
 ) -> dict[float, Q0MetricEvaluation] | None:
     """Rescore stored trial maps for warm-start q0 search (IDL policy); no point commit."""
     from pychmp.chmp_evaluation import ObservationEvaluationContext, evaluate_modeled_trial
@@ -2297,7 +2313,7 @@ def _rescore_record_to_warm_initial_evaluations(
             modeled_arr,
             evaluation_context,
             threshold=float(threshold),
-            mask_type="union",
+            mask_type=str(mask_type),
             explicit_mask=explicit_mask,
             use_emthreshold=True,
         )
@@ -2320,6 +2336,7 @@ def _rescore_auxiliary_map_record(
     target_metric: str,
     psf_kernel: np.ndarray | None = None,
     tr_region_mask: np.ndarray | None = None,
+    mask_type: str = "union",
 ) -> tuple[ABPointResult, dict[str, Any]] | None:
     if record.get("euv_tr_mask") is None and tr_region_mask is not None:
         record = {**dict(record), "euv_tr_mask": np.asarray(tr_region_mask, dtype=bool)}
@@ -2333,7 +2350,7 @@ def _rescore_auxiliary_map_record(
     observed_arr = np.asarray(observed, dtype=float)
     sigma_arr = np.asarray(sigma_map, dtype=float)
     explicit_mask_arr = None if explicit_mask is None else np.asarray(explicit_mask, dtype=bool)
-    mask_fn = resolve_threshold_mask("union")
+    mask_fn = resolve_threshold_mask(str(mask_type))
 
     if trial_maps_raw is None:
         diagnostics = dict(record.get("diagnostics") or {})
@@ -3060,6 +3077,22 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
     def set_preserve_stored_search_trials(self, enabled: bool) -> None:
         self._preserve_stored_search_trials = bool(enabled)
 
+    def _warm_rescore_mask_type(self) -> str:
+        return _warm_rescore_mask_type_from_diagnostics(
+            self._diagnostics,
+            explicit_mask=self._explicit_metric_mask,
+        )
+
+    def _pinned_promotion_search_id(self) -> str | None:
+        if not self._preserve_stored_search_trials:
+            return None
+        search_id = str(
+            self._diagnostics.get("selected_search_id")
+            or self._diagnostics.get("search_id")
+            or ""
+        ).strip()
+        return search_id or None
+
     def set_slice_map_index(self, index: Any | None) -> None:
         self._slice_map_index = index
 
@@ -3213,6 +3246,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             explicit_mask=self._explicit_metric_mask,
             target_metric=self._target_metric,
             use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
+            mask_type=self._warm_rescore_mask_type(),
         )
         if not events:
             return 0
@@ -3265,6 +3299,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 explicit_mask=self._explicit_metric_mask,
                 use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
                 rescore=not bool(self._preserve_stored_search_trials),
+                mask_type=self._warm_rescore_mask_type(),
             )
             if evaluations:
                 return evaluations
@@ -3285,6 +3320,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             target_metric=self._target_metric,
             use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
             slice_map_index=self._slice_map_index,
+            mask_type=self._warm_rescore_mask_type(),
         )
 
     def set_resume_policy(
@@ -3761,6 +3797,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 target_metric=self._target_metric,
                 psf_kernel=self._psf_kernel,
                 evaluation_context=evaluation_context,
+                mask_type=self._warm_rescore_mask_type(),
             )
             if warm_evaluations is None:
                 continue
@@ -3871,6 +3908,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         return count
 
     def _iter_rescore_candidate_records(self, *, include_maps: bool) -> Iterator[tuple[str | None, dict[str, Any]]]:
+        restrict_search_id = self._pinned_promotion_search_id()
         try:
             current_payload = load_scan_file(
                 self._artifact_h5,
@@ -3880,16 +3918,19 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         except KeyError:
             return
         seen_keys: set[tuple[float, float]] = set()
-        for record in current_payload.get("point_records", []):
-            if not isinstance(record, dict):
-                continue
-            key = (float(record["a"]), float(record["b"]))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            yield None, dict(record)
+        if not restrict_search_id:
+            for record in current_payload.get("point_records", []):
+                if not isinstance(record, dict):
+                    continue
+                key = (float(record["a"]), float(record["b"]))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                yield None, dict(record)
         for search in current_payload.get("search_records", []):
             search_id = str(search.get("search_id", "")).strip() or None
+            if restrict_search_id and search_id != restrict_search_id:
+                continue
             if search_id:
                 try:
                     search_payload = load_scan_file(
@@ -3947,6 +3988,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 compatibility_signature=self._compatibility_signature,
             ) and not bool(include_matching_signature):
                 continue
+            from pychmp.q0_search import point_record_trial_stages_match_recipe
+
+            q0_stages = tuple(str(stage) for stage in self._diagnostics.get("q0_search_stages") or ())
+            if q0_stages and not point_record_trial_stages_match_recipe(record, q0_search_stages=q0_stages):
+                continue
             warm_evaluations = _rescore_record_to_warm_initial_evaluations(
                 {
                     **dict(record),
@@ -3960,6 +4006,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 target_metric=self._target_metric,
                 psf_kernel=self._psf_kernel,
                 evaluation_context=evaluation_context,
+                mask_type=self._warm_rescore_mask_type(),
             )
             if warm_evaluations is None:
                 continue
@@ -4694,7 +4741,7 @@ def main() -> int:
         mask_type=metrics_mask_type,
         explicit_mask=explicit_metric_mask,
     )
-    if len(chmp_settings.q0_search_stages) > 1:
+    if chmp_settings.q0_search_stages:
         print(f"  Q0 search stages: {', '.join(chmp_settings.q0_search_stages)}")
     print(
         "  CHMP evaluation: "
@@ -4990,6 +5037,10 @@ def main() -> int:
             )
         target_search_id = pinned_search_id
         matching_search_id = pinned_search_id
+        validate_pinned_search_evaluation_recipe(
+            load_search_run_profile(artifact_h5, search_id=pinned_search_id),
+            compatibility_signature=compatibility_signature,
+        )
     elif bool(args.recompute_existing) and matching_search_id:
         target_search_id = matching_search_id
     elif matching_search_id and not bool(args.recompute_existing) and not new_search_identity:

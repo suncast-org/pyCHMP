@@ -1885,6 +1885,34 @@ def assert_expand_grid_search_cli_argv_allowed(argv: list[str]) -> None:
         )
 
 
+def validate_pinned_search_evaluation_recipe(
+    profile: dict[str, Any],
+    *,
+    compatibility_signature: str,
+) -> None:
+    """Refuse expand/recompute when the live CLI recipe drifts from the stored request."""
+    request = dict(profile.get("request") or {})
+    if not request:
+        return
+    stored_signature = search_evaluation_signature(request)
+    expected = str(compatibility_signature or "").strip()
+    if not expected:
+        return
+    if stored_signature == expected:
+        return
+    search_id = str(profile.get("search_id") or "").strip() or "<search_id>"
+    stored_q0 = request.get("q0_search_stages")
+    raise SystemExit(
+        "Pinned search recipe mismatch for "
+        f"{search_id}: stored evaluation signature "
+        f"{stored_signature[:16]}… does not match the resolved CLI recipe "
+        f"{expected[:16]}…. "
+        f"Stored q0_search_stages={stored_q0!r}. "
+        "Use --expand-grid-search-id / --recompute-search-id only (no recipe overrides), "
+        "or start a new identity with --new-search-identity."
+    )
+
+
 def load_search_run_profile(
     h5_path: Path,
     *,
@@ -2092,8 +2120,12 @@ def apply_search_run_profile_to_namespace(
     emthreshold = diagnostics.get("emthreshold")
     if emthreshold is not None and hasattr(args, "emthreshold"):
         args.emthreshold = float(emthreshold)
-    q0_stages = diagnostics.get("q0_search_stages")
-    if isinstance(q0_stages, (list, tuple)) and q0_stages and hasattr(args, "q0_search_stages"):
+    from .q0_search import canonical_q0_search_stages_from_profile
+
+    q0_stages = canonical_q0_search_stages_from_profile(
+        {"request": request, "diagnostics": diagnostics}
+    )
+    if q0_stages and hasattr(args, "q0_search_stages"):
         args.q0_search_stages = ",".join(str(item) for item in q0_stages)
 
 

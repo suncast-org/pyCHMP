@@ -47,6 +47,7 @@ from pychmp.ab_scan_artifacts import (
     write_active_point_snapshot,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
+    validate_pinned_search_evaluation_recipe,
     validate_scan_artifact_reuse_preflight,
     write_single_point_scan_file,
     write_live_trial_point,
@@ -1085,6 +1086,28 @@ def test_load_search_run_profile_and_apply_to_namespace(tmp_path: Path) -> None:
     assert args.target_metric == "eta2"
     assert args.render_frequencies_ghz == "1.4,6.9"
     assert args.execution_policy == "serial"
+
+
+def test_apply_search_run_profile_prefers_request_q0_stages(tmp_path: Path) -> None:
+    args = Namespace(q0_search_stages=None)
+    profile = {
+        "request": {"q0_search_stages": ["data"]},
+        "diagnostics": {"q0_search_stages": ["union"]},
+    }
+    apply_search_run_profile_to_namespace(args, profile)
+    assert args.q0_search_stages == "data"
+
+
+def test_validate_pinned_search_evaluation_recipe_rejects_drift() -> None:
+    profile = {
+        "search_id": "search_abc",
+        "request": {"schema": "pychmp.search_evaluation.v1", "q0_search_stages": ["data"], "target_metric": "eta2"},
+    }
+    with pytest.raises(SystemExit, match="Pinned search recipe mismatch"):
+        validate_pinned_search_evaluation_recipe(
+            profile,
+            compatibility_signature="deadbeef" * 4,
+        )
 
 
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:

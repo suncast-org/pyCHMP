@@ -29,6 +29,8 @@ from examples.python.adaptive_ab_search_single_observation import (
     _rescore_auxiliary_map_record,
     _resolve_geometry_request_flags,
     format_uncertified_basin_expand_guidance,
+    _rescore_record_to_warm_initial_evaluations,
+    _warm_rescore_mask_type_from_diagnostics,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
@@ -1929,6 +1931,36 @@ def test_register_parallel_search_preserves_prior_search(tmp_path: Path) -> None
     assert len(first_search_payload["point_records"]) == 1
     parallel_payload = load_scan_file(artifact_h5, search_id=parallel_search_id)
     assert parallel_payload["point_records"] == []
+
+
+def test_warm_rescore_mask_type_from_diagnostics_uses_data_stage() -> None:
+    mask_type = _warm_rescore_mask_type_from_diagnostics(
+        {"q0_search_stages": ["data"], "mask_type": "union"},
+        explicit_mask=None,
+    )
+    assert mask_type == "data"
+
+
+def test_rescore_record_to_warm_initial_evaluations_uses_requested_mask_stage() -> None:
+    observed = np.array([[0.0, 2.0], [0.0, 0.0]], dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    trial_map = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=float)
+    record = {
+        "fit_q0_trials": (0.5,),
+        "trial_raw_modeled_maps": np.stack([trial_map], axis=0),
+    }
+    evaluations = _rescore_record_to_warm_initial_evaluations(
+        record,
+        observed=observed,
+        sigma_map=sigma_map,
+        threshold=0.1,
+        explicit_mask=None,
+        target_metric="eta2",
+        mask_type="data",
+    )
+    assert evaluations is not None
+    evaluation = evaluations[0.5]
+    assert evaluation.mask_stage == "data"
 
 
 def test_format_uncertified_basin_expand_guidance_mentions_expand_mode() -> None:

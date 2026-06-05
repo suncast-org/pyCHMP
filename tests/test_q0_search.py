@@ -2,7 +2,14 @@ import pytest
 
 from pychmp.metrics import MetricValues
 from pychmp.optimize import Q0OptimizationResult, find_best_q0
-from pychmp.q0_search import merge_q0_stage_results, parse_q0_search_stages, resolve_q0_search_stages
+from pychmp.q0_search import (
+    canonical_q0_search_stages_from_profile,
+    merge_q0_stage_results,
+    parse_q0_search_stages,
+    point_record_trial_stages_match_recipe,
+    resolve_q0_search_stages,
+    resolve_warm_rescore_mask_type,
+)
 from pychmp.search_options import parse_xy_shift, resolve_chmp_search_settings, resolve_shift_policy_from_args
 
 
@@ -17,6 +24,34 @@ def test_parse_q0_search_stages_rejects_unknown_stage() -> None:
 
 def test_resolve_q0_search_stages_defaults_to_mask_type() -> None:
     assert resolve_q0_search_stages(q0_search_stages=None, mask_type="union", explicit_mask=None) == ("union",)
+
+
+def test_resolve_warm_rescore_mask_type_uses_data_stage() -> None:
+    assert (
+        resolve_warm_rescore_mask_type(
+            q0_search_stages=("data",),
+            mask_type="union",
+            explicit_mask=None,
+        )
+        == "data"
+    )
+
+
+def test_canonical_q0_search_stages_prefers_request_over_diagnostics() -> None:
+    profile = {
+        "request": {"q0_search_stages": ["data"]},
+        "diagnostics": {"q0_search_stages": ["union"]},
+    }
+    assert canonical_q0_search_stages_from_profile(profile) == ("data",)
+
+
+def test_point_record_trial_stages_match_recipe_rejects_union_for_data() -> None:
+    record = {"fit_trial_mask_stages": ("union", "union")}
+    assert not point_record_trial_stages_match_recipe(record, q0_search_stages=("data",))
+    assert point_record_trial_stages_match_recipe(
+        {"fit_trial_mask_stages": ("data", "data")},
+        q0_search_stages=("data",),
+    )
 
 
 def test_resolve_q0_search_stages_rejects_two_stage_with_explicit_mask() -> None:
