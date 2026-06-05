@@ -2664,6 +2664,101 @@ def _configure_expand_grid_search(args: argparse.Namespace) -> str | None:
     return expand_search_id
 
 
+_EXPAND_BOUND_FLAG_BY_AXIS: dict[str, str] = {
+    "a_min": "--a-min",
+    "a_max": "--a-max",
+    "b_min": "--b-min",
+    "b_max": "--b-max",
+}
+
+
+def _suggested_expand_bound_tokens(
+    *,
+    axes: tuple[str, ...],
+    a_min: float,
+    a_max: float,
+    b_min: float,
+    b_max: float,
+    da: float,
+    db: float,
+) -> list[str]:
+    """Example widened bound argv tokens for uncertified-basin guidance."""
+    suggestions: list[str] = []
+    for axis in axes:
+        flag = _EXPAND_BOUND_FLAG_BY_AXIS.get(str(axis))
+        if flag is None:
+            continue
+        if axis == "a_min":
+            value = float(a_min) - float(da)
+        elif axis == "a_max":
+            value = float(a_max) + float(da)
+        elif axis == "b_min":
+            value = float(b_min) - float(db)
+        elif axis == "b_max":
+            value = float(b_max) + float(db)
+        else:
+            continue
+        suggestions.extend([flag, f"{value:g}"])
+    return suggestions
+
+
+def format_uncertified_basin_expand_guidance(
+    *,
+    artifact_h5: Path | str,
+    search_id: str,
+    a_min: float,
+    a_max: float,
+    b_min: float,
+    b_max: float,
+    da: float,
+    db: float,
+    boundary_axes: tuple[str, ...] = (),
+    frontier_open_axes: tuple[str, ...] = (),
+) -> str:
+    """User-facing hint for widening a completed search via --expand-grid-search-id."""
+    artifact_path = Path(artifact_h5).expanduser()
+    search_id_text = str(search_id or "").strip() or "<search_id>"
+    hint_axes = tuple(frontier_open_axes or boundary_axes)
+    bound_tokens = _suggested_expand_bound_tokens(
+        axes=hint_axes,
+        a_min=float(a_min),
+        a_max=float(a_max),
+        b_min=float(b_min),
+        b_max=float(b_max),
+        da=float(da),
+        db=float(db),
+    )
+    if not bound_tokens:
+        bound_tokens = ["--a-min", f"{float(a_min) - float(da):g}"]
+
+    command_lines = [
+        "  python examples/python/adaptive_ab_search_single_observation.py \\",
+        f"    --artifact-h5 {artifact_path} \\",
+        f"    --expand-grid-search-id {search_id_text} \\",
+    ]
+    for index in range(0, len(bound_tokens), 2):
+        flag = bound_tokens[index]
+        value = bound_tokens[index + 1]
+        suffix = " \\" if index + 2 < len(bound_tokens) else " \\"
+        command_lines.append(f"    {flag} {value}{suffix}")
+    command_lines.append("    --no-viewer")
+
+    lines = [
+        "WARNING: this run did not certify a closed local-minimum basin around the best point.",
+        "Do not re-run a normal adaptive command with updated --a-min/--b-min; that does not expand",
+        "the completed search in place and may re-render or register a parallel search.",
+        "",
+        "Widen the stored footprint with expand mode only (recipe + completed cells preserved):",
+        *command_lines,
+        "",
+        "Allowed with --expand-grid-search-id: --artifact-h5, widened --a-min/--a-max/--b-min/--b-max,",
+        "and optional --no-viewer / --dry-run. Shell launchers that support pinned expand accept the same flags.",
+        f"Search id: {search_id_text}",
+        f"Artifact: {artifact_path}",
+    ]
+    return "\n".join(lines)
+
+
 def _diag_optional_float(diagnostics: dict[str, Any], key: str, default: float) -> float:
     value = diagnostics.get(key, default)
     if value is None:
@@ -5568,8 +5663,18 @@ def main() -> int:
     print(f"  Total elapsed: {elapsed:.3f}s")
     if not bool(result.minimum_certified):
         print(
-            "WARNING: this run did not certify a closed local-minimum basin around the best point. "
-            "Resume with wider a/b bounds if you want the search to continue expanding around the currently evaluated basin."
+            format_uncertified_basin_expand_guidance(
+                artifact_h5=artifact_h5,
+                search_id=str(target_search_id),
+                a_min=float(args.a_min),
+                a_max=float(args.a_max),
+                b_min=float(args.b_min),
+                b_max=float(args.b_max),
+                da=float(args.da),
+                db=float(args.db),
+                boundary_axes=boundary_axes,
+                frontier_open_axes=tuple(str(axis) for axis in result.frontier_open_axes),
+            )
         )
         if bool(args.require_interior_best):
             return 2

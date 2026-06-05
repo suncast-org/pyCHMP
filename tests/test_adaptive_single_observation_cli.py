@@ -28,6 +28,7 @@ from examples.python.adaptive_ab_search_single_observation import (
     _preload_search_cache_from_artifact,
     _rescore_auxiliary_map_record,
     _resolve_geometry_request_flags,
+    format_uncertified_basin_expand_guidance,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
@@ -1928,3 +1929,23 @@ def test_register_parallel_search_preserves_prior_search(tmp_path: Path) -> None
     assert len(first_search_payload["point_records"]) == 1
     parallel_payload = load_scan_file(artifact_h5, search_id=parallel_search_id)
     assert parallel_payload["point_records"] == []
+
+
+def test_format_uncertified_basin_expand_guidance_mentions_expand_mode() -> None:
+    message = format_uncertified_basin_expand_guidance(
+        artifact_h5=Path("/tmp/CESRA2026.h5"),
+        search_id="search_2a9954c828524a2c",
+        a_min=-1.0,
+        a_max=3.0,
+        b_min=0.0,
+        b_max=10.0,
+        da=0.25,
+        db=0.25,
+        boundary_axes=("a_min",),
+        frontier_open_axes=(),
+    )
+    assert "--expand-grid-search-id search_2a9954c828524a2c" in message
+    assert "examples/python/adaptive_ab_search_single_observation.py" in message
+    assert "--a-min -1.25" in message
+    assert "Do not re-run a normal adaptive command" in message
+    assert "Resume with wider a/b bounds" not in message
