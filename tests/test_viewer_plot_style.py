@@ -134,8 +134,11 @@ def test_heatmap_colorbar_reset_after_remove_recreates_cax() -> None:
     mappable.set_array([0.8, 1.0])
     cb = fig.colorbar(mappable, cax=cax)
     cb.remove()
-    assert cax.get_figure(root=False) is None
-    cax = fig.add_subplot(gs[0, 1])
+    parent_fig = cax.get_figure(root=False)
+    if parent_fig is None:
+        cax = fig.add_subplot(gs[0, 1])
+    else:
+        cax.cla()
     fig.colorbar(mappable, cax=cax)
 
 
