@@ -93,6 +93,7 @@ def test_load_obs_map_euv_external_fits_converts_integrated_dn(tmp_path) -> None
 
     np.testing.assert_allclose(obs_map.data, [[50.0, 100.0]])
     assert obs_map.header["BUNIT"] == "DN s^-1 pix^-1"
+    assert obs_map.header["PIXLUNIT"] == "DN s^-1 pix^-1"
     assert obs_map.wcs_metadata["euv_unit_conversion"] == "integrated_dn_to_rate"
     assert obs_map_noise_unit_label(obs_map) == "DN s^-1 pix^-1"
 
@@ -121,6 +122,52 @@ def test_load_obs_map_model_refmap_converts_using_source_path_attr(tmp_path) -> 
     np.testing.assert_allclose(obs_map.data, [[40.0, 40.0], [40.0, 40.0]])
     assert obs_map.wcs_metadata["euv_unit_conversion"] == "integrated_dn_to_rate"
     assert obs_map.wcs_metadata["euv_exposure_seconds"] == 4.0
+
+
+def test_load_obs_map_euv_external_fits_converts_when_domain_inferred(tmp_path) -> None:
+    fits_path = tmp_path / "aia_171.fits"
+    data = np.array([[90.0, 180.0]], dtype=np.float32)
+    header = fits.Header()
+    header["WAVELNTH"] = 171
+    header["WAVEUNIT"] = "angstrom"
+    header["INSTRUME"] = "AIA"
+    header["PIXLUNIT"] = "DN"
+    header["EXPTIME"] = 3.0
+    fits.PrimaryHDU(data=data, header=header).writeto(fits_path)
+
+    obs_map = load_obs_map(obs_path=fits_path)
+
+    assert obs_map.domain == "euv"
+    np.testing.assert_allclose(obs_map.data, [[30.0, 60.0]])
+    assert obs_map.header["PIXLUNIT"] == "DN s^-1 pix^-1"
+    assert obs_map.wcs_metadata["euv_unit_conversion"] == "integrated_dn_to_rate"
+
+
+def test_load_obs_map_model_refmap_relative_source_path(tmp_path) -> None:
+    fits_dir = tmp_path / "fits"
+    fits_dir.mkdir()
+    source_fits = fits_dir / "source_171.fits"
+    source_header = fits.Header()
+    source_header["EXPTIME"] = 5.0
+    fits.PrimaryHDU(data=np.ones((2, 2), dtype=np.float32), header=source_header).writeto(source_fits)
+
+    model_h5 = tmp_path / "model.h5"
+    embedded = np.full((2, 2), 100.0, dtype=np.float32)
+    header = fits.Header()
+    header["DATE-OBS"] = "2025-11-26T15:34:33.350"
+    header["INSTRUME"] = "AIA"
+
+    with h5py.File(model_h5, "w") as h5f:
+        group = h5f.create_group("refmaps").create_group("AIA_171")
+        group.create_dataset("data", data=embedded)
+        group.create_dataset("wcs_header", data=np.bytes_(header.tostring(sep="\n", endcard=True)))
+        group.attrs["source_path"] = "fits/source_171.fits"
+
+    obs_map = load_obs_map(model_h5=model_h5, map_id="AIA_171", source_mode="model_refmap")
+
+    np.testing.assert_allclose(obs_map.data, [[20.0, 20.0], [20.0, 20.0]])
+    assert obs_map.wcs_metadata["euv_unit_conversion"] == "integrated_dn_to_rate"
+    assert obs_map.wcs_metadata["euv_exposure_seconds"] == 5.0
 
 
 def test_load_obs_map_euv_external_fits_extracts_wavelength(tmp_path) -> None:

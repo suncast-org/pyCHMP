@@ -53,6 +53,24 @@ class ObservationalMap:
     wcs_metadata: dict[str, Any] | None
 
 
+def _resolve_refmap_source_fits_path(
+    source_path_attr: str,
+    model_h5: Path,
+) -> Path | None:
+    """Resolve embedded refmap ``source_path`` attrs to an on-disk FITS file."""
+    try:
+        candidate = Path(str(source_path_attr)).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if not candidate.is_absolute():
+        candidate = (model_h5.parent / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 def _optional_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -824,9 +842,13 @@ def _load_external_obs_map(
         raise ValueError(f"failed to read external FITS file: {resolved_obs_path}: {exc}") from exc
     resolved_domain = _normalize_domain(domain)
     header_psf = extract_psf_metadata_from_header(header)
-
-    frequency_ghz = extract_frequency_ghz(header) if resolved_domain == "mw" else _infer_frequency_ghz(header)
     wavelength_angstrom = _extract_wavelength_angstrom(header)
+    if resolved_domain == "generic":
+        try:
+            resolved_domain = infer_spectral_domain_from_header(header)
+        except ValueError:
+            pass
+    frequency_ghz = extract_frequency_ghz(header) if resolved_domain == "mw" else _infer_frequency_ghz(header)
     effective_time, observation_time_diag = infer_effective_observation_time(
         header,
         source_path=resolved_obs_path,
@@ -890,12 +912,10 @@ def _load_internal_obs_map(
         header_text = _decode_h5_scalar(group["wcs_header"][()])
         refmap_source_path = None
         if "source_path" in group.attrs:
-            try:
-                candidate = Path(str(group.attrs["source_path"]))
-                if candidate.is_file():
-                    refmap_source_path = candidate.resolve()
-            except (TypeError, ValueError, OSError):
-                refmap_source_path = None
+            refmap_source_path = _resolve_refmap_source_fits_path(
+                str(group.attrs["source_path"]),
+                resolved_model_h5,
+            )
 
     header = fits.Header.fromstring(header_text, sep="\n")
     header_psf = extract_psf_metadata_from_header(header)

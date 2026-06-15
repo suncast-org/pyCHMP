@@ -105,6 +105,8 @@ def convert_euv_observation_to_rate(
 
     rate = np.asarray(data, dtype=float) / float(exptime)
     out_header["BUNIT"] = MODELED_EUV_BUNIT
+    if "PIXLUNIT" in out_header:
+        out_header["PIXLUNIT"] = MODELED_EUV_BUNIT
     diagnostics["euv_unit_conversion"] = "integrated_dn_to_rate"
     diagnostics["euv_exposure_seconds"] = float(exptime)
     if source_path is not None:

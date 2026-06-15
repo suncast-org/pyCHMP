@@ -34,6 +34,7 @@ def test_convert_integrated_dn_to_rate() -> None:
     rate, out_header, diag = convert_euv_observation_to_rate(data, header)
     np.testing.assert_allclose(rate, [[50.0, 100.0]])
     assert out_header["BUNIT"] == MODELED_EUV_BUNIT
+    assert out_header["PIXLUNIT"] == MODELED_EUV_BUNIT
     assert diag["euv_unit_conversion"] == "integrated_dn_to_rate"
     assert diag["euv_exposure_seconds"] == 2.0
 
