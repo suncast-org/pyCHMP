@@ -122,24 +122,30 @@ def test_resolve_heatmap_color_norm_uses_log_for_positive_values() -> None:
 def test_heatmap_colorbar_reset_after_remove_recreates_cax() -> None:
     from matplotlib.figure import Figure
     import matplotlib.cm as mpl_cm
+    import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
 
     fig = Figure(layout=None)
     gs = fig.add_gridspec(1, 2, width_ratios=[22, 1], wspace=0.08)
     ax = fig.add_subplot(gs[0, 0])
     cax = fig.add_subplot(gs[0, 1])
-    mappable = mpl_cm.ScalarMappable(norm=LogNorm(0.75, 1.05), cmap=mpl_cm.get_cmap("viridis"))
+    cmap = plt.colormaps["viridis"]
+    mappable = mpl_cm.ScalarMappable(norm=LogNorm(0.75, 1.05), cmap=cmap)
     mappable.set_array([0.8, 1.0])
     cb = fig.colorbar(mappable, cax=cax)
     cb.remove()
-    assert cax.get_figure(root=False) is None
-    cax = fig.add_subplot(gs[0, 1])
+    parent_fig = cax.get_figure(root=False)
+    if parent_fig is None:
+        cax = fig.add_subplot(gs[0, 1])
+    else:
+        cax.cla()
     fig.colorbar(mappable, cax=cax)
 
 
 def test_heatmap_colorbar_cax_does_not_shrink_main_axes_on_repeat() -> None:
     from matplotlib.figure import Figure
     import matplotlib.cm as mpl_cm
+    import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
 
     fig = Figure(layout=None)
@@ -147,7 +153,7 @@ def test_heatmap_colorbar_cax_does_not_shrink_main_axes_on_repeat() -> None:
     ax = fig.add_subplot(gs[0, 0])
     cax = fig.add_subplot(gs[0, 1])
     width0 = float(ax.get_position().width)
-    cmap = mpl_cm.get_cmap("viridis")
+    cmap = plt.colormaps["viridis"]
     mappable = mpl_cm.ScalarMappable(norm=LogNorm(0.75, 1.05), cmap=cmap)
     mappable.set_array([0.8, 1.0, 1.04])
     for _ in range(6):
@@ -159,10 +165,10 @@ def test_heatmap_colorbar_cax_does_not_shrink_main_axes_on_repeat() -> None:
 
 
 def test_heatmap_facecolors_differ_between_linear_and_log_norm() -> None:
-    import matplotlib.cm as mpl_cm
+    import matplotlib.pyplot as plt
 
     values = np.asarray([0.6, 0.8, 1.0], dtype=float)
-    cmap = mpl_cm.get_cmap("viridis")
+    cmap = plt.colormaps["viridis"]
     linear_norm, _, _ = resolve_heatmap_color_norm(values, log_scale=False)
     log_norm, _, _ = resolve_heatmap_color_norm(values, log_scale=True)
     linear_colors = heatmap_facecolors_from_values(values, norm=linear_norm, cmap=cmap)

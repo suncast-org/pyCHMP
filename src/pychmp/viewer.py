@@ -6083,7 +6083,7 @@ class PychmpViewApp:
         heatmap_norm = None
         if patches:
             log_scale = self._use_heatmap_log_scale()
-            cmap = mpl_cm.get_cmap("viridis")
+            cmap = plt.colormaps["viridis"]
             heatmap_norm, _vmin, _vmax = resolve_heatmap_color_norm(color_values, log_scale=log_scale)
             facecolors = heatmap_facecolors_from_values(color_values, norm=heatmap_norm, cmap=cmap)
             metric_collection = PatchCollection(

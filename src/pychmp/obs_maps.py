@@ -20,6 +20,7 @@ import h5py
 import numpy as np
 from astropy.io import fits
 
+from .euv_obs_units import maybe_convert_euv_domain_observation
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .geometry_policy import infer_observation_observer, normalize_observer_identity
 from .map_noise import MapNoiseEstimate, estimate_map_noise
@@ -50,6 +51,24 @@ class ObservationalMap:
     source_map_id: str | None
     psf_metadata: dict[str, Any] | None
     wcs_metadata: dict[str, Any] | None
+
+
+def _resolve_refmap_source_fits_path(
+    source_path_attr: str,
+    model_h5: Path,
+) -> Path | None:
+    """Resolve embedded refmap ``source_path`` attrs to an on-disk FITS file."""
+    try:
+        candidate = Path(str(source_path_attr)).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if not candidate.is_absolute():
+        candidate = (model_h5.parent / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    if candidate.is_file():
+        return candidate
+    return None
 
 
 def _optional_float(value: Any) -> float | None:
@@ -823,20 +842,30 @@ def _load_external_obs_map(
         raise ValueError(f"failed to read external FITS file: {resolved_obs_path}: {exc}") from exc
     resolved_domain = _normalize_domain(domain)
     header_psf = extract_psf_metadata_from_header(header)
-
-    frequency_ghz = extract_frequency_ghz(header) if resolved_domain == "mw" else _infer_frequency_ghz(header)
     wavelength_angstrom = _extract_wavelength_angstrom(header)
+    if resolved_domain == "generic":
+        try:
+            resolved_domain = infer_spectral_domain_from_header(header)
+        except ValueError:
+            pass
+    frequency_ghz = extract_frequency_ghz(header) if resolved_domain == "mw" else _infer_frequency_ghz(header)
     effective_time, observation_time_diag = infer_effective_observation_time(
         header,
         source_path=resolved_obs_path,
     )
+    converted_data, converted_header, unit_diag = maybe_convert_euv_domain_observation(
+        data_arr,
+        header,
+        domain=resolved_domain,
+        source_path=resolved_obs_path,
+    )
 
     return ObservationalMap(
-        data=np.asarray(data_arr, dtype=float),
-        header=header.copy(),
+        data=converted_data,
+        header=converted_header,
         domain=resolved_domain,
-        instrument=_infer_instrument(header, instrument=instrument),
-        observer=_infer_observer(header),
+        instrument=_infer_instrument(converted_header, instrument=instrument),
+        observer=_infer_observer(converted_header),
         spectral_label=_format_spectral_label(
             domain=resolved_domain,
             frequency_ghz=frequency_ghz,
@@ -849,7 +878,7 @@ def _load_external_obs_map(
         source_path=str(resolved_obs_path),
         source_map_id=None,
         psf_metadata=None if header_psf is None else header_psf.as_dict(),
-        wcs_metadata={"hdu_name": str(hdu_name), **observation_time_diag},
+        wcs_metadata={"hdu_name": str(hdu_name), **observation_time_diag, **unit_diag},
     )
 
 
@@ -881,6 +910,12 @@ def _load_internal_obs_map(
             )
         data = np.asarray(group["data"], dtype=float)
         header_text = _decode_h5_scalar(group["wcs_header"][()])
+        refmap_source_path = None
+        if "source_path" in group.attrs:
+            refmap_source_path = _resolve_refmap_source_fits_path(
+                str(group.attrs["source_path"]),
+                resolved_model_h5,
+            )
 
     header = fits.Header.fromstring(header_text, sep="\n")
     header_psf = extract_psf_metadata_from_header(header)
@@ -910,25 +945,36 @@ def _load_internal_obs_map(
     if spectral_label is None:
         spectral_label = resolved_map_id
 
+    converted_data, converted_header, unit_diag = maybe_convert_euv_domain_observation(
+        data,
+        header,
+        domain=resolved_domain,
+        source_path=refmap_source_path,
+    )
+    wcs_metadata = {
+        "group_path": group_path,
+        "available_map_ids": available_map_ids,
+        "converted_from_sav": str(model_h5).lower().endswith(".sav"),
+        **unit_diag,
+    }
+    if refmap_source_path is not None:
+        wcs_metadata["refmap_source_path"] = str(refmap_source_path)
+
     return ObservationalMap(
-        data=np.asarray(data, dtype=float),
-        header=header.copy(),
+        data=converted_data,
+        header=converted_header,
         domain=resolved_domain,
         instrument=resolved_instrument,
-        observer=_infer_observer(header),
+        observer=_infer_observer(converted_header),
         spectral_label=spectral_label,
         frequency_ghz=frequency_ghz,
         wavelength_angstrom=wavelength_angstrom,
-        date_obs=_infer_date_obs(header),
+        date_obs=_infer_date_obs(converted_header),
         source_mode="model_refmap",
         source_path=str(resolved_model_h5),
         source_map_id=resolved_map_id,
         psf_metadata=None if header_psf is None else header_psf.as_dict(),
-        wcs_metadata={
-            "group_path": group_path,
-            "available_map_ids": available_map_ids,
-            "converted_from_sav": str(model_h5).lower().endswith(".sav"),
-        },
+        wcs_metadata=wcs_metadata,
     )
 
 
