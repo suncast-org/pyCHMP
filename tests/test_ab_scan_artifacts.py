@@ -1098,6 +1098,38 @@ def test_load_search_run_profile_and_apply_to_namespace(tmp_path: Path) -> None:
     assert args.execution_policy == "serial"
 
 
+def test_apply_search_run_profile_clears_obs_path_for_model_refmap() -> None:
+    stale_path = Path("/tmp/stale_external.fits")
+    profile = {
+        "diagnostics": {
+            "observation_source_mode": "model_refmap",
+            "observation_source_path": "/tmp/should_not_be_used.fits",
+            "fits_file": "/tmp/should_not_be_used.fits",
+            "observation_source_map_id": "AIA_94",
+            "model_path": "/tmp/model.h5",
+        },
+        "request": {},
+    }
+    args = Namespace(
+        fits_file=stale_path,
+        obs_path=stale_path,
+        obs_source=None,
+        obs_map_id=None,
+        model_h5=None,
+        model_h5_override=None,
+        ebtel_path=None,
+        obs_domain=None,
+        obs_frequency_ghz=None,
+    )
+
+    apply_search_run_profile_to_namespace(args, profile)
+
+    assert args.obs_source == "model_refmap"
+    assert args.obs_path is None
+    assert args.fits_file is None
+    assert args.obs_map_id == "AIA_94"
+
+
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:
     out_h5 = tmp_path / "sparse_scan.h5"
     observed = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=float)

@@ -1919,6 +1919,9 @@ def apply_search_run_profile_to_namespace(
         args.obs_source = source_mode
     if source_mode == "external_fits" and fits_path:
         args.obs_path = Path(fits_path)
+    elif source_mode == "model_refmap":
+        args.obs_path = None
+        args.fits_file = None
     map_id = diagnostics.get("observation_source_map_id")
     if map_id not in {None, ""}:
         args.obs_map_id = str(map_id)
