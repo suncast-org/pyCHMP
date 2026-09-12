@@ -83,28 +83,88 @@ def canonical_q0_search_stages_from_profile(profile: dict[str, object]) -> tuple
     )
 
 
+def _resolved_warm_mask_stages(
+    *,
+    q0_search_stages: tuple[str, ...] | list[str] | str | None = None,
+    mask_type: str = "union",
+    explicit_mask: object | None = None,
+) -> tuple[str, ...]:
+    parsed_stages = (
+        parse_q0_search_stages(q0_search_stages)
+        if isinstance(q0_search_stages, str)
+        else normalize_q0_search_stages_value(q0_search_stages)
+    )
+    return resolve_q0_search_stages(
+        q0_search_stages=parsed_stages,
+        mask_type=str(mask_type),
+        explicit_mask=explicit_mask,
+    )
+
+
+def _normalize_warm_mask_stage(stage: str, *, mask_type: str) -> str:
+    if stage == "explicit":
+        normalized = str(mask_type).strip().lower()
+        return normalized or "explicit_fits"
+    return str(stage)
+
+
+def resolve_warm_bracket_seed_mask_type(
+    *,
+    q0_search_stages: tuple[str, ...] | list[str] | str | None = None,
+    mask_type: str = "union",
+    explicit_mask: object | None = None,
+) -> str:
+    """Mask type for optimizer bracket seeding (first Q0 stage)."""
+    stages = _resolved_warm_mask_stages(
+        q0_search_stages=q0_search_stages,
+        mask_type=mask_type,
+        explicit_mask=explicit_mask,
+    )
+    return _normalize_warm_mask_stage(stages[0], mask_type=mask_type)
+
+
+def resolve_warm_curve_rescore_mask_type(
+    *,
+    q0_search_stages: tuple[str, ...] | list[str] | str | None = None,
+    mask_type: str = "union",
+    explicit_mask: object | None = None,
+) -> str:
+    """Mask type for artifact curve metrics (final Q0 stage)."""
+    stages = _resolved_warm_mask_stages(
+        q0_search_stages=q0_search_stages,
+        mask_type=mask_type,
+        explicit_mask=explicit_mask,
+    )
+    return _normalize_warm_mask_stage(stages[-1], mask_type=mask_type)
+
+
+def defer_warm_curve_commits(
+    *,
+    q0_search_stages: tuple[str, ...] | list[str] | str | None = None,
+    mask_type: str = "union",
+    explicit_mask: object | None = None,
+) -> bool:
+    """True when warm map_store trials should not be bulk-committed to the curve."""
+    stages = _resolved_warm_mask_stages(
+        q0_search_stages=q0_search_stages,
+        mask_type=mask_type,
+        explicit_mask=explicit_mask,
+    )
+    return len(stages) > 1
+
+
 def resolve_warm_rescore_mask_type(
     *,
     q0_search_stages: tuple[str, ...] | list[str] | str | None = None,
     mask_type: str = "union",
     explicit_mask: object | None = None,
 ) -> str:
-    """Mask type for warm-start map rescoring (first active Q0 stage)."""
-    parsed_stages = (
-        parse_q0_search_stages(q0_search_stages)
-        if isinstance(q0_search_stages, str)
-        else normalize_q0_search_stages_value(q0_search_stages)
-    )
-    stages = resolve_q0_search_stages(
-        q0_search_stages=parsed_stages,
-        mask_type=str(mask_type),
+    """Alias for :func:`resolve_warm_bracket_seed_mask_type` (optimizer warm-start only)."""
+    return resolve_warm_bracket_seed_mask_type(
+        q0_search_stages=q0_search_stages,
+        mask_type=mask_type,
         explicit_mask=explicit_mask,
     )
-    stage = stages[0]
-    if stage == "explicit":
-        normalized = str(mask_type).strip().lower()
-        return normalized or "explicit_fits"
-    return str(stage)
 
 
 def point_record_trial_stages_match_recipe(

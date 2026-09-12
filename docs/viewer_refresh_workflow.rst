@@ -103,6 +103,64 @@ Display pipeline (live == saved)
 3. Load raw map from ``map_store``; convolve with PSF from ``common``.
 4. Build observed / modeled / residual in Selected Solution panel.
 
+Heatmap semantics during a live search
+--------------------------------------
+
+The ``(a,b)`` heatmap uses **one fill color per cell**: the **best target-metric
+value committed so far** for that grid point (the metric selected in the viewer
+toolbar, typically ``eta2``). This applies to **finished and in-progress**
+cells alike.
+
+Partial / active cells (intended behaviour)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A cell can be **live** (yellow star, runner working on it) and **already painted**
+at the same time. The two overlays mean different things:
+
++------------------+-------------------------------------------------------------+
+| Visual           | Meaning                                                     |
++==================+=============================================================+
+| **Fill color**   | Best committed metric at that ``(a,b)`` so far              |
++------------------+-------------------------------------------------------------+
+| **Gray dashed  | Grid point not finished yet (``pending`` / ``RUNNING``)       |
+| outline**        |                                                             |
++------------------+-------------------------------------------------------------+
+| **Yellow star**  | Active live cell: runner is here now; shown once at least   |
+| (``active``)     | one trial is committed or a trial is streaming              |
++------------------+-------------------------------------------------------------+
+| **Purple star**  | Assigned footprint cell not yet evaluated (expand/resume)   |
++------------------+-------------------------------------------------------------+
+
+Rules implemented in ``viewer.py`` (``_draw_heatmap``):
+
+* A cell is **filled** when its grid record has a **finite** value for the
+  display metric — even if ``status`` is still ``pending`` (artifact
+  ``RUNNING``).
+* A cell stays **outline-only** when it is ``missing``, ``pending`` with **no**
+  finite metric yet, or a ``live_pending`` ghost (active coordinates not yet
+  present in the artifact).
+* When a point finishes (``COMPLETED``), the fill remains the final best metric;
+  the dashed pending outline and yellow active star move on to the next cell.
+
+Trials panel
+~~~~~~~~~~~~
+
+For the active ``(a,b)``, the Q₀ curve shows **committed trial history** as soon
+as trials land in the artifact, including while the point is still ``RUNNING``.
+The footer line (``trial #N/M q0=… metric=… [best]``) tracks the current best
+over committed trials, consistent with the heatmap fill.
+
+Why this design
+~~~~~~~~~~~~~~~
+
+Earlier viewer builds treated all ``pending`` cells as empty (“No data yet”), which
+hid useful partial curves during long Q₀ searches. Painting the **best-so-far**
+metric gives immediate feedback as trials commit, without waiting for the full
+point to complete.
+
+Related tests: ``test_draw_trials_shows_partial_history_for_running_pending_point``
+in ``tests/test_viewer_scan_state.py``.
+
 Implementation checklist
 ------------------------
 

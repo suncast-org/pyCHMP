@@ -118,6 +118,42 @@ def load_warm_q0_evaluations_for_grid_point(
     return evaluations or None
 
 
+def rescore_raw_modeled_map(
+    raw_modeled_map: np.ndarray,
+    *,
+    observed_template: np.ndarray,
+    psf_kernel: Any,
+    context: ObservationEvaluationContext,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+    use_emthreshold: bool,
+    ebtel_miss_ratio_fn: Any = None,
+    mask_type: str = "union",
+) -> Q0MetricEvaluation | None:
+    """Rescore one stored raw modeled map under the requested mask stage."""
+    _ = str(target_metric)
+    _raw_display, modeled, _residual, _has_raw = _derive_display_maps_from_raw(
+        np.asarray(raw_modeled_map, dtype=float),
+        observed_template=observed_template,
+        psf_kernel=psf_kernel,
+    )
+    if modeled is None:
+        return None
+    evaluation = evaluate_modeled_trial(
+        modeled,
+        context,
+        threshold=float(threshold),
+        mask_type=str(mask_type),
+        explicit_mask=explicit_mask,
+        ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
+        use_emthreshold=use_emthreshold,
+    )
+    if not evaluation.is_valid:
+        return None
+    return evaluation
+
+
 def _rescore_raw_map_ref(
     h5_file: Any,
     raw_ref: str,
@@ -336,6 +372,7 @@ def build_warm_grid_trial_commit_events(
     target_metric: str,
     use_emthreshold: bool = True,
     mask_type: str = "union",
+    psf_kernel: Any = None,
 ) -> list[GridTrialCommittedEvent]:
     """Rescore compatible map_store maps and return grid commit events (linked refs, all metrics)."""
     entries = slice_map_index.entries_for_point(float(a_value), float(b_value))
@@ -354,14 +391,16 @@ def build_warm_grid_trial_commit_events(
         if common is None:
             return []
         observed_template = np.asarray(common["observed"][()], dtype=float)
-        psf_kernel = common["psf_kernel"][()] if "psf_kernel" in common else None
+        resolved_psf_kernel = psf_kernel
+        if resolved_psf_kernel is None:
+            resolved_psf_kernel = common["psf_kernel"][()] if "psf_kernel" in common else None
         for entry in entries:
             evaluation = _rescore_raw_map_ref(
                 h5_file,
                 entry.raw_map_ref,
                 q0_value=float(entry.q0),
                 observed_template=observed_template,
-                psf_kernel=psf_kernel,
+                psf_kernel=resolved_psf_kernel,
                 context=context,
                 threshold=float(threshold),
                 explicit_mask=explicit_mask,
@@ -392,6 +431,7 @@ def build_warm_grid_trial_commit_events(
             shift_x_trials=shift_x_trials,
             shift_y_trials=shift_y_trials,
             shift_valid_trials=shift_valid_trials,
+            stage=str(evaluation.mask_stage or mask_type),
         )
         events.append(
             GridTrialCommittedEvent(

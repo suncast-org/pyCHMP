@@ -19,6 +19,7 @@ from .ab_scan_artifacts import (
     _H5PY_FILE,
     _json_loads_or_empty,
     _read_map_store_ref_array,
+    is_h5_transient_read_error,
 )
 from .grid_points import (
     GRID_POINTS_GROUP,
@@ -41,7 +42,12 @@ def grid_trial_row_should_purge(h5_file: h5py.File, trial_group: h5py.Group) -> 
         q0_value = float(trial_group.attrs["q0"])
     except Exception:
         return True, "missing_q0"
-    map_refs = _json_loads_or_empty(trial_group[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial_group else {}
+    try:
+        map_refs = _json_loads_or_empty(trial_group[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial_group else {}
+    except (OSError, RuntimeError) as exc:
+        if is_h5_transient_read_error(exc):
+            return True, "corrupt_trial_group"
+        raise
     raw_ref = str(map_refs.get("raw_modeled", "") or "").strip()
     if not (np.isfinite(q0_value) and q0_value > 0.0):
         return True, "non_finite_q0"

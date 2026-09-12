@@ -125,14 +125,21 @@ def _lookup_response_sampling_pixel_arcsec(instrument_name: str | None) -> tuple
             response_eui = import_module("pyeuvtools.response.eui")
             pixel_arcsec = float(getattr(response_eui, "_EUI_PIXEL_ARCSEC")["hri"])
             return pixel_arcsec, "euihri"
-        if instrument_key in {"stereoaeuvi", "euvia", "ahead", "stereoaeuvi"}:
+        if instrument_key in {
+            "stereoaeuvi",
+            "euvia",
+            "ahead",
+            "stereoa",
+            "stereo",
+            "stereobeuvi",
+            "euvib",
+            "behind",
+        }:
             response_euvi = import_module("pyeuvtools.response.euvi")
-            pixel_arcsec = float(getattr(response_euvi, "_EUVI_PIXEL_ARCSEC")["ahead"])
-            return pixel_arcsec, "stereoaeuvi"
-        if instrument_key in {"stereobeuvi", "euvib", "behind", "stereobeuvi"}:
-            response_euvi = import_module("pyeuvtools.response.euvi")
-            pixel_arcsec = float(getattr(response_euvi, "_EUVI_PIXEL_ARCSEC")["behind"])
-            return pixel_arcsec, "stereobeuvi"
+            spacecraft = "behind" if instrument_key in {"stereobeuvi", "euvib", "behind"} else "ahead"
+            pixel_arcsec = float(getattr(response_euvi, "_EUVI_PIXEL_ARCSEC")[spacecraft])
+            label = "stereoaeuvi" if spacecraft == "ahead" else "stereobeuvi"
+            return pixel_arcsec, label
         if instrument_key in {"trace"}:
             response_trace = import_module("pyeuvtools.response.trace")
             return float(getattr(response_trace, "TRACE_PIXEL_ARCSEC")), instrument_key
@@ -388,6 +395,138 @@ def elliptical_gaussian_kernel(
     kernel = np.exp(-0.5 * ((x_rot / sigma_x) ** 2 + (y_rot / sigma_y) ** 2))
     kernel /= np.sum(kernel)
     return kernel
+
+
+def _first_finite_float(*values: Any) -> float | None:
+    for value in values:
+        numeric = _optional_float(value)
+        if numeric is not None:
+            return float(numeric)
+    return None
+
+
+def psf_metadata_from_diagnostics(diagnostics: dict[str, Any] | None) -> PSFMetadata | None:
+    """Reconstruct PSF metadata from persisted slice/search diagnostics."""
+    diag = dict(diagnostics or {})
+    resolved = dict(diag.get("resolved_psf") or {})
+    kind = str(resolved.get("kind") or "").strip().lower()
+    source = str(diag.get("psf_source") or resolved.get("source") or "diagnostics").strip() or "diagnostics"
+    if kind == "gaussian" or resolved.get("active_bmaj_arcsec") is not None:
+        bmaj = _first_finite_float(
+            resolved.get("active_bmaj_arcsec"),
+            resolved.get("psf_bmaj_arcsec"),
+            resolved.get("reference_bmaj_arcsec"),
+        )
+        bmin = _first_finite_float(
+            resolved.get("active_bmin_arcsec"),
+            resolved.get("psf_bmin_arcsec"),
+            resolved.get("reference_bmin_arcsec"),
+        )
+        bpa = _first_finite_float(
+            resolved.get("active_bpa_deg"),
+            resolved.get("psf_bpa_deg"),
+            resolved.get("reference_bpa_deg"),
+            0.0,
+        )
+        if bmaj is not None and bmin is not None and bpa is not None:
+            return PSFMetadata(
+                source=source,
+                kind="gaussian",
+                bmaj_arcsec=float(bmaj),
+                bmin_arcsec=float(bmin),
+                bpa_deg=float(bpa),
+                allows_frequency_scaling=bool(resolved.get("allows_frequency_scaling", False)),
+            )
+    return None
+
+
+def _normalized_psf_kernel_array(psf_kernel: np.ndarray | None) -> np.ndarray | None:
+    if psf_kernel is None:
+        return None
+    kernel = np.asarray(psf_kernel, dtype=float)
+    if kernel.ndim != 2 or kernel.size == 0:
+        return None
+    kernel_sum = float(np.nansum(kernel))
+    if not np.isfinite(kernel_sum) or kernel_sum == 0.0:
+        return None
+    return np.asarray(kernel / kernel_sum, dtype=np.float32)
+
+
+_PSF_KERNEL_BUILD_CACHE: dict[tuple[Any, ...], np.ndarray | None] = {}
+
+
+def _psf_kernel_build_cache_key(
+    metadata: PSFMetadata,
+    *,
+    dx_arcsec: float,
+    dy_arcsec: float,
+    active_frequency_ghz: float | None,
+) -> tuple[Any, ...]:
+    return (
+        str(metadata.source),
+        str(metadata.kind),
+        None if metadata.bmaj_arcsec is None else float(metadata.bmaj_arcsec),
+        None if metadata.bmin_arcsec is None else float(metadata.bmin_arcsec),
+        None if metadata.bpa_deg is None else float(metadata.bpa_deg),
+        float(dx_arcsec),
+        float(dy_arcsec),
+        None if active_frequency_ghz is None else float(active_frequency_ghz),
+    )
+
+
+def clear_psf_kernel_build_cache() -> None:
+    """Clear the in-process PSF kernel build cache (mainly for tests)."""
+    _PSF_KERNEL_BUILD_CACHE.clear()
+
+
+def resolve_slice_psf_kernel(
+    *,
+    stored_kernel: np.ndarray | None,
+    diagnostics: dict[str, Any] | None = None,
+    dx_arcsec: float,
+    dy_arcsec: float,
+    active_frequency_ghz: float | None = None,
+) -> np.ndarray | None:
+    """Return the slice-common PSF kernel from storage or diagnostics."""
+    normalized = _normalized_psf_kernel_array(stored_kernel)
+    if normalized is not None:
+        return normalized
+
+    metadata = psf_metadata_from_diagnostics(diagnostics)
+    if metadata is None:
+        return None
+
+    resolved_frequency = active_frequency_ghz
+    if resolved_frequency is None and diagnostics is not None:
+        for key in ("frequency_ghz", "active_frequency_ghz", "mw_frequency_ghz"):
+            candidate = _optional_float(diagnostics.get(key))
+            if candidate is not None:
+                resolved_frequency = float(candidate)
+                break
+        if resolved_frequency is None:
+            resolved_block = dict(diagnostics.get("resolved_psf") or {})
+            resolved_frequency = _optional_float(resolved_block.get("active_frequency_ghz"))
+
+    cache_key = _psf_kernel_build_cache_key(
+        metadata,
+        dx_arcsec=float(dx_arcsec),
+        dy_arcsec=float(dy_arcsec),
+        active_frequency_ghz=resolved_frequency,
+    )
+    if cache_key in _PSF_KERNEL_BUILD_CACHE:
+        return _PSF_KERNEL_BUILD_CACHE[cache_key]
+
+    kernel, _resolved = build_psf_kernel(
+        metadata=metadata,
+        dx_arcsec=float(dx_arcsec),
+        dy_arcsec=float(dy_arcsec),
+        active_frequency_ghz=resolved_frequency,
+        ref_frequency_ghz=None,
+        scale_inverse_frequency=False,
+    )
+    normalized_kernel = _normalized_psf_kernel_array(kernel)
+    _PSF_KERNEL_BUILD_CACHE[cache_key] = normalized_kernel
+    return normalized_kernel
 
 
 def build_psf_kernel(

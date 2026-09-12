@@ -30,6 +30,8 @@ from examples.python.adaptive_ab_search_single_observation import (
     _resolve_geometry_request_flags,
     format_uncertified_basin_expand_guidance,
     _rescore_record_to_warm_initial_evaluations,
+    _warm_bracket_seed_mask_type_from_diagnostics,
+    _warm_curve_rescore_mask_type_from_diagnostics,
     _warm_rescore_mask_type_from_diagnostics,
     _resolve_observation_request,
     _resolve_render_slice_requests,
@@ -1590,6 +1592,108 @@ def test_persistent_cache_set_pending_points_writes_live_trial_marker(tmp_path: 
     assert int(headers[0]["n_trials"]) == 0
 
 
+def test_assign_grid_points_skips_reset_for_incomplete_running_point(tmp_path: Path) -> None:
+    import h5py
+
+    from pychmp.grid_points import (
+        GRID_POINTS_GROUP,
+        GridPointAssignedEvent,
+        GridPointStatus,
+        GridTrialCommittedEvent,
+        SEARCHES_GROUP,
+        SLICE_CONTAINER_GROUP,
+        apply_grid_point_event_with_retry,
+        read_grid_point_header,
+    )
+
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 1.0
+    header["CDELT2"] = 1.0
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    diagnostics = {
+        "artifact_kind": "unified_ab_scan",
+        "slice_key": "euv_193",
+        "target_slice_key": "euv_193",
+        "target_metric": "eta2",
+        "selected_search_id": "search_b5751ea4cf6c8571",
+        "search_id": "search_b5751ea4cf6c8571",
+    }
+    artifact_h5 = tmp_path / "adaptive.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    point_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(
+            a=-0.05,
+            b=4.0,
+            q0_start=0.05,
+            next_q0=0.07,
+            metric_name="eta2",
+        ),
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id=str(point_id),
+            trial_index=0,
+            q0=0.05,
+            metric=0.36,
+            next_q0=0.07,
+            best_trial_index=0,
+            best_metric=0.36,
+            raw_modeled_map=np.ones((2, 2), dtype=np.float32),
+        ),
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="eta2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-123",
+        viewer_heartbeat=None,
+    )
+    cache.set_preserve_stored_search_trials(True)
+    cache.hydrate_from_existing()
+    cache.set_pending_points([(-0.05, 4.0)], q0_starts=[0.08])
+    cache.flush_pending_writes()
+    cache.close()
+
+    with h5py.File(artifact_h5, "r") as f:
+        point_group = f[SLICE_CONTAINER_GROUP]["euv_193"][SEARCHES_GROUP]["search_b5751ea4cf6c8571"][GRID_POINTS_GROUP][point_id]
+        restored = read_grid_point_header(point_group)
+    assert restored["status"] == GridPointStatus.RUNNING.value
+    assert int(restored["n_trials"]) == 1
+    assert float(restored["next_q0"]) == pytest.approx(0.07)
+
+
 def test_dispatcher_advances_live_trial_marker_to_next_pending_point(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1934,11 +2038,22 @@ def test_register_parallel_search_preserves_prior_search(tmp_path: Path) -> None
 
 
 def test_warm_rescore_mask_type_from_diagnostics_uses_data_stage() -> None:
-    mask_type = _warm_rescore_mask_type_from_diagnostics(
-        {"q0_search_stages": ["data"], "mask_type": "union"},
-        explicit_mask=None,
+    diagnostics = {"q0_search_stages": ["data", "union"], "mask_type": "union"}
+    assert (
+        _warm_bracket_seed_mask_type_from_diagnostics(diagnostics, explicit_mask=None)
+        == "data"
     )
-    assert mask_type == "data"
+    assert (
+        _warm_curve_rescore_mask_type_from_diagnostics(diagnostics, explicit_mask=None)
+        == "union"
+    )
+    assert (
+        _warm_rescore_mask_type_from_diagnostics(
+            {"q0_search_stages": ["data"], "mask_type": "union"},
+            explicit_mask=None,
+        )
+        == "data"
+    )
 
 
 def test_rescore_record_to_warm_initial_evaluations_uses_requested_mask_stage() -> None:

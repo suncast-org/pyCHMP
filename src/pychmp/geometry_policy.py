@@ -54,7 +54,42 @@ def normalize_observer_identity(value: Any | None) -> str | None:
         return "stereo-a"
     if compact in {"stereo-b", "behind"} or "stereo-b" in compact:
         return "stereo-b"
+    if compact == "stereo":
+        return "stereo-a"
     return compact
+
+
+def resolve_euv_instrument_name(
+    obs_map: Any,
+    *,
+    observer_name: str | None = None,
+) -> str:
+    """Resolve gxrender EUV instrument token (``aia``, ``stereo-a``, ``euvi``, ...)."""
+
+    from .obs_maps import normalize_render_instrument
+
+    observer_los = normalize_observer_identity(observer_name)
+    if observer_los is None:
+        observer_los = infer_observation_observer(obs_map)
+    instrument_token = str(getattr(obs_map, "instrument", "") or "").strip().upper()
+    map_id = str(getattr(obs_map, "source_map_id", "") or "").strip().upper()
+    normalized = normalize_render_instrument(getattr(obs_map, "instrument", None))
+    is_stereo_euvi = (
+        normalized == "euvi"
+        or instrument_token in {"STEREO", "SECCHI", "EUVI"}
+        or map_id.startswith("STEREO_EUVI")
+    )
+    if is_stereo_euvi:
+        if observer_los in {"stereo-a", "stereo-b"}:
+            return observer_los
+        return "stereo-a"
+    if normalized in {"aia", "euvi", "eui", "suvi"}:
+        return normalized
+    if observer_los == "earth":
+        return "aia"
+    if observer_los in {"stereo-a", "stereo-b"}:
+        return observer_los
+    return str(normalized or observer_los or "aia")
 
 
 def infer_observation_observer(obs_map: Any) -> str | None:

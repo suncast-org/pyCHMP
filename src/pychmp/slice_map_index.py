@@ -81,6 +81,15 @@ def _identity_matches_slice(identity: dict[str, Any], descriptor: dict[str, Any]
     identity_channel = str(identity.get("channel_or_frequency") or "").strip().lower()
     if target_channel and identity_channel:
         return identity_channel == target_channel
+    identity_wavelength = _optional_float(identity.get("wavelength_angstrom"))
+    target_wavelength = _optional_float(descriptor.get("wavelength_angstrom"))
+    if target_wavelength is not None and identity_wavelength is not None:
+        return np.isclose(float(identity_wavelength), float(target_wavelength), rtol=0.0, atol=1e-6)
+    # EUV/UV maps are channel-specific.  Ambiguous legacy map_store entries
+    # must not be reused across slices because a 94 A raw map can otherwise be
+    # rescored as a 171 A trial and corrupt the q0 curve.
+    if target_domain in {"euv", "uv"}:
+        return False
     return True
 
 

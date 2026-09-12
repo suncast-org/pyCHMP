@@ -116,6 +116,8 @@ def _run_single_stage_q0_fit(
     progress_start_callback: ProgressStartCallback | None,
     progress_callback: ProgressCallback | None,
     initial_evaluations: InitialQ0Evaluations | None,
+    warm_seed_via_live_evaluation: bool = False,
+    skip_warm_refinement: bool = False,
     emthreshold: float = 0.1,
 ) -> Q0OptimizationResult:
     def metric_function(q0: float) -> Q0MetricEvaluation:
@@ -162,6 +164,8 @@ def _run_single_stage_q0_fit(
         progress_start_callback=progress_start_callback,
         progress_callback=progress_callback,
         initial_evaluations=initial_evaluations,
+        warm_seed_via_live_evaluation=warm_seed_via_live_evaluation,
+        skip_warm_refinement=skip_warm_refinement,
         emthreshold=emthreshold,
     )
 
@@ -206,6 +210,8 @@ def fit_q0_to_observation(
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
     initial_evaluations: InitialQ0Evaluations | None = None,
+    warm_seed_via_live_evaluation: bool = False,
+    skip_warm_refinement: bool = False,
     observation_reference: SliceObservationReference | None = None,
     evaluation_context: ObservationEvaluationContext | None = None,
     use_smoothed_obs_max: bool = True,
@@ -293,6 +299,8 @@ def fit_q0_to_observation(
             progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
             initial_evaluations=stage_initial_evaluations if stage_index == 0 else None,
+            warm_seed_via_live_evaluation=bool(warm_seed_via_live_evaluation and stage_index == 0),
+            skip_warm_refinement=bool(skip_warm_refinement and stage_index == 0),
             emthreshold=emthreshold,
         )
         stage_results.append(stage_result)

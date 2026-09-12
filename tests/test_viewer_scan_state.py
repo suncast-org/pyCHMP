@@ -68,6 +68,12 @@ class _AxisStub:
     def plot(self, *_args, **_kwargs) -> None:
         pass
 
+    def set_xscale(self, *_args, **_kwargs) -> None:
+        pass
+
+    def set_yscale(self, *_args, **_kwargs) -> None:
+        pass
+
     def axvline(self, *_args, **_kwargs) -> None:
         pass
 
@@ -76,6 +82,14 @@ class _AxisStub:
 
     def scatter(self, *_args, **_kwargs) -> None:
         pass
+
+
+class _PlotTrackingAxisStub(_AxisStub):
+    def __init__(self) -> None:
+        self.plot_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def plot(self, *args, **kwargs) -> None:
+        self.plot_calls.append((args, kwargs))
 
 
 class _AxisLimitsStub(_AxisStub):
@@ -170,6 +184,36 @@ def test_adaptive_sparse_complete_phase_reports_finished(tmp_path: Path) -> None
 
     assert badge == "FINISHED"
     assert "Last phase: scan complete" in info_detail
+
+
+def test_in_progress_search_without_live_runner_reports_incomplete(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": False,
+            "lifecycle": {"started_at": "2026-06-05T05:19:59Z"},
+            "diagnostics": {"q0_search_stages": ["data"]},
+        },
+        "selected_search_id": "search_live",
+        "a_values": [0.0, 0.3],
+        "b_values": [2.4, 3.0],
+        "points": {
+            (0, 0): {"status": "computed", "a": 0.0, "b": 2.4},
+            (0, 1): {"status": "pending", "a": 0.0, "b": 3.0},
+        },
+    }
+    app.a_values = np.asarray([0.0, 0.3], dtype=float)
+    app.b_values = np.asarray([2.4, 3.0], dtype=float)
+    app._runner_pid_from_log = lambda: None
+
+    assert app._live_runner_detected() is False
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INCOMPLETE"
+    assert "Live runner: no" in info_detail
 
 
 def test_fresh_scan_complete_refresh_does_not_report_running(tmp_path: Path) -> None:
@@ -480,6 +524,8 @@ def test_sync_live_trial_state_populates_live_state_from_artifact() -> None:
     viewer_module.load_grid_point_live_state = lambda *_args, **_kwargs: {
         "slice_key": "euv_193",
         "search_id": "search_b",
+        "point_id": "p000000",
+        "grid_point_status": "RUNNING",
         "a": 0.3,
         "b": 2.7,
         "metric_name": "eta2",
@@ -488,6 +534,7 @@ def test_sync_live_trial_state_populates_live_state_from_artifact() -> None:
         "fit_shift_x_trials": np.asarray([1.25, -0.5, 0.0], dtype=float),
         "fit_shift_y_trials": np.asarray([-0.75, 2.0, 0.0], dtype=float),
         "fit_find_shift_valid_trials": np.asarray([True, True, False], dtype=bool),
+        "fit_trial_mask_stages": ["data", "data", ""],
         "q0": 1.0e-2,
         "trial_index": 3,
     }
@@ -501,6 +548,8 @@ def test_sync_live_trial_state_populates_live_state_from_artifact() -> None:
     assert merged["active_trial_index"] == 3
     np.testing.assert_allclose(np.asarray(merged["fit_shift_x_trials"], dtype=float), [1.25, -0.5, 0.0])
     np.testing.assert_allclose(np.asarray(merged["fit_shift_y_trials"], dtype=float), [-0.75, 2.0, 0.0])
+    assert merged["grid_point_status"] == "RUNNING"
+    assert merged["fit_trial_mask_stages"] == ["data", "data", ""]
 
 
 def test_live_search_matches_when_heartbeat_search_id_is_null() -> None:
@@ -1887,14 +1936,14 @@ def test_free_mode_allows_active_star_heatmap_click() -> None:
     calls: list[str] = []
     app._refresh_selector_values = lambda: calls.append("selectors")
     app._refresh_action_states = lambda: calls.append("actions")
-    app._refresh_all = lambda: calls.append("refresh")
+    app._refresh_free_selection_views = lambda: calls.append("selection_refresh")
 
     app._on_canvas_click(_EventStub(inaxes=app.ax_heatmap, xdata=0.9, ydata=3.0))
 
     assert app.a_index_var.get() == 3
     assert app.b_index_var.get() == 2
     assert app._selected_trial_token is None
-    assert calls == ["selectors", "actions", "refresh"]
+    assert calls == ["selectors", "actions", "selection_refresh"]
 
 
 def test_free_mode_selects_clicked_coordinates_without_patch_record() -> None:
@@ -1926,7 +1975,7 @@ def test_free_mode_selects_clicked_coordinates_without_patch_record() -> None:
     calls: list[str] = []
     app._refresh_selector_values = lambda: calls.append("selectors")
     app._refresh_action_states = lambda: calls.append("actions")
-    app._refresh_all = lambda: calls.append("refresh")
+    app._refresh_free_selection_views = lambda: calls.append("selection_refresh")
 
     app._on_canvas_click(_EventStub(inaxes=app.ax_heatmap, xdata=0.6, ydata=2.7))
 
@@ -1934,7 +1983,7 @@ def test_free_mode_selects_clicked_coordinates_without_patch_record() -> None:
     assert app.a_index_var.get() == 2
     assert app.b_index_var.get() == 1
     assert app._selected_trial_token is None
-    assert calls == ["selectors", "actions", "refresh"]
+    assert calls == ["selectors", "actions", "selection_refresh"]
 
 
 def test_free_mode_selects_off_grid_click_coordinates() -> None:
@@ -1967,14 +2016,14 @@ def test_free_mode_selects_off_grid_click_coordinates() -> None:
     calls: list[str] = []
     app._refresh_selector_values = lambda: calls.append("selectors")
     app._refresh_action_states = lambda: calls.append("actions")
-    app._refresh_all = lambda: calls.append("refresh")
+    app._refresh_free_selection_views = lambda: calls.append("selection_refresh")
 
     app._on_canvas_click(_EventStub(inaxes=app.ax_heatmap, xdata=0.9, ydata=3.2))
 
     assert app._free_selection_ab == (0.9, 3.2)
     assert app._free_grid_selection_indices() is None
     assert app._selected_trial_token is None
-    assert calls == ["selectors", "actions", "refresh"]
+    assert calls == ["selectors", "actions", "selection_refresh"]
 
 
 def test_point_indices_for_coordinates_matches_grid_values(tmp_path: Path) -> None:
@@ -2628,6 +2677,63 @@ def test_draw_trials_handles_empty_grid_without_crashing() -> None:
     assert "Selected point:" in app.status_var.get()
 
 
+def test_draw_trials_shows_partial_history_for_running_pending_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app._live_trial_state = lambda: None
+    app._should_use_live_trials = lambda _live_state: False
+    app._should_force_live_trials = lambda _live_state: False
+    app._has_selected_point = lambda: True
+    app._has_saved_selected_point = lambda: True
+    app._point_payload_for_selection = lambda: {
+        "a": -0.05,
+        "b": 4.0,
+        "status": "pending",
+        "success": False,
+        "q0": 0.072,
+        "fit_q0_trials": np.asarray([0.05, 0.072], dtype=float),
+        "fit_metric_trials": np.asarray([0.35, 0.34], dtype=float),
+        "fit_eta2_trials": np.asarray([0.35, 0.34], dtype=float),
+        "target_metric": "eta2",
+        "diagnostics": {"grid_point_status": "RUNNING"},
+    }
+    app._trial_series_for_point = lambda point: (
+        np.asarray(point["fit_q0_trials"], dtype=float),
+        np.asarray(point["fit_metric_trials"], dtype=float),
+        "eta2",
+    )
+    app._selected_trial_index_for_point = lambda *_args, **_kwargs: 1
+    app._refresh_trial_selector_controls = lambda *_args, **_kwargs: None
+    app._annotate_display_metric_best_trial = lambda *_args, **_kwargs: None
+    app._capture_current_slice_view_state = lambda *_args, **_kwargs: None
+    app._slice_label = lambda _descriptor: "MW: 1.418 GHz"
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.trials_xscale_var = _Var("linear scale")
+    app.trials_yscale_var = _Var("linear scale")
+    app.trial_index_var = _Var(1)
+    app._selected_trial_token = None
+    app.ax_trials = _PlotTrackingAxisStub()
+    app.trials_figure = _FigureStub()
+    app.trials_canvas = type("_Canvas", (), {"draw_idle": lambda self: None})()
+    app._apply_trials_layout_margins = lambda: None
+    app._apply_figure_autolayout = lambda _figure: None
+    app._apply_trials_axis_controls = lambda **_kwargs: None
+    app._sync_trials_axis_controls_from_axes = lambda: None
+    app.navigation_mode_var = _Var("free")
+    app.status_var = _Var("")
+    app.payload = {"selected_slice": {"display_label": "MW: 1.418 GHz"}}
+    app.a_values = np.asarray([-0.05], dtype=float)
+    app.b_values = np.asarray([4.0], dtype=float)
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+
+    app._draw_trials()
+
+    assert app.ax_trials.plot_calls
+    assert "No data yet" not in app.status_var.get()
+    assert "pending" in app.status_var.get()
+
+
 def test_draw_trials_uses_unsaved_live_active_point_status_when_same_slice_selected() -> None:
     app = object.__new__(PychmpViewApp)
     app.navigation_mode_var = _Var("active")
@@ -3107,10 +3213,10 @@ def test_trials_canvas_click_uses_live_mode_for_saved_active_point() -> None:
     app._selected_trial_token = None
     calls = {"refresh": 0}
 
-    def _refresh() -> None:
+    def _refresh(**_kwargs: object) -> None:
         calls["refresh"] += 1
 
-    app._refresh_all = _refresh
+    app._refresh_free_selection_views = _refresh
 
     class _Event:
         inaxes = app.ax_trials
@@ -3337,6 +3443,153 @@ def test_refresh_search_controls_prefers_ui_search_over_stale_payload() -> None:
     app._refresh_search_controls()
 
     assert app.search_id_var.get() == "search_new"
+
+
+def test_refresh_slice_controls_prefers_ui_slice_over_stale_payload() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = None
+    app.payload = {"selected_slice_key": "mw_1p418335ghz"}
+    app.available_slices = [
+        {"key": "mw_1p418335ghz", "label": "MW: 1.418 GHz", "domain": "mw"},
+        {"key": "euv_171", "label": "EUV: 171 A", "domain": "euv"},
+    ]
+    app.slice_key_var = _Var("euv_171")
+    app.slice_display_var = _Var("")
+    app.slice_menu = type(
+        "_Menu",
+        (),
+        {
+            "configure": lambda *a, **k: None,
+            "current": lambda self, index=0: None,
+            "grid": lambda *a, **k: None,
+            "grid_remove": lambda *a, **k: None,
+        },
+    )()
+    app.slice_display_label = None
+    app._slice_label = PychmpViewApp._slice_label.__get__(app, PychmpViewApp)
+    app._unique_menu_labels = lambda labels, keys: labels
+    app._selected_slice_key = lambda: str(app.slice_key_var.get())
+
+    app._refresh_slice_controls()
+
+    assert app.slice_key_var.get() == "euv_171"
+
+
+def test_process_refresh_event_does_not_hijack_slice_in_free_mode() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = Path("/tmp/adaptive.h5")
+    app.navigation_mode_var = _Var("free")
+    app._navigation_mode_user_chosen = True
+    app._navigation_mode = lambda: "free"
+    app._live_runner_detected = lambda: True
+    app.payload = {"selected_slice_key": "euv_171", "a_values": [0.0], "b_values": [2.0], "points": {}}
+    app.slice_key_var = _Var("euv_171")
+    app.search_id_var = _Var("search_old")
+    app.a_values = np.asarray([0.0], dtype=float)
+    app.b_values = np.asarray([2.0], dtype=float)
+    app._apply_refresh_signal_payload = lambda _payload: None
+    app._refresh_slice_grid_metadata = lambda: True
+    app._apply_navigation_from_refresh = lambda _payload: None
+    app._sync_live_trial_state_from_artifact = lambda **_kwargs: None
+    app._refresh_selector_values = lambda: None
+    app._refresh_scan_state_display = lambda: None
+    app._refresh_action_states = lambda: None
+    app._schedule_refresh_all = lambda **_kwargs: None
+
+    app._process_refresh_event(
+        {
+            "event": "trial_committed",
+            "slice_key": "mw_1p418335ghz",
+            "search_id": "search_live",
+            "version": 2,
+        }
+    )
+
+    assert app.navigation_mode_var.get() == "free"
+    assert app.slice_key_var.get() == "euv_171"
+    assert app.search_id_var.get() == "search_old"
+
+
+def test_refresh_free_selection_views_skips_heatmap_and_scan_state() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.payload = {
+        "points": {
+            (0, 0): {
+                "status": "computed",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 1.0e-5,
+                "target_metric": "eta2",
+                "fit_q0_trials": [1.0e-5, 2.0e-5],
+                "fit_eta2_trials": [0.8, 0.7],
+                "diagnostics": {"eta2": 0.7},
+            }
+        },
+        "selected_slice_key": "mw_1p418335ghz",
+        "selected_slice": {"label": "MW: 1.418 GHz"},
+        "diagnostics": {},
+        "a_values": [0.3],
+        "b_values": [2.7],
+    }
+    app.a_values = np.asarray([0.3], dtype=float)
+    app.b_values = np.asarray([2.7], dtype=float)
+    app.navigation_mode_var = _Var("free")
+    app._navigation_mode = lambda: "free"
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+    app._free_selection_ab = (0.3, 2.7)
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.summary_var = _Var("")
+
+    class _CanvasStub:
+        def draw_idle(self) -> None:
+            return None
+
+    app.trials_canvas = _CanvasStub()
+
+    calls = {"heatmap": 0, "scan_state": 0, "trials": 0, "summary": 0, "marker": 0}
+    app._draw_heatmap = lambda: calls.__setitem__("heatmap", calls["heatmap"] + 1)
+    app._refresh_scan_state_display = lambda: calls.__setitem__("scan_state", calls["scan_state"] + 1)
+    app._draw_trials = lambda: calls.__setitem__("trials", calls["trials"] + 1)
+    app._refresh_summary = lambda **_kwargs: calls.__setitem__("summary", calls["summary"] + 1)
+    app._update_heatmap_selection_marker = lambda: calls.__setitem__("marker", calls["marker"] + 1)
+
+    app._refresh_free_selection_views()
+
+    assert calls == {"heatmap": 0, "scan_state": 0, "trials": 1, "summary": 1, "marker": 1}
+
+
+def test_trial_committed_refresh_uses_lightweight_path_without_grid_reload() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = Path("/tmp/adaptive.h5")
+    app.navigation_mode_var = _Var("active")
+    app._navigation_mode = lambda: "active"
+    app._live_runner_detected = lambda: True
+    app.payload = {"selected_slice_key": "mw_1p418335ghz", "a_values": [0.0], "b_values": [2.0], "points": {}}
+    app.slice_key_var = _Var("mw_1p418335ghz")
+    app.search_id_var = _Var("search_live")
+    app._apply_refresh_signal_payload = lambda _payload: None
+
+    calls = {"grid_reload": 0, "lightweight": 0, "schedule_refresh": 0}
+    app._schedule_slice_grid_metadata_refresh = lambda _payload: calls.__setitem__("grid_reload", calls["grid_reload"] + 1)
+    app._finish_lightweight_refresh_event = lambda _payload: calls.__setitem__("lightweight", calls["lightweight"] + 1)
+    app._schedule_refresh_all = lambda **_kwargs: calls.__setitem__("schedule_refresh", calls["schedule_refresh"] + 1)
+
+    app._process_refresh_event(
+        {
+            "event": "trial_committed",
+            "slice_key": "mw_1p418335ghz",
+            "search_id": "search_live",
+            "point_id": "p000001",
+            "trial_index": 3,
+            "version": 2,
+        }
+    )
+
+    assert calls["grid_reload"] == 0
+    assert calls["lightweight"] == 1
+    assert calls["schedule_refresh"] == 0
 
 
 def test_refresh_all_schedules_reload_when_payload_search_is_stale() -> None:

@@ -211,6 +211,8 @@ def evaluate_ab_point(
     use_emthreshold: bool = True,
     emthreshold: float = 0.1,
     initial_evaluations: InitialQ0Evaluations | None = None,
+    warm_seed_via_live_evaluation: bool = False,
+    skip_warm_refinement: bool = False,
 ) -> ABPointResult:
     """Evaluate the best-fit `q0` for one `(a, b)` point."""
 
@@ -242,6 +244,8 @@ def evaluate_ab_point(
         use_emthreshold=use_emthreshold,
         emthreshold=emthreshold,
         initial_evaluations=initial_evaluations,
+        warm_seed_via_live_evaluation=warm_seed_via_live_evaluation,
+        skip_warm_refinement=skip_warm_refinement,
     )
     return ABPointResult(
         a=float(a),
@@ -294,7 +298,53 @@ def _evaluate_ab_search_request(
     )
     if worker_payload.point_start_callback is not None:
         worker_payload.point_start_callback(a, b)
+    if worker_payload.cache_map is not None:
+        finalize_fn = getattr(
+            worker_payload.cache_map,
+            "try_finalize_resume_point_from_stored_trials",
+            None,
+        )
+        if callable(finalize_fn):
+            stored_result = finalize_fn(a, b)
+            if stored_result is not None:
+                renderer = worker_payload.renderer_factory(a, b)
+                prepare_maps = getattr(renderer, "prepare_stored_trial_maps", None)
+                if callable(prepare_maps):
+                    prepare_maps()
+                artifact_payload_builder = getattr(renderer, "build_artifact_payload", None)
+                if not callable(artifact_payload_builder):
+                    raise RuntimeError(
+                        "resume finalize requires renderer.build_artifact_payload"
+                    )
+                completed = replace(
+                    stored_result,
+                    artifact_payload=artifact_payload_builder(stored_result),
+                    elapsed_seconds=float(time.perf_counter() - point_started),
+                )
+                print(
+                    "    Finished point: "
+                    f"a={a:.3f} b={b:.3f} "
+                    f"q0={float(completed.q0):.6g} "
+                    f"{str(completed.target_metric)}={float(completed.objective_value):.6e} "
+                    f"elapsed={float(completed.elapsed_seconds):.3f}s",
+                    flush=True,
+                )
+                if worker_payload.point_complete_callback is not None:
+                    worker_payload.point_complete_callback(a, b)
+                return completed
     initial_evaluations = request.initial_evaluations
+    warm_seed_via_live_evaluation = False
+    skip_warm_refinement = False
+    if worker_payload.cache_map is not None:
+        needs_completion_fn = getattr(worker_payload.cache_map, "point_needs_completion", None)
+        is_resume_point = (
+            callable(needs_completion_fn) and bool(needs_completion_fn(a, b))
+        )
+        defer_fn = getattr(worker_payload.cache_map, "defer_warm_curve_commits", None)
+        if callable(defer_fn) and defer_fn() and not is_resume_point:
+            warm_seed_via_live_evaluation = True
+        if is_resume_point:
+            skip_warm_refinement = True
     if initial_evaluations is None and worker_payload.cache_map is not None:
         warm_resolver = getattr(worker_payload.cache_map, "initial_evaluations_for", None)
         if callable(warm_resolver):
@@ -333,6 +383,8 @@ def _evaluate_ab_search_request(
             use_emthreshold=request.use_emthreshold,
             emthreshold=float(request.emthreshold),
             initial_evaluations=initial_evaluations,
+            warm_seed_via_live_evaluation=warm_seed_via_live_evaluation,
+            skip_warm_refinement=skip_warm_refinement,
         )
     except BaseException:
         print(
@@ -647,11 +699,12 @@ def _append_adaptive_request_if_needed(
     emthreshold: float = 0.1,
 ) -> None:
     key = (float(a_values[a_index]), float(b_values[b_index]))
-    cached_point = cache_map.get(key)
-    if cached_point is not None:
-        point_results[key] = cached_point
+    if _cache_point_blocks_rerun(cache_map, key):
+        point_results[key] = cache_map.get(key)
         return
-    if key in point_results or key in pending_keys:
+    if key in pending_keys:
+        return
+    if key in point_results and _cache_point_blocks_rerun(cache_map, key):
         return
 
     normalized_q0_seed = _normalize_q0_seed(
@@ -1193,6 +1246,24 @@ def _adaptive_best_point(
     )
 
 
+def _cache_point_blocks_rerun(
+    cache_map: ABPointCache,
+    key: tuple[float, float],
+) -> bool:
+    needs_completion = getattr(cache_map, "point_needs_completion", None)
+    if needs_completion is not None:
+        try:
+            if bool(needs_completion(float(key[0]), float(key[1]))):
+                return False
+        except Exception:
+            pass
+    try:
+        cached_point = cache_map.get(key)
+    except Exception:
+        cached_point = None
+    return cached_point is not None
+
+
 def _seed_point_results_from_cache(
     cache_map: ABPointCache,
     *,
@@ -1202,14 +1273,27 @@ def _seed_point_results_from_cache(
     out: dict[tuple[float, float], ABPointResult] = {}
     a_tol = max(1e-12, abs(float(a_range[1]) - float(a_range[0])) * 1e-12)
     b_tol = max(1e-12, abs(float(b_range[1]) - float(b_range[0])) * 1e-12)
-    for key, point in cache_map.items():
+
+    def _maybe_add(key: tuple[float, float], point: ABPointResult) -> None:
         a_value = float(key[0])
         b_value = float(key[1])
         if not (float(a_range[0]) - a_tol <= a_value <= float(a_range[1]) + a_tol):
-            continue
+            return
         if not (float(b_range[0]) - b_tol <= b_value <= float(b_range[1]) + b_tol):
-            continue
+            return
         out[(a_value, b_value)] = point
+
+    for key, point in cache_map.items():
+        _maybe_add(key, point)
+    partial_provider = getattr(cache_map, "partial_point_results", None)
+    if partial_provider is not None:
+        try:
+            partial_items = partial_provider()
+        except Exception:
+            partial_items = {}
+        if isinstance(partial_items, dict):
+            for key, point in partial_items.items():
+                _maybe_add((float(key[0]), float(key[1])), point)
     return out
 
 
@@ -1353,6 +1437,104 @@ def _certify_local_minimum_basin(
                 return False, tuple(sorted(open_axes))
 
     return not bool(open_axes), tuple(sorted(open_axes))
+
+
+def drain_incomplete_resume_points(
+    renderer_factory: ABRendererFactory,
+    observed: np.ndarray,
+    sigma: np.ndarray | None,
+    *,
+    cache_map: ABPointCache | None,
+    a_range: tuple[float, float],
+    b_range: tuple[float, float],
+    q0_min: float,
+    q0_max: float,
+    hard_q0_min: float | None = None,
+    hard_q0_max: float | None = None,
+    threshold: float = 0.1,
+    mask_type: str = "union",
+    explicit_mask: np.ndarray | None = None,
+    target_metric: MetricName = "chi2",
+    xatol: float = 1e-3,
+    maxiter: int = 200,
+    adaptive_bracketing: bool = False,
+    q0_step: float = 1.61803398875,
+    max_bracket_steps: int = 12,
+    progress_start_callback: ProgressStartCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+    point_start_callback: PointLifecycleCallback | None = None,
+    point_complete_callback: PointLifecycleCallback | None = None,
+    observation_reference: SliceObservationReference | None = None,
+    q0_search_stages: tuple[str, ...] | None = None,
+    use_smoothed_obs_max: bool = True,
+    use_emthreshold: bool = True,
+    emthreshold: float = 0.1,
+    execution_policy: ABRequestedExecutionPolicy = "serial",
+    max_workers: int | None = None,
+    worker_chunksize: int = 1,
+) -> int:
+    """Finish artifact-incomplete grid points before adaptive exploration resumes."""
+    if cache_map is None:
+        return 0
+    candidate_getter = getattr(cache_map, "incomplete_resume_candidates", None)
+    if candidate_getter is None:
+        return 0
+    try:
+        candidates = list(candidate_getter())
+    except Exception:
+        return 0
+    if not candidates:
+        return 0
+
+    a_values = np.asarray(sorted({float(a) for a, _b, _q0 in candidates}), dtype=float)
+    b_values = np.asarray(sorted({float(b) for _a, b, _q0 in candidates}), dtype=float)
+    index_points: list[tuple[int, int, float | None]] = []
+    for a_value, b_value, q0_seed in candidates:
+        a_index = int(np.argmin(np.abs(a_values - float(a_value))))
+        b_index = int(np.argmin(np.abs(b_values - float(b_value))))
+        index_points.append((a_index, b_index, float(q0_seed)))
+
+    point_results = _seed_point_results_from_cache(
+        cache_map,
+        a_range=(float(a_range[0]), float(a_range[1])),
+        b_range=(float(b_range[0]), float(b_range[1])),
+    )
+    _evaluate_adaptive_index_batch(
+        renderer_factory,
+        observed,
+        sigma,
+        a_values=a_values,
+        b_values=b_values,
+        candidate_points=index_points,
+        q0_min=q0_min,
+        q0_max=q0_max,
+        hard_q0_min=hard_q0_min,
+        hard_q0_max=hard_q0_max,
+        threshold=float(threshold),
+        mask_type=str(mask_type),
+        explicit_mask=explicit_mask,
+        target_metric=target_metric,
+        xatol=float(xatol),
+        maxiter=int(maxiter),
+        adaptive_bracketing=bool(adaptive_bracketing),
+        q0_step=float(q0_step),
+        max_bracket_steps=int(max_bracket_steps),
+        point_results=point_results,
+        cache_map=cache_map,
+        execution_policy=execution_policy,
+        max_workers=max_workers,
+        worker_chunksize=int(worker_chunksize),
+        progress_start_callback=progress_start_callback,
+        progress_callback=progress_callback,
+        point_start_callback=point_start_callback,
+        point_complete_callback=point_complete_callback,
+        observation_reference=observation_reference,
+        q0_search_stages=q0_search_stages,
+        use_smoothed_obs_max=use_smoothed_obs_max,
+        use_emthreshold=use_emthreshold,
+        emthreshold=float(emthreshold),
+    )
+    return len(candidates)
 
 
 def search_local_minimum_ab(

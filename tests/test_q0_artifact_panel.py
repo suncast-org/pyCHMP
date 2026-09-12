@@ -140,7 +140,12 @@ def test_draw_mask_contours_applies_to_all_map_axes() -> None:
         dtype=float,
     )
     modeled = observed.copy()
-    diagnostics = {"mask_type": "union", "metrics_mask_threshold": 0.1}
+    diagnostics = {
+        "mask_type": "union",
+        "metrics_mask_threshold": 0.1,
+        "fit_trial_mask_stages": ["union"],
+        "selected_trial_index": 0,
+    }
 
     panel._draw_mask_contours(True, observed, modeled, diagnostics)
 
