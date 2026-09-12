@@ -14,4 +14,5 @@ Sections
    workflow_architecture
    geometry_policy
    provenance
+   moddir_compatible_map_store_plan
    viewer_refresh_workflow
