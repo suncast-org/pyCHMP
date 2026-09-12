@@ -48,13 +48,14 @@ Current Python Problem
 
 The current pyCHMP map store is too closely coupled to search/trial records.
 It can persist individual arrays under ``map_store`` and link them from trial
-rows, but the stored arrays do not always have enough identity to prove:
+rows, but the stored arrays do not always carry enough map-attached identity to
+prove:
 
 - which spectral channel or frequency they represent,
 - which multi-channel render product they came from,
 - which model/FOV/observer/response/EBTEL settings created them,
-- whether they are raw forward-model components or already masked/convolved
-  comparison products,
+- whether they are raw forward-model maps or search-specific comparison
+  products,
 - whether a later search can safely reuse them without rerendering.
 
 This makes the implementation both less reusable and less safe than IDL
@@ -71,12 +72,15 @@ Design Principles
    a search branch. Searches consume render products; they do not define their
    identity.
 
-2. Store provenance with the product.
+2. Store provenance with each reusable map/layer.
 
-   Every reusable product must have a structured key equivalent in role to
-   IDL ``gx_key``. It should include model identity, geometry/FOV, observer
-   policy, renderer configuration, EBTEL table, EBTEL formula, response table,
-   ``a``, ``b``, ``q0``, and the available spectral channels.
+   Every reusable map or layer must carry a structured key equivalent in role
+   to IDL ``gx_key``. A map may be moved out of its original repository and
+   still describe its provenance. The repository may keep indices for fast
+   lookup, but those indices are not the source of truth. The key should
+   include model identity, geometry/FOV, observer policy, renderer
+   configuration, EBTEL table, EBTEL formula, response table, ``a``, ``b``,
+   ``q0``, and the spectral descriptor.
 
 3. Keep multi-channel outputs grouped.
 
@@ -87,8 +91,10 @@ Design Principles
 4. Separate render products from scoring products.
 
    Raw rendered evidence should be cached independently from metric masks,
-   smoothing, PSF convolution, and residual products. Metric-specific products
-   may be cached, but they are derived from reusable evidence.
+   smoothing, PSF convolution, residual products, and metric values. PSF
+   kernels, residual maps, metric masks, thresholds, shifts, and scores are
+   search-specific state. They belong to the search identity or search results,
+   not to the multi-search map store.
 
 5. Preserve EUV decomposition when available.
 
@@ -134,8 +140,9 @@ Each product can contain multiple spectral layers:
 - microwave frequencies
 - future UV/EUV channels
 
-Each layer has an explicit spectral descriptor. It is illegal for scoring code
-to infer the channel from a previous search id.
+Each layer has an explicit spectral descriptor and carries its own
+``gx_key``-like provenance. It is illegal for scoring code to infer the channel
+from a previous search id or from a repository index alone.
 
 Component Layers
 ~~~~~~~~~~~~~~~~
@@ -145,12 +152,14 @@ Each spectral layer may contain one or more component arrays:
 - raw total model map
 - coronal contribution
 - transition-region contribution
-- optional convolved comparison map
-- optional residual or diagnostic map
 
-Reusable component arrays are stored before comparison masks are applied.
-Metric-specific products should be explicitly marked as derived and tied to a
-scoring recipe.
+Reusable component arrays are stored before comparison masks, PSF convolution,
+normalization choices, or residual calculations are applied.
+
+Convolved maps, residual maps, metric maps, and diagnostic comparison products
+are not component layers of the reusable map store. They may be generated,
+displayed, or cached under a search-specific results area, but they must not be
+used as reusable render evidence.
 
 
 Search-Time Behavior
@@ -174,7 +183,8 @@ When a search evaluates ``(a, b, q0)``:
    metric, and any fixed shifts.
 
 6. Persist the trial score and link it to the render product and selected
-   layer/component identities.
+   layer/component identities. Persist search-specific outputs, such as
+   residuals or convolved maps, only under the search result namespace.
 
 7. If no compatible product exists, render a new product, store all requested
    layers/components, and then score the selected layer.
@@ -211,6 +221,8 @@ Phase 3: Product-Centric Store
 - Store grouped render products instead of unrelated scalar arrays.
 - Preserve all rendered channels under the same product when rendered together.
 - Keep search trial rows as links to product/layer/component ids.
+- Ensure each reusable layer is self-describing, with provenance attached to
+  the layer metadata, not only to an external map-store index.
 - Provide a compatibility shim so old artifacts can still be viewed, repaired,
   or rescored conservatively.
 
@@ -256,8 +268,12 @@ The redesign is not complete until these behaviors are covered by tests:
 - Purging a search branch does not delete reusable render products.
 - Changing a metric mask causes rescoring, not rerendering, when reusable raw
   products exist.
+- Changing the PSF recipe causes reconvolution/rescoring, not rerendering, and
+  does not alter the reusable map-store product.
 - Changing the TR mask causes recombination/rescoring, not rerendering, when
   TR/corona components exist.
+- Residual maps and convolved maps are stored only under search-specific
+  results, never as reusable map-store evidence.
 - Ambiguous legacy EUV/UV map-store entries fail closed.
 - Viewer labels and diagnostics show product identity, selected layer, and
   scoring recipe separately.
