@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pytest
 from astropy.io import fits
@@ -134,3 +136,72 @@ def test_slice_map_index_register_dedupes_by_q0() -> None:
     assert index.raw_map_ref(0.1, 1.0, 0.001) == "/map_store/maps/bbb"
     assert index.summary() == "1 map(s) across 1 (a,b) point(s)"
     assert index.point_keys() == ((0.1, 1.0),)
+
+
+def test_euv_slice_map_index_requires_explicit_channel_identity(tmp_path: Path) -> None:
+    observed = np.ones((2, 2), dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        "target_slice_key": "euv_171",
+        "spectral_domain": "euv",
+        "spectral_label": "171 A",
+        "wavelength_angstrom": 171.0,
+        "euv_channel": "171",
+        "target_metric": "eta2",
+    }
+    artifact_h5 = tmp_path / "euv_index.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=_header(),
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    with h5py.File(artifact_h5, "r+") as handle:
+        maps = handle.require_group("map_store").require_group("maps")
+        ambiguous = maps.create_group("ambiguous")
+        ambiguous.create_dataset("data", data=np.ones((2, 2), dtype=np.float32))
+        ambiguous.create_dataset(
+            "identity_json",
+            data=np.bytes_(
+                json.dumps(
+                    {
+                        "schema": "pychmp.map_identity.v0",
+                        "domain": "euv",
+                        "component": "stokes_i",
+                        "a": 0.6,
+                        "b": 1.8,
+                        "q0": 0.003,
+                    }
+                )
+            ),
+        )
+
+    index = build_slice_map_index(artifact_h5, slice_key="euv_171")
+    assert index.trial_count() == 0
+
+    with h5py.File(artifact_h5, "r+") as handle:
+        explicit = handle["map_store/maps"].create_group("explicit")
+        explicit.create_dataset("data", data=np.full((2, 2), 2.0, dtype=np.float32))
+        explicit.create_dataset(
+            "identity_json",
+            data=np.bytes_(
+                json.dumps(
+                    {
+                        "schema": "pychmp.map_identity.v2",
+                        "domain": "euv",
+                        "channel_or_frequency": "171",
+                        "component": "stokes_i",
+                        "a": 0.6,
+                        "b": 1.8,
+                        "q0": 0.003,
+                    }
+                )
+            ),
+        )
+
+    index = build_slice_map_index(artifact_h5, slice_key="euv_171")
+    assert index.trial_count() == 1
+    assert index.raw_map_ref(0.6, 1.8, 0.003) == "/map_store/maps/explicit"

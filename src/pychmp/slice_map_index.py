@@ -81,6 +81,8 @@ def _identity_matches_slice(identity: dict[str, Any], descriptor: dict[str, Any]
     identity_channel = str(identity.get("channel_or_frequency") or "").strip().lower()
     if target_channel and identity_channel:
         return identity_channel == target_channel
+    if target_domain in {"euv", "uv"}:
+        return False
     return True
 
 
@@ -213,6 +215,14 @@ def _index_map_store_maps(h5_file: h5py.File, index: SliceMapIndex, descriptor: 
             identity = json.loads(decode_scalar(map_group["identity_json"][()]))
         except Exception:
             continue
+        if "map_layer_json" in map_group:
+            try:
+                layer = json.loads(decode_scalar(map_group["map_layer_json"][()]))
+                if isinstance(layer, dict):
+                    layer_keys = {"domain", "channel_or_frequency", "component", "a", "b", "q0"}
+                    identity = {**identity, **{k: v for k, v in layer.items() if k in layer_keys}}
+            except Exception:
+                pass
         if not isinstance(identity, dict) or not _identity_matches_slice(identity, descriptor):
             continue
         a_value = _optional_float(identity.get("a"))

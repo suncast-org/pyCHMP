@@ -567,6 +567,17 @@ def test_point_artifact_persists_single_common_psf_kernel(tmp_path: Path) -> Non
     with h5py.File(out_h5, "r") as handle:
         assert f"slices/{selected_slice_key}/common/psf_kernel" in handle
         assert f"slices/{selected_slice_key}/common/psf_kernel_meta_json" in handle
+        maps = handle[f"{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}"]
+        assert len(maps) >= 1
+        for map_group in maps.values():
+            identity = json.loads(map_group["identity_json"][()].decode())
+            assert "psf_source" not in identity
+            assert "resolved_psf" not in identity
+            if str(identity.get("component", "")).lower() in {"stokes_i", "stokes_v", "corona", "tr"}:
+                assert "render_product_json" in map_group
+                assert "map_layer_json" in map_group
+                layer = json.loads(map_group["map_layer_json"][()].decode())
+                assert layer["render_product_id"] == map_group.attrs["render_product_id"].decode()
 
 
 def test_validate_scan_artifact_compatibility_rejects_header_mismatch(tmp_path: Path) -> None:

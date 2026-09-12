@@ -21,6 +21,13 @@ from .search_contract import (
     search_evaluation_signature,
     search_id_from_evaluation_config,
 )
+from .map_store import (
+    MAP_IDENTITY_SCHEMA,
+    build_map_identity,
+    build_map_layer_provenance,
+    build_render_product_identity,
+    is_reusable_component,
+)
 from .obs_preprocessing import compute_array_content_sha256
 
 
@@ -68,7 +75,6 @@ MAP_REFS_DATASET = "map_refs_json"
 TRIAL_HISTORY_DATASET = "trial_history_json"
 POINT_SYNTHETIC_MAP_MACHINE_KEYS_DATASET = "synthetic_map_machine_keys_json"
 CANONICAL_ARTIFACT_CONTRACT_VERSION = "2026-05-28-slice-shared-canvas"
-MAP_IDENTITY_SCHEMA = "pychmp.map_identity.v1"
 ARTIFACT_GEOMETRY_SCHEMA = "pychmp.artifact_geometry.v1"
 FORWARD_MODEL_IDENTITY_VERSION = "pychmp.forward_model.file_sha256.v0"
 COMMON_ARTIFACT_GEOMETRY_DATASET = "artifact_geometry_json"
@@ -251,44 +257,6 @@ def artifact_geometry_sha256(geometry_block: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def build_map_identity(
-    *,
-    a: float,
-    b: float,
-    q0: float,
-    domain: str,
-    channel_or_frequency: str,
-    component: str,
-    forward_model_sha256: str,
-    ebtel_sha256: str,
-    artifact_geometry_sha256: str,
-    forward_model_identity_version: str = FORWARD_MODEL_IDENTITY_VERSION,
-    euv_response_sha256: str | None = None,
-    euv_response_identity_version: str | None = None,
-    array_name: str | None = None,
-) -> dict[str, Any]:
-    identity = {
-        "schema": MAP_IDENTITY_SCHEMA,
-        "forward_model_sha256": str(forward_model_sha256),
-        "forward_model_identity_version": str(forward_model_identity_version),
-        "ebtel_sha256": str(ebtel_sha256),
-        "artifact_geometry_sha256": str(artifact_geometry_sha256),
-        "a": float(a),
-        "b": float(b),
-        "q0": float(q0),
-        "domain": str(domain).strip().lower(),
-        "channel_or_frequency": str(channel_or_frequency),
-        "component": str(component).strip().lower(),
-    }
-    if array_name is not None:
-        identity["array_name"] = str(array_name)
-    if euv_response_sha256 is not None:
-        identity["euv_response_sha256"] = str(euv_response_sha256)
-    if euv_response_identity_version is not None:
-        identity["euv_response_identity_version"] = str(euv_response_identity_version)
-    return identity
-
-
 def _recombine_euv_raw_maps(
     flux_corona: np.ndarray,
     flux_tr: np.ndarray,
@@ -350,6 +318,8 @@ def _component_from_array_name(name: str) -> str | None:
     if lowered in mapping:
         return mapping[lowered]
     if lowered.startswith("trial_raw_modeled_maps/"):
+        return "stokes_i"
+    if lowered.endswith("/raw_modeled") or "/raw_modeled/" in lowered:
         return "stokes_i"
     return None
 
@@ -4224,13 +4194,6 @@ def _map_store_identity(
             "observer_b0sun_deg",
             "observer_dsun_cm",
             "observer_obs_time",
-            "psf_source",
-            "resolved_psf",
-            "psf_bmaj_arcsec",
-            "psf_bmin_arcsec",
-            "psf_bpa_deg",
-            "psf_ref_frequency_ghz",
-            "psf_scale_inverse_frequency",
             "render_channels",
             "render_frequencies_ghz",
         )
@@ -4279,6 +4242,16 @@ def _write_map_store_array(
         map_group = maps_group.create_group(map_id)
         map_group.create_dataset("data", data=arr, compression="gzip", compression_opts=4)
         _create_text_dataset(map_group, "identity_json", _json_dumps(identity))
+        component = str(identity.get("component") or "").strip().lower()
+        if is_reusable_component(component):
+            render_product = build_render_product_identity(identity)
+            map_layer = build_map_layer_provenance(identity)
+            _create_text_dataset(map_group, "render_product_json", _json_dumps(render_product))
+            _create_text_dataset(map_group, "map_layer_json", _json_dumps(map_layer))
+            map_group.attrs["render_product_id"] = np.bytes_(str(render_product["render_product_id"]))
+            map_group.attrs["map_layer_id"] = np.bytes_(str(map_layer["layer_id"]))
+            map_group.attrs["component"] = np.bytes_(component)
+            map_group.attrs["channel_or_frequency"] = np.bytes_(str(map_layer["channel_or_frequency"]))
     return f"/{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}/{map_id}"
 
 
