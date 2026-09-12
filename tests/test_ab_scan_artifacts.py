@@ -1107,6 +1107,8 @@ def test_apply_search_run_profile_clears_obs_path_for_model_refmap() -> None:
             "fits_file": "/tmp/should_not_be_used.fits",
             "observation_source_map_id": "AIA_94",
             "model_path": "/tmp/model.h5",
+            "observation_time_original": "2012-07-12T04:46:23.340",
+            "model_time_reference": "2012-07-12T04:46:23.340",
         },
         "request": {},
     }
@@ -1120,6 +1122,7 @@ def test_apply_search_run_profile_clears_obs_path_for_model_refmap() -> None:
         ebtel_path=None,
         obs_domain=None,
         obs_frequency_ghz=None,
+        observation_time=None,
     )
 
     apply_search_run_profile_to_namespace(args, profile)
@@ -1128,6 +1131,8 @@ def test_apply_search_run_profile_clears_obs_path_for_model_refmap() -> None:
     assert args.obs_path is None
     assert args.fits_file is None
     assert args.obs_map_id == "AIA_94"
+    assert args.observation_time == "2012-07-12T04:46:23.340"
+    assert args.stored_model_time_reference == "2012-07-12T04:46:23.340"
 
 
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:

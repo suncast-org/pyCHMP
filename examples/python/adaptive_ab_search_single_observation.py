@@ -4409,6 +4409,9 @@ def main() -> int:
     )
 
     model_obs_time = str(model_observer_meta.get("observer_obs_time") or load_model_obs_time_text(model_h5) or "").strip()
+    stored_model_time_reference = str(getattr(args, "stored_model_time_reference", "") or "").strip()
+    if stored_model_time_reference:
+        model_obs_time = stored_model_time_reference
     obs_time_text = str(obs_map.date_obs or header.get("DATE-OBS", header.get("DATE_OBS", "")) or "").strip()
     observation_time_override = str(getattr(args, "observation_time", "") or "").strip()
     if observation_time_override:

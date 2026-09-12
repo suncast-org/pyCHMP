@@ -1922,6 +1922,12 @@ def apply_search_run_profile_to_namespace(
     elif source_mode == "model_refmap":
         args.obs_path = None
         args.fits_file = None
+    observation_time = str(diagnostics.get("observation_time_original") or "").strip()
+    if observation_time and hasattr(args, "observation_time"):
+        args.observation_time = observation_time
+    model_time_reference = str(diagnostics.get("model_time_reference") or "").strip()
+    if model_time_reference:
+        setattr(args, "stored_model_time_reference", model_time_reference)
     map_id = diagnostics.get("observation_source_map_id")
     if map_id not in {None, ""}:
         args.obs_map_id = str(map_id)
