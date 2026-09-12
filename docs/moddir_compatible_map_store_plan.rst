@@ -96,13 +96,23 @@ Design Principles
    search-specific state. They belong to the search identity or search results,
    not to the multi-search map store.
 
-5. Preserve EUV decomposition when available.
+5. Treat PSFs as reference/scoring assets.
+
+   PSFs are not synthetic render products. In the IDL workflow the PSF belongs
+   to the reference map side and is retrieved when metrics are computed. pyCHMP
+   should follow that semantic model: default channel/frequency PSFs may be
+   cached in the artifact with the observation/reference payload, but the
+   selected PSF and any user override are part of the search recipe. Changing a
+   PSF changes the metric identity but must not change or contaminate reusable
+   synthetic render products.
+
+6. Preserve EUV decomposition when available.
 
    EUV transition-region and coronal components should be stored separately
    when the renderer can provide them. A changed TR mask or comparison mask can
    then recombine and rescore without rerendering.
 
-6. Fail closed on ambiguous legacy entries.
+7. Fail closed on ambiguous legacy entries.
 
    Until a map-store entry has sufficient identity, EUV/UV searches should not
    reuse it across channels. Ambiguous entries can remain in old artifacts but
@@ -112,7 +122,7 @@ Design Principles
 Target Data Model
 -----------------
 
-The target store has three logical layers.
+The target artifact has separate synthetic-render and reference/scoring layers.
 
 Render Product
 ~~~~~~~~~~~~~~
@@ -161,6 +171,21 @@ are not component layers of the reusable map store. They may be generated,
 displayed, or cached under a search-specific results area, but they must not be
 used as reusable render evidence.
 
+Reference and PSF Assets
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Observed maps, uncertainty maps, WCS/geometry descriptors, and default
+channel/frequency PSF kernels belong to the reference side of the artifact, not
+to the synthetic render-product store. This follows the IDL CHMP design, where
+the PSF is a property of the reference maps used during metric computation.
+
+The artifact may cache PSF kernels so searches can reproduce convolved maps,
+metrics, and residual panels without regenerating instrument responses. A search
+uses the reference/default PSF unless its recipe explicitly selects a corrected
+or replacement PSF. The selected PSF identity and fingerprint are part of the
+search identity; the PSF kernel itself is not part of the reusable synthetic
+map provenance.
+
 
 Search-Time Behavior
 --------------------
@@ -179,8 +204,9 @@ When a search evaluates ``(a, b, q0)``:
    For EUV, recombine TR/corona components using the current TR mask policy if
    component storage is available.
 
-5. Apply the current scoring recipe: PSF, comparison mask, sigma policy,
-   metric, and any fixed shifts.
+5. Apply the current scoring recipe: selected PSF, comparison mask, sigma
+   policy, metric, and any fixed shifts. The selected PSF is resolved from the
+   reference/default PSF assets or from an explicit search override.
 
 6. Persist the trial score and link it to the render product and selected
    layer/component identities. Persist search-specific outputs, such as
@@ -234,6 +260,8 @@ Phase 4: Channel-Aware Rescoring
   sharing trial metrics.
 - Separate render reuse from score reuse. A previous rendered map can be reused
   while metrics are recomputed for a different target channel or scoring recipe.
+- Resolve PSFs from reference/default assets or explicit search overrides; do
+  not look for PSF kernels in synthetic render-product provenance.
 
 Phase 5: EUV Component Reuse
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -270,6 +298,8 @@ The redesign is not complete until these behaviors are covered by tests:
   products exist.
 - Changing the PSF recipe causes reconvolution/rescoring, not rerendering, and
   does not alter the reusable map-store product.
+- Default PSFs are stored with the reference/observation payload, and a
+  search-level PSF override creates a distinct scoring identity.
 - Changing the TR mask causes recombination/rescoring, not rerendering, when
   TR/corona components exist.
 - Residual maps and convolved maps are stored only under search-specific
