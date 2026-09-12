@@ -4274,11 +4274,40 @@ def _write_point_map_ref(
 ) -> None:
     if data is None:
         return
+    identity = _synthetic_map_identity_for_store_name(
+        dict(normalized.get("diagnostics") or {}),
+        map_store_name=name,
+    )
+    if identity is None:
+        identity = _map_store_identity(name=name, normalized=normalized)
     map_refs[name] = _write_map_store_array(
         grp.file,
-        identity=_map_store_identity(name=name, normalized=normalized),
+        identity=identity,
         data=np.asarray(data, dtype=float),
     )
+
+
+def _synthetic_map_identity_for_store_name(
+    diagnostics: dict[str, Any],
+    *,
+    map_store_name: str,
+) -> dict[str, Any] | None:
+    requested = str(map_store_name or "").strip()
+    candidates = [requested]
+    if requested.startswith("extra/"):
+        candidates.append(requested[len("extra/") :])
+    else:
+        candidates.append(f"extra/{requested}")
+    candidate_set = set(candidates)
+    for entry in _synthetic_map_entries_from_diagnostics(diagnostics):
+        array_name = str(entry.get("map_store_array") or "").strip()
+        if array_name not in candidate_set:
+            continue
+        identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else None
+        if identity is None:
+            continue
+        return dict(identity)
+    return None
 
 
 def _synthetic_map_entries_from_diagnostics(diagnostics: dict[str, Any]) -> list[dict[str, Any]]:

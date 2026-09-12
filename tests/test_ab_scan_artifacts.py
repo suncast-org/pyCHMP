@@ -1657,9 +1657,14 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
             "label": "EUV 193 best",
             "identity": {
                 "schema": "pychmp.synthetic_map_db.v1",
+                "domain": "euv",
                 "domain_label": "euv",
                 "channel_or_frequency": "193",
+                "component": "stokes_i",
                 "map_role": "rendered_best",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 2.5,
             },
         },
         {
@@ -1668,9 +1673,14 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
             "label": "EUV 193 trial 0",
             "identity": {
                 "schema": "pychmp.synthetic_map_db.v1",
+                "domain": "euv",
                 "domain_label": "euv",
                 "channel_or_frequency": "193",
+                "component": "stokes_i",
                 "map_role": "trial_000_rendered",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 2.0,
             },
         },
         {
@@ -1679,9 +1689,14 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
             "label": "EUV 193 trial 1",
             "identity": {
                 "schema": "pychmp.synthetic_map_db.v1",
+                "domain": "euv",
                 "domain_label": "euv",
                 "channel_or_frequency": "193",
+                "component": "stokes_i",
                 "map_role": "trial_001_rendered",
+                "a": 0.3,
+                "b": 2.7,
+                "q0": 2.5,
             },
         },
     ]
@@ -1737,6 +1752,18 @@ def test_auxiliary_map_store_records_can_use_synthetic_machine_keys(tmp_path: Pa
     assert records[0]["fit_q0_trials"] == (2.0, 2.5)
     np.testing.assert_allclose(records[0]["trial_modeled_maps"][0], np.full((2, 2), 2.0, dtype=float))
     np.testing.assert_allclose(records[0]["modeled_best"], np.full((2, 2), 2.5, dtype=float))
+    with h5py.File(out_h5, "r") as handle:
+        record = handle["slices/euv_171/searches"][str(load_scan_file(out_h5)["selected_search_id"])]["point_records"]["r000000"]
+        refs = json.loads(record["map_refs_json"][()].decode())
+        for ref_key in (
+            "extra/synthetic/syn-193-best",
+            "extra/synthetic/syn-193-trial0",
+            "extra/synthetic/syn-193-trial1",
+        ):
+            identity = json.loads(handle[refs[ref_key]]["identity_json"][()].decode())
+            assert identity["domain"] == "euv"
+            assert identity["channel_or_frequency"] == "193"
+            assert identity["component"] == "stokes_i"
 
 
 def test_auxiliary_map_store_records_disable_synthetic_key_lookup_uses_legacy_prefix(tmp_path: Path) -> None:
