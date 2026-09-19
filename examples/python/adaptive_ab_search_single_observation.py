@@ -211,6 +211,7 @@ from pychmp import (
     obs_map_noise_unit_label,
     prepare_observation_for_metrics,
     resolve_geometry_policy,
+    resolve_renderer_observer_name,
     resolve_slice_observation_reference,
     SliceObservationReference,
     SliceObservationReferenceError,
@@ -4006,7 +4007,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nbase", type=float, default=DEFAULT_NBASE, help="Base density in cm^-3")
     parser.add_argument("--observer", default=None, help="Observer name override, e.g. earth")
     parser.add_argument("--dsun-cm", type=float, default=None, help="Observer-Sun distance override in cm")
-    parser.add_argument("--lonc-deg", type=float, default=None, help="Observer Carrington longitude override in degrees")
+    parser.add_argument(
+        "--lonc-deg",
+        type=float,
+        default=None,
+        help="gxrender renderer-relative model longitude override in degrees",
+    )
     parser.add_argument("--b0sun-deg", type=float, default=None, help="Observer latitude override in degrees")
     parser.add_argument("--pixel-scale-arcsec", type=float, default=2.0, help="Pixel scale used with the model saved FOV")
     parser.add_argument("--psf-bmaj-arcsec", type=float, default=None, help="PSF major-axis FWHM in arcsec")
@@ -4369,8 +4375,10 @@ def main() -> int:
         geometry_overrides_requested=geometry_overrides_requested,
         explicit_observer_requested=explicit_observer_requested,
     )
-    geometry_observer_name = (
-        None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+    geometry_observer_name = resolve_renderer_observer_name(
+        geometry_policy,
+        explicit_observer_name=args.observer,
+        explicit_observer_requested=explicit_observer_requested,
     )
     geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
     resolved_geometry = resolve_render_geometry_via_gxrender(
@@ -4385,12 +4393,13 @@ def main() -> int:
     )
     geometry = resolved_geometry.geometry
     if not explicit_observer_requested:
-        observer_overrides = sdk.ObserverOverrides(
-            dsun_cm=float(geometry_policy.observer_dsun_cm),
-            lonc_deg=float(geometry_policy.observer_lonc_deg),
-            b0sun_deg=float(geometry_policy.observer_b0sun_deg),
-        )
+        observer_overrides = None
         observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+    render_observer_name = resolve_renderer_observer_name(
+        geometry_policy,
+        explicit_observer_name=args.observer,
+        explicit_observer_requested=explicit_observer_requested,
+    )
     effective_observer_name = str(args.observer or geometry_policy.observer_name)
     effective_observer_lonc_deg = float(
         getattr(observer_overrides, "lonc_deg", None)
@@ -4709,7 +4718,7 @@ def main() -> int:
                 b=float(args.b_start),
                 geometry=geometry,
                 observer=observer_overrides,
-                observer_name=effective_observer_name,
+                observer_name=render_observer_name,
                 tr_region_mask=euv_tr_mask,
                 pixel_scale_arcsec=float(args.pixel_scale_arcsec),
             )
@@ -5159,7 +5168,7 @@ def main() -> int:
             lonc_deg=None if getattr(observer_overrides, "lonc_deg", None) is None else float(observer_overrides.lonc_deg),
             b0sun_deg=None if getattr(observer_overrides, "b0sun_deg", None) is None else float(observer_overrides.b0sun_deg),
         ),
-        observer_name=effective_observer_name,
+        observer_name=render_observer_name,
         pixel_scale_arcsec=float(args.pixel_scale_arcsec),
         psf_kernel=None if psf_kernel is None else np.asarray(psf_kernel, dtype=float),
         tr_region_mask=None if euv_tr_mask is None else np.asarray(euv_tr_mask, dtype=bool),

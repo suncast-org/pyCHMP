@@ -35,6 +35,28 @@ class GeometryPolicyDecision:
     reason: str
 
 
+def resolve_renderer_observer_name(
+    decision: GeometryPolicyDecision,
+    *,
+    explicit_observer_name: str | None,
+    explicit_observer_requested: bool,
+) -> str | None:
+    """Return the observer identity to pass to gxrender.
+
+    ``GeometryPolicyDecision.observer_lonc_deg`` is observer ephemeris metadata
+    used for WCS/provenance.  It is not gxrender's renderer-relative model
+    longitude override.  A compatible saved FOV therefore delegates observer
+    restoration to gxrender, while an observation-driven render passes only a
+    named observer unless the user explicitly supplied scalar overrides.
+    """
+
+    if explicit_observer_name:
+        return str(explicit_observer_name)
+    if decision.use_model_saved_fov and not explicit_observer_requested:
+        return None
+    return str(decision.observer_name)
+
+
 def normalize_observer_identity(value: Any | None) -> str | None:
     """Normalize common observer names to stable LOS identities."""
 
