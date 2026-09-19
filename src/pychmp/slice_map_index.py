@@ -100,6 +100,7 @@ class SliceMapIndex:
         self.slice_key = str(slice_key).strip()
         self.descriptor = dict(descriptor)
         self._entries: dict[tuple[float, float], dict[float, MapStoreEntry]] = {}
+        self._component_entries: dict[tuple[float, float], dict[float, dict[str, MapStoreEntry]]] = {}
 
     def register(
         self,
@@ -130,8 +131,14 @@ class SliceMapIndex:
             source_search_id=source_search_id,
             source_point_id=source_point_id,
         )
-        if existing is None or len(ref) >= len(existing.raw_map_ref):
-            bucket[q0_norm] = entry
+        component_key = str(component or "").strip().lower()
+        component_bucket = self._component_entries.setdefault(key, {}).setdefault(q0_norm, {})
+        existing_component = component_bucket.get(component_key)
+        if existing_component is None or len(ref) >= len(existing_component.raw_map_ref):
+            component_bucket[component_key] = entry
+        if _component_accepts_warm_start(component_key):
+            if existing is None or len(ref) >= len(existing.raw_map_ref):
+                bucket[q0_norm] = entry
 
     def has_point(self, a: float, b: float) -> bool:
         return _ab_key(a, b) in self._entries
@@ -159,6 +166,21 @@ class SliceMapIndex:
         if not bucket:
             return ()
         return tuple(bucket[q0] for q0 in sorted(bucket.keys()))
+
+    def component_ref(self, a: float, b: float, q0: float, component: str) -> str | None:
+        bucket = self._component_entries.get(_ab_key(a, b))
+        if not bucket:
+            return None
+        q0_bucket = bucket.get(_q0_key(q0))
+        if q0_bucket is None:
+            for candidate_q0, candidate_bucket in bucket.items():
+                if np.isclose(candidate_q0, float(q0), rtol=0.0, atol=1e-12):
+                    q0_bucket = candidate_bucket
+                    break
+        if not q0_bucket:
+            return None
+        entry = q0_bucket.get(str(component or "").strip().lower())
+        return None if entry is None else entry.raw_map_ref
 
     def point_count(self) -> int:
         return len(self._entries)
@@ -237,8 +259,6 @@ def _index_map_store_maps(h5_file: h5py.File, index: SliceMapIndex, descriptor: 
                 component = "stokes_i"
             else:
                 continue
-        if not _component_accepts_warm_start(component):
-            continue
         ref_path = f"/{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}/{map_id}"
         before = index.trial_count()
         index.register(
@@ -268,8 +288,6 @@ def _index_synthetic_registry(h5_file: h5py.File, index: SliceMapIndex, descript
             continue
         map_role = str(entry.get("map_role") or "").strip().lower()
         component = str(entry.get("component") or map_role or "stokes_i").strip().lower()
-        if not _component_accepts_warm_start(component) and "raw" not in map_role:
-            continue
         before = index.trial_count()
         index.register(
             a=float(a_value),

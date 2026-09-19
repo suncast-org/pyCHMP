@@ -54,6 +54,25 @@ def test_resolve_metrics_threshold_mask_uses_smoothed_obs_peak() -> None:
     assert int(np.count_nonzero(mask)) <= int(np.count_nonzero(raw_mask))
 
 
+def test_resolve_metrics_threshold_mask_loads_explicit_fits(tmp_path) -> None:
+    observed = np.ones((5, 5), dtype=float)
+    modeled = np.ones((5, 5), dtype=float)
+    explicit = np.zeros((5, 5), dtype=np.uint8)
+    explicit[1:3, 2:4] = 1
+    mask_path = tmp_path / "roi_mask.fits"
+    fits.writeto(mask_path, explicit, overwrite=True)
+
+    mask = resolve_metrics_threshold_mask(
+        observed,
+        modeled,
+        {"metrics_mask_source": "explicit_fits", "metrics_mask_fits": str(mask_path)},
+    )
+
+    assert mask is not None
+    assert mask.dtype == bool
+    np.testing.assert_array_equal(mask, explicit.astype(bool))
+
+
 def test_union_mask_can_be_larger_than_data_mask_at_low_heating() -> None:
     observed = np.zeros((7, 7), dtype=float)
     observed[3, 3] = 100.0

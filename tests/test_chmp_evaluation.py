@@ -54,6 +54,39 @@ def test_evaluate_modeled_trial_fixed_policy_computes_metrics() -> None:
     assert result.shift_y_arcsec == 0.0
 
 
+def test_evaluate_modeled_trial_explicit_mask_computes_metrics() -> None:
+    observed = np.zeros((8, 8), dtype=float)
+    observed[3:5, 3:5] = 10.0
+    modeled = observed.copy()
+    modeled[3:5, 3:5] = 8.0
+    sigma = np.full((8, 8), 0.5, dtype=float)
+    explicit_mask = np.zeros((8, 8), dtype=bool)
+    explicit_mask[3:5, 3:5] = True
+    context = ObservationEvaluationContext(
+        model_header=_header(8, 8),
+        shift_policy="fixed",
+        observed=observed,
+        sigma=sigma,
+        use_smoothed_obs_max=False,
+    )
+
+    result = evaluate_modeled_trial(
+        modeled,
+        context,
+        threshold=0.1,
+        mask_type="explicit",
+        explicit_mask=explicit_mask,
+        use_emthreshold=False,
+    )
+
+    assert result.is_valid
+    assert np.isfinite(result.metrics.eta2)
+    assert result.total_observed_flux == pytest.approx(40.0)
+    assert result.total_modeled_flux == pytest.approx(32.0)
+    assert result.mask_obs_fraction == pytest.approx(4 / 64)
+    assert result.mask_mod_fraction == pytest.approx(4 / 64)
+
+
 def test_evaluate_modeled_trial_invalid_mask_still_reports_flux_totals() -> None:
     observed = np.zeros((8, 8), dtype=float)
     observed[3:5, 3:5] = 10.0

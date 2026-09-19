@@ -15,6 +15,7 @@ from pychmp.grid_points import (
     apply_grid_point_assigned,
     apply_grid_trial_committed,
 )
+from pychmp.map_store import build_map_identity
 from pychmp.slice_map_index import (
     SliceMapIndex,
     build_slice_map_index,
@@ -126,6 +127,132 @@ def test_build_slice_map_index_from_grid_trial(tmp_path: Path) -> None:
     )
     assert hydrated >= 1
     assert len(raw_by_q0) >= 1
+
+
+def test_grid_trial_auxiliary_maps_are_channel_safe(tmp_path: Path) -> None:
+    observed = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float)
+    sigma = np.ones((2, 2), dtype=float)
+    header = _header()
+    artifact_h5 = tmp_path / "euv_auxiliary_index.h5"
+    base = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        COMPATIBILITY_SIGNATURE_KEY: "sig-euv-aux",
+        "target_metric": "eta2",
+        "spectral_domain": "euv",
+        "metrics_mask_threshold": 0.1,
+        "forward_model_sha256": "forward",
+        "forward_model_identity_version": "v-test",
+        "ebtel_sha256": "ebtel",
+        "artifact_geometry_sha256": "geometry",
+        "euv_response_sha256": "response",
+        "euv_response_identity_version": "response-v-test",
+    }
+    diagnostics_94 = {
+        **base,
+        "target_slice_key": "euv_94",
+        "slice_key": "euv_94",
+        "spectral_label": "94 A",
+        "euv_channel": "94",
+        "wavelength_angstrom": 94.0,
+    }
+    diagnostics_171 = {
+        **base,
+        "target_slice_key": "euv_171",
+        "slice_key": "euv_171",
+        "spectral_label": "171 A",
+        "euv_channel": "171",
+        "wavelength_angstrom": 171.0,
+    }
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics_94,
+        point_records=[],
+    )
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics_171,
+        point_records=[],
+    )
+    apply_grid_point_assigned(
+        artifact_h5,
+        GridPointAssignedEvent(a=0.6, b=1.8, q0_start=1e-3, next_q0=1e-3, metric_name="eta2"),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics_94,
+    )
+    identity_94 = build_map_identity(
+        a=0.6,
+        b=1.8,
+        q0=1e-3,
+        domain="euv",
+        channel_or_frequency="94",
+        component="stokes_i",
+        forward_model_sha256="forward",
+        forward_model_identity_version="v-test",
+        ebtel_sha256="ebtel",
+        artifact_geometry_sha256="geometry",
+        euv_response_sha256="response",
+        euv_response_identity_version="response-v-test",
+    )
+    identity_171 = build_map_identity(
+        a=0.6,
+        b=1.8,
+        q0=1e-3,
+        domain="euv",
+        channel_or_frequency="171",
+        component="stokes_i",
+        forward_model_sha256="forward",
+        forward_model_identity_version="v-test",
+        ebtel_sha256="ebtel",
+        artifact_geometry_sha256="geometry",
+        euv_response_sha256="response",
+        euv_response_identity_version="response-v-test",
+    )
+    apply_grid_trial_committed(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id="p000000",
+            trial_index=0,
+            q0=1e-3,
+            metric=0.3,
+            next_q0=2e-3,
+            best_trial_index=0,
+            best_metric=0.3,
+            raw_modeled_map=np.full((2, 2), 94.0, dtype=np.float32),
+            raw_map_identity=identity_94,
+            map_store_arrays={"synthetic/euv171": np.full((2, 2), 171.0, dtype=np.float32)},
+            map_store_identities={"synthetic/euv171": identity_171},
+        ),
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics_94,
+    )
+
+    index_94 = build_slice_map_index(artifact_h5, slice_key="euv_94")
+    index_171 = build_slice_map_index(artifact_h5, slice_key="euv_171")
+    ref_94 = index_94.raw_map_ref(0.6, 1.8, 1e-3)
+    ref_171 = index_171.raw_map_ref(0.6, 1.8, 1e-3)
+    assert ref_94 is not None
+    assert ref_171 is not None
+    assert ref_94 != ref_171
+
+    with h5py.File(artifact_h5, "r") as h5:
+        data_94 = np.asarray(h5[ref_94]["data"][()], dtype=float)
+        data_171 = np.asarray(h5[ref_171]["data"][()], dtype=float)
+        identity_json_94 = json.loads(h5[ref_94]["identity_json"][()].decode("utf-8"))
+        identity_json_171 = json.loads(h5[ref_171]["identity_json"][()].decode("utf-8"))
+    np.testing.assert_allclose(data_94, np.full((2, 2), 94.0))
+    np.testing.assert_allclose(data_171, np.full((2, 2), 171.0))
+    assert identity_json_94["channel_or_frequency"] == "94"
+    assert identity_json_171["channel_or_frequency"] == "171"
 
 
 def test_slice_map_index_register_dedupes_by_q0() -> None:

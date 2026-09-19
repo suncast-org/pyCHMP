@@ -108,6 +108,7 @@ def build_search_evaluation_config(
         },
         "tr_mask": {
             "source": diagnostics.get("tr_mask_source"),
+            "fits": diagnostics.get("tr_mask_fits"),
             "bmin_gauss": diagnostics.get("tr_mask_bmin_gauss"),
         },
         "use_smoothed_obs_max": diagnostics.get("use_smoothed_obs_max"),

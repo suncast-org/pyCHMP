@@ -351,7 +351,7 @@ class _SelectedSolutionWindow:
         self.toolbar_context_var = tk.StringVar(value="Selected solution window is ready.")
         self.common_map_link_var = tk.StringVar(value="Auto (each panel)")
         self.common_map_scale_var = tk.StringVar(value="linear")
-        self.residual_map_mode_var = tk.StringVar(value="Tb (M−O)")
+        self.residual_map_mode_var = tk.StringVar(value="Tb (O−M)")
         self.residual_map_scale_var = tk.StringVar(value="linear")
 
         outer = ttk.Frame(self.window, padding=8)
@@ -416,7 +416,7 @@ class _SelectedSolutionWindow:
             toolbar,
             width=22,
             state="readonly",
-            values=("Tb (M−O)", "Normalized (M−O)/(M+O)"),
+            values=("Tb (O−M)", "Normalized (O−M)/(O+M)"),
             textvariable=self.residual_map_mode_var,
         )
         place(residual_mode_menu)
@@ -453,7 +453,7 @@ class _SelectedSolutionWindow:
         _ToolTip(maps_auto_button, "Reset map link and scale to defaults (per-panel auto limits).")
         _ToolTip(
             residual_mode_menu,
-            "Residual definition: Tb difference (model−obs) or normalized (M−O)/(M+O) in [-1, 1].",
+            "Residual definition: Tb difference (observed−model) or normalized (observed−model)/(observed+model) in [-1, 1].",
         )
         _ToolTip(residual_scale_menu, "Residual intensity scale. Use symlog for signed residuals with wide dynamic range.")
         _ToolTip(residual_auto_button, "Reset residual type and scale to defaults.")
@@ -666,7 +666,7 @@ class _SelectedSolutionWindow:
         self.update_selection()
 
     def _reset_residual_map_display(self) -> None:
-        self.residual_map_mode_var.set("Tb (M−O)")
+        self.residual_map_mode_var.set("Tb (O−M)")
         self.residual_map_scale_var.set("linear")
         self.update_selection()
 

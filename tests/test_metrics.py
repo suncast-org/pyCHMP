@@ -9,19 +9,21 @@ def test_compute_display_residual_tb_and_normalized() -> None:
     modeled = np.array([[12.0, 0.0], [27.0, 44.0]])
 
     tb = compute_display_residual(modeled, observed, mode="tb")
-    assert tb[0, 0] == pytest.approx(2.0)
+    assert tb[0, 0] == pytest.approx(-2.0)
     assert tb[0, 1] == pytest.approx(0.0)
 
     norm = compute_display_residual(modeled, observed, mode="normalized")
-    assert norm[0, 0] == pytest.approx((12.0 - 10.0) / (12.0 + 10.0))
+    assert norm[0, 0] == pytest.approx((10.0 - 12.0) / (10.0 + 12.0))
     assert np.isnan(norm[0, 1])
-    assert norm[1, 0] == pytest.approx((27.0 - 30.0) / (27.0 + 30.0))
+    assert norm[1, 0] == pytest.approx((30.0 - 27.0) / (30.0 + 27.0))
     assert np.all(np.abs(norm[np.isfinite(norm)]) <= 1.0)
 
 
 def test_normalize_residual_display_mode_aliases() -> None:
     assert normalize_residual_display_mode("Normalized (M−O)/(M+O)") == "normalized"
+    assert normalize_residual_display_mode("Normalized (O−M)/(O+M)") == "normalized"
     assert normalize_residual_display_mode("Tb (M−O)") == "tb"
+    assert normalize_residual_display_mode("Tb (O−M)") == "tb"
 
 
 def test_threshold_union_mask_selects_union() -> None:

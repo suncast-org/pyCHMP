@@ -150,6 +150,7 @@ SEARCH_SPECIFIC_DIAGNOSTIC_KEYS = {
     "metrics_mask_source",
     "metrics_mask_fits",
     "mask_type",
+    "tr_mask_fits",
     "tr_mask_bmin_gauss",
     "tr_mask_source",
     "search_mode",
@@ -1104,7 +1105,7 @@ def _search_request_from_group(search_group: h5py.Group) -> dict[str, Any]:
 
 def _matching_search_id_for_request(searches_group: h5py.Group, request: dict[str, Any]) -> str | None:
     target_signature = search_evaluation_signature(request)
-    matches: list[tuple[int, str]] = []
+    matches: list[tuple[int, int, str]] = []
     for search_id in searches_group.keys():
         search_group = searches_group[search_id]
         existing_request = _search_request_from_group(search_group)
@@ -1115,12 +1116,20 @@ def _matching_search_id_for_request(searches_group: h5py.Group, request: dict[st
 
         if GRID_POINTS_GROUP in search_group:
             point_count = max(int(point_count), int(len(search_group[GRID_POINTS_GROUP])))
-        matches.append((int(point_count), str(search_id)))
+        lifecycle = (
+            _json_loads_or_empty(search_group["lifecycle_json"][()])
+            if "lifecycle_json" in search_group
+            else {}
+        )
+        status = str(lifecycle.get("status") or "").strip().lower()
+        active = bool(lifecycle.get("active", False))
+        completion_rank = 1 if status == "complete" and not active else 0
+        matches.append((completion_rank, int(point_count), str(search_id)))
     if not matches:
         return None
     # Prefer the most complete existing search when duplicates already exist.
-    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return matches[0][1]
+    matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    return matches[0][2]
 
 
 def _search_lifecycle_payload(
@@ -1327,12 +1336,19 @@ def _resolve_observation_reference_payload(
     common: h5py.Group,
     *,
     search_group: h5py.Group | None = None,
+    allow_render_only: bool = False,
 ) -> dict[str, Any] | None:
     if search_group is not None and OBSERVATION_REF_GROUP in search_group:
         search_payload = _read_observation_ref_group(search_group[OBSERVATION_REF_GROUP])
         if search_payload.get("observed") is not None or search_payload.get("observation_canvas") is not None:
             return search_payload
     payload = _observation_ref_payload_from_common(common)
+    if (
+        payload is not None
+        and not allow_render_only
+        and bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False))
+    ):
+        return None
     if payload is not None and (
         payload.get("observed") is not None
         or payload.get("observation_canvas") is not None
@@ -1374,7 +1390,10 @@ def load_slice_observation_reference_payload(
                     payload.get("observed") is not None or payload.get("observation_canvas") is not None
                 ):
                     return payload
-        return _observation_ref_payload_from_common(common)
+        fallback = _observation_ref_payload_from_common(common)
+        if fallback is not None and bool(dict(fallback.get("diagnostics") or {}).get("render_only_slice", False)):
+            return None
+        return fallback
 
 
 def load_search_observation_reference_payload(
@@ -1417,6 +1436,7 @@ def _write_search_group(
     _create_text_dataset(search_group, "run_history_json", _json_dumps(list(run_history or [])))
     records_group = search_group.create_group("point_records")
     for record_order, payload in enumerate(point_records):
+        _write_search_tr_mask_if_available(search_group, diagnostics_out, payload)
         grp = records_group.create_group(f"r{record_order:06d}")
         _write_point_group(grp, payload, record_order=record_order)
     request = _search_request_from_diagnostics(diagnostics_out, layout=layout)
@@ -1982,6 +2002,9 @@ def apply_search_run_profile_to_namespace(
     threshold_metric = _opt_or_diag("threshold_metric")
     if threshold_metric is not None:
         args.threshold_metric = float(threshold_metric)
+    tr_mask_fits = diagnostics.get("tr_mask_fits")
+    if tr_mask_fits not in {None, ""}:
+        args.tr_mask_fits = Path(str(tr_mask_fits))
     tr_mask = diagnostics.get("tr_mask_bmin_gauss")
     if tr_mask is not None:
         args.tr_mask_bmin_gauss = float(tr_mask)
@@ -3170,7 +3193,11 @@ def load_scan_file(
         search_group = None
         if selected_search_id is not None and SEARCHES_GROUP in group and selected_search_id in group[SEARCHES_GROUP]:
             search_group = group[SEARCHES_GROUP][selected_search_id]
-        obs_ref_payload = _resolve_observation_reference_payload(common, search_group=search_group)
+        obs_ref_payload = _resolve_observation_reference_payload(
+            common,
+            search_group=search_group,
+            allow_render_only=True,
+        )
         if obs_ref_payload is None:
             raise KeyError(
                 f"observation reference not found for slice={selected_key!r} search={selected_search_id!r}"
@@ -3943,6 +3970,7 @@ def extract_artifact_identity_summary(
         "metrics_mask_fits",
         "metrics_mask_source",
         "mask_type",
+        "tr_mask_fits",
         "tr_mask_bmin_gauss",
         "tr_mask_source",
     )
@@ -3956,6 +3984,7 @@ def extract_artifact_identity_summary(
             "metrics_mask_fits",
             "metrics_mask_source",
             "mask_type",
+            "tr_mask_fits",
             "tr_mask_bmin_gauss",
             "tr_mask_source",
             COMPATIBILITY_SIGNATURE_KEY,
@@ -5231,6 +5260,49 @@ def _write_point_group(grp: h5py.Group, payload: dict[str, Any], *, record_order
     _create_text_dataset(grp, "diagnostics_json", _json_dumps(diagnostics_out))
 
 
+def _write_search_tr_mask_if_available(
+    search_group: h5py.Group,
+    diagnostics: dict[str, Any],
+    point_payload: dict[str, Any],
+) -> None:
+    """Store the actual EUV TR mask used by this search identity."""
+
+    if "tr_mask" in search_group:
+        return
+    mask = point_payload.get("euv_tr_mask")
+    if mask is None:
+        return
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.ndim != 2 or mask_arr.size <= 0:
+        return
+    ds = search_group.create_dataset(
+        "tr_mask",
+        data=mask_arr.astype(np.uint8),
+        compression="gzip",
+        compression_opts=4,
+    )
+    source = diagnostics.get("tr_mask_source")
+    description = "TR mask stored by EUV search"
+    if source == "explicit_fits":
+        description = "TR mask: explicit FITS"
+    elif source == "abs_blos_ge_bmin":
+        try:
+            description = f"TR mask: |B_los| >= {float(diagnostics.get('tr_mask_bmin_gauss')):.0f} G"
+        except Exception:
+            description = "TR mask: |B_los| threshold"
+    ds.attrs["description"] = np.bytes_(description)
+    ds.attrs["source"] = np.bytes_(str(source or "unknown"))
+    if diagnostics.get("tr_mask_fits") not in {None, ""}:
+        ds.attrs["source_path"] = np.bytes_(str(diagnostics.get("tr_mask_fits")))
+    if diagnostics.get("tr_mask_bmin_gauss") is not None:
+        try:
+            ds.attrs["bmin_gauss"] = float(diagnostics.get("tr_mask_bmin_gauss"))
+        except Exception:
+            pass
+    ds.attrs["selected_pixels"] = int(np.count_nonzero(mask_arr))
+    ds.attrs["total_pixels"] = int(mask_arr.size)
+
+
 def write_point_scan_artifact(
     out_h5: Path,
     *,
@@ -5483,6 +5555,7 @@ def append_scan_point_record(
                         SEARCH_REQUEST_DATASET,
                         _json_dumps(request_payload),
                     )
+                _write_search_tr_mask_if_available(search_group, diagnostics_out, point_payload)
                 search_records = search_group.require_group("point_records")
                 search_orders = [int(search_records[name].attrs.get("record_order", -1)) for name in search_records.keys()]
                 search_next_order = max(search_orders, default=-1) + 1

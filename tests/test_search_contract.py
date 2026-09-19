@@ -139,6 +139,25 @@ def test_load_slice_observation_reference_payload_reads_slice_common(tmp_path) -
     np.testing.assert_allclose(payload["observed"], observed)
 
 
+def test_load_slice_observation_reference_payload_ignores_render_only_shell(tmp_path) -> None:
+    out_h5 = tmp_path / "artifact_render_only.h5"
+    observed = np.full((2, 2), np.nan, dtype=float)
+    sigma_map = np.full((2, 2), np.nan, dtype=float)
+    diagnostics = _make_diagnostics()
+    diagnostics["render_only_slice"] = True
+    write_point_scan_artifact(
+        out_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=_make_header(),
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    with h5py.File(out_h5, "r") as f:
+        slice_key = next(iter(f[SLICE_CONTAINER_GROUP].keys()))
+    assert load_slice_observation_reference_payload(out_h5, slice_key=slice_key) is None
+
+
 def test_load_slice_observation_reference_payload_legacy_search_ref_fallback(tmp_path) -> None:
     out_h5 = tmp_path / "legacy.h5"
     observed = np.ones((2, 2), dtype=float)

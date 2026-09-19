@@ -49,8 +49,8 @@ def compute_display_residual(
     """Build a 2D residual map for viewer display.
 
     Modes:
-    - ``tb`` (default): ``modeled - observed`` (brightness temperature difference).
-    - ``normalized``: ``(modeled - observed) / (modeled + observed)``, NaN where
+    - ``tb`` (default): ``observed - modeled`` (brightness temperature difference).
+    - ``normalized``: ``(observed - modeled) / (observed + modeled)``, NaN where
       the sum is zero or non-finite. Finite values are clipped to ``[-1, 1]``.
     """
     mod = np.asarray(modeled, dtype=float)
@@ -60,9 +60,9 @@ def compute_display_residual(
 
     display_mode = normalize_residual_display_mode(mode)
     if display_mode == "tb":
-        return np.asarray(mod - obs, dtype=float)
+        return np.asarray(obs - mod, dtype=float)
 
-    diff = mod - obs
+    diff = obs - mod
     denom = mod + obs
     out = np.full(diff.shape, np.nan, dtype=float)
     valid = np.isfinite(diff) & np.isfinite(denom) & (np.abs(denom) > 0.0)
@@ -317,7 +317,17 @@ def resolve_metrics_threshold_mask(
     """Build the CHMP-faithful metrics ROI mask for visualization."""
     mask_source = str(diagnostics.get("metrics_mask_source", "")).strip().lower()
     if mask_source == "explicit_fits":
-        return None
+        mask_path = str(diagnostics.get("metrics_mask_fits", "")).strip()
+        if not mask_path:
+            return None
+        try:
+            mask_data = np.asarray(fits.getdata(Path(mask_path).expanduser()))
+        except Exception:
+            return None
+        mask_data = np.squeeze(mask_data)
+        if mask_data.shape != np.asarray(observed).shape:
+            return None
+        return np.asarray(np.isfinite(mask_data) & (mask_data != 0), dtype=bool)
     mask_type = resolve_metrics_mask_type(diagnostics)
     threshold = float(diagnostics.get("metrics_mask_threshold", diagnostics.get("threshold", 0.1)))
     obs_max = resolve_observation_peak_for_mask(observed, diagnostics, wcs_header=wcs_header)

@@ -181,11 +181,26 @@ def evaluate_modeled_trial(
     )
 
     resolved_mask_type = mask_type.strip().lower()
-    mask_fn = resolve_threshold_mask(mask_type)
     if explicit_mask is not None:
         mask = np.asarray(explicit_mask, dtype=bool)
         effective_mask_stage = resolved_mask_stage
-    elif resolved_mask_type in {"union", "data", "and"}:
+        if mask.shape != observed_arr.shape:
+            raise ValueError(f"explicit mask shape mismatch: {mask.shape} vs {observed_arr.shape}")
+        mask_fraction = float(np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
+        mask_obs_frac = mask_fraction
+        mask_mod_frac = mask_fraction
+        obs_flux, mod_flux = union_mask_flux_totals(
+            observed_arr,
+            modeled_arr,
+            mask,
+            pixel_scale_x_arcsec=scale_x,
+            pixel_scale_y_arcsec=scale_y,
+        )
+        valid_mask = bool(np.any(mask))
+        mask_message = "" if valid_mask else "explicit mask is empty"
+    else:
+        mask_fn = resolve_threshold_mask(mask_type)
+    if explicit_mask is None and resolved_mask_type in {"union", "data", "and"}:
         mask = mask_fn(observed_arr, modeled_arr, threshold, obs_max=obs_peak)
         effective_mask_stage = resolved_mask_stage
         mask_obs_frac, mask_mod_frac = mask_area_fractions(
@@ -230,7 +245,7 @@ def evaluate_modeled_trial(
             if effective_mask_stage == "data":
                 valid_mask = mask_obs_frac <= 0.99
                 mask_message = "" if valid_mask else "observation mask fraction > 0.99"
-    else:
+    elif explicit_mask is None:
         mask = mask_fn(observed_arr, modeled_arr, threshold)
         effective_mask_stage = resolved_mask_stage
         mask_obs_frac, mask_mod_frac = mask_area_fractions(

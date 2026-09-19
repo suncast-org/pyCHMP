@@ -472,6 +472,9 @@ class GridTrialCommittedEvent:
     best_metric: float
     raw_modeled_map: np.ndarray | None = None
     raw_map_ref: str | None = None
+    raw_map_identity: dict[str, Any] | None = None
+    map_store_arrays: dict[str, np.ndarray] | None = None
+    map_store_identities: dict[str, dict[str, Any]] | None = None
     trial_metadata: dict[str, Any] | None = None
     shift_x: float | None = None
     shift_y: float | None = None
@@ -712,13 +715,42 @@ def apply_grid_trial_committed(
                 "q0": float(event.q0),
                 "target_metric": str(header.get("metric_name", "chi2")),
             }
-            map_refs["raw_modeled"] = _write_map_store_array(
-                f,
-                identity=_map_store_identity(
+            raw_identity = (
+                dict(event.raw_map_identity)
+                if event.raw_map_identity is not None
+                else _map_store_identity(
                     name=f"grid_points/{event.point_id}/trials/{trial_name}/raw_modeled",
                     normalized=identity_source,
-                ),
+                )
+            )
+            map_refs["raw_modeled"] = _write_map_store_array(
+                f,
+                identity=raw_identity,
                 data=np.asarray(event.raw_modeled_map, dtype=float),
+            )
+        for map_name, array in dict(event.map_store_arrays or {}).items():
+            normalized_name = str(map_name).strip()
+            if not normalized_name:
+                continue
+            identities = dict(event.map_store_identities or {})
+            map_identity = identities.get(normalized_name)
+            if map_identity is None:
+                identity_source = {
+                    **dict(diagnostics),
+                    "a": float(header["a"]),
+                    "b": float(header["b"]),
+                    "q0": float(event.q0),
+                    "target_metric": str(header.get("metric_name", "chi2")),
+                    "map_store_array": normalized_name,
+                }
+                map_identity = _map_store_identity(
+                    name=f"grid_points/{event.point_id}/trials/{trial_name}/extra/{normalized_name}",
+                    normalized=identity_source,
+                )
+            map_refs[f"extra/{normalized_name}"] = _write_map_store_array(
+                f,
+                identity=dict(map_identity),
+                data=np.asarray(array, dtype=float),
             )
         existing_metadata = (
             _json_loads_or_empty(trial_group["trial_metadata_json"][()])

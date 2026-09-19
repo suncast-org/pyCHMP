@@ -9,6 +9,7 @@ import numpy as np
 
 from .ab_scan_artifacts import _derive_display_maps_from_raw, _read_map_store_ref_array
 from .chmp_evaluation import ObservationEvaluationContext, evaluate_modeled_trial
+from .gxrender_adapter import recombine_euv_components
 from .grid_points import (
     GRID_POINTS_GROUP,
     GRID_POINTS_TRIALS_GROUP,
@@ -132,6 +133,71 @@ def _rescore_raw_map_ref(
     raw_modeled = _read_map_store_ref_array(h5_file, raw_ref)
     if raw_modeled is None:
         return None
+    _raw_display, modeled, _residual, _has_raw = _derive_display_maps_from_raw(
+        raw_modeled,
+        observed_template=observed_template,
+        psf_kernel=psf_kernel,
+    )
+    if modeled is None:
+        return None
+    evaluation = evaluate_modeled_trial(
+        modeled,
+        context,
+        threshold=float(threshold),
+        mask_type="union",
+        explicit_mask=explicit_mask,
+        ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
+        use_emthreshold=use_emthreshold,
+    )
+    if not evaluation.is_valid:
+        return None
+    return evaluation
+
+
+def _rescore_raw_map_for_entry(
+    h5_file: Any,
+    *,
+    slice_map_index: SliceMapIndex,
+    entry: Any,
+    a_value: float,
+    b_value: float,
+    tr_region_mask: np.ndarray | None,
+) -> tuple[np.ndarray | None, str | None, bool]:
+    if tr_region_mask is not None:
+        corona_ref = slice_map_index.component_ref(float(a_value), float(b_value), float(entry.q0), "corona")
+        tr_ref = slice_map_index.component_ref(float(a_value), float(b_value), float(entry.q0), "tr")
+        if corona_ref and tr_ref:
+            corona = _read_map_store_ref_array(h5_file, corona_ref)
+            tr_flux = _read_map_store_ref_array(h5_file, tr_ref)
+            if corona is not None and tr_flux is not None:
+                try:
+                    return (
+                        recombine_euv_components(
+                            np.asarray(corona, dtype=float),
+                            np.asarray(tr_flux, dtype=float),
+                            tr_region_mask=np.asarray(tr_region_mask, dtype=bool),
+                        ),
+                        None,
+                        True,
+                    )
+                except ValueError:
+                    pass
+    raw_modeled = _read_map_store_ref_array(h5_file, entry.raw_map_ref)
+    return (None if raw_modeled is None else np.asarray(raw_modeled, dtype=float), str(entry.raw_map_ref), False)
+
+
+def _evaluate_raw_modeled_map(
+    raw_modeled: np.ndarray,
+    *,
+    observed_template: np.ndarray,
+    psf_kernel: Any,
+    context: ObservationEvaluationContext,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+    use_emthreshold: bool,
+    ebtel_miss_ratio_fn: Any = None,
+) -> Q0MetricEvaluation | None:
     _raw_display, modeled, _residual, _has_raw = _derive_display_maps_from_raw(
         raw_modeled,
         observed_template=observed_template,
@@ -326,13 +392,17 @@ def build_warm_grid_trial_commit_events(
     threshold: float,
     explicit_mask: np.ndarray | None,
     target_metric: str,
+    tr_region_mask: np.ndarray | None = None,
+    tr_mask_source: str | None = None,
+    observed_template_override: np.ndarray | None = None,
+    psf_kernel_override: np.ndarray | None = None,
     use_emthreshold: bool = True,
 ) -> list[GridTrialCommittedEvent]:
     """Rescore compatible map_store maps and return grid commit events (linked refs, all metrics)."""
     entries = slice_map_index.entries_for_point(float(a_value), float(b_value))
     if not entries:
         return []
-    scored: list[tuple[float, str, Q0MetricEvaluation]] = []
+    scored: list[tuple[float, str | None, np.ndarray | None, bool, Q0MetricEvaluation]] = []
     with _H5PY_FILE(artifact_h5, "r") as h5_file:
         slice_group, _descriptors, _selected_key = _resolve_slice_group(
             h5_file,
@@ -344,13 +414,31 @@ def build_warm_grid_trial_commit_events(
         common = slice_group.get("common")
         if common is None:
             return []
-        observed_template = np.asarray(common["observed"][()], dtype=float)
-        psf_kernel = common["psf_kernel"][()] if "psf_kernel" in common else None
+        observed_template = (
+            np.asarray(observed_template_override, dtype=float)
+            if observed_template_override is not None
+            else np.asarray(common["observed"][()], dtype=float)
+        )
+        psf_kernel = (
+            psf_kernel_override
+            if psf_kernel_override is not None
+            else common["psf_kernel"][()]
+            if "psf_kernel" in common
+            else None
+        )
         for entry in entries:
-            evaluation = _rescore_raw_map_ref(
+            raw_modeled, raw_ref, recombined = _rescore_raw_map_for_entry(
                 h5_file,
-                entry.raw_map_ref,
-                q0_value=float(entry.q0),
+                slice_map_index=slice_map_index,
+                entry=entry,
+                a_value=float(a_value),
+                b_value=float(b_value),
+                tr_region_mask=tr_region_mask,
+            )
+            if raw_modeled is None:
+                continue
+            evaluation = _evaluate_raw_modeled_map(
+                np.asarray(raw_modeled, dtype=float),
                 observed_template=observed_template,
                 psf_kernel=psf_kernel,
                 context=context,
@@ -361,28 +449,42 @@ def build_warm_grid_trial_commit_events(
             )
             if evaluation is None:
                 continue
-            scored.append((float(entry.q0), str(entry.raw_map_ref), evaluation))
+            scored.append(
+                (
+                    float(entry.q0),
+                    None if raw_ref is None else str(raw_ref),
+                    np.asarray(raw_modeled, dtype=float) if recombined else None,
+                    bool(recombined),
+                    evaluation,
+                )
+            )
     if not scored:
         return []
     scored.sort(key=lambda item: item[0])
     metric_name = str(target_metric).strip().lower()
-    shift_x_trials = [float(item[2].shift_x_arcsec) for item in scored]
-    shift_y_trials = [float(item[2].shift_y_arcsec) for item in scored]
-    shift_valid_trials = [bool(item[2].find_shift_valid) for item in scored]
-    metric_trials = [_metric_value(item[2].metrics, metric_name) for item in scored]
+    shift_x_trials = [float(item[4].shift_x_arcsec) for item in scored]
+    shift_y_trials = [float(item[4].shift_y_arcsec) for item in scored]
+    shift_valid_trials = [bool(item[4].find_shift_valid) for item in scored]
+    metric_trials = [_metric_value(item[4].metrics, metric_name) for item in scored]
     finite = [(idx, value) for idx, value in enumerate(metric_trials) if np.isfinite(float(value))]
     best_index = int(finite[0][0]) if finite else 0
     best_metric = float(metric_trials[best_index]) if metric_trials else float("nan")
     if finite:
         best_index, best_metric = min(finite, key=lambda item: item[1])
     events: list[GridTrialCommittedEvent] = []
-    for trial_index, (q0_value, raw_ref, evaluation) in enumerate(scored):
+    for trial_index, (q0_value, raw_ref, raw_modeled, recombined, evaluation) in enumerate(scored):
         shift_metadata, shift_x, shift_y, shift_valid = resolve_trial_shift_commit_fields(
             trial_index=int(trial_index),
             shift_x_trials=shift_x_trials,
             shift_y_trials=shift_y_trials,
             shift_valid_trials=shift_valid_trials,
         )
+        if recombined:
+            shift_metadata = {
+                **shift_metadata,
+                "tr_region_mask_source": str(tr_mask_source or "external"),
+                "tr_region_mask_applied": True,
+            }
         events.append(
             GridTrialCommittedEvent(
                 point_id=str(point_id),
@@ -392,8 +494,8 @@ def build_warm_grid_trial_commit_events(
                 next_q0=float(q0_value),
                 best_trial_index=int(best_index),
                 best_metric=float(best_metric),
-                raw_modeled_map=None,
-                raw_map_ref=str(raw_ref),
+                raw_modeled_map=raw_modeled,
+                raw_map_ref=raw_ref,
                 trial_metadata=shift_metadata,
                 shift_x=shift_x,
                 shift_y=shift_y,

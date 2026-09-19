@@ -917,6 +917,45 @@ class _TrackedRendererProxy:
             )
         return None
 
+    def _record_cached_render_products(self, q0_value: float) -> None:
+        q0_key = float(q0_value)
+
+        def candidates() -> list[Any]:
+            values = [self._renderer]
+            renderer_base = getattr(self._renderer, "_base", None)
+            if renderer_base is not None:
+                values.append(renderer_base)
+            tracked_base = getattr(self, "_base", None)
+            if tracked_base is not None:
+                values.append(tracked_base)
+            return values
+
+        for candidate in candidates():
+            cache = getattr(candidate, "_components_cache", None)
+            if isinstance(cache, dict):
+                payload = cache.get(q0_key)
+                if payload is not None:
+                    self._stream.record_components(
+                        a_value=self._a_value,
+                        b_value=self._b_value,
+                        q0_value=q0_key,
+                        components=dict(payload),
+                    )
+                    break
+
+        for candidate in candidates():
+            cache = getattr(candidate, "_cube_cache", None)
+            if isinstance(cache, dict):
+                payload = cache.get(q0_key)
+                if payload is not None:
+                    self._stream.record_cube(
+                        a_value=self._a_value,
+                        b_value=self._b_value,
+                        q0_value=q0_key,
+                        cube_payload=dict(payload),
+                    )
+                    break
+
     def render_pair(self, q0: float) -> tuple[np.ndarray, np.ndarray]:
         q0_value = float(q0)
         stored = self._load_stored_render_pair(q0_value)
@@ -947,6 +986,8 @@ class _TrackedRendererProxy:
             modeled=modeled_arr,
             stokes_v=None if stokes_v is None else np.asarray(stokes_v, dtype=np.float32),
         )
+        if not from_map_store:
+            self._record_cached_render_products(q0_value)
         return raw_arr, modeled_arr
 
     def render(self, q0: float) -> np.ndarray:
@@ -1415,6 +1456,12 @@ def _build_synthetic_map_identity(
     channel_or_frequency_label: str,
     component: str,
 ) -> dict[str, Any]:
+    def renderer_attr(name: str, default: str | None = "unknown") -> str | None:
+        value = getattr(renderer_factory, name, default)
+        if value is None:
+            return None
+        return str(value)
+
     return build_map_identity(
         a=float(a_value),
         b=float(b_value),
@@ -1422,13 +1469,32 @@ def _build_synthetic_map_identity(
         domain=str(domain_label),
         channel_or_frequency=str(channel_or_frequency_label),
         component=str(component),
-        forward_model_sha256=str(renderer_factory.forward_model_sha256),
-        forward_model_identity_version=str(renderer_factory.forward_model_identity_version),
-        ebtel_sha256=str(renderer_factory.ebtel_sha256),
-        artifact_geometry_sha256=str(renderer_factory.artifact_geometry_sha256),
-        euv_response_sha256=renderer_factory.euv_response_sha256,
-        euv_response_identity_version=renderer_factory.euv_response_identity_version,
+        forward_model_sha256=renderer_attr("forward_model_sha256") or "unknown",
+        forward_model_identity_version=renderer_attr("forward_model_identity_version") or "unknown",
+        ebtel_sha256=renderer_attr("ebtel_sha256") or "unknown",
+        artifact_geometry_sha256=renderer_attr("artifact_geometry_sha256") or "unknown",
+        euv_response_sha256=renderer_attr("euv_response_sha256", None),
+        euv_response_identity_version=renderer_attr("euv_response_identity_version", None),
     )
+
+
+def _normalize_euv_channel_identity_label(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower().replace("angstrom", "a").replace("å", "a")
+    lowered = lowered.removeprefix("a").strip()
+    for suffix in (" a", "a"):
+        if lowered.endswith(suffix):
+            lowered = lowered[: -len(suffix)].strip()
+    try:
+        numeric = float(lowered)
+    except Exception:
+        return text.strip()
+    rounded = round(numeric)
+    if np.isclose(numeric, float(rounded), rtol=0.0, atol=1e-9):
+        return str(int(rounded))
+    return f"{numeric:.6g}"
 
 
 def _lookup_stream_value_by_q0(
@@ -1690,7 +1756,8 @@ def _point_payload_from_result(
             euv_coronal_best = np.asarray(corona_target, dtype=np.float32)
         if tr_target is not None:
             euv_tr_best = np.asarray(tr_target, dtype=np.float32)
-        for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+        for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+            channel_label = _normalize_euv_channel_identity_label(channel)
             _register_synthetic_map(
                 identity=_build_synthetic_map_identity(
                     renderer_factory=renderer_factory,
@@ -1698,14 +1765,31 @@ def _point_payload_from_result(
                     b_value=point_b,
                     q0_value=point_q0,
                     domain_label="euv",
-                    channel_or_frequency_label=str(channel),
+                    channel_or_frequency_label=channel_label,
+                    component="stokes_i",
+                ),
+                array=np.asarray(rendered, dtype=np.float32),
+                label=f"EUV {channel_label} rendered",
+                map_role="stokes_i",
+            )
+        for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+            channel_label = _normalize_euv_channel_identity_label(channel)
+            _register_synthetic_map(
+                identity=_build_synthetic_map_identity(
+                    renderer_factory=renderer_factory,
+                    a_value=point_a,
+                    b_value=point_b,
+                    q0_value=point_q0,
+                    domain_label="euv",
+                    channel_or_frequency_label=channel_label,
                     component="corona",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} corona",
+                label=f"EUV {channel_label} corona",
                 map_role="corona",
             )
         for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+            channel_label = _normalize_euv_channel_identity_label(channel)
             _register_synthetic_map(
                 identity=_build_synthetic_map_identity(
                     renderer_factory=renderer_factory,
@@ -1713,11 +1797,11 @@ def _point_payload_from_result(
                     b_value=point_b,
                     q0_value=point_q0,
                     domain_label="euv",
-                    channel_or_frequency_label=str(channel),
+                    channel_or_frequency_label=channel_label,
                     component="tr",
                 ),
                 array=np.asarray(rendered, dtype=np.float32),
-                label=f"EUV {channel} TR",
+                label=f"EUV {channel_label} TR",
                 map_role="tr",
             )
 
@@ -1762,7 +1846,8 @@ def _point_payload_from_result(
                     if coronal is not None and tr_flux is not None:
                         euv_coronal_trials.append(np.asarray(coronal, dtype=np.float32))
                         euv_tr_trials.append(np.asarray(tr_flux, dtype=np.float32))
-                    for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+                    for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                        channel_label = _normalize_euv_channel_identity_label(channel)
                         _register_synthetic_map(
                             identity=_build_synthetic_map_identity(
                                 renderer_factory=renderer_factory,
@@ -1770,14 +1855,31 @@ def _point_payload_from_result(
                                 b_value=point_b,
                                 q0_value=float(q0_value),
                                 domain_label="euv",
-                                channel_or_frequency_label=str(channel),
+                                channel_or_frequency_label=channel_label,
+                                component="stokes_i",
+                            ),
+                            array=np.asarray(rendered, dtype=np.float32),
+                            label=f"EUV {channel_label} trial {trial_index:03d} rendered",
+                            map_role=f"trial_{trial_index:03d}_stokes_i",
+                        )
+                    for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+                        channel_label = _normalize_euv_channel_identity_label(channel)
+                        _register_synthetic_map(
+                            identity=_build_synthetic_map_identity(
+                                renderer_factory=renderer_factory,
+                                a_value=point_a,
+                                b_value=point_b,
+                                q0_value=float(q0_value),
+                                domain_label="euv",
+                                channel_or_frequency_label=channel_label,
                                 component="corona",
                             ),
                             array=np.asarray(rendered, dtype=np.float32),
-                            label=f"EUV {channel} trial {trial_index:03d} corona",
+                            label=f"EUV {channel_label} trial {trial_index:03d} corona",
                             map_role=f"trial_{trial_index:03d}_corona",
                         )
                     for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+                        channel_label = _normalize_euv_channel_identity_label(channel)
                         _register_synthetic_map(
                             identity=_build_synthetic_map_identity(
                                 renderer_factory=renderer_factory,
@@ -1785,11 +1887,11 @@ def _point_payload_from_result(
                                 b_value=point_b,
                                 q0_value=float(q0_value),
                                 domain_label="euv",
-                                channel_or_frequency_label=str(channel),
+                                channel_or_frequency_label=channel_label,
                                 component="tr",
                             ),
                             array=np.asarray(rendered, dtype=np.float32),
-                            label=f"EUV {channel} trial {trial_index:03d} TR",
+                            label=f"EUV {channel_label} trial {trial_index:03d} TR",
                             map_role=f"trial_{trial_index:03d}_tr",
                         )
                 trial_cube = _lookup_stream_value_by_q0(stream_record.cube_by_q0, q0_value)
@@ -3024,6 +3126,141 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 return []
             return _load_grid_point_trials(search_group[GRID_POINTS_GROUP][point_id], include_maps=False)
 
+    def _identity_target_domain_and_label(self) -> tuple[str, str]:
+        domain = str(self._diagnostics.get("spectral_domain") or "").strip().lower()
+        if domain == "mw":
+            frequency = self._diagnostics.get("frequency_ghz")
+            if frequency is not None:
+                try:
+                    return "mw", f"{float(frequency):.6f}ghz"
+                except Exception:
+                    pass
+            label = str(self._diagnostics.get("spectral_label") or self._diagnostics.get("target_slice_key") or "").strip()
+            return "mw", label or "unknown"
+        if domain in {"euv", "uv"}:
+            channel = str(self._diagnostics.get("euv_channel") or "").strip()
+            if not channel:
+                slice_key = str(self._diagnostics.get("target_slice_key") or self._diagnostics.get("slice_key") or "").strip()
+                if slice_key.lower().startswith(("euv_", "uv_")):
+                    channel = slice_key.split("_", 1)[1]
+            if not channel:
+                channel = str(self._diagnostics.get("spectral_label") or "").strip()
+            return domain, _normalize_euv_channel_identity_label(channel) or "unknown"
+        label = str(self._diagnostics.get("spectral_label") or self._diagnostics.get("target_slice_key") or "unknown").strip()
+        return domain or "unknown", label or "unknown"
+
+    def _raw_trial_map_identity(self, *, a_value: float, b_value: float, q0_value: float) -> dict[str, Any]:
+        domain, label = self._identity_target_domain_and_label()
+        return _build_synthetic_map_identity(
+            renderer_factory=self._renderer_factory,
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
+            domain_label=domain,
+            channel_or_frequency_label=label,
+            component="stokes_i",
+        )
+
+    def _trial_map_store_payload(
+        self,
+        *,
+        a_value: float,
+        b_value: float,
+        q0_value: float,
+    ) -> tuple[dict[str, np.ndarray], dict[str, dict[str, Any]]]:
+        record = self._render_stream.snapshot_record(a_value=float(a_value), b_value=float(b_value))
+        if record is None:
+            return {}, {}
+        arrays: dict[str, np.ndarray] = {}
+        identities: dict[str, dict[str, Any]] = {}
+
+        def register(identity: dict[str, Any], array: Any) -> None:
+            if array is None:
+                return
+            map_store_name = f"synthetic/{_canonical_json_sha256(identity)}"
+            arrays[map_store_name] = np.asarray(array, dtype=np.float32)
+            identities[map_store_name] = dict(identity)
+
+        components = _lookup_stream_value_by_q0(record.components_by_q0, float(q0_value))
+        if isinstance(components, dict):
+            for channel, rendered in dict(components.get("rendered_by_channel", {})).items():
+                channel_label = _normalize_euv_channel_identity_label(channel)
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="euv",
+                        channel_or_frequency_label=channel_label,
+                        component="stokes_i",
+                    ),
+                    rendered,
+                )
+            for channel, rendered in dict(components.get("flux_corona_by_channel", {})).items():
+                channel_label = _normalize_euv_channel_identity_label(channel)
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="euv",
+                        channel_or_frequency_label=channel_label,
+                        component="corona",
+                    ),
+                    rendered,
+                )
+            for channel, rendered in dict(components.get("flux_tr_by_channel", {})).items():
+                channel_label = _normalize_euv_channel_identity_label(channel)
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="euv",
+                        channel_or_frequency_label=channel_label,
+                        component="tr",
+                    ),
+                    rendered,
+                )
+
+        cube_payload = _lookup_stream_value_by_q0(record.cube_by_q0, float(q0_value))
+        if isinstance(cube_payload, dict):
+            stokes_v_by_frequency = dict(cube_payload.get("stokes_v_by_frequency", {}))
+            for freq, rendered in dict(cube_payload.get("raw_modeled_by_frequency", {})).items():
+                freq_label = f"{float(freq):.6f}ghz"
+                register(
+                    _build_synthetic_map_identity(
+                        renderer_factory=self._renderer_factory,
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                        domain_label="mw",
+                        channel_or_frequency_label=freq_label,
+                        component="stokes_i",
+                    ),
+                    rendered,
+                )
+                rendered_v = stokes_v_by_frequency.get(freq)
+                if rendered_v is None:
+                    rendered_v = stokes_v_by_frequency.get(float(freq))
+                if rendered_v is not None:
+                    register(
+                        _build_synthetic_map_identity(
+                            renderer_factory=self._renderer_factory,
+                            a_value=float(a_value),
+                            b_value=float(b_value),
+                            q0_value=float(q0_value),
+                            domain_label="mw",
+                            channel_or_frequency_label=freq_label,
+                            component="stokes_v",
+                        ),
+                        rendered_v,
+                    )
+        return arrays, identities
+
     def _ensure_grid_point_map_contract(self, a_value: float, b_value: float) -> None:
         """Reject restored trial metadata without map_store links; reset point for a clean run."""
         slice_key = self._target_slice_key()
@@ -3353,6 +3590,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if shift_valid is not None:
             shift_kwargs["shift_valid"] = bool(shift_valid)
         merged_metadata = {**dict(shift_kwargs.get("trial_metadata") or {}), **dict(trial_metadata or {})}
+        map_store_arrays, map_store_identities = self._trial_map_store_payload(
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
+        )
         event = GridTrialCommittedEvent(
             point_id=str(point_id),
             trial_index=int(trial_index),
@@ -3362,6 +3604,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             best_trial_index=int(best_index),
             best_metric=float(metric_value),
             raw_modeled_map=raw_modeled_map,
+            raw_map_identity=self._raw_trial_map_identity(
+                a_value=float(a_value),
+                b_value=float(b_value),
+                q0_value=float(q0_value),
+            ),
+            map_store_arrays=map_store_arrays,
+            map_store_identities=map_store_identities,
             trial_metadata=merged_metadata,
             shift_x=shift_kwargs.get("shift_x"),
             shift_y=shift_kwargs.get("shift_y"),
@@ -3429,6 +3678,11 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             shift_valid_trials=shift_valid_trials,
         )
         merged_metadata = {**dict(shift_kwargs.get("trial_metadata") or {}), **dict(trial_metadata or {})}
+        map_store_arrays, map_store_identities = self._trial_map_store_payload(
+            a_value=float(a_value),
+            b_value=float(b_value),
+            q0_value=float(q0_value),
+        )
         self._writer.write_grid_event(
             GridTrialCommittedEvent(
                 point_id=str(self.point_id_for(a_value, b_value) or ""),
@@ -3439,6 +3693,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 best_trial_index=int(best_index),
                 best_metric=float(best_metric),
                 raw_modeled_map=np.asarray(completed_trial_raw_map, dtype=np.float32),
+                raw_map_identity=self._raw_trial_map_identity(
+                    a_value=float(a_value),
+                    b_value=float(b_value),
+                    q0_value=float(q0_value),
+                ),
+                map_store_arrays=map_store_arrays,
+                map_store_identities=map_store_identities,
                 trial_metadata=merged_metadata,
                 shift_x=shift_kwargs.get("shift_x"),
                 shift_y=shift_kwargs.get("shift_y"),
@@ -3478,11 +3739,18 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         shift_y_trials = payload.get("fit_shift_y_trials", result.trial_shift_y_arcsec)
         shift_valid_trials = payload.get("fit_find_shift_valid_trials", result.trial_find_shift_valid)
         existing_refs: dict[int, str] = {}
+        existing_refs_by_q0: dict[float, str] = {}
         loaded_trials = self._load_grid_trials_for_point(str(point_id))
         for item in loaded_trials:
             ref = str(item.get("raw_map_ref", "") or "").strip()
             if ref:
                 existing_refs[int(item["trial_index"])] = ref
+                try:
+                    existing_q0 = float(item.get("q0"))
+                except Exception:
+                    existing_q0 = float("nan")
+                if np.isfinite(existing_q0) and existing_q0 > 0.0:
+                    existing_refs_by_q0[existing_q0] = ref
 
         for trial_index, q0_value in enumerate(q0_trials):
             raw_map = None
@@ -3496,12 +3764,26 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 raw_map = self.trial_raw_map_for(float(a_value), float(b_value), float(q0_value))
             if raw_map is None:
                 linked_ref = str(existing_refs.get(int(trial_index), "")).strip()
+            if raw_map is None and not linked_ref:
+                for existing_q0, existing_ref in existing_refs_by_q0.items():
+                    if np.isclose(existing_q0, float(q0_value), rtol=0.0, atol=1e-12):
+                        linked_ref = str(existing_ref).strip()
+                        break
+            if raw_map is None and not linked_ref:
+                linked_ref = str(
+                    self.stored_raw_map_ref_for(float(a_value), float(b_value), float(q0_value)) or ""
+                ).strip()
             q0_numeric = float(q0_value)
             if raw_map is None and not linked_ref and np.isfinite(q0_numeric) and q0_numeric > 0.0:
                 raise RuntimeError(
                     "Cannot commit grid trial without a stored map: "
                     f"a={float(a_value):.3f} b={float(b_value):.3f} trial_index={int(trial_index)} q0={q0_numeric:g}"
                 )
+            map_store_arrays, map_store_identities = self._trial_map_store_payload(
+                a_value=float(a_value),
+                b_value=float(b_value),
+                q0_value=float(q0_value),
+            )
             metric_value = float(metric_trials[trial_index]) if trial_index < len(metric_trials) else float("nan")
             finite_metrics = [
                 (idx, float(metric_trials[idx]))
@@ -3531,6 +3813,13 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                     best_metric=float(best_metric),
                     raw_modeled_map=None if raw_map is None else np.asarray(raw_map, dtype=np.float32),
                     raw_map_ref=linked_ref or None,
+                    raw_map_identity=self._raw_trial_map_identity(
+                        a_value=float(a_value),
+                        b_value=float(b_value),
+                        q0_value=float(q0_value),
+                    ),
+                    map_store_arrays=map_store_arrays,
+                    map_store_identities=map_store_identities,
                     trial_metadata=dict(shift_kwargs.get("trial_metadata") or {}),
                     shift_x=shift_kwargs.get("shift_x"),
                     shift_y=shift_kwargs.get("shift_y"),
@@ -3596,6 +3885,16 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if raw_map is None:
             return None
         return np.asarray(raw_map, dtype=np.float32)
+
+    def stored_raw_map_ref_for(self, a_value: float, b_value: float, q0_value: float) -> str | None:
+        index = self._slice_map_index
+        if index is None:
+            return None
+        raw_ref = index.raw_map_ref(float(a_value), float(b_value), float(q0_value))
+        if raw_ref is None:
+            return None
+        raw_ref = str(raw_ref).strip()
+        return raw_ref or None
 
     def drop_persisted_trial_render(self, a_value: float, b_value: float, q0_value: float) -> None:
         self._render_stream.drop_trial_render(
@@ -3987,6 +4286,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-mask-threshold", type=float, default=0.1, help="Relative threshold used by the default union metrics mask.")
     parser.add_argument("--metrics-mask-fits", type=Path, default=None, help="Optional FITS bit mask used for metrics evaluation. Non-zero finite pixels are treated as in-mask and override --metrics-mask-threshold.")
     parser.add_argument("--tr-mask-bmin-gauss", type=float, default=1000.0, help="For EUV/UV, build the default TR-region mask from abs(B_los) >= Bmin [G]. Negative inputs are treated as abs(Bmin).")
+    parser.add_argument("--tr-mask-fits", type=Path, default=None, help="Optional FITS bit mask used to gate EUV/UV TR-component contribution. Non-zero finite pixels are treated as in-mask and must match the synthetic-map shape.")
     parser.add_argument("--threshold", dest="metrics_mask_threshold", type=float, help=argparse.SUPPRESS)
     parser.add_argument("--mask-type", choices=("union", "data", "model", "and"), default="union", help=argparse.SUPPRESS)
     parser.add_argument("--threshold-metric", type=float, default=1.1, help="Phase-2 threshold region multiplier around the best point")
@@ -4566,7 +4866,18 @@ def main() -> int:
     )
     euv_tr_mask = None
     if render_selection.domain != "mw":
-        if blos_reference_for_fov is not None:
+        if args.tr_mask_fits is not None:
+            euv_tr_mask = _load_explicit_metric_mask(
+                args.tr_mask_fits,
+                expected_shape=tuple(np.asarray(observed_cropped, dtype=float).shape),
+            )
+            selected = int(np.count_nonzero(euv_tr_mask))
+            total = int(euv_tr_mask.size)
+            print(
+                f"  EUV TR mask: explicit FITS {Path(args.tr_mask_fits).expanduser()} "
+                f"({selected}/{total} pixels, {selected / max(total, 1):.1%})"
+            )
+        elif blos_reference_for_fov is not None:
             tr_mask_bmin_gauss = abs(float(args.tr_mask_bmin_gauss))
             euv_tr_mask = build_tr_region_mask_from_blos(
                 np.asarray(blos_reference_for_fov[0], dtype=float),
@@ -4853,9 +5164,20 @@ def main() -> int:
         "metrics_mask_source": "explicit_fits" if explicit_metric_mask is not None else "union_threshold",
         "mask_type": "explicit_fits" if explicit_metric_mask is not None else "union",
         "threshold_metric": float(args.threshold_metric),
-        "tr_mask_bmin_gauss": abs(float(args.tr_mask_bmin_gauss)) if render_selection.domain != "mw" else None,
+        "tr_mask_fits": (
+            None
+            if args.tr_mask_fits is None or render_selection.domain == "mw"
+            else str(Path(args.tr_mask_fits).expanduser())
+        ),
+        "tr_mask_bmin_gauss": (
+            None
+            if render_selection.domain == "mw" or args.tr_mask_fits is not None
+            else abs(float(args.tr_mask_bmin_gauss))
+        ),
         "tr_mask_source": (
-            "abs_blos_ge_bmin" if euv_tr_mask is not None else ("unavailable" if render_selection.domain != "mw" else None)
+            "explicit_fits"
+            if args.tr_mask_fits is not None and render_selection.domain != "mw"
+            else ("abs_blos_ge_bmin" if euv_tr_mask is not None else ("unavailable" if render_selection.domain != "mw" else None))
         ),
         "no_area": bool(args.no_area),
         "execution_policy": str(args.execution_policy),
