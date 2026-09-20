@@ -53,6 +53,7 @@ from .ab_scan_artifacts import (
     _write_reference_map_group,
     _write_search_lifecycle_dataset,
     _write_search_status_attrs,
+    _resolved_psf_kernel_from_common_payload,
     append_scan_point_record,
     decode_scalar,
     target_slice_descriptor_from_diagnostics,
@@ -326,6 +327,14 @@ def _ensure_search_context(
             group_name="Bz_reference",
             data=np.asarray(blos_data, dtype=float),
             wcs_header=blos_header,
+        )
+    elif ensure_slice_common:
+        from .ab_scan_artifacts import ensure_slice_common_psf_kernel
+
+        ensure_slice_common_psf_kernel(
+            slice_group["common"],
+            psf_kernel=psf_kernel,
+            diagnostics=diagnostics_out,
         )
     searches_group = slice_group.require_group(SEARCHES_GROUP)
     layout_payload = {"kind": "point_list"}
@@ -1034,8 +1043,13 @@ def _load_grid_point_trials_once(point_group: h5py.Group, *, include_maps: bool)
     trials_group = point_group[GRID_POINTS_TRIALS_GROUP]
     for name in sorted(trials_group.keys()):
         trial = trials_group[name]
-        trial_metadata = _json_loads_or_empty(trial["trial_metadata_json"][()]) if "trial_metadata_json" in trial else {}
-        map_refs = _json_loads_or_empty(trial[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial else {}
+        try:
+            trial_metadata = _json_loads_or_empty(trial["trial_metadata_json"][()]) if "trial_metadata_json" in trial else {}
+            map_refs = _json_loads_or_empty(trial[MAP_REFS_DATASET][()]) if MAP_REFS_DATASET in trial else {}
+        except (OSError, RuntimeError) as exc:
+            if not is_h5_transient_read_error(exc):
+                raise
+            continue
         entry = {
             "trial_index": int(trial.attrs.get("trial_index", 0)),
             "q0": float(trial.attrs["q0"]),
@@ -1241,6 +1255,7 @@ def load_grid_point_trial_plot_payload(
     trial_index: int | None = None,
     slice_key: str | None = None,
     search_id: str | None = None,
+    psf_kernel: np.ndarray | None = None,
 ) -> dict[str, Any] | None:
     with _H5PY_FILE(h5_path, "r") as f:
         group, _descriptors, selected_key = _resolve_slice_group(
@@ -1300,11 +1315,16 @@ def load_grid_point_trial_plot_payload(
             return None
         common_payload = _read_common_group(group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        if psf_kernel is not None:
+            from .psf import _normalized_psf_kernel_array
+
+            resolved_psf_kernel = _normalized_psf_kernel_array(psf_kernel)
+        else:
+            resolved_psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
             raw_modeled,
             observed_template=observed,
-            psf_kernel=psf_kernel,
+            psf_kernel=resolved_psf_kernel,
         )
         if raw_display is None or modeled is None or residual is None:
             return None
@@ -1319,7 +1339,7 @@ def load_grid_point_trial_plot_payload(
             "residual": np.asarray(residual, dtype=float),
             "observed": observed,
             "wcs_header": common_payload["wcs_header"],
-            "psf_kernel": psf_kernel,
+            "psf_kernel": resolved_psf_kernel,
             "selected_slice_key": str(selected_key),
             "selected_search_id": str(selected_search_id),
         }
@@ -1362,7 +1382,7 @@ def hydrate_render_maps_from_grid_point(
             return 0
         common_payload = _read_common_group(slice_group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         for trial in _load_grid_point_trials(point_group, include_maps=False):
             q0_value = float(trial["q0"])
             key = f"{float(q0_value):.17g}"
@@ -1438,6 +1458,8 @@ def load_grid_point_live_state(
             "fit_shift_x_trials": list(record_preview.get("fit_shift_x_trials") or ()),
             "fit_shift_y_trials": list(record_preview.get("fit_shift_y_trials") or ()),
             "fit_find_shift_valid_trials": list(record_preview.get("fit_find_shift_valid_trials") or ()),
+            "fit_trial_mask_stages": list(record_preview.get("fit_trial_mask_stages") or ()),
+            "grid_point_status": str(header.get("status", "")),
             "q0": None if active_trial_q0 is None else float(active_trial_q0),
             "trial_index": None if active_trial_q0 is None else active_trial_index,
         }

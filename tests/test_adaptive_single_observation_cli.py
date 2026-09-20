@@ -28,6 +28,11 @@ from examples.python.adaptive_ab_search_single_observation import (
     _preload_search_cache_from_artifact,
     _rescore_auxiliary_map_record,
     _resolve_geometry_request_flags,
+    format_uncertified_basin_expand_guidance,
+    _rescore_record_to_warm_initial_evaluations,
+    _warm_bracket_seed_mask_type_from_diagnostics,
+    _warm_curve_rescore_mask_type_from_diagnostics,
+    _warm_rescore_mask_type_from_diagnostics,
     _resolve_observation_request,
     _resolve_render_slice_requests,
 )
@@ -1587,6 +1592,108 @@ def test_persistent_cache_set_pending_points_writes_live_trial_marker(tmp_path: 
     assert int(headers[0]["n_trials"]) == 0
 
 
+def test_assign_grid_points_skips_reset_for_incomplete_running_point(tmp_path: Path) -> None:
+    import h5py
+
+    from pychmp.grid_points import (
+        GRID_POINTS_GROUP,
+        GridPointAssignedEvent,
+        GridPointStatus,
+        GridTrialCommittedEvent,
+        SEARCHES_GROUP,
+        SLICE_CONTAINER_GROUP,
+        apply_grid_point_event_with_retry,
+        read_grid_point_header,
+    )
+
+    observed = np.ones((2, 2), dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    header = fits.Header()
+    header["CRVAL1"] = 0.0
+    header["CRVAL2"] = 0.0
+    header["CDELT1"] = 1.0
+    header["CDELT2"] = 1.0
+    header["CRPIX1"] = 1.0
+    header["CRPIX2"] = 1.0
+    header["NAXIS1"] = 2
+    header["NAXIS2"] = 2
+    diagnostics = {
+        "artifact_kind": "unified_ab_scan",
+        "slice_key": "euv_193",
+        "target_slice_key": "euv_193",
+        "target_metric": "eta2",
+        "selected_search_id": "search_b5751ea4cf6c8571",
+        "search_id": "search_b5751ea4cf6c8571",
+    }
+    artifact_h5 = tmp_path / "adaptive.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    point_id = apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridPointAssignedEvent(
+            a=-0.05,
+            b=4.0,
+            q0_start=0.05,
+            next_q0=0.07,
+            metric_name="eta2",
+        ),
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+    apply_grid_point_event_with_retry(
+        artifact_h5,
+        GridTrialCommittedEvent(
+            point_id=str(point_id),
+            trial_index=0,
+            q0=0.05,
+            metric=0.36,
+            next_q0=0.07,
+            best_trial_index=0,
+            best_metric=0.36,
+            raw_modeled_map=np.ones((2, 2), dtype=np.float32),
+        ),
+        observed=observed,
+        sigma_map=sigma_map,
+        wcs_header=header,
+        diagnostics=diagnostics,
+    )
+
+    cache = _PersistentPointCache(
+        artifact_h5=artifact_h5,
+        observed=observed,
+        sigma_map=sigma_map,
+        target_header=header,
+        diagnostics=diagnostics,
+        blos_reference=None,
+        renderer_factory=lambda a_value, b_value: None,
+        target_metric="eta2",
+        psf_source="none",
+        psf_kernel=None,
+        compatibility_signature="sig-123",
+        viewer_heartbeat=None,
+    )
+    cache.set_preserve_stored_search_trials(True)
+    cache.hydrate_from_existing()
+    cache.set_pending_points([(-0.05, 4.0)], q0_starts=[0.08])
+    cache.flush_pending_writes()
+    cache.close()
+
+    with h5py.File(artifact_h5, "r") as f:
+        point_group = f[SLICE_CONTAINER_GROUP]["euv_193"][SEARCHES_GROUP]["search_b5751ea4cf6c8571"][GRID_POINTS_GROUP][point_id]
+        restored = read_grid_point_header(point_group)
+    assert restored["status"] == GridPointStatus.RUNNING.value
+    assert int(restored["n_trials"]) == 1
+    assert float(restored["next_q0"]) == pytest.approx(0.07)
+
+
 def test_dispatcher_advances_live_trial_marker_to_next_pending_point(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1928,3 +2035,64 @@ def test_register_parallel_search_preserves_prior_search(tmp_path: Path) -> None
     assert len(first_search_payload["point_records"]) == 1
     parallel_payload = load_scan_file(artifact_h5, search_id=parallel_search_id)
     assert parallel_payload["point_records"] == []
+
+
+def test_warm_rescore_mask_type_from_diagnostics_uses_data_stage() -> None:
+    diagnostics = {"q0_search_stages": ["data", "union"], "mask_type": "union"}
+    assert (
+        _warm_bracket_seed_mask_type_from_diagnostics(diagnostics, explicit_mask=None)
+        == "data"
+    )
+    assert (
+        _warm_curve_rescore_mask_type_from_diagnostics(diagnostics, explicit_mask=None)
+        == "union"
+    )
+    assert (
+        _warm_rescore_mask_type_from_diagnostics(
+            {"q0_search_stages": ["data"], "mask_type": "union"},
+            explicit_mask=None,
+        )
+        == "data"
+    )
+
+
+def test_rescore_record_to_warm_initial_evaluations_uses_requested_mask_stage() -> None:
+    observed = np.array([[0.0, 2.0], [0.0, 0.0]], dtype=float)
+    sigma_map = np.ones((2, 2), dtype=float)
+    trial_map = np.array([[0.0, 1.0], [0.0, 0.0]], dtype=float)
+    record = {
+        "fit_q0_trials": (0.5,),
+        "trial_raw_modeled_maps": np.stack([trial_map], axis=0),
+    }
+    evaluations = _rescore_record_to_warm_initial_evaluations(
+        record,
+        observed=observed,
+        sigma_map=sigma_map,
+        threshold=0.1,
+        explicit_mask=None,
+        target_metric="eta2",
+        mask_type="data",
+    )
+    assert evaluations is not None
+    evaluation = evaluations[0.5]
+    assert evaluation.mask_stage == "data"
+
+
+def test_format_uncertified_basin_expand_guidance_mentions_expand_mode() -> None:
+    message = format_uncertified_basin_expand_guidance(
+        artifact_h5=Path("/tmp/CESRA2026.h5"),
+        search_id="search_2a9954c828524a2c",
+        a_min=-1.0,
+        a_max=3.0,
+        b_min=0.0,
+        b_max=10.0,
+        da=0.25,
+        db=0.25,
+        boundary_axes=("a_min",),
+        frontier_open_axes=(),
+    )
+    assert "--expand-grid-search-id search_2a9954c828524a2c" in message
+    assert "examples/python/adaptive_ab_search_single_observation.py" in message
+    assert "--a-min -1.25" in message
+    assert "Do not re-run a normal adaptive command" in message
+    assert "Resume with wider a/b bounds" not in message

@@ -654,20 +654,40 @@ def _idl_golden_brent_refine(
     """Refine q0 on a sorted grid using CHMP golden/Brent steps (``FindBestFitQ.pro``)."""
     grid = list(q_grid)
     refine_steps = 0
+    bracket_locked = q_bound_min is not None and q_bound_max is not None
     for _ in range(max(1, int(maxiter))):
-        valid_indices = [index for index, q0 in enumerate(grid) if cache[float(q0)].is_valid]
-        if len(valid_indices) < 3:
-            break
-        ib = min(
-            valid_indices,
-            key=lambda index: cache[float(grid[index])].objective_value,
-        )
-        if ib <= 0 or ib >= len(grid) - 1:
-            break
-
-        qa = float(grid[ib - 1])
-        qb = float(grid[ib])
-        qc = float(grid[ib + 1])
+        if bracket_locked:
+            basin_lo = float(q_bound_min)  # type: ignore[arg-type]
+            basin_hi = float(q_bound_max)  # type: ignore[arg-type]
+            basin_records = _valid_records_in_range(cache, q0_lo=basin_lo, q0_hi=basin_hi)
+            if len(basin_records) < 3:
+                break
+            best_record = min(basin_records, key=lambda item: item.objective_value)
+            left_neighbor, right_neighbor = _nearest_valid_neighbors(
+                cache,
+                center_q0=float(best_record.q0),
+                q0_lo=basin_lo,
+                q0_hi=basin_hi,
+            )
+            if left_neighbor is None or right_neighbor is None:
+                break
+            qa = float(left_neighbor.q0)
+            qb = float(best_record.q0)
+            qc = float(right_neighbor.q0)
+            ib = grid.index(qb) if qb in grid else -1
+        else:
+            valid_indices = [index for index, q0 in enumerate(grid) if cache[float(q0)].is_valid]
+            if len(valid_indices) < 3:
+                break
+            ib = min(
+                valid_indices,
+                key=lambda index: cache[float(grid[index])].objective_value,
+            )
+            if ib <= 0 or ib >= len(grid) - 1:
+                break
+            qa = float(grid[ib - 1])
+            qb = float(grid[ib])
+            qc = float(grid[ib + 1])
         mtra = float(cache[qa].objective_value)
         mtrb = float(cache[qb].objective_value)
         mtrc = float(cache[qc].objective_value)
@@ -708,11 +728,16 @@ def _idl_golden_brent_refine(
             and rb_miss <= 10.0
         )
         qx = qxb if use_brent else qxg
-        if q_bound_min is not None:
-            qx = max(float(qx), float(q_bound_min))
-        if q_bound_max is not None:
-            qx = min(float(qx), float(q_bound_max))
+        if bracket_locked:
+            qx = min(max(float(qx), float(qa)), float(qc))
+        else:
+            if q_bound_min is not None:
+                qx = max(float(qx), float(q_bound_min))
+            if q_bound_max is not None:
+                qx = min(float(qx), float(q_bound_max))
         if math.isclose(qx, qb, rel_tol=0.0, abs_tol=1e-15):
+            break
+        if float(qx) <= float(qa) or float(qx) >= float(qc):
             break
 
         _evaluate_q0(
@@ -724,8 +749,11 @@ def _idl_golden_brent_refine(
             progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
         )
-        insert_at = ib if qx > qb else ib - 1
-        grid = grid[: insert_at + 1] + [float(qx)] + grid[insert_at + 1 :]
+        if bracket_locked:
+            grid = sorted(set(grid + [float(qx)]))
+        elif ib >= 0:
+            insert_at = ib if qx > qb else ib - 1
+            grid = grid[: insert_at + 1] + [float(qx)] + grid[insert_at + 1 :]
         refine_steps += 1
 
     return grid, refine_steps
@@ -888,9 +916,17 @@ def _idl_chmp_finalize_bracket_and_refine(
 
     relative_acc = max(float(xatol), _IDL_RELATIVE_ACC_DEFAULT)
     if bracket_found and bracket is not None and allow_refinement:
+        bracket_qa, _bracket_qb, bracket_qc = bracket
+        local_grid = sorted(
+            float(q0)
+            for q0 in q_grid
+            if float(bracket_qa) <= float(q0) <= float(bracket_qc)
+        )
+        if len(local_grid) < 3:
+            local_grid = sorted({float(bracket_qa), float(_bracket_qb), float(bracket_qc)})
         q_grid, refine_steps = _idl_golden_brent_refine(
             metric_function,
-            q_grid=q_grid,
+            q_grid=local_grid,
             cache=cache,
             evaluation_order=evaluation_order,
             target_metric=target_metric,
@@ -898,8 +934,8 @@ def _idl_chmp_finalize_bracket_and_refine(
             maxiter=maxiter,
             progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
-            q_bound_min=q_bound_min,
-            q_bound_max=q_bound_max,
+            q_bound_min=float(bracket_qa),
+            q_bound_max=float(bracket_qc),
         )
         message_parts.append("CHMP golden/Brent q0 refinement")
         bracket_steps += refine_steps
@@ -931,6 +967,7 @@ def _idl_chmp_find_best_q0_warm_start(
     evaluation_order: list[float],
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    skip_warm_refinement: bool = False,
 ) -> Q0OptimizationResult:
     """Continue CHMP q0 search from a rescored warm trial curve (IDL policy)."""
     q_grid = _idl_sorted_q_grid(cache)
@@ -943,9 +980,19 @@ def _idl_chmp_find_best_q0_warm_start(
     interior_minima = _idl_interior_minimum_count(q_grid, cache)
 
     if interior_minima == 1:
-        message_parts.append(
-            "rescored curve has one interior minimum; refine within stored q0 range only"
-        )
+        bracket = _find_bracket(cache)
+        if skip_warm_refinement:
+            message_parts.append(
+                "rescored curve has one interior minimum; resume finalize skips refinement"
+            )
+        elif bracket is not None:
+            message_parts.append(
+                "rescored curve has one interior minimum; refine within bracket basin only"
+            )
+        else:
+            message_parts.append(
+                "rescored curve has one interior minimum; refine within stored q0 range only"
+            )
         return _idl_chmp_finalize_bracket_and_refine(
             metric_function,
             q_grid=q_grid,
@@ -958,9 +1005,9 @@ def _idl_chmp_find_best_q0_warm_start(
             message_parts=message_parts,
             progress_start_callback=progress_start_callback,
             progress_callback=progress_callback,
-            q_bound_min=warm_lo,
-            q_bound_max=warm_hi,
-            allow_refinement=True,
+            q_bound_min=float(bracket[0]) if bracket is not None else warm_lo,
+            q_bound_max=float(bracket[2]) if bracket is not None else warm_hi,
+            allow_refinement=not bool(skip_warm_refinement),
         )
 
     if interior_minima > 1:
@@ -1366,6 +1413,8 @@ def find_best_q0(
     progress_start_callback: ProgressStartCallback | None = None,
     progress_callback: ProgressCallback | None = None,
     initial_evaluations: InitialQ0Evaluations | None = None,
+    warm_seed_via_live_evaluation: bool = False,
+    skip_warm_refinement: bool = False,
     emthreshold: float = 0.1,
 ) -> Q0OptimizationResult:
     """Find best Q0 with optional CHMP IDL-style adaptive search.
@@ -1417,6 +1466,7 @@ def find_best_q0(
         hard_q0_min=hard_q0_min,
         hard_q0_max=hard_q0_max,
     )
+    # Warm-start trials stay in cache; metric_function runs only for optimizer-new q0.
 
     def objective(q0: float) -> float:
         record = _evaluate_q0(
@@ -1455,6 +1505,7 @@ def find_best_q0(
                 evaluation_order=evaluation_order,
                 progress_start_callback=progress_start_callback,
                 progress_callback=progress_callback,
+                skip_warm_refinement=bool(skip_warm_refinement),
             )
         return _idl_chmp_find_best_q0(
             metric_function,

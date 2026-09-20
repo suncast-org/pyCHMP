@@ -852,9 +852,14 @@ class Q0ArtifactPanelFigure:
     ) -> None:
         image = self._common_images[name]
         axis = self._common_axes[name]
+        array = np.asarray(data, dtype=float)
+        if array.ndim != 2 or array.size <= 0 or not np.any(np.isfinite(array)):
+            self._common_titles[name] = title
+            self._common_notes[name].set_text(f"{note}\n(map unavailable)")
+            return
         image.set_cmap(_intensity_colormap_for_panel(name, self._map_diagnostics))
         display_data, norm, _limits, _applied_scale = _resolve_image_render_state(
-            np.asarray(data, dtype=float),
+            array,
             scale=scale,
             vmin=vmin,
             vmax=vmax,

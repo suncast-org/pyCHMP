@@ -262,6 +262,39 @@ def test_find_best_q0_warm_start_refines_within_rescored_range_only() -> None:
     assert result.q0 == pytest.approx(1.0, abs=0.05)
 
 
+def test_find_best_q0_warm_start_skip_refinement_avoids_new_evaluations() -> None:
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 1.0) ** 2,
+                rho2=(q0 - 1.0) ** 2,
+                eta2=(q0 - 1.0) ** 2,
+            )
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=10.0,
+        adaptive_bracketing=True,
+        q0_start=1.0,
+        initial_evaluations={
+            0.5: MetricValues(chi2=2.0, rho2=2.0, eta2=2.0),
+            1.0: MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            2.0: MetricValues(chi2=1.0, rho2=1.0, eta2=1.0),
+        },
+        skip_warm_refinement=True,
+    )
+
+    assert evaluated == []
+    assert result.success
+    assert result.q0 == pytest.approx(1.0, abs=1e-12)
+    assert "skips refinement" in result.message
+
+
 def test_find_best_q0_warm_start_multiple_minima_idl_policy() -> None:
     """IDL policy: more than one interior minimum skips refinement and marks failure."""
     result = find_best_q0(
@@ -525,3 +558,81 @@ def test_find_best_q0_tracks_unique_trials_and_unique_evaluations() -> None:
     assert result.nfev == len(result.trial_q0)
     assert result.nfev == len(calls)
     assert result.trial_q0 == pytest.approx(tuple(calls))
+
+
+def test_find_best_q0_warm_seed_does_not_rerender_cached_initial_evaluations() -> None:
+    calls: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        calls.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(chi2=float(q0), rho2=float(q0), eta2=float(q0)),
+            is_valid=True,
+            message="ok",
+        )
+
+    seeded = {
+        0.3: Q0MetricEvaluation(
+            metrics=MetricValues(chi2=9.0, rho2=9.0, eta2=9.0),
+            is_valid=True,
+            message="seed",
+            mask_stage="data",
+        ),
+        0.1: Q0MetricEvaluation(
+            metrics=MetricValues(chi2=1.0, rho2=1.0, eta2=1.0),
+            is_valid=True,
+            message="seed",
+            mask_stage="data",
+        ),
+    }
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.05,
+        q0_max=1.0,
+        q0_start=0.2,
+        target_metric="chi2",
+        adaptive_bracketing=True,
+        initial_evaluations=seeded,
+        warm_seed_via_live_evaluation=True,
+    )
+
+    assert 0.1 not in calls
+    assert 0.3 not in calls
+    assert result.trial_q0[:2] == pytest.approx((0.1, 0.3))
+
+
+def test_find_best_q0_warm_start_refinement_stays_inside_bracket_basin() -> None:
+    evaluated: list[float] = []
+
+    def metric_function(q0: float) -> Q0MetricEvaluation:
+        evaluated.append(float(q0))
+        return Q0MetricEvaluation(
+            metrics=MetricValues(
+                chi2=(q0 - 1.0) ** 2,
+                rho2=(q0 - 1.0) ** 2,
+                eta2=(q0 - 1.0) ** 2,
+            )
+        )
+
+    result = find_best_q0(
+        metric_function,
+        q0_min=0.1,
+        q0_max=10.0,
+        adaptive_bracketing=True,
+        q0_start=1.0,
+        initial_evaluations={
+            0.5: MetricValues(chi2=2.0, rho2=2.0, eta2=2.0),
+            1.0: MetricValues(chi2=0.0, rho2=0.0, eta2=0.0),
+            2.0: MetricValues(chi2=1.0, rho2=1.0, eta2=1.0),
+            8.0: MetricValues(chi2=50.0, rho2=50.0, eta2=50.0),
+        },
+    )
+
+    assert result.bracket_found
+    assert result.bracket is not None
+    qa, _qb, qc = result.bracket
+    assert evaluated
+    assert min(evaluated) >= float(qa) - 1e-15
+    assert max(evaluated) <= float(qc) + 1e-15
+    assert result.q0 == pytest.approx(1.0, abs=0.05)

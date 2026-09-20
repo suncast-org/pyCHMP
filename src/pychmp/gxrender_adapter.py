@@ -10,19 +10,12 @@ from pathlib import Path
 import threading
 from types import SimpleNamespace
 from typing import Any, Sequence
-import warnings
 
 import numpy as np
 
 
-_EUV_PROJECTION_FLAGS_WARNING = (
-    "Current Python EUV workflow uses projection flags off "
-    "(parallel=False, exact=False, nthreads=0) for the DLL simbox path."
-)
 EUV_RESPONSE_IDENTITY_VERSION = "pychmp.euv_response_identity.v1"
 FORWARD_MODEL_IDENTITY_VERSION = "pychmp.forward_model.file_sha256.v0"
-_euv_projection_flags_warning_emitted = False
-_euv_projection_flags_warning_lock = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -750,6 +743,9 @@ class GXRenderEUVAdapter:
     selective_heating: bool = False
     shtable: Any | None = None
     omp_threads: int = 8
+    parallel: bool = False
+    exact: bool = False
+    projection_threads: int = 0
     pixel_scale_arcsec: float = 2.0
     geometry: Any | None = None
     observer: Any | None = None
@@ -834,6 +830,9 @@ class GXRenderEUVAdapter:
             response_dt=None,
             response_meta=None,
             omp_threads=int(self.omp_threads),
+            parallel=bool(self.parallel),
+            exact=bool(self.exact),
+            projection_threads=int(self.projection_threads),
             output_dir=None,
             output_name=None,
             save_outputs=False,
@@ -951,6 +950,9 @@ class GXRenderEUVAdapter:
             response_meta=None if cached_response is None else cached_response.response_meta,
             plasma=plasma,
             omp_threads=int(self.omp_threads),
+            parallel=bool(self.parallel),
+            exact=bool(self.exact),
+            projection_threads=int(self.projection_threads),
             geometry=geometry,
             observer=self.observer,
             observer_name=self.observer_name,
@@ -958,33 +960,7 @@ class GXRenderEUVAdapter:
             write_preview=False,
             verbose=bool(self.verbose),
         )
-        global _euv_projection_flags_warning_emitted
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            warnings.filterwarnings(
-                "always",
-                message=(
-                    r"Current Python EUV workflow uses projection flags off "
-                    r"\(parallel=False, exact=False, nthreads=0\) for the DLL simbox path\..*"
-                ),
-                category=UserWarning,
-            )
-            result = sdk.render_euv_maps(options)
-        for warning in caught_warnings:
-            if (
-                issubclass(warning.category, UserWarning)
-                and str(warning.message).startswith(_EUV_PROJECTION_FLAGS_WARNING)
-            ):
-                with _euv_projection_flags_warning_lock:
-                    if not _euv_projection_flags_warning_emitted:
-                        warnings.warn(str(warning.message), category=warning.category, stacklevel=2)
-                        _euv_projection_flags_warning_emitted = True
-                continue
-            warnings.warn_explicit(
-                warning.message,
-                warning.category,
-                warning.filename,
-                warning.lineno,
-            )
+        result = sdk.render_euv_maps(options)
         flux_corona = np.asarray(result.flux_corona, dtype=float)
         flux_tr = np.asarray(result.flux_tr, dtype=float)
         if flux_corona.shape != flux_tr.shape:

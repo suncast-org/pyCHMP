@@ -47,6 +47,7 @@ from pychmp.ab_scan_artifacts import (
     write_active_point_snapshot,
     scan_artifact_compatibility_issues,
     validate_scan_artifact_compatibility,
+    validate_pinned_search_evaluation_recipe,
     validate_scan_artifact_reuse_preflight,
     write_single_point_scan_file,
     write_live_trial_point,
@@ -1133,6 +1134,28 @@ def test_apply_search_run_profile_clears_obs_path_for_model_refmap() -> None:
     assert args.obs_map_id == "AIA_94"
     assert args.observation_time == "2012-07-12T04:46:23.340"
     assert args.stored_model_time_reference == "2012-07-12T04:46:23.340"
+
+
+def test_apply_search_run_profile_prefers_request_q0_stages(tmp_path: Path) -> None:
+    args = Namespace(q0_search_stages=None)
+    profile = {
+        "request": {"q0_search_stages": ["data"]},
+        "diagnostics": {"q0_search_stages": ["union"]},
+    }
+    apply_search_run_profile_to_namespace(args, profile)
+    assert args.q0_search_stages == "data"
+
+
+def test_validate_pinned_search_evaluation_recipe_rejects_drift() -> None:
+    profile = {
+        "search_id": "search_abc",
+        "request": {"schema": "pychmp.search_evaluation.v1", "q0_search_stages": ["data"], "target_metric": "eta2"},
+    }
+    with pytest.raises(SystemExit, match="Pinned search recipe mismatch"):
+        validate_pinned_search_evaluation_recipe(
+            profile,
+            compatibility_signature="deadbeef" * 4,
+        )
 
 
 def test_validate_scan_artifact_compatibility_allows_sparse_target_metric_change(tmp_path: Path) -> None:
@@ -3010,3 +3033,15 @@ def test_grid_indices_for_coordinates_finds_missing_cells() -> None:
     model = ab_scan_artifacts.build_patch_grid_model(payload)
     assert ab_scan_artifacts.find_record_for_point(model, -0.25, 4.0) is None
     assert ab_scan_artifacts.grid_indices_for_coordinates(payload, -0.25, 4.0) == (1, 1)
+
+
+def test_pinned_search_restores_projection_from_canonical_request() -> None:
+    args = Namespace(euv_parallel=False, euv_exact=True, euv_projection_threads=0)
+    profile = {
+        "request": {"render_projection": {"parallel": True, "exact": False, "nthreads": 8}},
+        "diagnostics": {"render_projection": {"parallel": False, "exact": True, "nthreads": 2}},
+    }
+    apply_search_run_profile_to_namespace(args, profile)
+    assert args.euv_parallel is True
+    assert args.euv_exact is False
+    assert args.euv_projection_threads == 8

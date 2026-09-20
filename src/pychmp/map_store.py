@@ -47,6 +47,8 @@ def build_render_product_identity(layer_identity: dict[str, Any]) -> dict[str, A
         value = identity.get(key)
         if value not in (None, ""):
             product[key] = str(value)
+    if identity.get("render_projection") is not None:
+        product["render_projection"] = dict(identity["render_projection"])
     product["render_product_id"] = canonical_json_sha256(product)
     return product
 
@@ -86,6 +88,7 @@ def build_map_identity(
     forward_model_identity_version: str,
     euv_response_sha256: str | None = None,
     euv_response_identity_version: str | None = None,
+    render_projection: dict[str, Any] | None = None,
     array_name: str | None = None,
 ) -> dict[str, Any]:
     component_norm = str(component or "").strip().lower()
@@ -110,6 +113,8 @@ def build_map_identity(
         identity["euv_response_sha256"] = str(euv_response_sha256)
     if euv_response_identity_version is not None:
         identity["euv_response_identity_version"] = str(euv_response_identity_version)
+    if render_projection is not None:
+        identity["render_projection"] = dict(render_projection)
     product = build_render_product_identity(identity)
     layer = build_map_layer_provenance(identity)
     identity["render_product_id"] = product["render_product_id"]

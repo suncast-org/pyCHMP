@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import time
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
@@ -359,6 +360,7 @@ def _map_identity_physical_keys_from_diagnostics(diagnostics: dict[str, Any]) ->
         "ebtel_sha256",
         "euv_response_sha256",
         "euv_response_identity_version",
+        "render_projection",
     ):
         if key in diagnostics and str(diagnostics.get(key, "")).strip():
             out[key] = diagnostics[key]
@@ -1875,6 +1877,34 @@ def assert_expand_grid_search_cli_argv_allowed(argv: list[str]) -> None:
         )
 
 
+def validate_pinned_search_evaluation_recipe(
+    profile: dict[str, Any],
+    *,
+    compatibility_signature: str,
+) -> None:
+    """Refuse expand/recompute when the live CLI recipe drifts from the stored request."""
+    request = dict(profile.get("request") or {})
+    if not request:
+        return
+    stored_signature = search_evaluation_signature(request)
+    expected = str(compatibility_signature or "").strip()
+    if not expected:
+        return
+    if stored_signature == expected:
+        return
+    search_id = str(profile.get("search_id") or "").strip() or "<search_id>"
+    stored_q0 = request.get("q0_search_stages")
+    raise SystemExit(
+        "Pinned search recipe mismatch for "
+        f"{search_id}: stored evaluation signature "
+        f"{stored_signature[:16]}… does not match the resolved CLI recipe "
+        f"{expected[:16]}…. "
+        f"Stored q0_search_stages={stored_q0!r}. "
+        "Use --expand-grid-search-id / --recompute-search-id only (no recipe overrides), "
+        "or start a new identity with --new-search-identity."
+    )
+
+
 def load_search_run_profile(
     h5_path: Path,
     *,
@@ -1966,6 +1996,13 @@ def apply_search_run_profile_to_namespace(
     spectral_domain = str(diagnostics.get("spectral_domain") or "").strip().lower()
     if spectral_domain in {"mw", "euv", "uv", "generic"}:
         args.obs_domain = spectral_domain
+    observation_time = str(
+        diagnostics.get("observation_time_original")
+        or diagnostics.get("observation_time")
+        or ""
+    ).strip()
+    if observation_time:
+        args.observation_time = observation_time
     frequency_ghz = _profile_optional_float(diagnostics, "frequency_ghz", "active_frequency_ghz")
     if frequency_ghz is not None:
         args.obs_frequency_ghz = frequency_ghz
@@ -2050,6 +2087,15 @@ def apply_search_run_profile_to_namespace(
     if euv_response not in {None, ""}:
         args.euv_response_sav = Path(str(euv_response))
 
+    projection = request.get("render_projection") or diagnostics.get("render_projection")
+    if isinstance(projection, dict):
+        for key, field in (("parallel", "euv_parallel"), ("exact", "euv_exact")):
+            value = _profile_optional_bool(projection.get(key))
+            if value is not None:
+                setattr(args, field, value)
+        if projection.get("nthreads") is not None:
+            args.euv_projection_threads = int(projection["nthreads"])
+
     pixel_scale = _profile_optional_float(diagnostics, "map_dx_arcsec")
     if pixel_scale is not None and hasattr(args, "pixel_scale_arcsec"):
         args.pixel_scale_arcsec = pixel_scale
@@ -2094,8 +2140,12 @@ def apply_search_run_profile_to_namespace(
     emthreshold = diagnostics.get("emthreshold")
     if emthreshold is not None and hasattr(args, "emthreshold"):
         args.emthreshold = float(emthreshold)
-    q0_stages = diagnostics.get("q0_search_stages")
-    if isinstance(q0_stages, (list, tuple)) and q0_stages and hasattr(args, "q0_search_stages"):
+    from .q0_search import canonical_q0_search_stages_from_profile
+
+    q0_stages = canonical_q0_search_stages_from_profile(
+        {"request": request, "diagnostics": diagnostics}
+    )
+    if q0_stages and hasattr(args, "q0_search_stages"):
         args.q0_search_stages = ",".join(str(item) for item in q0_stages)
 
 
@@ -2175,6 +2225,12 @@ def register_sparse_search_in_artifact(
                 group_name="Bz_reference",
                 data=np.asarray(blos_data, dtype=float),
                 wcs_header=blos_header,
+            )
+        elif "common" in slice_group:
+            ensure_slice_common_psf_kernel(
+                slice_group["common"],
+                psf_kernel=psf_kernel,
+                diagnostics=diagnostics_out,
             )
         searches_group = slice_group.require_group(SEARCHES_GROUP)
         resolved_search_id = str(search_id or "").strip()
@@ -3266,6 +3322,7 @@ def load_scan_file(
                     target_metric = decode_scalar(summary.attrs.get("target_metric", diagnostics.get("target_metric", b"chi2")))
                 else:
                     target_metric = str(diagnostics.get("target_metric", "chi2"))
+        resolved_psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         payload = _payload_from_point_records(
             observed=observed,
             sigma_map=sigma_map,
@@ -3273,7 +3330,7 @@ def load_scan_file(
             diagnostics=diagnostics,
             point_records=point_records,
             target_metric=target_metric,
-            psf_kernel=common_payload.get("psf_kernel"),
+            psf_kernel=resolved_psf_kernel,
             include_maps=include_maps,
         )
         selected_descriptor = next((item for item in descriptors if str(item["key"]) == str(selected_key)), None)
@@ -3284,7 +3341,7 @@ def load_scan_file(
         payload["search_records"] = search_records
         payload["selected_search_id"] = selected_search_id
         payload["selected_search"] = selected_search_record
-        payload["psf_kernel"] = common_payload.get("psf_kernel")
+        payload["psf_kernel"] = resolved_psf_kernel
         payload["psf_kernel_metadata"] = common_payload.get("psf_kernel_metadata")
         if not search_records:
             legacy_status = _search_status_from_records(payload.get("point_records", []))
@@ -3581,7 +3638,7 @@ def load_live_trial_plot_payload(
             return None
         common_payload = _read_common_group(group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
             raw_modeled,
             observed_template=observed,
@@ -3614,6 +3671,7 @@ def load_selected_trial_plot_payload(
     trial_index: int | None = None,
     slice_key: str | None = None,
     search_id: str | None = None,
+    psf_kernel: np.ndarray | None = None,
 ) -> dict[str, Any] | None:
     from .grid_points import GRID_POINTS_GROUP, load_grid_point_trial_plot_payload
 
@@ -3639,6 +3697,7 @@ def load_selected_trial_plot_payload(
                         trial_index=trial_index,
                         slice_key=slice_key or selected_key,
                         search_id=selected_search_id,
+                        psf_kernel=psf_kernel,
                     )
         records_group: h5py.Group | None = None
         if selected_search_id is not None and SEARCHES_GROUP in group:
@@ -3717,11 +3776,16 @@ def load_selected_trial_plot_payload(
 
         common_payload = _read_common_group(group["common"])
         observed = np.asarray(common_payload.get("observed"), dtype=float)
-        psf_kernel = common_payload.get("psf_kernel")
+        if psf_kernel is not None:
+            from .psf import _normalized_psf_kernel_array
+
+            resolved_psf_kernel = _normalized_psf_kernel_array(psf_kernel)
+        else:
+            resolved_psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
         raw_display, modeled, residual, _has_raw = _derive_display_maps_from_raw(
             raw_modeled,
             observed_template=observed,
-            psf_kernel=psf_kernel,
+            psf_kernel=resolved_psf_kernel,
         )
         if raw_display is None or modeled is None or residual is None:
             return None
@@ -3735,7 +3799,7 @@ def load_selected_trial_plot_payload(
             "residual": np.asarray(residual, dtype=float),
             "observed": observed,
             "wcs_header": common_payload["wcs_header"],
-            "psf_kernel": psf_kernel,
+            "psf_kernel": resolved_psf_kernel,
             "selected_slice_key": str(selected_key),
             "selected_search_id": str(selected_search_id) if selected_search_id is not None else None,
         }
@@ -4258,6 +4322,7 @@ def _map_store_identity(
         artifact_geometry_sha256=artifact_geom_sha,
         euv_response_sha256=physical.get("euv_response_sha256"),
         euv_response_identity_version=physical.get("euv_response_identity_version"),
+        render_projection=physical.get("render_projection"),
         array_name=str(name),
     )
 
@@ -4757,6 +4822,89 @@ def load_auxiliary_map_store_point_records(
     return out
 
 
+def _resolved_psf_kernel_from_common_payload(common_payload: dict[str, Any]) -> np.ndarray | None:
+    """Return slice PSF kernel from storage or rebuild from persisted diagnostics."""
+    from .psf import resolve_slice_psf_kernel
+
+    diagnostics = dict(common_payload.get("diagnostics") or {})
+    dx_arcsec = _optional_float(diagnostics.get("map_dx_arcsec"))
+    if dx_arcsec is None:
+        dx_arcsec = 2.0
+    dy_arcsec = _optional_float(diagnostics.get("map_dy_arcsec"))
+    if dy_arcsec is None:
+        dy_arcsec = float(dx_arcsec)
+    active_frequency_ghz = _optional_float(
+        diagnostics.get("active_frequency_ghz") or diagnostics.get("frequency_ghz")
+    )
+    return resolve_slice_psf_kernel(
+        stored_kernel=common_payload.get("psf_kernel"),
+        diagnostics=diagnostics,
+        dx_arcsec=float(dx_arcsec),
+        dy_arcsec=float(dy_arcsec),
+        active_frequency_ghz=active_frequency_ghz,
+    )
+
+
+def ensure_slice_common_psf_kernel(
+    common: h5py.Group,
+    *,
+    psf_kernel: np.ndarray | None,
+    diagnostics: dict[str, Any],
+) -> bool:
+    """Persist ``common/psf_kernel`` when missing (per-slice artifact contract)."""
+    if COMMON_PSF_KERNEL_DATASET in common:
+        return False
+    kernel = None
+    try:
+        from .psf import _normalized_psf_kernel_array
+
+        kernel = _normalized_psf_kernel_array(psf_kernel)
+    except Exception:
+        kernel = None
+    if kernel is None:
+        return False
+    common.create_dataset(
+        COMMON_PSF_KERNEL_DATASET,
+        data=np.asarray(kernel, dtype=np.float32),
+        compression="gzip",
+        compression_opts=4,
+    )
+    kernel_meta = {
+        "source": diagnostics.get("psf_source"),
+        "resolved_psf": diagnostics.get("resolved_psf"),
+        "shape": [int(v) for v in kernel.shape],
+        "normalized": True,
+    }
+    _create_text_dataset(common, COMMON_PSF_KERNEL_META_DATASET, _json_dumps(kernel_meta))
+    return True
+
+
+def ensure_slice_common_psf_kernel_in_file(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    psf_kernel: np.ndarray | None,
+    diagnostics: dict[str, Any],
+) -> bool:
+    """Backfill missing slice-common PSF kernel datasets in an existing artifact."""
+    if not Path(h5_path).exists():
+        return False
+    slice_name = str(slice_key or "").strip()
+    if not slice_name:
+        return False
+    with _H5PY_FILE(Path(h5_path), "a") as h5_file:
+        if SLICE_CONTAINER_GROUP not in h5_file or slice_name not in h5_file[SLICE_CONTAINER_GROUP]:
+            return False
+        slice_group = h5_file[SLICE_CONTAINER_GROUP][slice_name]
+        if "common" not in slice_group:
+            return False
+        return ensure_slice_common_psf_kernel(
+            slice_group["common"],
+            psf_kernel=psf_kernel,
+            diagnostics=dict(diagnostics),
+        )
+
+
 def _write_common_group(
     common: h5py.Group,
     *,
@@ -4812,25 +4960,11 @@ def _write_common_group(
     _create_text_dataset(common, COMMON_SLICE_DESCRIPTORS_DATASET, _json_dumps(slice_descriptors))
     _create_text_dataset(common, COMMON_TARGET_SLICE_KEY_DATASET, str(target_slice_key))
     _create_text_dataset(common, COMMON_TRIAL_LOGGING_POLICY_DATASET, _json_dumps(trial_logging_policy))
-    if psf_kernel is not None:
-        kernel = np.asarray(psf_kernel, dtype=float)
-        if kernel.ndim == 2 and kernel.size > 0:
-            kernel_sum = float(np.nansum(kernel))
-            if np.isfinite(kernel_sum) and kernel_sum != 0.0:
-                kernel = kernel / kernel_sum
-            common.create_dataset(
-                COMMON_PSF_KERNEL_DATASET,
-                data=np.asarray(kernel, dtype=np.float32),
-                compression="gzip",
-                compression_opts=4,
-            )
-            kernel_meta = {
-                "source": diagnostics.get("psf_source"),
-                "resolved_psf": diagnostics.get("resolved_psf"),
-                "shape": [int(v) for v in kernel.shape],
-                "normalized": True,
-            }
-            _create_text_dataset(common, COMMON_PSF_KERNEL_META_DATASET, _json_dumps(kernel_meta))
+    ensure_slice_common_psf_kernel(
+        common,
+        psf_kernel=psf_kernel,
+        diagnostics=diagnostics,
+    )
     if blos_reference is not None:
         refmaps = common.create_group("refmaps")
         blos_data, blos_header = blos_reference
@@ -5011,8 +5145,31 @@ def _copy_legacy_root_layout_to_slice(src: h5py.File, dst_slice: h5py.Group) -> 
 
 
 def _copy_existing_map_store(src: h5py.File, dst: h5py.File) -> None:
-    if MAP_STORE_GROUP in src and MAP_STORE_GROUP not in dst:
-        src.copy(src[MAP_STORE_GROUP], dst, name=MAP_STORE_GROUP)
+    if MAP_STORE_GROUP not in src or MAP_STORE_GROUP in dst:
+        return
+    src_ms = src[MAP_STORE_GROUP]
+    dst_ms = dst.create_group(MAP_STORE_GROUP)
+    skipped: list[str] = []
+    for name in src_ms.keys():
+        if name == MAP_STORE_MAPS_GROUP:
+            continue
+        try:
+            src.copy(src_ms[name], dst_ms, name=name)
+        except OSError as exc:
+            skipped.append(f"{name}: {exc}")
+    dst_maps = dst_ms.require_group(MAP_STORE_MAPS_GROUP)
+    for map_id in src_ms[MAP_STORE_MAPS_GROUP].keys():
+        try:
+            src.copy(src_ms[MAP_STORE_MAPS_GROUP][map_id], dst_maps, name=map_id)
+        except OSError as exc:
+            skipped.append(f"maps/{map_id}: {exc}")
+    if skipped:
+        warnings.warn(
+            "map_store copy skipped "
+            f"{len(skipped)} corrupt or unreadable object(s); first: {skipped[0]}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def write_grid_scan_artifact(
@@ -5533,6 +5690,12 @@ def append_scan_point_record(
                             blos_reference=blos_reference,
                             psf_kernel=psf_kernel,
                             run_history=None,
+                        )
+                    else:
+                        ensure_slice_common_psf_kernel(
+                            slice_group["common"],
+                            psf_kernel=psf_kernel,
+                            diagnostics=diagnostics_out,
                         )
                 searches_group = slice_group.require_group(SEARCHES_GROUP)
                 layout_payload = {"kind": "point_list"}

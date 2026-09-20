@@ -242,3 +242,24 @@ def test_apply_search_shift_diagnostics_overrides_slice_common_auto_for_legacy_s
     )
     assert auto_merged["shift_policy"] == "auto"
     assert auto_merged["max_shift_arcsec"] == pytest.approx(20.0)
+
+
+def test_projection_changes_search_and_cached_map_identity() -> None:
+    from pychmp.map_store import build_map_identity
+
+    products, layers, signatures = set(), set(), set()
+    for projection in (None, {"parallel": False, "exact": False, "nthreads": 0},
+                       {"parallel": True, "exact": False, "nthreads": 8},
+                       {"parallel": True, "exact": True, "nthreads": 8}):
+        identity = build_map_identity(
+            a=0.6, b=1.8, q0=0.00358, domain="euv", channel_or_frequency="94",
+            component="corona", forward_model_sha256="model", ebtel_sha256="ebtel",
+            artifact_geometry_sha256="geometry", forward_model_identity_version="v0",
+            render_projection=projection,
+        )
+        products.add(identity["render_product_id"])
+        layers.add(identity["map_layer_id"])
+        diagnostics = _make_diagnostics()
+        diagnostics.update(spectral_domain="euv", render_projection=projection)
+        signatures.add(search_evaluation_signature(build_search_evaluation_config(diagnostics)))
+    assert len(products) == len(layers) == len(signatures) == 4

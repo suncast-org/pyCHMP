@@ -6,6 +6,8 @@ import pytest
 from pychmp.ab_search import (
     ABPointResult,
     ExpandResumeContext,
+    _append_adaptive_request_if_needed,
+    _cache_point_blocks_rerun,
     idl_q0_start_heuristic,
     multi_scan_ab,
     search_local_minimum_ab,
@@ -863,3 +865,192 @@ def test_search_local_minimum_ab_resume_expands_cached_frontier_when_bounds_wide
     assert len(factory.calls) > 0
     assert resumed.evaluated_point_count > first.evaluated_point_count
     assert first_call_count > 0
+
+
+class _IncompleteResumeAdaptiveCache(RecordingAdaptiveCache):
+    def __init__(self, *, partial_point: ABPointResult) -> None:
+        super().__init__()
+        self._partial_point = partial_point
+        self._resume_keys = {(float(partial_point.a), float(partial_point.b))}
+
+    def point_needs_completion(self, a_value: float, b_value: float) -> bool:
+        return (float(a_value), float(b_value)) in self._resume_keys
+
+    def partial_point_results(self) -> dict[tuple[float, float], ABPointResult]:
+        key = (float(self._partial_point.a), float(self._partial_point.b))
+        return {key: self._partial_point}
+
+
+def test_cache_point_blocks_rerun_allows_incomplete_resume_points() -> None:
+    partial = ABPointResult(
+        a=0.45,
+        b=3.75,
+        q0=0.04,
+        objective_value=0.37,
+        metrics=MetricValues(chi2=1.0, rho2=0.5, eta2=0.37),
+        target_metric="eta2",
+        success=False,
+        nfev=3,
+        nit=2,
+        message="partial",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        trial_q0=(0.03, 0.04, 0.05),
+        trial_objective_values=(0.39, 0.37, 0.38),
+        trial_chi2_values=(1.1, 1.0, 1.05),
+        trial_rho2_values=(0.49, 0.5, 0.51),
+        trial_eta2_values=(0.39, 0.37, 0.38),
+    )
+    cache = _IncompleteResumeAdaptiveCache(partial_point=partial)
+    key = (0.45, 3.75)
+    assert _cache_point_blocks_rerun(cache, key) is False
+
+
+def test_append_adaptive_request_if_needed_queues_incomplete_partial_topology() -> None:
+    partial = ABPointResult(
+        a=-0.05,
+        b=4.0,
+        q0=0.07,
+        objective_value=0.35,
+        metrics=MetricValues(chi2=1.0, rho2=0.5, eta2=0.35),
+        target_metric="eta2",
+        success=False,
+        nfev=4,
+        nit=3,
+        message="partial",
+        used_adaptive_bracketing=False,
+        bracket_found=False,
+        bracket=None,
+        trial_q0=(0.05, 0.07, 0.09),
+        trial_objective_values=(0.36, 0.35, 0.37),
+        trial_chi2_values=(1.1, 1.0, 1.05),
+        trial_rho2_values=(0.49, 0.5, 0.51),
+        trial_eta2_values=(0.36, 0.35, 0.37),
+    )
+    cache = _IncompleteResumeAdaptiveCache(partial_point=partial)
+    a_values = np.asarray([-0.05], dtype=float)
+    b_values = np.asarray([4.0], dtype=float)
+    point_results = {(float(partial.a), float(partial.b)): partial}
+    pending_requests = []
+    pending_keys: set[tuple[float, float]] = set()
+    _append_adaptive_request_if_needed(
+        pending_requests,
+        pending_keys,
+        a_values=a_values,
+        b_values=b_values,
+        a_index=0,
+        b_index=0,
+        q0_min=1e-5,
+        q0_max=1e-1,
+        hard_q0_min=None,
+        hard_q0_max=None,
+        threshold=0.1,
+        mask_type="union",
+        explicit_mask=None,
+        target_metric="eta2",
+        xatol=1e-3,
+        maxiter=50,
+        adaptive_bracketing=False,
+        q0_seed=0.07,
+        q0_step=1.618,
+        max_bracket_steps=8,
+        point_results=point_results,
+        cache_map=cache,
+    )
+    assert len(pending_requests) == 1
+    assert pending_requests[0].q0_start == pytest.approx(0.07)
+
+
+def test_evaluate_ab_search_request_finalizes_resume_without_rendering() -> None:
+    from types import SimpleNamespace
+
+    from pychmp.ab_search import (
+        ABPointEvaluationRequest,
+        ABPointTask,
+        ABSearchWorkerPayload,
+        _evaluate_ab_search_request,
+    )
+
+    partial = ABPointResult(
+        a=-0.05,
+        b=4.0,
+        q0=0.072105,
+        objective_value=0.337719,
+        metrics=MetricValues(chi2=1.0, rho2=0.5, eta2=0.337719),
+        target_metric="eta2",
+        success=True,
+        nfev=84,
+        nit=83,
+        message="restored from grid point trials",
+        used_adaptive_bracketing=False,
+        bracket_found=True,
+        bracket=None,
+        trial_q0=(0.05, 0.072105, 0.09),
+        trial_objective_values=(0.36, 0.337719, 0.37),
+        trial_chi2_values=(1.1, 1.0, 1.05),
+        trial_rho2_values=(0.49, 0.5, 0.51),
+        trial_eta2_values=(0.36, 0.337719, 0.37),
+    )
+    render_log: list[float] = []
+
+    class _ResumeFinalizeCache(_IncompleteResumeAdaptiveCache):
+        def try_finalize_resume_point_from_stored_trials(
+            self,
+            a_value: float,
+            b_value: float,
+        ) -> ABPointResult | None:
+            if (float(a_value), float(b_value)) == (-0.05, 4.0):
+                return partial
+            return None
+
+    class _FinalizeRenderer:
+        def prepare_stored_trial_maps(self) -> int:
+            return 0
+
+        def build_artifact_payload(self, point: ABPointResult) -> dict[str, object]:
+            return {"q0": float(point.q0), "best_metric": float(point.objective_value)}
+
+        def render(self, q0: float) -> np.ndarray:
+            render_log.append(float(q0))
+            return np.zeros((4, 4), dtype=float)
+
+    request = ABPointEvaluationRequest(
+        task=ABPointTask(
+            slice_key="mw_test",
+            slice_domain="mw",
+            slice_label="1.418 GHz",
+            slice_display_label="MW: 1.418 GHz",
+            a=-0.05,
+            b=4.0,
+            a_index=0,
+            b_index=0,
+            q0_min=1e-4,
+            q0_max=0.2,
+            target_metric="eta2",
+            source_kind="adaptive",
+        ),
+        hard_q0_min=None,
+        hard_q0_max=None,
+        threshold=0.2,
+        mask_type="union",
+        explicit_mask=None,
+        target_metric="eta2",
+        xatol=1e-3,
+        maxiter=200,
+        adaptive_bracketing=True,
+        q0_start=0.072105,
+        q0_step=1.618,
+        max_bracket_steps=12,
+    )
+    payload = ABSearchWorkerPayload(
+        renderer_factory=lambda _a, _b: _FinalizeRenderer(),
+        observed=np.ones((4, 4), dtype=float),
+        sigma=np.ones((4, 4), dtype=float),
+        cache_map=_ResumeFinalizeCache(partial_point=partial),
+    )
+    result = _evaluate_ab_search_request(request, payload)
+    assert render_log == []
+    assert result.q0 == pytest.approx(0.072105)
+    assert result.artifact_payload is not None
+    assert float(result.artifact_payload["best_metric"]) == pytest.approx(0.337719)

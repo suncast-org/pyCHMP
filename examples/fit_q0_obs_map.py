@@ -51,7 +51,7 @@ from pychmp import (
 )
 from pychmp.metrics import MetricValues, compute_metrics, resolve_threshold_mask
 from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
-from pychmp.geometry_policy import resolve_geometry_policy
+from pychmp.geometry_policy import resolve_geometry_policy, resolve_renderer_observer_name
 from pychmp.psf import (
     KernelConvolvedRenderer as _CoreKernelConvolvedRenderer,
     build_psf_kernel as _core_build_psf_kernel,
@@ -705,20 +705,7 @@ def _resolve_observer_overrides(
     source = "saved_observer_metadata"
 
     if observer_name:
-        try:
-            from astropy.time import Time
-            from gxrender.geometry import normalize_observer_name
-            from gxrender.geometry.observer_geometry import _observer_from_sunpy
-
-            model_time = Time(_load_model_obs_time_iso(model_path) or "2025-01-01T00:00:00")
-            norm_name = normalize_observer_name(observer_name) or observer_name
-            l0, b0_resolved, dsun_resolved = _observer_from_sunpy(str(norm_name), model_time)
-            lonc = float(l0) if lonc is None else lonc
-            b0 = float(b0_resolved) if b0 is None else b0
-            dsun = float(dsun_resolved) if dsun is None else dsun
-            source = f"observer_name:{norm_name}"
-        except Exception as exc:
-            raise ValueError(f"unable to resolve --observer '{observer_name}': {exc}") from exc
+        source = f"observer_name:{observer_name}"
 
     if lonc is None and b0 is None and dsun is None:
         return None, source
@@ -1210,7 +1197,12 @@ Examples:
     parser.add_argument("--b", type=float, default=None, help="Override model parameter b")
     parser.add_argument("--observer", default=None, help="Observer name (earth, stereo-a, stereo-b)")
     parser.add_argument("--dsun-cm", type=float, default=None, help="Observer-Sun distance override in cm")
-    parser.add_argument("--lonc-deg", type=float, default=None, help="Observer heliographic Carrington longitude override in deg")
+    parser.add_argument(
+        "--lonc-deg",
+        type=float,
+        default=None,
+        help="gxrender renderer-relative model longitude override in deg",
+    )
     parser.add_argument("--b0sun-deg", type=float, default=None, help="Observer heliographic latitude override in deg")
     parser.add_argument("--xc", type=float, default=None, help="Map center X in arcsec (exact override)")
     parser.add_argument("--yc", type=float, default=None, help="Map center Y in arcsec (exact override)")
@@ -1507,8 +1499,10 @@ Examples:
                 geometry_overrides_requested=False,
                 explicit_observer_requested=explicit_observer_requested,
             )
-            geometry_observer_name = (
-                None if bool(geometry_policy.use_model_saved_fov) and not explicit_observer_requested else str(args.observer or geometry_policy.observer_name)
+            geometry_observer_name = resolve_renderer_observer_name(
+                geometry_policy,
+                explicit_observer_name=args.observer,
+                explicit_observer_requested=explicit_observer_requested,
             )
             geometry_observer = None if bool(geometry_policy.use_model_saved_fov) else (observer_overrides if explicit_observer_requested else None)
             resolved_geometry = resolve_render_geometry_via_gxrender(
@@ -1525,12 +1519,13 @@ Examples:
             geometry_mode = f"gxrender:{resolved_geometry.center_source}"
 
         if not explicit_observer_requested:
-            observer_overrides = sdk.ObserverOverrides(
-                dsun_cm=float(geometry_policy.observer_dsun_cm),
-                lonc_deg=float(geometry_policy.observer_lonc_deg),
-                b0sun_deg=float(geometry_policy.observer_b0sun_deg),
-            )
+            observer_overrides = None
             observer_source = f"geometry_policy:{geometry_policy.observation_observer}"
+        render_observer_name = resolve_renderer_observer_name(
+            geometry_policy,
+            explicit_observer_name=args.observer,
+            explicit_observer_requested=explicit_observer_requested,
+        )
         effective_observer_name = str(args.observer or geometry_policy.observer_name)
         effective_observer_lonc_deg = float(
             getattr(observer_overrides, "lonc_deg", None)
@@ -1781,7 +1776,7 @@ Examples:
                 b=b_param,
                 geometry=geometry,
                 observer=observer_overrides,
-                observer_name=effective_observer_name,
+                observer_name=render_observer_name,
                 pixel_scale_arcsec=float(args.pixel_scale_arcsec),
             )
             base_adapter = GXRenderMWAdapter(**adapter_kwargs)
@@ -1798,7 +1793,7 @@ Examples:
                 b=b_param,
                 geometry=geometry,
                 observer=observer_overrides,
-                observer_name=effective_observer_name,
+                observer_name=render_observer_name,
                 tr_region_mask=euv_tr_mask,
                 pixel_scale_arcsec=float(args.pixel_scale_arcsec),
             )

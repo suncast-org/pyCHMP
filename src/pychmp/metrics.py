@@ -267,23 +267,122 @@ def pixel_scales_from_wcs_header(header: fits.Header) -> tuple[float, float]:
     return abs(float(header["CDELT1"])), abs(float(header["CDELT2"]))
 
 
+KNOWN_METRICS_MASK_STAGES: frozenset[str] = frozenset({"union", "data", "model", "and"})
+METRICS_MASK_STAGE_UNKNOWN = "unknown"
+
+
+def _normalize_committed_trial_mask_stage(value: object) -> str | None:
+    stage_text = str(value).strip().lower()
+    if stage_text in KNOWN_METRICS_MASK_STAGES:
+        return stage_text
+    return None
+
+
+def _normalize_q0_search_stages_value(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        return tuple(
+            part.strip().lower()
+            for part in str(value).split(",")
+            if part.strip() and part.strip().lower() in KNOWN_METRICS_MASK_STAGES
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            str(stage).strip().lower()
+            for stage in value
+            if str(stage).strip() and str(stage).strip().lower() in KNOWN_METRICS_MASK_STAGES
+        )
+    return ()
+
+
+def _grid_point_status_is_live_pending(diagnostics: dict[str, Any]) -> bool:
+    status = str(diagnostics.get("grid_point_status", "")).strip().upper()
+    return status in {"RUNNING", "ASSIGNED"}
+
+
+def resolve_selected_trial_mask_stage(diagnostics: dict[str, Any]) -> str | None:
+    """Return the committed mask stage for the selected trial, or None if missing/invalid."""
+    selected_index = diagnostics.get("selected_trial_index")
+    trial_stages = diagnostics.get("fit_trial_mask_stages") or diagnostics.get("trial_mask_stages")
+    if selected_index is None or not trial_stages:
+        return None
+    try:
+        return _normalize_committed_trial_mask_stage(trial_stages[int(selected_index)])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def resolve_display_trial_mask_stage(diagnostics: dict[str, Any]) -> str | None:
+    """Resolve mask stage for viewer contours: committed trial stage, else recipe on live points."""
+    committed = resolve_selected_trial_mask_stage(diagnostics)
+    if committed is not None:
+        return committed
+    if not _grid_point_status_is_live_pending(diagnostics):
+        return None
+    q0_stages = _normalize_q0_search_stages_value(diagnostics.get("q0_search_stages"))
+    if len(q0_stages) == 1:
+        return q0_stages[0]
+    return None
+
+
 def resolve_metrics_mask_type(diagnostics: dict[str, Any]) -> str:
-    """Resolve the threshold mask type used for display for one trial/point."""
+    """Resolve the threshold mask type for viewer display."""
     mask_source = str(diagnostics.get("metrics_mask_source", "")).strip().lower()
     if mask_source == "explicit_fits":
         return "explicit"
+    stage = resolve_display_trial_mask_stage(diagnostics)
+    if stage is not None:
+        return stage
+    return METRICS_MASK_STAGE_UNKNOWN
+
+
+def resolve_metrics_mask_inconsistency_warning(diagnostics: dict[str, Any]) -> str | None:
+    """Describe artifact inconsistencies without inferring the mask used for scoring."""
+    warnings: list[str] = []
     selected_index = diagnostics.get("selected_trial_index")
     trial_stages = diagnostics.get("fit_trial_mask_stages") or diagnostics.get("trial_mask_stages")
+    committed_stage = resolve_selected_trial_mask_stage(diagnostics)
+    display_stage = resolve_display_trial_mask_stage(diagnostics)
     if selected_index is not None and trial_stages:
         try:
-            stage = trial_stages[int(selected_index)]
-            stage_text = str(stage).strip().lower()
-            if stage_text in {"union", "data", "model", "and"}:
-                return stage_text
+            raw_stage = trial_stages[int(selected_index)]
         except (IndexError, TypeError, ValueError):
-            pass
-    mask_type = str(diagnostics.get("mask_type", "union")).strip().lower()
-    return mask_type or "union"
+            raw_stage = None
+        if committed_stage is None:
+            if _grid_point_status_is_live_pending(diagnostics) and display_stage is not None:
+                warnings.append(
+                    "trial mask stage not yet committed; contour uses search recipe stage "
+                    f"{display_stage!r}"
+                )
+            elif raw_stage is None or not str(raw_stage).strip():
+                warnings.append("selected trial is missing committed mask stage metadata")
+            else:
+                warnings.append(f"selected trial has unsupported mask stage {raw_stage!r}")
+    trial_stage = display_stage
+
+    q0_stages = _normalize_q0_search_stages_value(diagnostics.get("q0_search_stages"))
+    legacy_mask = str(diagnostics.get("mask_type", "")).strip().lower()
+    if q0_stages and legacy_mask in KNOWN_METRICS_MASK_STAGES:
+        if len(q0_stages) == 1 and q0_stages[0] != legacy_mask:
+            warnings.append(
+                f"search recipe q0_search_stages={list(q0_stages)!r} "
+                f"disagrees with stored mask_type={legacy_mask!r}"
+            )
+
+    if trial_stage is not None and q0_stages:
+        if len(q0_stages) == 1 and trial_stage != q0_stages[0]:
+            warnings.append(
+                f"selected trial stage {trial_stage!r} "
+                f"disagrees with search recipe q0_search_stages={list(q0_stages)!r}"
+            )
+        elif len(q0_stages) > 1 and trial_stage not in q0_stages:
+            warnings.append(
+                f"selected trial stage {trial_stage!r} "
+                f"is not listed in search recipe q0_search_stages={list(q0_stages)!r}"
+            )
+
+    if not warnings:
+        return None
+    return "; ".join(warnings)
 
 
 def resolve_observation_peak_for_mask(
@@ -329,6 +428,8 @@ def resolve_metrics_threshold_mask(
             return None
         return np.asarray(np.isfinite(mask_data) & (mask_data != 0), dtype=bool)
     mask_type = resolve_metrics_mask_type(diagnostics)
+    if mask_type in {METRICS_MASK_STAGE_UNKNOWN, "explicit"}:
+        return None
     threshold = float(diagnostics.get("metrics_mask_threshold", diagnostics.get("threshold", 0.1)))
     obs_max = resolve_observation_peak_for_mask(observed, diagnostics, wcs_header=wcs_header)
     mask_fn = resolve_threshold_mask(mask_type)
@@ -351,7 +452,11 @@ def format_metrics_mask_label(diagnostics: dict[str, Any]) -> str:
     peak_note = ""
     if bool(diagnostics.get("use_smoothed_obs_max", True)):
         peak_note = ", smoothed obs peak"
-    return f"ROI mask: {mask_type} @ {threshold_text}{peak_note}"
+    label = f"ROI mask: {mask_type} @ {threshold_text}{peak_note}"
+    warning = resolve_metrics_mask_inconsistency_warning(diagnostics)
+    if warning:
+        label = f"{label} [WARNING: {warning}]"
+    return label
 
 
 def resolve_threshold_mask(mask_type: str):

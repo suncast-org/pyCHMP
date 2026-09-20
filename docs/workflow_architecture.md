@@ -347,6 +347,15 @@ Phase substring matching is implemented in `_heartbeat_requires_payload_reload()
 
 `pychmp_view.py` auto-selects the active slice/search and Active navigation when a live runner or in-progress search is present on the opened artifact.
 
+#### Heatmap fill vs live active cell
+
+During a live adaptive search, heatmap **fill color** is the **best committed
+metric so far** at each `(a,b)` — including cells still `RUNNING` / `pending`.
+A cell can therefore be **painted and active** at once: the color reflects partial
+progress; the yellow **active** star and gray dashed outline mean the runner is
+still working that point. See `docs/viewer_refresh_workflow.rst` (section *Heatmap
+semantics during a live search*) for the full visual legend.
+
 ### Display pipeline for maps
 
 For a selected trial index:

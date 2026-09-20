@@ -184,8 +184,17 @@ def _load_slice_write_context(
         raise RescoreBuildError(f"Slice {slice_key!r} common maps are incomplete")
     diagnostics = dict(profile_diagnostics)
     diagnostics.update(dict(common_payload.get("diagnostics") or {}))
+    max_shift = diagnostics.get("max_shift_arcsec")
+    if max_shift in {None, "", 0, 0.0}:
+        diagnostics["max_shift_arcsec"] = (
+            profile_diagnostics.get("max_shift_arcsec")
+            or diagnostics.get("slice_canvas_max_shift_arcsec")
+            or 20.0
+        )
     blos_reference = common_payload.get("blos_reference")
-    psf_kernel = common_payload.get("psf_kernel")
+    from .ab_scan_artifacts import _resolved_psf_kernel_from_common_payload
+
+    psf_kernel = _resolved_psf_kernel_from_common_payload(common_payload)
     diagnostics["target_slice_key"] = str(slice_key)
     return _SliceWriteContext(
         observed=np.asarray(observed, dtype=float),
@@ -223,7 +232,11 @@ def _evaluation_context_from_diagnostics(
             identity=dict(obs_ref_payload.get("identity") or obs_ref_payload.get("diagnostics") or {}),
             restored_from_artifact=True,
             shift_policy=str(write_ctx.diagnostics.get("shift_policy") or "auto"),
-            max_shift_arcsec=write_ctx.diagnostics.get("max_shift_arcsec"),
+            max_shift_arcsec=float(
+                write_ctx.diagnostics.get("max_shift_arcsec")
+                or write_ctx.diagnostics.get("slice_canvas_max_shift_arcsec")
+                or 20.0
+            ),
             xy_shift_arcsec=(
                 float(write_ctx.diagnostics.get("xy_shift_arcsec", [0.0, 0.0])[0]),
                 float(write_ctx.diagnostics.get("xy_shift_arcsec", [0.0, 0.0])[1]),
@@ -517,6 +530,7 @@ def build_rescore_sidecar(
             observed_template_override=write_ctx.observed,
             psf_kernel_override=write_ctx.psf_kernel,
             use_emthreshold=use_emthreshold,
+            psf_kernel=write_ctx.psf_kernel,
         )
         if not events:
             apply_grid_point_failed(

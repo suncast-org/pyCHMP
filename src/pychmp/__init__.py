@@ -12,6 +12,7 @@ from .ab_search import (
     ABScanResult,
     ABRendererFactory,
     ExpandResumeContext,
+    drain_incomplete_resume_points,
     evaluate_ab_point,
     idl_q0_start_heuristic,
     multi_scan_ab,
@@ -22,7 +23,7 @@ from .ab_search import (
 from .fits_utils import extract_frequency_ghz, load_2d_fits_image
 from .fitting import Q0MapRenderer, fit_q0_to_observation
 from .gxrender_adapter import EUVResponseIdentity, EUV_RESPONSE_IDENTITY_VERSION, ForwardModelIdentity, FORWARD_MODEL_IDENTITY_VERSION, GXRenderEUVAdapter, GXRenderMWAdapter, GXRenderMWContext, ResolvedRenderGeometry, build_tr_region_mask_from_blos, compute_euv_response_identity, compute_forward_model_identity_placeholder, recombine_euv_components, resolve_euv_response_identity, resolve_render_geometry_via_gxrender
-from .geometry_policy import GeometryPolicyDecision, infer_observation_observer, resolve_geometry_policy
+from .geometry_policy import GeometryPolicyDecision, infer_observation_observer, resolve_euv_instrument_name, resolve_geometry_policy, resolve_renderer_observer_name
 from .map_noise import MapNoiseEstimate, estimate_map_noise
 from .metrics import MetricValues, compute_metrics, threshold_union_mask
 from .obs_maps import ObservationalMap, estimate_obs_map_noise, load_obs_map, obs_map_noise_unit_label, validate_obs_map_identity, find_named_testdata_file, resolve_default_testdata_fixture_paths
@@ -65,6 +66,7 @@ __all__ = [
   "idl_q0_start_heuristic",
   "multi_scan_ab",
   "search_local_minimum_ab",
+  "drain_incomplete_resume_points",
   "ExpandResumeContext",
   "select_expand_frontier_seed",
   "widened_boundary_axes",
@@ -79,7 +81,9 @@ __all__ = [
   "resolve_render_geometry_via_gxrender",
   "GeometryPolicyDecision",
   "infer_observation_observer",
+  "resolve_euv_instrument_name",
   "resolve_geometry_policy",
+  "resolve_renderer_observer_name",
   "ObsModelTimeAlignment",
   "assess_obs_model_time_alignment",
   "align_observation_to_model_time",

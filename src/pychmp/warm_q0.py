@@ -44,6 +44,7 @@ def load_warm_q0_evaluations_for_grid_point(
     use_emthreshold: bool = True,
     ebtel_miss_ratio_fn: Any = None,
     slice_map_index: SliceMapIndex | None = None,
+    mask_type: str = "union",
 ) -> InitialQ0Evaluations | None:
     """Rescore stored trial maps for one (a, b); prefer slice map index when provided."""
     if slice_map_index is not None and slice_map_index.has_point(float(a_value), float(b_value)):
@@ -58,6 +59,7 @@ def load_warm_q0_evaluations_for_grid_point(
             target_metric=str(target_metric),
             use_emthreshold=bool(use_emthreshold),
             ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
+            mask_type=str(mask_type),
         )
 
     evaluations: dict[float, Q0MetricEvaluation] = {}
@@ -109,11 +111,48 @@ def load_warm_q0_evaluations_for_grid_point(
                 target_metric=target_metric,
                 use_emthreshold=use_emthreshold,
                 ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
+                mask_type=str(mask_type),
             )
             if evaluation is not None:
                 evaluations[float(q0_value)] = evaluation
 
     return evaluations or None
+
+
+def rescore_raw_modeled_map(
+    raw_modeled_map: np.ndarray,
+    *,
+    observed_template: np.ndarray,
+    psf_kernel: Any,
+    context: ObservationEvaluationContext,
+    threshold: float,
+    explicit_mask: np.ndarray | None,
+    target_metric: str,
+    use_emthreshold: bool,
+    ebtel_miss_ratio_fn: Any = None,
+    mask_type: str = "union",
+) -> Q0MetricEvaluation | None:
+    """Rescore one stored raw modeled map under the requested mask stage."""
+    _ = str(target_metric)
+    _raw_display, modeled, _residual, _has_raw = _derive_display_maps_from_raw(
+        np.asarray(raw_modeled_map, dtype=float),
+        observed_template=observed_template,
+        psf_kernel=psf_kernel,
+    )
+    if modeled is None:
+        return None
+    evaluation = evaluate_modeled_trial(
+        modeled,
+        context,
+        threshold=float(threshold),
+        mask_type=str(mask_type),
+        explicit_mask=explicit_mask,
+        ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
+        use_emthreshold=use_emthreshold,
+    )
+    if not evaluation.is_valid:
+        return None
+    return evaluation
 
 
 def _rescore_raw_map_ref(
@@ -129,6 +168,7 @@ def _rescore_raw_map_ref(
     target_metric: str,
     use_emthreshold: bool,
     ebtel_miss_ratio_fn: Any = None,
+    mask_type: str = "union",
 ) -> Q0MetricEvaluation | None:
     raw_modeled = _read_map_store_ref_array(h5_file, raw_ref)
     if raw_modeled is None:
@@ -144,7 +184,7 @@ def _rescore_raw_map_ref(
         modeled,
         context,
         threshold=float(threshold),
-        mask_type="union",
+        mask_type=str(mask_type),
         explicit_mask=explicit_mask,
         ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
         use_emthreshold=use_emthreshold,
@@ -197,6 +237,7 @@ def _evaluate_raw_modeled_map(
     target_metric: str,
     use_emthreshold: bool,
     ebtel_miss_ratio_fn: Any = None,
+    mask_type: str = "union",
 ) -> Q0MetricEvaluation | None:
     _raw_display, modeled, _residual, _has_raw = _derive_display_maps_from_raw(
         raw_modeled,
@@ -209,7 +250,7 @@ def _evaluate_raw_modeled_map(
         modeled,
         context,
         threshold=float(threshold),
-        mask_type="union",
+        mask_type=str(mask_type),
         explicit_mask=explicit_mask,
         ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
         use_emthreshold=use_emthreshold,
@@ -231,6 +272,7 @@ def _warm_evaluations_from_slice_index(
     target_metric: str,
     use_emthreshold: bool = True,
     ebtel_miss_ratio_fn: Any = None,
+    mask_type: str = "union",
 ) -> InitialQ0Evaluations | None:
     entries = slice_map_index.entries_for_point(float(a_value), float(b_value))
     if not entries:
@@ -262,6 +304,7 @@ def _warm_evaluations_from_slice_index(
                 target_metric=target_metric,
                 use_emthreshold=use_emthreshold,
                 ebtel_miss_ratio_fn=ebtel_miss_ratio_fn,
+                mask_type=str(mask_type),
             )
             if evaluation is not None:
                 evaluations[float(entry.q0)] = evaluation
@@ -334,6 +377,7 @@ def initial_evaluations_from_grid_trials(
     explicit_mask: np.ndarray | None,
     use_emthreshold: bool = True,
     rescore: bool = True,
+    mask_type: str = "union",
 ) -> InitialQ0Evaluations | None:
     """Build optimizer warm-start from grid trials (rescored maps or stored trial scalars)."""
     fit_trials = select_fit_trials_for_viewer(trials)
@@ -375,6 +419,7 @@ def initial_evaluations_from_grid_trials(
                 explicit_mask=explicit_mask,
                 target_metric=str(target_metric),
                 use_emthreshold=bool(use_emthreshold),
+                mask_type=str(mask_type),
             )
             if evaluation is not None:
                 evaluations[q0_value] = evaluation
@@ -397,6 +442,8 @@ def build_warm_grid_trial_commit_events(
     observed_template_override: np.ndarray | None = None,
     psf_kernel_override: np.ndarray | None = None,
     use_emthreshold: bool = True,
+    mask_type: str = "union",
+    psf_kernel: Any = None,
 ) -> list[GridTrialCommittedEvent]:
     """Rescore compatible map_store maps and return grid commit events (linked refs, all metrics)."""
     entries = slice_map_index.entries_for_point(float(a_value), float(b_value))
@@ -419,9 +466,11 @@ def build_warm_grid_trial_commit_events(
             if observed_template_override is not None
             else np.asarray(common["observed"][()], dtype=float)
         )
-        psf_kernel = (
+        resolved_psf_kernel = (
             psf_kernel_override
             if psf_kernel_override is not None
+            else psf_kernel
+            if psf_kernel is not None
             else common["psf_kernel"][()]
             if "psf_kernel" in common
             else None
@@ -440,12 +489,13 @@ def build_warm_grid_trial_commit_events(
             evaluation = _evaluate_raw_modeled_map(
                 np.asarray(raw_modeled, dtype=float),
                 observed_template=observed_template,
-                psf_kernel=psf_kernel,
+                psf_kernel=resolved_psf_kernel,
                 context=context,
                 threshold=float(threshold),
                 explicit_mask=explicit_mask,
                 target_metric=str(target_metric),
                 use_emthreshold=bool(use_emthreshold),
+                mask_type=str(mask_type),
             )
             if evaluation is None:
                 continue
@@ -478,6 +528,7 @@ def build_warm_grid_trial_commit_events(
             shift_x_trials=shift_x_trials,
             shift_y_trials=shift_y_trials,
             shift_valid_trials=shift_valid_trials,
+            stage=str(evaluation.mask_stage or mask_type),
         )
         if recombined:
             shift_metadata = {

@@ -3,10 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import threading
 import time
 from types import SimpleNamespace
-import warnings
 
 import numpy as np
 import pytest
@@ -526,89 +524,26 @@ def test_gxrender_euv_adapter_leaves_supported_instrument_response_to_sdk(monkey
     assert FakeSDKWithEUVI.last_euv_options.kwargs["response_meta"] is None
 
 
-def test_gxrender_euv_adapter_reports_projection_flags_warning_once(monkeypatch) -> None:
-    class FakeSDKWithProjectionWarning(FakeSDK):
+@pytest.mark.parametrize("parallel,exact,threads", [(False, False, 0), (True, False, 8), (True, True, 2)])
+def test_gxrender_euv_adapter_forwards_projection(monkeypatch, parallel, exact, threads) -> None:
+    options_seen = []
+
+    class ProjectionSDK(FakeSDK):
         @staticmethod
         def render_euv_maps(options):
-            del options
-            warnings.warn(
-                "Current Python EUV workflow uses projection flags off "
-                "(parallel=False, exact=False, nthreads=0) for the DLL simbox path. "
-                "This assumption is explicit in the workflow today because high-level projection controls are not exposed yet.",
-                stacklevel=2,
-            )
-            cube = np.full((2, 3, 1), 2.0, dtype=float)
-            return FakeEUVResult(cube, channels=["171"])
+            options_seen.append(options.kwargs)
+            return FakeEUVResult(np.ones((2, 3, 1)), channels=["171"])
 
-    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithProjectionWarning)
-    monkeypatch.setattr(gxrender_adapter, "_euv_projection_flags_warning_emitted", False)
+    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: ProjectionSDK)
     adapter = GXRenderEUVAdapter(
-        model_path="model.h5",
-        channel="171",
-        instrument="AIA",
-        ebtel_path="ebtel.sav",
-        tbase=1e6,
-        nbase=1e8,
-        a=0.3,
-        b=2.7,
+        model_path="model.h5", channel="171", instrument="AIA",
+        ebtel_path="ebtel.sav", tbase=1e6, nbase=1e8, a=0.3, b=2.7,
+        parallel=parallel, exact=exact, projection_threads=threads,
     )
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        adapter.render(0.0217)
-        adapter.render(0.0218)
-
-    projection_warnings = [
-        warning
-        for warning in caught
-        if "Current Python EUV workflow uses projection flags off" in str(warning.message)
-    ]
-    assert len(projection_warnings) == 1
-
-
-def test_gxrender_euv_adapter_projection_warning_once_is_thread_safe(monkeypatch) -> None:
-    barrier = threading.Barrier(2)
-    original_warn = warnings.warn
-    emitted_projection_warnings: list[str] = []
-
-    def capture_reemitted_warning(message, category=None, stacklevel=1, source=None):
-        del category, stacklevel, source
-        text = str(message)
-        if "Current Python EUV workflow uses projection flags off" in text:
-            emitted_projection_warnings.append(text)
-
-    class FakeSDKWithProjectionWarning(FakeSDK):
-        @staticmethod
-        def render_euv_maps(options):
-            del options
-            barrier.wait(timeout=2.0)
-            original_warn(
-                "Current Python EUV workflow uses projection flags off "
-                "(parallel=False, exact=False, nthreads=0) for the DLL simbox path. "
-                "This assumption is explicit in the workflow today because high-level projection controls are not exposed yet.",
-                stacklevel=2,
-            )
-            cube = np.full((2, 3, 1), 2.0, dtype=float)
-            return FakeEUVResult(cube, channels=["171"])
-
-    monkeypatch.setattr(gxrender_adapter, "_load_gxrender_sdk", lambda: FakeSDKWithProjectionWarning)
-    monkeypatch.setattr(gxrender_adapter, "_euv_projection_flags_warning_emitted", False)
-    monkeypatch.setattr(gxrender_adapter.warnings, "warn", capture_reemitted_warning)
-    adapter = GXRenderEUVAdapter(
-        model_path="model.h5",
-        channel="171",
-        instrument="AIA",
-        ebtel_path="ebtel.sav",
-        tbase=1e6,
-        nbase=1e8,
-        a=0.3,
-        b=2.7,
-    )
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        list(executor.map(adapter.render, [0.0217, 0.0218]))
-
-    assert len(emitted_projection_warnings) == 1
+    adapter.render(0.0217)
+    assert options_seen[0]["parallel"] is parallel
+    assert options_seen[0]["exact"] is exact
+    assert options_seen[0]["projection_threads"] == threads
 
 
 def test_gxrender_euv_adapter_reuses_cached_response_payload(monkeypatch) -> None:

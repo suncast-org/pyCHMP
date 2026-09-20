@@ -97,6 +97,7 @@ def build_search_evaluation_config(
         "ebtel_sha256": diagnostics.get("ebtel_sha256"),
         "euv_response_identity_version": diagnostics.get("euv_response_identity_version"),
         "euv_response_sha256": diagnostics.get("euv_response_sha256"),
+        "render_projection": diagnostics.get("render_projection"),
         "shift_policy": diagnostics.get("shift_policy"),
         "max_shift_arcsec": diagnostics.get("max_shift_arcsec"),
         "xy_shift_arcsec": diagnostics.get("xy_shift_arcsec"),
