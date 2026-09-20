@@ -4107,3 +4107,101 @@ def test_refresh_all_draws_heatmap_when_search_completed_without_live_point() ->
     assert drawn["heatmap"] == 1
     assert drawn["trials"] == 1
     assert "Waiting for first completed" not in app.status_var.get()
+
+
+def test_background_load_discards_old_selection_and_runs_latest(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    callbacks = []
+    applied = []
+    app = object.__new__(PychmpViewApp)
+    app.artifact_h5 = tmp_path / 'scan.h5'
+    app._is_closing = False
+    app._payload_reload_in_progress = False
+    app._payload_reload_token = 0
+    app._deferred_scan_load_request = None
+    app.slice_key_var = _Var('euv_193')
+    app.search_id_var = _Var('active_search')
+    app.payload = {}
+    app.root = SimpleNamespace(after=lambda delay, callback: callbacks.append(callback))
+    app._load_scan_file_blocking = lambda path, **kw: dict(kw)
+    class InlineThread:
+        def __init__(self, target, **kw): self.target = target
+        def start(self): self.target()
+    monkeypatch.setattr(viewer_mod.threading, 'Thread', InlineThread)
+    app._schedule_background_scan_load(slice_key='euv_193', search_id='active_search', on_success=applied.append)
+    app.slice_key_var.set('euv_171')
+    app.search_id_var.set('chosen_search')
+    app._schedule_background_scan_load(slice_key='euv_171', search_id='chosen_search', on_success=applied.append)
+    callbacks.pop(0)()
+    assert applied == []
+    callbacks.pop(0)()
+    assert applied == [{'slice_key': 'euv_171', 'search_id': 'chosen_search'}]
+    assert not app._payload_reload_in_progress
+
+
+def test_metadata_refresh_preserves_free_coordinate_when_grid_grows() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var('free')
+    app.a_values = np.array([0., 1.])
+    app.b_values = np.array([0.])
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(0)
+    app._free_selection_ab = (1., 0.)
+    app._payload_cache_by_selection = {}
+    app._refresh_shared_heatmap_extents = lambda: None
+    app._pin_slice_psf_kernel = lambda: None
+    app.payload = {'a_values': app.a_values, 'b_values': app.b_values, 'points': {}}
+    payload = {'a_values': [-1., 0., 1.], 'b_values': [0.], 'points': {},
+               'selected_slice_key': 'euv_171', 'selected_search_id': 'chosen'}
+    app._apply_slice_grid_metadata_from_payload(payload, requested_slice_key='euv_171', requested_search_id='chosen')
+    assert app._free_selection_ab == (1., 0.)
+    assert (app.a_index_var.get(), app.b_index_var.get()) == (2, 0)
+
+
+@pytest.mark.parametrize('log_scale', [False, True])
+@pytest.mark.parametrize('completed', [True, False])
+def test_heatmap_pending_outlier_does_not_set_color_limits(monkeypatch, log_scale, completed) -> None:
+    from matplotlib.figure import Figure
+    from matplotlib.collections import PatchCollection
+
+    app = object.__new__(PychmpViewApp)
+    app.payload = {'point_records': []}
+    records = []
+    for i, value in enumerate([.44, .9, 50.]):
+        records.append({'a': float(i), 'b': 0., 'a_center': float(i), 'b_center': 0.,
+                        'a_index': i, 'b_index': 0, 'a0': i-.5, 'a1': i+.5, 'b0': -.5, 'b1': .5,
+                        'metrics': {'eta2': value}, 'status': 'computed' if completed and i<2 else 'pending'})
+    app.display_model = {'records': records}
+    app.heatmap_figure = Figure()
+    app.ax_heatmap = app.heatmap_figure.add_subplot(121)
+    app.ax_heatmap_cbar = app.heatmap_figure.add_subplot(122)
+    app._reset_heatmap_colorbar = lambda: None
+    app._ensure_heatmap_colorbar_axes = lambda: None
+    app._heatmap_display_metric = lambda: 'eta2'
+    app._heatmap_display_model = lambda: app.display_model
+    app._use_heatmap_log_scale = lambda: log_scale
+    app._heatmap_plot_limits = lambda model: (-.5, 2.5, -.5, .5)
+    app._heatmap_selection_locked = lambda: True
+    app._navigation_mode = lambda: 'active'
+    app._refresh_signal_active_point = None
+    app._refresh_signal_pending_points = []
+    app._draw_heatmap()
+    if completed:
+        assert app._heatmap_colorbar.norm.vmin == pytest.approx(.44)
+        assert app._heatmap_colorbar.norm.vmax == pytest.approx(.9)
+        colored = app.ax_heatmap.collections[0]
+        assert isinstance(colored, PatchCollection)
+        assert len(colored.get_paths()) == 2
+    else:
+        assert app._heatmap_colorbar is None
+
+
+def test_refresh_controls_does_not_restore_previous_slice_search_while_loading() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.payload = {'selected_slice_key': 'euv_193', 'selected_search_id': 'active'}
+    app.slice_key_var = _Var('euv_171')
+    app.search_id_var = _Var('chosen')
+    app.available_searches = [{'search_id': 'active'}]
+    app._refresh_search_controls()
+    assert app.search_id_var.get() == 'chosen'

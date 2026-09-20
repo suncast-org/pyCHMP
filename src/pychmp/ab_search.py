@@ -153,6 +153,19 @@ class ABSearchWorkerPayload:
     point_complete_callback: PointLifecycleCallback | None = None
 
 
+def point_search_spectral_label(factory: ABRendererFactory, fallback: str = "single-slice") -> str:
+    """Describe the target being optimized, never its auxiliary render channels."""
+    frequency = getattr(factory, "frequency_ghz", None)
+    wavelength = getattr(factory, "wavelength_angstrom", None)
+    if frequency is not None:
+        return f"{float(frequency):g} GHz"
+    instrument = str(getattr(factory, "euv_instrument", None) or "").strip()
+    if wavelength is not None:
+        return f"{instrument} {float(wavelength):g} Å".strip()
+    label = str(getattr(factory, "spectral_label", None) or fallback).strip()
+    return f"{instrument} {label}".strip()
+
+
 def idl_q0_start_heuristic(a: float, b: float) -> float:
     """Return the empirical IDL `Q0_start(a, b)` heuristic.
 
@@ -289,6 +302,7 @@ def _evaluate_ab_search_request(
     q0_start_text = "auto" if q0_start is None else f"{float(q0_start):.6g}"
     print(
         "    Starting point: "
+        f"{point_search_spectral_label(worker_payload.renderer_factory, request.task.slice_display_label)}; "
         f"a={a:.3f} b={b:.3f} "
         f"q0_range=({float(request.task.q0_min):.6g}, {float(request.task.q0_max):.6g}) "
         f"q0_start={q0_start_text} "

@@ -226,6 +226,7 @@ from pychmp import (
     widened_boundary_axes,
     validate_obs_map_identity,
 )
+from pychmp.ab_search import point_search_spectral_label
 from pychmp.search_options import add_chmp_search_cli_arguments, resolve_chmp_search_settings, resolve_shift_policy_from_args
 from pychmp.render_obs_fits_dir import (
     build_render_obs_target_context,
@@ -6349,7 +6350,7 @@ def main() -> int:
                 )
             else:
                 print(
-                    f"    Starting point: a={float(a_value):.3f} b={float(b_value):.3f} (rendering new trials)",
+                    f"    Starting point: {point_search_spectral_label(factory)}; a={float(a_value):.3f} b={float(b_value):.3f} (rendering new trials)",
                     flush=True,
                 )
 

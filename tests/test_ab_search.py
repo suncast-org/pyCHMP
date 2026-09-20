@@ -1054,3 +1054,23 @@ def test_evaluate_ab_search_request_finalizes_resume_without_rendering() -> None
     assert result.q0 == pytest.approx(0.072105)
     assert result.artifact_payload is not None
     assert float(result.artifact_payload["best_metric"]) == pytest.approx(0.337719)
+
+
+@pytest.mark.parametrize('frequency,wavelength,instrument,label', [
+    (None, 211., 'AIA', 'AIA 211 Å'),
+    (17., None, None, '17 GHz'),
+])
+def test_point_start_log_identifies_target_spectrum(capsys, frequency, wavelength, instrument, label) -> None:
+    observed = _localized_peak_observed()
+    factory = CountingRendererFactory(observed)
+    factory.frequency_ghz = frequency
+    factory.wavelength_angstrom = wavelength
+    factory.euv_instrument = instrument
+    factory.render_channels = ('94', '131', '171', '193', '211', '304', '335')
+    search_local_minimum_ab(
+        factory, observed, np.ones_like(observed), a_start=0., b_start=0., da=.1, db=.1,
+        a_range=(0., 0.), b_range=(0., 0.), q0_min=.1, q0_max=10., maxiter=2,
+    )
+    starts = [line for line in capsys.readouterr().out.splitlines() if 'Starting point:' in line]
+    assert starts
+    assert all(f'Starting point: {label}; a=' in line for line in starts)

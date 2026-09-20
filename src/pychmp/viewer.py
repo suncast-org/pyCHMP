@@ -1493,6 +1493,9 @@ class PychmpViewApp:
                 if self._is_closing or int(self._initial_reload_token) != token:
                     return
                 self._initial_reload_in_progress = False
+                if (requested_slice_key, requested_search_id) != (self._selected_slice_key(), self._selected_search_id()):
+                    self._schedule_payload_reload()
+                    return
                 if error is not None:
                     if isinstance(error, FileNotFoundError):
                         self.status_var.set(
@@ -2618,6 +2621,7 @@ class PychmpViewApp:
         requested_slice_key: str | None,
         requested_search_id: str | None,
     ) -> None:
+        self._capture_free_grid_selection_coords()
         cache_key = (str(requested_slice_key or ""), str(requested_search_id or ""))
         selected_cache_key = (
             str(payload.get("selected_slice_key", "") or ""),
@@ -2634,6 +2638,8 @@ class PychmpViewApp:
         self.run_target_metric = str(self.payload.get("target_metric", "chi2"))
         self._refresh_shared_heatmap_extents()
         self._last_payload_reload_at_s = float(time.time())
+        if self._navigation_mode() == "free":
+            self._restore_free_grid_selection_from_coords()
         self._pin_slice_psf_kernel()
 
     def _point_is_saved(self, a_index: int, b_index: int) -> bool:
@@ -2757,6 +2763,7 @@ class PychmpViewApp:
             self._apply_best_navigation(force_reanchor=True)
         self._navigation_mode_user_chosen = True
         if requested == "free":
+            self._open_session_prefers_active = False
             self._anchor_free_selection_to_current_indices()
             self._stale_active_notice = ""
         self._refresh_navigation_control_states()
@@ -4441,7 +4448,7 @@ class PychmpViewApp:
             self._preferred_initial_metric = None
             return
 
-        if not getattr(self, "_open_session_prefers_active", False):
+        if not getattr(self, "_open_session_prefers_active", False) and not getattr(self, "_navigation_mode_user_chosen", False):
             saved_mode = str(state.get("navigation_mode", "") or "").strip().lower()
             if saved_mode == "active" and not self._active_navigation_mode_available():
                 saved_mode = "best" if self._best_navigation_available() else "free"
@@ -4540,6 +4547,12 @@ class PychmpViewApp:
         return f"{search_id}{suffix}"
 
     def _refresh_search_controls(self) -> None:
+        # A user-selected slice may still be loading. Its search selector must
+        # not be repopulated from the previous slice's search catalog.
+        loaded_slice = str(self.payload.get("selected_slice_key", "") or "").strip()
+        selected_slice = str(self._selected_slice_key() or "").strip()
+        if loaded_slice and selected_slice and loaded_slice != selected_slice:
+            return
         records = list(getattr(self, "available_searches", []) or [])
         labels = [self._search_label(record) for record in records]
         ids = [str(record.get("search_id", "")) for record in records]
@@ -4926,6 +4939,7 @@ class PychmpViewApp:
         self._payload_reload_in_progress = True
         self._payload_reload_token += 1
         token = int(self._payload_reload_token)
+        selection_at_start = (slice_key or self._selected_slice_key(), search_id or self._selected_search_id())
         try:
             artifact_path = Path(self.artifact_h5).expanduser().resolve()
         except Exception:
@@ -4954,7 +4968,11 @@ class PychmpViewApp:
                 if int(self._payload_reload_token) != token:
                     return
                 self._payload_reload_in_progress = False
-                if error is not None:
+                selection_unchanged = selection_at_start == (self._selected_slice_key(), self._selected_search_id())
+                artifact_unchanged = self.artifact_h5 is not None and Path(self.artifact_h5).expanduser().resolve() == artifact_path
+                if not selection_unchanged or not artifact_unchanged:
+                    pass  # Discard obsolete results; the latest queued load runs below.
+                elif error is not None:
                     if on_error is not None:
                         on_error(error)
                 elif payload is not None:
@@ -6586,7 +6604,7 @@ class PychmpViewApp:
                 metric_name,
                 log_scale=log_scale,
             )
-            if status == "missing" or (status == "pending" and not has_metric):
+            if status in {"missing", "pending", "running", "assigned"}:
                 pending_records.append(record)
             elif has_metric:
                 computed_records.append(record)
@@ -6619,17 +6637,8 @@ class PychmpViewApp:
             metric_mappable = mpl_cm.ScalarMappable(norm=heatmap_norm, cmap=cmap)
             metric_mappable.set_array(np.asarray(color_values, dtype=float))
             self.ax_heatmap.add_collection(metric_collection)
-        partial_records = [
-            record
-            for record in computed_records
-            if str(record.get("status", "computed")).strip().lower() == "pending"
-        ]
-        if pending_records or partial_records:
-            outline_records = list(pending_records)
-            for record in partial_records:
-                if record not in outline_records:
-                    outline_records.append(record)
-            pending_patches = [_heatmap_grid_rectangle(record) for record in outline_records]
+        if pending_records:
+            pending_patches = [_heatmap_grid_rectangle(record) for record in pending_records]
             pending_collection = PatchCollection(
                 pending_patches,
                 facecolors="none",
