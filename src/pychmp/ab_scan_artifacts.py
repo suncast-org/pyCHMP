@@ -196,24 +196,37 @@ def is_h5_transient_read_error(exc: BaseException) -> bool:
 
 
 def _open_h5_with_lock_tolerance(path: Path | str, mode: str = "r", *args: Any, **kwargs: Any) -> h5py.File:
+    """Open an HDF5 file, retrying when process-local locking flags disagree.
+
+    Explicit ``locking=False`` / ``True`` both set HDF5's ``ignore_when_disabled``
+    to false. An already-open bare handle (or env / FS default) may use a different
+    ``ignore_when_disabled`` value, which surfaces as
+    ``file locking 'ignore disabled locks' flag values don't match``. Try the
+    common explicit modes, then ``best-effort``, then a bare open that inherits
+    the ambient policy so nested reads match an outer ``h5py.File(...)``.
+    Write and read paths share this policy.
+    """
     if "locking" in kwargs:
         return h5py.File(path, mode, *args, **kwargs)
 
-    text_mode = str(mode)
-    if text_mode in {"r", "r+"}:
-        last_exc: OSError | None = None
-        for locking in (False, True):
-            try:
-                return h5py.File(path, mode, *args, locking=locking, **kwargs)
-            except TypeError:
+    # ``None`` means omit the kwarg (inherit env / match an already-open bare handle).
+    locking_candidates: tuple[Any, ...] = (False, True, "best-effort", None)
+    last_exc: OSError | None = None
+    for locking in locking_candidates:
+        try:
+            if locking is None:
                 return h5py.File(path, mode, *args, **kwargs)
-            except OSError as exc:
-                if _is_h5_locking_flag_mismatch(exc):
-                    last_exc = exc
-                    continue
-                raise
-        if last_exc is not None:
-            raise last_exc
+            return h5py.File(path, mode, *args, locking=locking, **kwargs)
+        except TypeError:
+            # Older h5py without a locking= argument.
+            return h5py.File(path, mode, *args, **kwargs)
+        except OSError as exc:
+            if _is_h5_locking_flag_mismatch(exc):
+                last_exc = exc
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
     return h5py.File(path, mode, *args, **kwargs)
 
 

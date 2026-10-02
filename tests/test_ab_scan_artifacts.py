@@ -154,6 +154,10 @@ def _make_blos_reference() -> tuple[np.ndarray, fits.Header]:
 def test_is_h5_locking_flag_mismatch_detects_h5py_message() -> None:
     exc = OSError("Unable to synchronously open file (file locking flag values don't match)")
     assert _is_h5_locking_flag_mismatch(exc)
+    ignore_disabled = OSError(
+        "Unable to synchronously open file (file locking 'ignore disabled locks' flag values don't match)"
+    )
+    assert _is_h5_locking_flag_mismatch(ignore_disabled)
     assert not _is_h5_locking_flag_mismatch(OSError("No such file"))
 
 
@@ -162,6 +166,10 @@ def test_is_h5_transient_read_error_detects_symbol_table_and_lock_races() -> Non
     assert is_h5_transient_read_error(sym)
     lock = OSError("Unable to synchronously open file (file locking flag values don't match)")
     assert is_h5_transient_read_error(lock)
+    ignore_disabled = OSError(
+        "Unable to synchronously open file (file locking 'ignore disabled locks' flag values don't match)"
+    )
+    assert is_h5_transient_read_error(ignore_disabled)
     assert not is_h5_transient_read_error(ValueError("bad symbol table node signature"))
 
 
