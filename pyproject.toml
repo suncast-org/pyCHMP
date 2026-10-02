@@ -45,6 +45,7 @@ pychmp = "pychmp.cli:main"
 pychmp-view = "pychmp.viewer:main"
 pychmp-rescore = "pychmp.rescore_search:main"
 pychmp-repair-grid-trial-maps = "pychmp.repair_grid_trial_maps:main"
+pychmp-clean-map-store = "pychmp.map_store_cleaner:main"
 
 [project.urls]
 Homepage = "https://github.com/suncast-org/pyCHMP"
