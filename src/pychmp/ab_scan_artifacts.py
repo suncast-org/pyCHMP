@@ -225,9 +225,8 @@ def _open_h5_with_lock_tolerance(path: Path | str, mode: str = "r", *args: Any, 
                 last_exc = exc
                 continue
             raise
-    if last_exc is not None:
-        raise last_exc
-    return h5py.File(path, mode, *args, **kwargs)
+    assert last_exc is not None  # candidates either return or record a mismatch
+    raise last_exc
 
 
 _H5PY_FILE = _open_h5_with_lock_tolerance

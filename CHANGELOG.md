@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- HDF5 artifact opens retry locking modes (False/True/`best-effort`/bare) when process-local
+  lock-flag mismatches occur, including nested opens against an already-open bare handle.
 - Ordinary restart / warm-start paths preserve finished search work: a matching completed
   search early-exits instead of silently rewriting or rescoring (bypass via recompute,
   expand, new identity, or `--retry-failed`).

@@ -54,7 +54,11 @@ from pychmp.ab_scan_artifacts import (
     write_point_scan_artifact,
 )
 from pychmp import ab_scan_artifacts
-from pychmp.ab_scan_artifacts import _is_h5_locking_flag_mismatch, is_h5_transient_read_error
+from pychmp.ab_scan_artifacts import (
+    _is_h5_locking_flag_mismatch,
+    _open_h5_with_lock_tolerance,
+    is_h5_transient_read_error,
+)
 from pychmp.search_contract import build_search_evaluation_config
 
 
@@ -171,6 +175,20 @@ def test_is_h5_transient_read_error_detects_symbol_table_and_lock_races() -> Non
     )
     assert is_h5_transient_read_error(ignore_disabled)
     assert not is_h5_transient_read_error(ValueError("bad symbol table node signature"))
+
+
+def test_open_h5_with_lock_tolerance_succeeds_with_bare_outer_handle(tmp_path: Path) -> None:
+    """Nested open must succeed when an outer bare ``h5py.File`` is already held."""
+    path = tmp_path / "nested_open.h5"
+    with h5py.File(path, "w") as created:
+        created.create_dataset("probe", data=[1])
+    with h5py.File(path, "r") as _outer:
+        inner = _open_h5_with_lock_tolerance(path, "r")
+        try:
+            assert "probe" in inner
+            assert list(inner["probe"][...]) == [1]
+        finally:
+            inner.close()
 
 
 def test_active_point_snapshot_round_trip(tmp_path: Path) -> None:
