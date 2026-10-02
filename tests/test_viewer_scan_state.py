@@ -217,6 +217,73 @@ def test_in_progress_search_without_live_runner_reports_incomplete(tmp_path: Pat
     assert "Live runner: no" in info_detail
 
 
+def test_stale_completed_at_before_started_does_not_report_finished(tmp_path: Path) -> None:
+    """Regression: green FINISHED with in_progress + stale completed_at (Sep 21 followup)."""
+
+    app = _make_app(tmp_path, phase="adaptive search failed", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": False,
+            "lifecycle": {
+                "started_at": "2026-09-21T13:48:26Z",
+                "completed_at": "2026-09-20T20:10:23Z",
+                "active": False,
+                "in_progress": True,
+            },
+        },
+        "selected_search_id": "search_72b4da2f13369cc9",
+        "selected_slice_key": "euv_94",
+        "selected_slice": {"key": "euv_94", "label": "EUV: 94 A", "domain": "euv"},
+        "a_values": [0.0],
+        "b_values": [2.4],
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.0, "b": 2.4},
+        },
+    }
+    app.a_values = np.asarray([0.0], dtype=float)
+    app.b_values = np.asarray([2.4], dtype=float)
+    app._runner_pid_from_log = lambda: None
+    app._process_is_running = lambda _pid: False
+
+    badge, toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INTERRUPTED"
+    assert badge != "FINISHED"
+    assert "0/1 computed" in toolbar_detail
+    assert "Search status: in_progress" in info_detail
+    assert "Search active marker: no" in info_detail
+    assert "Search completed: 2026-09-20T20:10:23Z" in info_detail
+    assert "Last phase: adaptive search failed" in info_detail
+
+
+def test_inactive_marker_alone_does_not_imply_finished(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": False,
+            "lifecycle": {
+                "started_at": "2026-09-21T13:48:26Z",
+                "active": False,
+                "in_progress": True,
+            },
+        },
+        "selected_search_id": "search_incomplete",
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.3, "b": 2.7},
+        },
+    }
+    app._runner_pid_from_log = lambda: None
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INCOMPLETE"
+    assert "Search active marker: no" in info_detail
+
+
 def test_fresh_scan_complete_refresh_does_not_report_running(tmp_path: Path) -> None:
     app = _make_app(tmp_path, phase="scan complete", refresh_active=True)
     app.payload = {

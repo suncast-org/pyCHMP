@@ -2312,13 +2312,36 @@ def _iter_slice_search_lifecycles(h5_path: Path) -> list[tuple[str, str, dict[st
     return records
 
 
+def search_lifecycle_completed_at_is_authoritative(lifecycle: dict[str, Any] | None) -> bool:
+    """True when ``completed_at`` belongs to this search, not a stale prior run.
+
+    Prefer explicit ``status``. Ignore ``completed_at`` that is earlier than
+    ``started_at`` (common when a resume reuses slice-common timestamps).
+    """
+    data = dict(lifecycle or {})
+    status = str(data.get("status", "") or "").strip().lower()
+    if status in {"in_progress", "running", "indexing", "pending", "failed", "aborted", "interrupted"}:
+        return False
+    if status in {"complete", "completed"}:
+        return True
+    completed_at = str(data.get("completed_at") or "").strip()
+    if not completed_at:
+        return False
+    started_at = str(data.get("started_at") or "").strip()
+    if started_at and completed_at < started_at:
+        return False
+    return True
+
+
 def search_lifecycle_is_in_progress(lifecycle: dict[str, Any] | None) -> bool:
     """True only for searches that are genuinely running, not stale active flags."""
     data = dict(lifecycle or {})
     status = str(data.get("status", "") or "").strip().lower()
     if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
         return False
-    if str(data.get("completed_at") or "").strip():
+    if status in {"in_progress", "running", "indexing"}:
+        return True
+    if search_lifecycle_completed_at_is_authoritative(data):
         return False
     if bool(data.get("in_progress", False)):
         return True

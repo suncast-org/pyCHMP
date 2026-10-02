@@ -1867,31 +1867,72 @@ class PychmpViewApp:
             return False
         if text in {"scan complete", "complete"}:
             return True
-        return text in {
+        return self._refresh_phase_indicates_failure(text)
+
+    def _refresh_phase_indicates_failure(self, phase: str | None = None) -> bool:
+        text = str(phase if phase is not None else getattr(self, "_refresh_signal_phase", "") or "").strip().lower()
+        if not text:
+            return False
+        if text in {
             "scan interrupted",
             "interrupted",
             "scan aborted",
             "aborted",
             "scan failed",
             "failed",
-        }
+        }:
+            return True
+        return any(token in text for token in ("failed", "interrupted", "aborted"))
 
     def _refresh_event_is_terminal(self, event: str | None = None) -> bool:
         name = str(event if event is not None else getattr(self, "_refresh_signal_event", "") or "").strip().lower()
         return name in {"search_completed", "search_failed"}
 
+    def _selected_search_lifecycle_dict(self) -> dict[str, Any]:
+        payload = getattr(self, "payload", None) or {}
+        selected = dict(payload.get("selected_search") or {})
+        lifecycle = dict(selected.get("lifecycle") or {})
+        status = str(selected.get("status", lifecycle.get("status", "")) or "").strip()
+        if status:
+            lifecycle["status"] = status
+        if "in_progress" in selected:
+            lifecycle["in_progress"] = bool(selected.get("in_progress"))
+        if "active" in selected:
+            lifecycle["active"] = bool(selected.get("active"))
+        return lifecycle
+
+    def _selected_search_is_successfully_complete(self) -> bool:
+        """True only for the selected search's own successful completion.
+
+        Does not inherit a stale ``completed_at`` from a prior run, and does not
+        treat an inactive marker alone as success.
+        """
+        from .ab_scan_artifacts import search_lifecycle_completed_at_is_authoritative
+
+        lifecycle = self._selected_search_lifecycle_dict()
+        status = str(lifecycle.get("status", "") or "").strip().lower()
+        if status in {"complete", "completed"}:
+            return True
+        if status in {"in_progress", "running", "indexing", "pending", "failed", "aborted", "interrupted"}:
+            return False
+        return search_lifecycle_completed_at_is_authoritative(lifecycle)
+
+    def _selected_search_is_failed_or_interrupted(self) -> bool:
+        lifecycle = self._selected_search_lifecycle_dict()
+        status = str(lifecycle.get("status", "") or "").strip().lower()
+        return status in {"failed", "aborted", "interrupted"}
+
     def _search_run_terminal(self) -> bool:
         if self._refresh_event_is_terminal() or self._refresh_phase_is_terminal():
             return True
-        payload = getattr(self, "payload", None) or {}
-        if payload:
-            selected = dict(payload.get("selected_search") or {})
-            lifecycle = dict(selected.get("lifecycle") or {})
-            status = str(selected.get("status", "") or "").strip().lower()
-            if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
-                return True
-            if str(lifecycle.get("completed_at") or "").strip():
-                return True
+        lifecycle = self._selected_search_lifecycle_dict()
+        status = str(lifecycle.get("status", "") or "").strip().lower()
+        if status in {"complete", "completed", "failed", "aborted", "interrupted"}:
+            return True
+        from .ab_scan_artifacts import search_lifecycle_completed_at_is_authoritative
+
+        if search_lifecycle_completed_at_is_authoritative(lifecycle):
+            return True
         pid = self._runner_pid_from_log()
         if pid is not None and self._process_is_running(pid):
             return False
@@ -2917,14 +2958,7 @@ class PychmpViewApp:
 
         phase = str(self._refresh_signal_phase or "").strip().lower()
         phase_complete = phase in {"scan complete", "complete"}
-        phase_aborted = phase in {
-            "scan interrupted",
-            "interrupted",
-            "scan aborted",
-            "aborted",
-            "scan failed",
-            "failed",
-        }
+        phase_aborted = self._refresh_phase_indicates_failure(phase)
         heartbeat_slice_key = str(getattr(self, "_refresh_signal_slice_key", None) or "").strip()
         heartbeat_search_id = str(getattr(self, "_refresh_signal_search_id", None) or "").strip()
         matches_slice, matches_search = self._heartbeat_matches_selection(
@@ -2934,7 +2968,8 @@ class PychmpViewApp:
         scoped_refresh_active = refresh_active and matches_slice
         scoped_phase_complete = phase_complete and matches_slice
         artifact_live_active = self._heartbeat_activity_present() and matches_slice and matches_search
-        search_completed = (search_status == "complete") or bool(completed_at)
+        search_completed = self._selected_search_is_successfully_complete()
+        search_failed = self._selected_search_is_failed_or_interrupted()
         runner_active = self._runner_targets_selection(
             selected_slice_key=selected_slice_key,
             selected_search_id=selected_search_id,
@@ -2949,15 +2984,19 @@ class PychmpViewApp:
             or (adaptive_point_run and scoped_refresh_active and not scoped_phase_complete)
         ):
             if self._search_run_terminal():
-                badge = "FINISHED"
-                color = "#2b8a3e"
+                if search_failed or phase_aborted:
+                    badge = "INTERRUPTED"
+                    color = "#c92a2a"
+                else:
+                    badge = "FINISHED"
+                    color = "#2b8a3e"
             else:
                 badge = "RUNNING"
                 color = "#0b7285"
         elif scoped_phase_complete or (search_completed and not runner_active):
             badge = "FINISHED"
             color = "#2b8a3e"
-        elif phase_aborted:
+        elif phase_aborted or search_failed:
             badge = "INTERRUPTED"
             color = "#c92a2a"
         elif not search_completed:
