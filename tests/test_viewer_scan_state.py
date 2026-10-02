@@ -284,6 +284,61 @@ def test_inactive_marker_alone_does_not_imply_finished(tmp_path: Path) -> None:
     assert "Search active marker: no" in info_detail
 
 
+def test_badge_reports_running_while_runner_pid_alive(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="point 1 saved", refresh_active=False)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": True,
+            "lifecycle": {"active": True, "in_progress": True, "started_at": "2026-10-02T12:00:00Z"},
+        },
+        "selected_search_id": "search_live",
+        "selected_slice_key": "mw_2p873584ghz",
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.3, "b": 2.7},
+        },
+    }
+    app._refresh_signal_slice_key = "mw_2p873584ghz"
+    app._refresh_signal_search_id = "search_live"
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: True
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "RUNNING"
+    assert "Live runner: yes" in info_detail
+
+
+def test_badge_reports_incomplete_after_runner_pid_gone_despite_fresh_heartbeat(tmp_path: Path) -> None:
+    app = _make_app(tmp_path, phase="point 1 saved", refresh_active=True)
+    app.payload = {
+        **dict(app.payload),
+        "selected_search": {
+            "status": "in_progress",
+            "active": True,
+            "lifecycle": {"active": True, "in_progress": True, "started_at": "2026-10-02T12:00:00Z"},
+        },
+        "selected_search_id": "search_dead",
+        "selected_slice_key": "mw_2p873584ghz",
+        "points": {
+            (0, 0): {"status": "pending", "a": 0.3, "b": 2.7},
+        },
+    }
+    app._refresh_signal_slice_key = "mw_2p873584ghz"
+    app._refresh_signal_search_id = "search_dead"
+    app._refresh_signal_active_point = (0.3, 2.7)
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: False
+
+    assert app._live_runner_detected() is False
+
+    badge, _toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INCOMPLETE"
+    assert "Live runner: no" in info_detail
+
+
 def test_fresh_scan_complete_refresh_does_not_report_running(tmp_path: Path) -> None:
     app = _make_app(tmp_path, phase="scan complete", refresh_active=True)
     app.payload = {

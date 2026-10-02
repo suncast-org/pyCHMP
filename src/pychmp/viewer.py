@@ -1994,10 +1994,24 @@ class PychmpViewApp:
         lifecycle = dict(selected.get("lifecycle") or {})
         return bool(selected.get("active", lifecycle.get("active", False)))
 
-    def _live_runner_detected(self) -> bool:
+    def _runner_pid_alive_state(self) -> str:
+        """Return ``alive``, ``dead``, or ``unknown`` for the artifact log PID."""
         pid = self._runner_pid_from_log()
-        if pid is not None and self._process_is_running(pid):
+        if pid is None:
+            return "unknown"
+        return "alive" if self._process_is_running(pid) else "dead"
+
+    def _live_runner_detected(self) -> bool:
+        """True while the search process is alive, or heartbeat-only if PID unknown.
+
+        A known-dead PID never counts as live, even if a stale refresh file remains.
+        Incomplete/Interrupted badges apply only after the process is gone.
+        """
+        state = self._runner_pid_alive_state()
+        if state == "alive":
             return True
+        if state == "dead":
+            return False
         if self._refresh_signal_is_fresh() and not self._search_run_terminal():
             return True
         return False
@@ -2916,8 +2930,12 @@ class PychmpViewApp:
             )
             artifact_live = self._heartbeat_activity_present() and matches_slice and matches_search
             runner_active = self._runner_targets_selection(selected_slice_key=selected_slice_key)
+            pid_dead = self._runner_pid_alive_state() == "dead"
+            heartbeat_running = (not pid_dead) and (
+                artifact_live or (adaptive_point_run and refresh_active and matches_slice)
+            )
 
-            if runner_active or artifact_live or (adaptive_point_run and refresh_active and matches_slice):
+            if runner_active or heartbeat_running:
                 badge = "RUNNING"
                 color = "#0b7285"
             elif artifact_live or search_active_flag:
@@ -2976,13 +2994,13 @@ class PychmpViewApp:
         )
         live_runner = runner_active and (artifact_live_active or self._heartbeat_activity_present())
         cross_slice_runner = self._live_runner_detected() and not matches_slice
-
-        if (
-            runner_active
-            or artifact_live_active
-            or cross_slice_runner
+        pid_dead = self._runner_pid_alive_state() == "dead"
+        heartbeat_running = (not pid_dead) and (
+            artifact_live_active
             or (adaptive_point_run and scoped_refresh_active and not scoped_phase_complete)
-        ):
+        )
+
+        if runner_active or heartbeat_running or cross_slice_runner:
             if self._search_run_terminal():
                 if search_failed or phase_aborted:
                     badge = "INTERRUPTED"
