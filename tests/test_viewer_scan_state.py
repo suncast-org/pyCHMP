@@ -4747,6 +4747,74 @@ def test_unvisited_store_dots_read_off_the_ui_thread(monkeypatch) -> None:
     assert queries == [0]
 
 
+def test_stored_map_dots_ignore_stale_apply_after_artifact_switch(monkeypatch) -> None:
+    """Path A finishing after B opens must not paint A's dots."""
+    import threading
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(True)
+    path_a = str(app.artifact_h5)
+    path_b = "/tmp/other-store-dots.h5"
+    painted: list[str] = []
+    started_a = threading.Event()
+    release_a = threading.Event()
+
+    def _indexed(path, slice_key="", after_row=0):
+        del slice_key, after_row
+        key = str(path)
+        if key == path_a:
+            started_a.set()
+            assert release_a.wait(2.0)
+            return {(9.0, 9.0)}, 1
+        return {(1.0, 2.0)}, 1
+
+    class _Root:
+        def __init__(self) -> None:
+            self.callbacks: list = []
+
+        def after(self, _delay: int, callback) -> None:
+            self.callbacks.append(callback)
+
+    app.root = _Root()
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _indexed)
+
+    # Start async fill for artifact A.
+    assert app._cached_unvisited_store_tokens(Path(path_a)) == set()
+    assert started_a.wait(2.0)
+    assert app._unvisited_store_dot_load_key == path_a
+
+    # Open B: clear cache/load key the same way ``_reload_payload`` does on path switch.
+    app.artifact_h5 = Path(path_b)
+    app._unvisited_store_dot_cache = {}
+    app._unvisited_store_dot_load_key = None
+
+    release_a.set()
+    deadline = time.time() + 2.0
+    while not app.root.callbacks and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(app.root.callbacks) == 1
+
+    app._draw_heatmap = lambda: painted.append(str(app._unvisited_store_dot_cache.get("path")))
+
+    # Stale A apply must drop: no cache write, no redraw of A's dots.
+    app.root.callbacks[0]()
+    assert app._unvisited_store_dot_load_key is None
+    assert app._unvisited_store_dot_cache == {}
+    assert painted == []
+
+    # Fresh B fill still works after the discarded A result.
+    app.root.callbacks.clear()
+    assert app._cached_unvisited_store_tokens(Path(path_b)) == set()
+    deadline = time.time() + 2.0
+    while not app.root.callbacks and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(app.root.callbacks) == 1
+    app.root.callbacks[0]()
+    assert app._unvisited_store_dot_cache.get("path") == path_b
+    assert app._unvisited_store_dot_cache.get("points") == {(1.0, 2.0)}
+    assert painted == [path_b]
+
+
 def test_refresh_controls_does_not_restore_previous_slice_search_while_loading() -> None:
     app = object.__new__(PychmpViewApp)
     app.payload = {'selected_slice_key': 'euv_193', 'selected_search_id': 'active'}

@@ -340,10 +340,10 @@ As of the ``design/moddir-compatible-map-store`` branch:
   (last register wins). Do not claim modDir parity until hash-aware lookup lands.
 
 
-Immediate Next Step
--------------------
+Remaining plan work (not started here)
+--------------------------------------
 
-Before implementation, inspect the current pyCHMP map-store writer, reader,
-warm-start, and Q0 scoring paths and map them onto this plan. The first code
-change should be a failing regression test for channel contamination, followed
-by the smallest identity guard that makes that test pass on the clean branch.
+Provenance-checked warm/index lookup (Phases 2–4), wiring or documenting
+``bind_legacy_search_responses``, and the Phase 6 repair/migration CLI remain
+open. Channel fail-closed (Phase 1) and provenance *write* paths are already on
+this branch; see “Current implementation status” above.

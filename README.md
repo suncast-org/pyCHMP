@@ -132,7 +132,7 @@ act as an audit log of failed or abandoned attempts.
 
 Practical interpretation:
 
-- same target + same compatible signature + default (no flags): resume
+- same target + same compatible signature + default (no flags): resume (a matching finished search early-exits; use recompute / expand / new identity / `--retry-failed` to bypass)
 - same target + same compatible signature + `--recompute-existing`: same search
    id, fresh grid, map_store warm start
 - same target + same compatible signature + `--new-search-identity`: parallel

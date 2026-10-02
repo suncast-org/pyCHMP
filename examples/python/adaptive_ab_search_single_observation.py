@@ -5537,6 +5537,29 @@ def _resolve_geometry_request_flags(args: argparse.Namespace) -> tuple[bool, boo
     return geometry_overrides_requested, explicit_observer_requested
 
 
+def _resolve_persisted_euv_response_identity(
+    prebuilt_euv_response: Any,
+    *,
+    response_adapter: Any | None = None,
+) -> Any:
+    """Resolve EUV response identity after load-or-save.
+
+    Loaded-from-artifact paths never construct ``response_adapter``. Prefer an
+    attached ``response_identity`` and only fall back to the adapter when one
+    was built in this process; otherwise raise explicitly instead of NameError.
+    """
+    if prebuilt_euv_response is None:
+        raise RuntimeError("Unable to resolve EUV response for persistence; search not started")
+    identity = getattr(prebuilt_euv_response, "response_identity", None)
+    if identity is not None:
+        return identity
+    if response_adapter is None:
+        raise RuntimeError(
+            "Loaded EUV response has no response_identity and no adapter was constructed"
+        )
+    return response_adapter.response_identity()
+
+
 def main() -> int:
     args = _parse_args()
     recompute_search_id = _configure_targeted_recompute_search(args)
@@ -6198,17 +6221,10 @@ def main() -> int:
                     prebuilt_euv_response = reloaded
         else:
             print("  EUV response: loaded arrays from artifact (no response provider/network call)", flush=True)
-        if prebuilt_euv_response is None:
-            raise RuntimeError("Unable to resolve EUV response for persistence; search not started")
-        euv_response_identity = getattr(prebuilt_euv_response, "response_identity", None)
-        if euv_response_identity is None:
-            # Loaded-from-artifact path never constructs response_adapter; do not NameError.
-            adapter = locals().get("response_adapter")
-            if adapter is None:
-                raise RuntimeError(
-                    "Loaded EUV response has no response_identity and no adapter was constructed"
-                )
-            euv_response_identity = adapter.response_identity()
+        euv_response_identity = _resolve_persisted_euv_response_identity(
+            prebuilt_euv_response,
+            response_adapter=locals().get("response_adapter"),
+        )
         euv_response_identity_version = str(euv_response_identity.version)
         euv_response_sha256 = str(euv_response_identity.sha256)
         euv_response_identity_summary = dict(euv_response_identity.summary)

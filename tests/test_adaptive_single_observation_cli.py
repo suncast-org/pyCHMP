@@ -2313,6 +2313,49 @@ def test_completed_resume_requires_same_walk_and_finished_points(tmp_path, chang
                                        diagnostics=diagnostics) == (change is None)
 
 
+def test_resolve_persisted_euv_response_identity_raises_without_identity_or_adapter() -> None:
+    from examples.python.adaptive_ab_search_single_observation import (
+        _resolve_persisted_euv_response_identity,
+    )
+
+    loaded = SimpleNamespace()  # no response_identity attribute
+    with pytest.raises(RuntimeError, match="no response_identity and no adapter"):
+        _resolve_persisted_euv_response_identity(loaded, response_adapter=None)
+
+    loaded_none = SimpleNamespace(response_identity=None)
+    with pytest.raises(RuntimeError, match="no response_identity and no adapter"):
+        _resolve_persisted_euv_response_identity(loaded_none)
+
+    with pytest.raises(RuntimeError, match="Unable to resolve EUV response"):
+        _resolve_persisted_euv_response_identity(None)
+
+
+def test_resolve_persisted_euv_response_identity_uses_attr_or_adapter() -> None:
+    from examples.python.adaptive_ab_search_single_observation import (
+        _resolve_persisted_euv_response_identity,
+    )
+
+    attached = SimpleNamespace(version="v-attached", sha256="aa", summary={"source": "sav"})
+    assert (
+        _resolve_persisted_euv_response_identity(SimpleNamespace(response_identity=attached))
+        is attached
+    )
+
+    from_adapter = SimpleNamespace(version="v-adapter", sha256="bb", summary={"source": "dyn"})
+
+    class _Adapter:
+        def response_identity(self):
+            return from_adapter
+
+    assert (
+        _resolve_persisted_euv_response_identity(
+            SimpleNamespace(response_identity=None),
+            response_adapter=_Adapter(),
+        )
+        is from_adapter
+    )
+
+
 def test_matching_resume_preload_does_not_promote_or_rescore_maps():
     class Cache:
         _preserve_stored_search_trials = True
