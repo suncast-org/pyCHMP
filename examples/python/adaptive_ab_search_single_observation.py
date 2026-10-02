@@ -6193,12 +6193,22 @@ def main() -> int:
             prebuilt_euv_response = canonical_response(prebuilt_euv_response)
             if artifact_h5.exists():
                 save_response(artifact_h5, response_store_request, prebuilt_euv_response)
-                prebuilt_euv_response = load_response(artifact_h5, response_store_request)
+                reloaded = load_response(artifact_h5, response_store_request)
+                if reloaded is not None:
+                    prebuilt_euv_response = reloaded
         else:
             print("  EUV response: loaded arrays from artifact (no response provider/network call)", flush=True)
-        euv_response_identity = prebuilt_euv_response.response_identity
+        if prebuilt_euv_response is None:
+            raise RuntimeError("Unable to resolve EUV response for persistence; search not started")
+        euv_response_identity = getattr(prebuilt_euv_response, "response_identity", None)
         if euv_response_identity is None:
-            euv_response_identity = response_adapter.response_identity()
+            # Loaded-from-artifact path never constructs response_adapter; do not NameError.
+            adapter = locals().get("response_adapter")
+            if adapter is None:
+                raise RuntimeError(
+                    "Loaded EUV response has no response_identity and no adapter was constructed"
+                )
+            euv_response_identity = adapter.response_identity()
         euv_response_identity_version = str(euv_response_identity.version)
         euv_response_sha256 = str(euv_response_identity.sha256)
         euv_response_identity_summary = dict(euv_response_identity.summary)

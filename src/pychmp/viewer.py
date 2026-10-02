@@ -3844,8 +3844,10 @@ class PychmpViewApp:
                 filled = None
 
             def _apply() -> None:
-                if getattr(self, "_unvisited_store_dot_load_key", None) == path:
-                    self._unvisited_store_dot_load_key = None
+                # Stale worker (artifact switched while load was in flight): drop result.
+                if getattr(self, "_unvisited_store_dot_load_key", None) != path:
+                    return
+                self._unvisited_store_dot_load_key = None
                 if filled is not None:
                     self._unvisited_store_dot_cache = filled
                 if not self._use_unvisited_store_dots():
@@ -4801,6 +4803,8 @@ class PychmpViewApp:
                 self._navigation_mode_user_chosen = False
                 self._open_global_best_applied = False
                 self._stale_active_notice = ""
+                self._unvisited_store_dot_cache = {}
+                self._unvisited_store_dot_load_key = None
             try:
                 self.artifact_h5 = resolved_path
             except Exception:
@@ -4831,6 +4835,8 @@ class PychmpViewApp:
             self._live_snapshot_cache_value = None
             self._selected_trial_map_cache_key = None
             self._selected_trial_map_cache_value = None
+            self._unvisited_store_dot_cache = {}
+            self._unvisited_store_dot_load_key = None
             self._navigation_mode_initialized = False
             self._navigation_mode_user_chosen = False
             self._open_global_best_applied = False
@@ -4863,6 +4869,8 @@ class PychmpViewApp:
             self._live_snapshot_cache_value = None
             self._selected_trial_map_cache_key = None
             self._selected_trial_map_cache_value = None
+            self._unvisited_store_dot_cache = {}
+            self._unvisited_store_dot_load_key = None
         cache_key = (str(requested_slice_key or ""), str(requested_search_id or ""))
         cached_payload = self._payload_cache_by_selection.get(cache_key)
         if cached_payload is not None and requested_search_id:
