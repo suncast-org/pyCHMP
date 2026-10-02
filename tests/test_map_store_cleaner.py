@@ -118,3 +118,78 @@ def test_cli_defaults_to_dry_run(tmp_path: Path, capsys) -> None:
     assert "Re-run with --delete" in out
     with h5py.File(path, "r") as handle:
         assert "orphan_map" in handle["map_store/maps"]
+
+
+def _seed_multi_search_artifact(path: Path) -> None:
+    """Two searches share one slice; each visits a distinct store map + one orphan."""
+    with h5py.File(path, "w") as handle:
+        maps = handle.create_group("map_store/maps")
+        _write_map(maps, "a_map", a=0.1, b=1.0)
+        _write_map(maps, "b_map", a=0.5, b=1.5)
+        _write_map(maps, "orphan_map", a=0.9, b=2.0)
+        _write_slice_index_rows(
+            handle,
+            [
+                ("euv_171", 0.1, 1.0, 1e-3, "a_map", "stokes_i"),
+                ("euv_171", 0.5, 1.5, 1e-3, "b_map", "stokes_i"),
+                ("euv_171", 0.9, 2.0, 1e-3, "orphan_map", "stokes_i"),
+            ],
+        )
+        search_a = handle.create_group("slices/euv_171/searches/search_a")
+        _write_grid_point(search_a, "p000000", a=0.1, b=1.0)
+        search_b = handle.create_group("slices/euv_171/searches/search_b")
+        _write_grid_point(search_b, "p000000", a=0.5, b=1.5)
+
+
+def test_report_with_search_id_filter_still_uses_global_visited(tmp_path: Path) -> None:
+    path = tmp_path / "artifact.h5"
+    _seed_multi_search_artifact(path)
+
+    report = report_unvisited_map_store_points(path, search_id="search_a")
+
+    assert [item.search_id for item in report.per_search] == ["search_a"]
+    assert report.per_search[0].unvisited_store_ab_count == 2  # b_map + orphan vs search_a only
+    # Orphans must not include b_map — search_b visited it.
+    assert report.visited_ab_count == 2
+    assert report.orphan_ab_count == 1
+    assert report.orphan_map_keys == ["orphan_map"]
+
+
+def test_delete_with_search_id_filter_preserves_other_search_maps(tmp_path: Path) -> None:
+    """Regression: scoped --delete must not wipe maps another search still uses."""
+    path = tmp_path / "artifact.h5"
+    _seed_multi_search_artifact(path)
+
+    report = clean_unvisited_map_store_points(path, search_id="search_a", delete=True)
+
+    assert report.dry_run is False
+    assert report.deleted_map_keys == ["orphan_map"]
+    assert report.deleted_map_count == 1
+    with h5py.File(path, "r") as handle:
+        assert set(handle["map_store/maps"].keys()) == {"a_map", "b_map"}
+        index = handle["map_store"][MAP_STORE_SLICE_INDEX_GROUP]
+        keys = [str(v) if not isinstance(v, bytes) else v.decode() for v in index["map_key"][()]]
+        assert set(keys) == {"a_map", "b_map"}
+
+
+def test_delete_with_slice_key_filter_preserves_other_search_maps(tmp_path: Path) -> None:
+    path = tmp_path / "artifact.h5"
+    _seed_multi_search_artifact(path)
+    # Add a second slice with its own visited map so slice filter is meaningful for reporting.
+    with h5py.File(path, "a") as handle:
+        maps = handle["map_store/maps"]
+        _write_map(maps, "other_slice_map", a=0.2, b=0.3)
+        search_other = handle.create_group("slices/euv_94/searches/search_other")
+        _write_grid_point(search_other, "p000000", a=0.2, b=0.3)
+
+    report = clean_unvisited_map_store_points(path, slice_key="euv_171", delete=True)
+
+    assert "orphan_map" in report.deleted_map_keys
+    assert "b_map" not in report.deleted_map_keys
+    assert "other_slice_map" not in report.deleted_map_keys
+    with h5py.File(path, "r") as handle:
+        remaining = set(handle["map_store/maps"].keys())
+        assert "a_map" in remaining
+        assert "b_map" in remaining
+        assert "other_slice_map" in remaining
+        assert "orphan_map" not in remaining

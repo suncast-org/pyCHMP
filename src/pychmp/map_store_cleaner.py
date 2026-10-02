@@ -203,7 +203,13 @@ def report_unvisited_map_store_points(
     slice_key: str | None = None,
     search_id: str | None = None,
 ) -> MapStoreCleanerReport:
-    """Report map_store (a, b) points that searches never visited (dry-run friendly)."""
+    """Report map_store (a, b) points that searches never visited (dry-run friendly).
+
+    ``slice_key`` / ``search_id`` only scope the per-search report section.
+    Orphan detection always unions visited ``(a, b)`` from **all** searches in
+    the artifact so a filtered report cannot mark another search's maps as
+    orphans (and therefore cannot delete them under ``--delete``).
+    """
     path = Path(artifact_h5)
     report = MapStoreCleanerReport(artifact_path=str(path), dry_run=True)
     with _H5PY_FILE(path, "r") as h5_file:
@@ -211,32 +217,32 @@ def report_unvisited_map_store_points(
         store_abs = {_ab_token(a, b) for _key, a, b in entries}
         report.store_ab_count = int(len(store_abs))
 
-        visited_union: set[tuple[float, float]] = set()
-        search_visits: list[tuple[str, str, set[tuple[float, float]]]] = []
-        for sk, sid, search_group in _iter_search_groups(h5_file, slice_key=slice_key, search_id=search_id):
-            visited = _visited_ab_for_search(search_group)
-            visited_union.update(visited)
-            search_visits.append((sk, sid, visited))
-
-        # When filtering to one search, still gather global visited for orphan safety
-        # unless the caller also scoped the slice. Orphans always use the full union
-        # of matching searches in this pass.
-        report.visited_ab_count = int(len(visited_union))
+        # Global visited union: every search, regardless of CLI filters.
+        # Orphan / delete decisions must use this set so scoped filters cannot
+        # destroy maps still referenced by another search.
+        global_visited: set[tuple[float, float]] = set()
+        for _sk, _sid, search_group in _iter_search_groups(h5_file):
+            global_visited.update(_visited_ab_for_search(search_group))
+        report.visited_ab_count = int(len(global_visited))
 
         orphan_abs = sorted(
-            ab for ab in store_abs if not _point_in_set(ab[0], ab[1], visited_union)
+            ab for ab in store_abs if not _point_in_set(ab[0], ab[1], global_visited)
         )
         report.orphan_abs = orphan_abs
         report.orphan_ab_count = int(len(orphan_abs))
         orphan_keys = [
             key
             for key, a, b in entries
-            if not _point_in_set(a, b, visited_union)
+            if not _point_in_set(a, b, global_visited)
         ]
         report.orphan_map_keys = orphan_keys
         report.orphan_map_count = int(len(orphan_keys))
 
-        for sk, sid, visited in search_visits:
+        # Filters only affect which searches appear in the report detail.
+        for sk, sid, search_group in _iter_search_groups(
+            h5_file, slice_key=slice_key, search_id=search_id
+        ):
+            visited = _visited_ab_for_search(search_group)
             unvisited = sorted(ab for ab in store_abs if not _point_in_set(ab[0], ab[1], visited))
             report.per_search.append(
                 SearchVisitReport(
@@ -261,6 +267,10 @@ def clean_unvisited_map_store_points(
     """Report unvisited map_store points; delete orphans only when ``delete`` is True.
 
     Dry-run is the default: ``delete=False`` never modifies the artifact.
+
+    Orphan deletion always uses the global visited union across all searches
+    (filters only scope per-search reporting). Passing ``--search-id`` /
+    ``--slice-key`` with ``--delete`` cannot remove maps another search visited.
     """
     report = report_unvisited_map_store_points(
         artifact_h5,
@@ -291,14 +301,14 @@ def _print_report(report: MapStoreCleanerReport) -> None:
     print(f"Artifact: {report.artifact_path}")
     print(f"Mode: {'dry-run (report only)' if report.dry_run else 'delete'}")
     print(f"Map-store distinct (a,b): {report.store_ab_count}")
-    print(f"Visited distinct (a,b) across searches: {report.visited_ab_count}")
-    print(f"Orphan (a,b) not visited by any matched search: {report.orphan_ab_count}")
+    print(f"Visited distinct (a,b) across all searches: {report.visited_ab_count}")
+    print(f"Orphan (a,b) not visited by any search: {report.orphan_ab_count}")
     print(f"Orphan map_store entries: {report.orphan_map_count}")
     if report.deleted_map_count:
         print(f"Deleted map_store entries: {report.deleted_map_count}")
     if report.per_search:
         print("")
-        print("Per search:")
+        print("Per search (filters scope this section only; orphans use all searches):")
         for item in report.per_search:
             print(
                 f"  [{item.slice_key}/{item.search_id}] "
@@ -319,16 +329,29 @@ def build_parser() -> argparse.ArgumentParser:
         prog="pychmp-clean-map-store",
         description=(
             "Report map_store (a,b) points that no search grid visited. "
-            "Dry-run by default; pass --delete to remove orphan map entries."
+            "Dry-run by default; pass --delete to remove orphan map entries. "
+            "Orphan detection always unions visited points from all searches; "
+            "--slice-key / --search-id only filter the per-search report."
         ),
     )
     parser.add_argument("artifact_h5", type=Path, help="Unified artifact H5 path")
-    parser.add_argument("--slice-key", default=None, help="Limit to one slice key")
-    parser.add_argument("--search-id", default=None, help="Limit visit accounting to one search id")
+    parser.add_argument(
+        "--slice-key",
+        default=None,
+        help="Limit per-search report to one slice key (orphan/delete still uses all searches)",
+    )
+    parser.add_argument(
+        "--search-id",
+        default=None,
+        help="Limit per-search report to one search id (orphan/delete still uses all searches)",
+    )
     parser.add_argument(
         "--delete",
         action="store_true",
-        help="Delete orphan map_store entries (off by default; dry-run otherwise)",
+        help=(
+            "Delete orphan map_store entries not visited by any search "
+            "(off by default; dry-run otherwise)"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON report")
     return parser
