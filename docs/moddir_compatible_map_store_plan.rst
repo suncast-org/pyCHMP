@@ -324,6 +324,22 @@ Open Questions
   during the debugging session?
 
 
+Current implementation status (known gap)
+-----------------------------------------
+
+As of the ``design/moddir-compatible-map-store`` branch:
+
+- Channel fail-closed for EUV/UV ambiguous identities is implemented and tested
+  (Phase 1 guard against 94↔171 cross-scoring).
+- Structured provenance fields (model / EBTEL / geometry / response / projection
+  hashes and related identity JSON) are **written** onto new map-store products.
+- Warm-start and persisted ``slice_index`` lookup still match primarily on
+  domain/channel + ``(a, b, q0)``. Full provenance-checked “compatible render
+  product” reuse (Phases 2–4) is **not** complete: two maps with the same
+  channel and ``(a, b, q0)`` but different model or response can still collide
+  (last register wins). Do not claim modDir parity until hash-aware lookup lands.
+
+
 Immediate Next Step
 -------------------
 

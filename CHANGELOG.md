@@ -12,6 +12,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - EUV/UV observation loading: external FITS and embedded pyAMPP refmaps are converted
   from exposure-integrated `DN` to `DN s^-1 pix^-1` when `EXPTIME` is available (header
   or refmap `source_path` FITS), matching gxrender modeled-map units.
+- EUV/UV pixel-area normalization before rebinned rate maps (frebin-like area factor) so
+  reprojected observation maps stay in `DN s^-1 pix^-1` after spatial resampling.
+- Persisted `map_store` slice index (`slice_index` v1) so channel-aware `(a,b,q0)` lookups
+  survive artifact reopen without rescanning every map group.
+- Shared EUV response / calibration store with launcher load-or-save (resolve once, reuse
+  from the artifact; avoids repeat provider/network calls on restart).
+- Viewer operator tools: lock Active/Best Q₀ pointer selection; Stored-maps overlay for
+  unvisited map-store `(a,b)` dots on the heatmap.
+- CLI `pychmp-clean-map-store`: report (default) or delete map-store entries whose `(a,b)`
+  was never visited by any search grid. Orphan detection always unions **all** searches;
+  `--slice-key` / `--search-id` only filter the per-search report section.
+- Scan-artifact packaging hooks for area-corrected common observation refs and slice-index
+  append on write.
+
+### Changed
+
+- Ordinary restart / warm-start paths preserve finished search work: a matching completed
+  search early-exits instead of silently rewriting or rescoring (bypass via recompute,
+  expand, new identity, or `--retry-failed`).
+- Viewer status badge: dead search PID beats a stale heartbeat for non-empty grids
+  (INCOMPLETE rather than a false RUNNING/INTERRUPTED path when the process is gone).
+- FINISHED banner requires authoritative successful completion; stale `completed_at` or
+  failed-phase markers no longer paint green FINISHED.
+- Residual display defaults to **O−M** (observation minus model) in the viewer; scoring
+  residuals remain M−O internally.
+- `--lonc-deg` help clarifies gxrender renderer-relative model longitude (not Carrington).
+- EUV/UV map-store entries without a channel identity are fail-closed (not indexed / not
+  reused) to prevent cross-channel contamination (for example 94↔171).
+
+### Known limitations
+
+- Map identity / render-product provenance hashes (`forward_model_sha256`, EBTEL,
+  geometry, response, projection, etc.) are **written** onto new map-store products, but
+  warm-start and slice-index lookup still key primarily on domain/channel + `(a,b,q0)`.
+  Two maps with the same channel/`(a,b,q0)` but different model or response can still
+  collide (last register wins). Channel fail-closed for EUV/UV is in place; full
+  provenance-checked “compatible render product” reuse from
+  `docs/moddir_compatible_map_store_plan.rst` is **not** complete yet — do not claim
+  modDir parity.
+- `bind_legacy_search_responses` is exported and unit-tested but not wired into the
+  launcher (parked).
+- Migrating/repairing ambiguous legacy map-store entries (plan Phase 6) is not shipped.
 
 ## [0.1.0] - 2026-06-04
 
