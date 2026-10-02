@@ -7,7 +7,11 @@ from typing import Any
 
 import numpy as np
 
-from .ab_scan_artifacts import _derive_display_maps_from_raw, _read_map_store_ref_array
+from .ab_scan_artifacts import (
+    _derive_display_maps_from_raw,
+    _read_map_store_ref_array,
+    ensure_slice_common_observation_maps,
+)
 from .chmp_evaluation import ObservationEvaluationContext, evaluate_modeled_trial
 from .gxrender_adapter import recombine_euv_components
 from .grid_points import (
@@ -426,6 +430,28 @@ def initial_evaluations_from_grid_trials(
     return evaluations or None
 
 
+def _prepared_warm_observation_arrays(
+    context: ObservationEvaluationContext,
+    observation_reference: Any | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, Any]:
+    """Return the area-corrected reference already built for this search."""
+    if observation_reference is not None:
+        return (
+            getattr(observation_reference, "observed", None),
+            getattr(observation_reference, "sigma", None),
+            getattr(observation_reference, "observation_canvas", None),
+            getattr(observation_reference, "sigma_canvas", None),
+            getattr(observation_reference, "canvas_header", None),
+        )
+    return (
+        context.observed,
+        context.sigma,
+        context.observation_canvas,
+        context.sigma_canvas,
+        context.canvas_header,
+    )
+
+
 def build_warm_grid_trial_commit_events(
     artifact_h5: Path,
     *,
@@ -444,11 +470,24 @@ def build_warm_grid_trial_commit_events(
     use_emthreshold: bool = True,
     mask_type: str = "union",
     psf_kernel: Any = None,
+    observation_reference: Any | None = None,
 ) -> list[GridTrialCommittedEvent]:
     """Rescore compatible map_store maps and return grid commit events (linked refs, all metrics)."""
     entries = slice_map_index.entries_for_point(float(a_value), float(b_value))
     if not entries:
         return []
+    prepared_observed, prepared_sigma, prepared_canvas, prepared_sigma_canvas, prepared_canvas_header = (
+        _prepared_warm_observation_arrays(context, observation_reference)
+    )
+    ensure_slice_common_observation_maps(
+        artifact_h5,
+        slice_key=str(slice_map_index.slice_key),
+        observed=prepared_observed,
+        sigma_map=prepared_sigma,
+        observation_canvas=prepared_canvas,
+        sigma_canvas=prepared_sigma_canvas,
+        canvas_wcs_header=prepared_canvas_header,
+    )
     scored: list[tuple[float, str | None, np.ndarray | None, bool, Q0MetricEvaluation]] = []
     with _H5PY_FILE(artifact_h5, "r") as h5_file:
         slice_group, _descriptors, _selected_key = _resolve_slice_group(

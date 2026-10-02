@@ -267,3 +267,15 @@ def test_fit_q0_two_stage_clamps_inter_stage_q0_start(monkeypatch: pytest.Monkey
     )
     assert calls == [("data", None), ("union", pytest.approx(0.001))]
     assert result.q0 == pytest.approx(0.0005)
+
+
+def test_resolved_explicit_recipe_round_trips_through_warm_start():
+    from pychmp.q0_search import normalize_q0_search_stages_value, canonical_q0_search_stages_from_profile
+    stages = resolve_q0_search_stages(q0_search_stages=None, mask_type="explicit_fits", explicit_mask=object())
+    assert normalize_q0_search_stages_value(list(stages)) == ("explicit",)
+    assert canonical_q0_search_stages_from_profile({"request": {"q0_search_stages": list(stages)}}) == stages
+    for resolver in (resolve_warm_bracket_seed_mask_type, resolve_warm_curve_rescore_mask_type):
+        assert resolver(q0_search_stages=stages, mask_type="explicit_fits", explicit_mask=object()) == "explicit_fits"
+    assert not defer_warm_curve_commits(q0_search_stages=stages, mask_type="explicit_fits", explicit_mask=object())
+    with pytest.raises(ValueError):
+        normalize_q0_search_stages_value(["explicit", "union"])

@@ -140,3 +140,80 @@ def test_grid_trial_commit_links_existing_map_store_ref(tmp_path: Path) -> None:
         stored = _read_map_store_ref_array(f, ref_path)
         assert stored is not None
         assert np.allclose(stored, stored_map)
+
+
+def test_missing_observed_dataset_is_built_before_warm_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    observed = np.array([[0.0, 2.0], [0.0, 0.0]], dtype=float)
+    sigma = np.array([[0.4, 0.5], [0.6, 0.7]], dtype=float)
+    header = _header()
+    diagnostics = {
+        "artifact_kind": "pychmp_ab_scan_sparse_points",
+        "target_slice_key": "euv_94",
+        "slice_key": "euv_94",
+        "target_metric": "eta2",
+        "spectral_domain": "euv",
+        "spectral_label": "AIA 94",
+        "channel_label": "94",
+        "metrics_mask_threshold": 0.1,
+        "shift_policy": "fixed",
+        "selected_search_id": "search_test",
+        "search_id": "search_test",
+    }
+    artifact_h5 = tmp_path / "warm_missing_observed.h5"
+    write_point_scan_artifact(
+        artifact_h5,
+        observed=observed,
+        sigma_map=sigma,
+        wcs_header=header,
+        diagnostics=diagnostics,
+        point_records=[],
+    )
+    with h5py.File(artifact_h5, "a") as f:
+        common = f[SLICE_CONTAINER_GROUP]["euv_94"]["common"]
+        del common["observed"]
+        del common["sigma_map"]
+        ref_path = _write_map_store_array(
+            f,
+            identity={"name": "test/warm_missing_observed"},
+            data=np.array([[0.0, 1.8], [0.0, 0.0]], dtype=float),
+        )
+    with h5py.File(artifact_h5, "r") as f:
+        common = f[SLICE_CONTAINER_GROUP]["euv_94"]["common"]
+        assert "observed" not in common
+        assert "sigma_map" not in common
+
+    def _reject_regrid(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("warm start must not regrid; it persists the prepared reference")
+
+    monkeypatch.setattr("pychmp.obs_preprocessing.regrid_observation_to_target_fov", _reject_regrid)
+    index = SliceMapIndex(
+        slice_key="euv_94",
+        descriptor={"key": "euv_94", "domain": "euv", "channel_label": "94"},
+    )
+    index.register(a=0.6, b=1.8, q0=5e-4, raw_map_ref=ref_path)
+    context = ObservationEvaluationContext(
+        model_header=header,
+        shift_policy="fixed",
+        observed=observed,
+        sigma=sigma,
+        use_smoothed_obs_max=True,
+    )
+    events = build_warm_grid_trial_commit_events(
+        artifact_h5,
+        point_id="point_missing_observed",
+        slice_map_index=index,
+        a_value=0.6,
+        b_value=1.8,
+        context=context,
+        threshold=0.1,
+        explicit_mask=None,
+        target_metric="eta2",
+        use_emthreshold=False,
+    )
+    assert events
+    with h5py.File(artifact_h5, "r") as f:
+        common = f[SLICE_CONTAINER_GROUP]["euv_94"]["common"]
+        assert "observed" in common
+        assert "sigma_map" in common
+        assert np.allclose(np.asarray(common["observed"], dtype=float), observed)
+        assert np.allclose(np.asarray(common["sigma_map"], dtype=float), sigma)

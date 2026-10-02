@@ -357,8 +357,8 @@ def _evaluate_ab_search_request(
         defer_fn = getattr(worker_payload.cache_map, "defer_warm_curve_commits", None)
         if callable(defer_fn) and defer_fn() and not is_resume_point:
             warm_seed_via_live_evaluation = True
-        if is_resume_point:
-            skip_warm_refinement = True
+        # Interrupted points retain their scores, but still need the normal
+        # convergence/refinement check. Being resumed does not imply completion.
     if initial_evaluations is None and worker_payload.cache_map is not None:
         warm_resolver = getattr(worker_payload.cache_map, "initial_evaluations_for", None)
         if callable(warm_resolver):

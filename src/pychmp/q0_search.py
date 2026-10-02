@@ -64,6 +64,10 @@ def normalize_q0_search_stages_value(value: object | None) -> tuple[str, ...] | 
         stages = tuple(str(item).strip().lower() for item in value if str(item).strip())
         if not stages:
             return None
+        # Resolved recipes store this internal stage for a fixed FITS mask.
+        # It is not a user-selectable threshold stage or a multi-stage recipe.
+        if stages == ("explicit",):
+            return stages
         unknown = [stage for stage in stages if stage not in Q0_MASK_STAGE_NAMES]
         if unknown:
             allowed = ", ".join(sorted(Q0_MASK_STAGE_NAMES))
