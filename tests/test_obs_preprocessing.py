@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 
 import numpy as np
+import pytest
 from astropy.io import fits
 
 from pychmp.metrics import compute_metrics
@@ -36,6 +37,52 @@ def _make_header(*, nx: int, ny: int, crval1: float, crval2: float, cdelt: float
     header["CRVAL2"] = crval2
     header["DATE-OBS"] = "2020-11-26T20:00:00"
     return header
+
+
+def test_euv_regrid_applies_pixel_area_factor_and_microwave_does_not() -> None:
+    """2 arcsec model pixels over 0.6 arcsec source pixels scale EUV by about 11.11."""
+    value = 3.0
+    sigma_value = 0.4
+    source = np.full((16, 16), value, dtype=float)
+    sigma = np.full((16, 16), sigma_value, dtype=float)
+    source_header = _make_header(nx=16, ny=16, crval1=0.0, crval2=0.0, cdelt=0.6)
+    source_header["BUNIT"] = "DN s^-1 pix^-1"
+    source_header["WAVELNTH"] = 94.0
+    target_header = _make_header(nx=4, ny=4, crval1=0.0, crval2=0.0, cdelt=2.0)
+    factor = (2.0 * 2.0) / (0.6 * 0.6)
+
+    cropped = regrid_observation_to_target_fov(source, source_header, target_header)
+
+    assert factor == pytest.approx(11.1111111111)
+    np.testing.assert_allclose(cropped, value * factor)
+
+    degree_header = source_header.copy()
+    degree_header["CUNIT1"] = "deg"
+    degree_header["CUNIT2"] = "deg"
+    degree_header["CDELT1"] = 0.6 / 3600.0
+    degree_header["CDELT2"] = 0.6 / 3600.0
+    degree_cropped = regrid_observation_to_target_fov(source, degree_header, target_header)
+    np.testing.assert_allclose(degree_cropped, value * factor)
+
+    microwave_header = _make_header(nx=16, ny=16, crval1=0.0, crval2=0.0, cdelt=0.6)
+    microwave_header["BUNIT"] = "K"
+    microwave_header["CTYPE3"] = "FREQ"
+    microwave_header["CUNIT3"] = "Hz"
+    microwave_header["CRVAL3"] = 17.0e9
+    microwave = regrid_observation_to_target_fov(source, microwave_header, target_header)
+    np.testing.assert_allclose(microwave, value)
+
+    observed, sigma_out, _header, _diagnostics = prepare_observation_for_metrics(
+        source,
+        source_header,
+        target_header,
+        model_time_text="2020-11-26T20:00:00",
+        observation_time_text="2020-11-26T20:00:00",
+        sigma=sigma,
+    )
+    np.testing.assert_allclose(observed, value * factor)
+    assert sigma_out is not None
+    np.testing.assert_allclose(sigma_out, sigma_value * factor)
 
 
 def test_regrid_observation_to_target_fov_changes_shape_to_render_grid() -> None:

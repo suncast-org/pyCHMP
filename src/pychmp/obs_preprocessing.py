@@ -27,6 +27,7 @@ import numpy as np
 from astropy.io import fits
 from scipy.ndimage import map_coordinates
 
+from .euv_obs_units import euv_observation_declares_dn_rate
 from .obs_time_alignment import (
     DEFAULT_MAX_ROTATION_SECONDS,
     ObsModelTimeAlignment,
@@ -34,6 +35,8 @@ from .obs_time_alignment import (
     assess_obs_model_time_alignment,
 )
 from .search_contract import normalize_shift_policy
+
+_DEG_TO_ARCSEC = 3600.0
 
 SLICE_OBSERVATION_REFERENCE_SCHEMA = "pychmp.slice_observation_reference.v2"
 CHMP_EVAL_POLICY_VERSION = "1"
@@ -387,36 +390,89 @@ def _try_restore_slice_observation_reference(
     )
 
 
+def _cunit_to_arcsec_scale(unit: object) -> float:
+    """Scale factor that turns this angular CUNIT into arcsec.
+
+    Degree plate scales are multiplied by 3600. Arcsec, and any CUNIT that is
+    already arcsec, stays at 1 so a caller that converted earlier is not scaled again.
+    """
+    token = str(unit or "").strip().lower().replace(" ", "")
+    if token in {"deg", "degree", "degrees"}:
+        return _DEG_TO_ARCSEC
+    return 1.0
+
+
+def _axis_cdelt_crval_arcsec(header: fits.Header, axis: int) -> tuple[float, float]:
+    """Return signed CDELT and CRVAL for one spatial axis, in arcsec."""
+    scale = _cunit_to_arcsec_scale(header.get(f"CUNIT{axis}"))
+    return float(header[f"CDELT{axis}"]) * scale, float(header[f"CRVAL{axis}"]) * scale
+
+
+def _header_is_frequency_map(header: fits.Header) -> bool:
+    """True for microwave/frequency maps, which IDL does not rebin with /total."""
+    for axis in (3, 4):
+        ctype = str(header.get(f"CTYPE{axis}", "")).strip().upper()
+        if ctype.startswith("FREQ"):
+            return True
+        unit = str(header.get(f"CUNIT{axis}", "")).strip().lower().replace(" ", "")
+        if unit in {"hz", "khz", "mhz", "ghz"}:
+            return True
+    for key in ("FREQ", "FREQUENCY", "OBSFREQ", "RESTFRQ", "RESTFREQ"):
+        if key in header:
+            return True
+    return False
+
+
+def _scale_euv_channel_pixel_area(header: fits.Header) -> bool:
+    """EUV/UV channel maps in DN s^-1 pix^-1, not microwave brightness temperature."""
+    if _header_is_frequency_map(header):
+        return False
+    bunit = str(header.get("BUNIT", "")).strip().upper().replace(" ", "")
+    if bunit in {"K", "KELVIN"}:
+        return False
+    if not euv_observation_declares_dn_rate(header):
+        return False
+    return any(key in header for key in ("WAVELNTH", "WAVE_LEN", "WAVELENGTH"))
+
+
+def _euv_pixel_area_factor(source_header: fits.Header, target_header: fits.Header) -> float:
+    """Plate-scale area ratio in arcsec, matching frebin /TOTAL for a constant scale."""
+    src_dx, _ = _axis_cdelt_crval_arcsec(source_header, 1)
+    src_dy, _ = _axis_cdelt_crval_arcsec(source_header, 2)
+    tgt_dx, _ = _axis_cdelt_crval_arcsec(target_header, 1)
+    tgt_dy, _ = _axis_cdelt_crval_arcsec(target_header, 2)
+    src_area = abs(src_dx) * abs(src_dy)
+    tgt_area = abs(tgt_dx) * abs(tgt_dy)
+    if src_area == 0.0 or not np.isfinite(src_area) or not np.isfinite(tgt_area):
+        return 1.0
+    return float(tgt_area / src_area)
+
+
 def regrid_observation_to_target_fov(
     data: np.ndarray,
     source_header: fits.Header,
     target_header: fits.Header,
 ) -> np.ndarray:
-    """Bilinearly resample *data* from *source_header* onto the *target_header* grid."""
+    """Bilinearly resample *data* from *source_header* onto the *target_header* grid.
+
+    Spatial CDELT/CRVAL are converted to arcsec when CUNIT is degrees before the
+    sample. EUV/UV channel maps in DN s^-1 pix^-1 are then multiplied by the
+    arcsec pixel-area ratio. Microwave brightness-temperature maps are not.
+    """
 
     ny = int(target_header["NAXIS2"])
     nx = int(target_header["NAXIS1"])
+    tgt_dx, tgt_crval1 = _axis_cdelt_crval_arcsec(target_header, 1)
+    tgt_dy, tgt_crval2 = _axis_cdelt_crval_arcsec(target_header, 2)
+    src_dx, src_crval1 = _axis_cdelt_crval_arcsec(source_header, 1)
+    src_dy, src_crval2 = _axis_cdelt_crval_arcsec(source_header, 2)
 
-    target_x = (
-        (np.arange(nx, dtype=float) + 1.0 - float(target_header["CRPIX1"])) * float(target_header["CDELT1"])
-        + float(target_header["CRVAL1"])
-    )
-    target_y = (
-        (np.arange(ny, dtype=float) + 1.0 - float(target_header["CRPIX2"])) * float(target_header["CDELT2"])
-        + float(target_header["CRVAL2"])
-    )
+    target_x = (np.arange(nx, dtype=float) + 1.0 - float(target_header["CRPIX1"])) * tgt_dx + tgt_crval1
+    target_y = (np.arange(ny, dtype=float) + 1.0 - float(target_header["CRPIX2"])) * tgt_dy + tgt_crval2
     world_x, world_y = np.meshgrid(target_x, target_y)
 
-    src_x = (
-        (world_x - float(source_header["CRVAL1"])) / float(source_header["CDELT1"])
-        + float(source_header["CRPIX1"])
-        - 1.0
-    )
-    src_y = (
-        (world_y - float(source_header["CRVAL2"])) / float(source_header["CDELT2"])
-        + float(source_header["CRPIX2"])
-        - 1.0
-    )
+    src_x = (world_x - src_crval1) / src_dx + float(source_header["CRPIX1"]) - 1.0
+    src_y = (world_y - src_crval2) / src_dy + float(source_header["CRPIX2"]) - 1.0
     sampled = map_coordinates(
         np.asarray(data, dtype=float),
         [np.asarray(src_y, dtype=float), np.asarray(src_x, dtype=float)],
@@ -424,7 +480,10 @@ def regrid_observation_to_target_fov(
         mode="constant",
         cval=np.nan,
     )
-    return np.asarray(sampled, dtype=float)
+    sampled = np.asarray(sampled, dtype=float)
+    if _scale_euv_channel_pixel_area(source_header):
+        sampled *= _euv_pixel_area_factor(source_header, target_header)
+    return sampled
 
 
 def _fill_observed_nans(observed: np.ndarray) -> np.ndarray:
@@ -519,6 +578,7 @@ def prepare_observation_for_metrics(
 
     sigma_cropped = None
     if sigma is not None:
+        # Same resample as the observation, including the EUV/UV pixel-area factor.
         sigma_cropped = regrid_observation_to_target_fov(
             np.asarray(sigma, dtype=float),
             regrid_header,
