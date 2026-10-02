@@ -756,6 +756,7 @@ class GXRenderEUVAdapter:
     verbose: bool = False
     render_call_count: int = 0
     cache_response: bool = True
+    prebuilt_response: _CachedEUVResponse | None = None
     _response_cache: _CachedEUVResponse | None = field(default=None, init=False, repr=False)
     _response_cache_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
     _response_cache_attempted: bool = field(default=False, init=False, repr=False)
@@ -837,11 +838,11 @@ class GXRenderEUVAdapter:
             output_name=None,
             save_outputs=False,
             write_preview=False,
-            tbase=float(self.tbase),
-            nbase=float(self.nbase),
+            tbase=None if self.tbase is None else float(self.tbase),
+            nbase=None if self.nbase is None else float(self.nbase),
             q0=0.0,
-            a=float(self.a),
-            b=float(self.b),
+            a=None if self.a is None else float(self.a),
+            b=None if self.b is None else float(self.b),
             corona_mode=int(self.mode),
             selective_heating=bool(self.selective_heating),
             shtable=self.shtable,
@@ -875,9 +876,9 @@ class GXRenderEUVAdapter:
         )
 
     def _ensure_euv_response_cache(self) -> _CachedEUVResponse | None:
+        if self.prebuilt_response is not None:
+            return self.prebuilt_response
         if not bool(self.cache_response):
-            return None
-        if self.response_sav is None:
             return None
         cache_key = self._response_cache_key_for_current_request()
         cached = self._response_cache

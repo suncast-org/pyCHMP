@@ -9,6 +9,8 @@ selections for EUV/UV slices.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import math
 import queue
 import hashlib
@@ -26,7 +28,7 @@ from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 from astropy.io import fits
@@ -94,8 +96,20 @@ def _build_run_history_entry(
     }
 
 
-def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int | None:
-    """Return an existing pychmp-view PID for this artifact, if visible."""
+class _ViewerLaunchDecision(NamedTuple):
+    """What ``--viewer`` should do for one artifact.
+
+    ``running`` and ``reuse`` mean a viewer is already open, so the caller
+    must not start another process. ``launch`` means no open window was found.
+    """
+
+    action: str
+    pid: int | None = None
+    focused: bool = False
+
+
+def _find_existing_viewer_pids(*, viewer_script: Path, artifact_h5: Path) -> list[int]:
+    """Return pychmp-view PIDs whose command line includes this artifact."""
     try:
         artifact_text = str(Path(artifact_h5).expanduser().resolve())
         script_name = Path(viewer_script).name
@@ -107,10 +121,11 @@ def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int 
             timeout=2.0,
         )
     except Exception:
-        return None
+        return []
     if proc.returncode != 0:
-        return None
+        return []
     current_pid = os.getpid()
+    found: list[int] = []
     for line in proc.stdout.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -123,19 +138,245 @@ def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int 
         if pid == current_pid:
             continue
         if script_name in command and artifact_text in command:
-            return pid
+            found.append(pid)
+    return found
+
+
+def _find_existing_viewer_pid(*, viewer_script: Path, artifact_h5: Path) -> int | None:
+    """Return an existing pychmp-view PID for this artifact, if any."""
+    found = _find_existing_viewer_pids(viewer_script=viewer_script, artifact_h5=artifact_h5)
+    if not found:
+        return None
+    return found[0]
+
+
+def _viewer_window_title(artifact_h5: Path) -> str:
+    return f"pychmp-view: {Path(artifact_h5).name}"
+
+
+def _x11_window_name_matches_artifact(window_name: str, artifact_h5: Path) -> bool:
+    """True when an X11 window title is this artifact's pychmp-view window."""
+    expected = _viewer_window_title(artifact_h5)
+    text = str(window_name or "").strip()
+    return text == expected or text.startswith(expected + " ")
+
+
+_X11_ERROR_HANDLER = None
+
+
+def _load_x11_library() -> Any | None:
+    cached = getattr(_load_x11_library, "_library", None)
+    if cached is not None:
+        return cached
+    candidates: list[str] = []
+    found = ctypes.util.find_library("X11")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            "/opt/X11/lib/libX11.dylib",
+            "libX11.so.6",
+            "libX11.so",
+        ]
+    )
+    for name in candidates:
+        try:
+            library = ctypes.cdll.LoadLibrary(name)
+        except OSError:
+            continue
+        library.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        library.XOpenDisplay.restype = ctypes.c_void_p
+        library.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        library.XCloseDisplay.restype = ctypes.c_int
+        library.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        library.XDefaultRootWindow.restype = ctypes.c_ulong
+        library.XQueryTree.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        library.XQueryTree.restype = ctypes.c_int
+        library.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+        library.XFetchName.restype = ctypes.c_int
+        library.XFree.argtypes = [ctypes.c_void_p]
+        library.XFree.restype = ctypes.c_int
+        library.XMapRaised.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        library.XMapRaised.restype = ctypes.c_int
+        library.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        library.XRaiseWindow.restype = ctypes.c_int
+        library.XFlush.argtypes = [ctypes.c_void_p]
+        library.XFlush.restype = ctypes.c_int
+        library.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        library.XSync.restype = ctypes.c_int
+        handler_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        library.XSetErrorHandler.argtypes = [handler_type]
+        library.XSetErrorHandler.restype = ctypes.c_void_p
+        global _X11_ERROR_HANDLER
+        if _X11_ERROR_HANDLER is None:
+            def _ignore_x_error(_display: Any, _event: Any) -> int:
+                return 0
+
+            _X11_ERROR_HANDLER = handler_type(_ignore_x_error)
+        library.XSetErrorHandler(_X11_ERROR_HANDLER)
+        _load_x11_library._library = library  # type: ignore[attr-defined]
+        return library
     return None
 
 
-def _focus_existing_viewer_pid(pid: int) -> bool:
-    """Try to bring an existing pychmp-view process to the foreground."""
+def _walk_x11_windows(library: Any, display: Any, root: int) -> list[tuple[int, str]]:
+    named: list[tuple[int, str]] = []
+    pending = [int(root)]
+    seen = 0
+    while pending and seen < 4000:
+        window = pending.pop()
+        root_return = ctypes.c_ulong()
+        parent_return = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        count = ctypes.c_uint()
+        status = library.XQueryTree(
+            display,
+            ctypes.c_ulong(window),
+            ctypes.byref(root_return),
+            ctypes.byref(parent_return),
+            ctypes.byref(children),
+            ctypes.byref(count),
+        )
+        if not status:
+            continue
+        child_ids = [int(children[index]) for index in range(int(count.value))]
+        if child_ids:
+            library.XFree(ctypes.cast(children, ctypes.c_void_p))
+        for child in child_ids:
+            seen += 1
+            pending.append(child)
+            name_pointer = ctypes.c_char_p()
+            fetched = library.XFetchName(display, ctypes.c_ulong(child), ctypes.byref(name_pointer))
+            if fetched and name_pointer.value:
+                named.append((child, name_pointer.value.decode("utf-8", "replace")))
+                library.XFree(ctypes.cast(name_pointer, ctypes.c_void_p))
+    return named
+
+
+def _query_open_viewer_windows(artifact_h5: Path) -> tuple[bool, list[int]]:
+    """Return ``(display_queried, window_ids)`` for this artifact's viewer.
+
+    A queried display with an empty list means the viewer window is not open.
+    ``display_queried`` is false when X11 cannot be asked.
+    """
+    library = _load_x11_library()
+    if library is None:
+        return False, []
+    display = library.XOpenDisplay(None)
+    if not display:
+        return False, []
+    try:
+        root = int(library.XDefaultRootWindow(display))
+        matches = [
+            window_id
+            for window_id, name in _walk_x11_windows(library, display, root)
+            if _x11_window_name_matches_artifact(name, artifact_h5)
+        ]
+        return True, matches
+    except Exception:
+        return False, []
+    finally:
+        try:
+            library.XCloseDisplay(display)
+        except Exception:
+            pass
+
+
+def _raise_open_viewer_windows(window_ids: list[int]) -> bool:
+    """Map and raise viewer X windows, including iconic (hidden) ones."""
+    if not window_ids:
+        return False
+    library = _load_x11_library()
+    if library is None:
+        return False
+    display = library.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        for window_id in window_ids:
+            library.XMapRaised(display, ctypes.c_ulong(int(window_id)))
+            library.XRaiseWindow(display, ctypes.c_ulong(int(window_id)))
+        library.XFlush(display)
+        library.XSync(display, False)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            library.XCloseDisplay(display)
+        except Exception:
+            pass
+
+
+def _osascript_show_viewer(pid: int, *, unhide_xquartz: bool) -> bool:
+    """Unhide a Mac viewer process and, for XQuartz, the X11 application."""
     if not sys.platform.startswith("darwin"):
         return False
-    script = (
-        'tell application "System Events"\n'
-        f"set frontmost of first process whose unix id is {int(pid)} to true\n"
-        "end tell"
-    )
+    lines = []
+    if unhide_xquartz:
+        lines.extend(
+            [
+                "try",
+                'tell application "XQuartz" to activate',
+                "end try",
+            ]
+        )
+    lines.append('tell application "System Events"')
+    if int(pid) > 1:
+        lines.extend(
+            [
+                "try",
+                f"set targetProc to first process whose unix id is {int(pid)}",
+                "try",
+                "set visible of targetProc to true",
+                "end try",
+                "try",
+                "set frontmost of targetProc to true",
+                "end try",
+                "try",
+                "repeat with w in windows of targetProc",
+                "try",
+                'set value of attribute "AXMinimized" of w to false',
+                "end try",
+                "end repeat",
+                "end try",
+                "end try",
+            ]
+        )
+    if unhide_xquartz:
+        lines.extend(
+            [
+                "repeat with appName in {\"XQuartz\", \"X11.bin\", \"X11\"}",
+                "try",
+                "set xProc to first process whose name is appName",
+                "try",
+                "set visible of xProc to true",
+                "end try",
+                "try",
+                "set frontmost of xProc to true",
+                "end try",
+                "try",
+                "repeat with w in windows of xProc",
+                "try",
+                'set value of attribute "AXMinimized" of w to false',
+                "end try",
+                "end repeat",
+                "end try",
+                "end try",
+                "end repeat",
+            ]
+        )
+    lines.append("end tell")
+    if len(lines) <= 2 and not unhide_xquartz:
+        return False
+    script = "\n".join(lines)
     try:
         proc = subprocess.run(
             ["osascript", "-e", script],
@@ -147,6 +388,225 @@ def _focus_existing_viewer_pid(pid: int) -> bool:
     except Exception:
         return False
     return proc.returncode == 0
+
+
+def _cocoa_bounds_are_viewer_window(width: float, height: float, layer: int) -> bool:
+    """True for a main viewer window, not a menu bar or a small popup."""
+    return int(layer) == 0 and float(width) >= 400.0 and float(height) >= 300.0
+
+
+def _cocoa_viewer_owner_pids(candidate_pids: list[int]) -> tuple[bool, list[int]]:
+    """Return ``(queried, pids)`` for Aqua Tk windows owned by these processes."""
+    if not sys.platform.startswith("darwin") or not candidate_pids:
+        return False, []
+    wanted = {int(pid) for pid in candidate_pids}
+    try:
+        core_graphics = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        core_foundation = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+    except OSError:
+        return False, []
+    core_graphics.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    core_graphics.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+    core_foundation.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    core_foundation.CFArrayGetCount.restype = ctypes.c_long
+    core_foundation.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    core_foundation.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    core_foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    core_foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+    core_foundation.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    core_foundation.CFNumberGetValue.restype = ctypes.c_bool
+    core_foundation.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+    core_foundation.CFStringCreateWithCString.restype = ctypes.c_void_p
+    core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    try:
+        pid_key = ctypes.c_void_p.in_dll(core_graphics, "kCGWindowOwnerPID")
+        bounds_key = ctypes.c_void_p.in_dll(core_graphics, "kCGWindowBounds")
+        layer_key = ctypes.c_void_p.in_dll(core_graphics, "kCGWindowLayer")
+    except ValueError:
+        return False, []
+    array = core_graphics.CGWindowListCopyWindowInfo(0, 0)
+    if not array:
+        return False, []
+    created_keys: list[Any] = []
+    try:
+        def _make_key(text: str) -> Any:
+            value = core_foundation.CFStringCreateWithCString(None, text.encode(), 0x08000100)
+            created_keys.append(value)
+            return value
+
+        key_w = _make_key("Width")
+        key_h = _make_key("Height")
+
+        def _number(value: Any) -> float | None:
+            if not value:
+                return None
+            as_float = ctypes.c_double()
+            if core_foundation.CFNumberGetValue(value, 13, ctypes.byref(as_float)):
+                return float(as_float.value)
+            return None
+
+        owners: set[int] = set()
+        count = int(core_foundation.CFArrayGetCount(array))
+        for index in range(count):
+            item = core_foundation.CFArrayGetValueAtIndex(array, index)
+            pid_value = _number(core_foundation.CFDictionaryGetValue(item, pid_key))
+            if pid_value is None or int(pid_value) not in wanted:
+                continue
+            bounds = core_foundation.CFDictionaryGetValue(item, bounds_key)
+            if not bounds:
+                continue
+            width = _number(core_foundation.CFDictionaryGetValue(bounds, key_w))
+            height = _number(core_foundation.CFDictionaryGetValue(bounds, key_h))
+            layer = _number(core_foundation.CFDictionaryGetValue(item, layer_key))
+            if width is None or height is None or layer is None:
+                continue
+            if _cocoa_bounds_are_viewer_window(width, height, int(layer)):
+                owners.add(int(pid_value))
+        return True, sorted(owners)
+    except Exception:
+        return False, []
+    finally:
+        for value in created_keys:
+            try:
+                core_foundation.CFRelease(value)
+            except Exception:
+                pass
+        try:
+            core_foundation.CFRelease(array)
+        except Exception:
+            pass
+
+
+def _activate_cocoa_viewer_pid(pid: int) -> bool:
+    """Unhide and activate an Aqua viewer, including a minimized window."""
+    if not sys.platform.startswith("darwin") or int(pid) <= 1:
+        return False
+    try:
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+        objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
+    except OSError:
+        return False
+    objc.objc_getClass.argtypes = [ctypes.c_char_p]
+    objc.objc_getClass.restype = ctypes.c_void_p
+    objc.sel_registerName.argtypes = [ctypes.c_char_p]
+    objc.sel_registerName.restype = ctypes.c_void_p
+    runtime_class = objc.objc_getClass(b"NSRunningApplication")
+    if not runtime_class:
+        return False
+    try:
+        lookup = ctypes.cast(
+            objc.objc_msgSend,
+            ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int),
+        )
+        application = lookup(
+            runtime_class,
+            objc.sel_registerName(b"runningApplicationWithProcessIdentifier:"),
+            int(pid),
+        )
+        if not application:
+            return False
+        void_send = ctypes.cast(
+            objc.objc_msgSend,
+            ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p),
+        )
+        void_send(application, objc.sel_registerName(b"unhide"))
+        activate = ctypes.cast(
+            objc.objc_msgSend,
+            ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulonglong),
+        )
+        # NSApplicationActivateAllWindows | NSApplicationActivateIgnoringOtherApps
+        return bool(activate(application, objc.sel_registerName(b"activateWithOptions:"), 3))
+    except Exception:
+        return False
+
+
+def _viewer_window_owner_pids(candidate_pids: list[int], artifact_h5: Path) -> tuple[bool, list[int]]:
+    """Return ``(windows_queried, pids)`` that currently show this artifact.
+
+    On this Mac the viewer is Aqua Tk, so CoreGraphics is authoritative.
+    X11 titles are the fallback when that list cannot be read.
+    """
+    cocoa_queried, cocoa_pids = _cocoa_viewer_owner_pids(candidate_pids)
+    if cocoa_queried:
+        return True, list(cocoa_pids)
+    try:
+        x11_queried, x11_windows = _query_open_viewer_windows(artifact_h5)
+    except Exception:
+        x11_queried, x11_windows = False, []
+    if not x11_queried:
+        return False, []
+    if x11_windows and candidate_pids:
+        return True, [max(int(pid) for pid in candidate_pids)]
+    return True, []
+
+
+def _focus_existing_viewer_pid(pid: int, *, artifact_h5: Path | None = None) -> bool:
+    """Bring an existing viewer forward, including a hidden or minimized window."""
+    cocoa_shown = False
+    if sys.platform.startswith("darwin") and int(pid) > 1:
+        try:
+            cocoa_shown = _activate_cocoa_viewer_pid(int(pid))
+        except Exception:
+            cocoa_shown = False
+    x11_shown = False
+    if artifact_h5 is not None:
+        try:
+            _queried, window_ids = _query_open_viewer_windows(artifact_h5)
+        except Exception:
+            window_ids = []
+        if window_ids:
+            try:
+                x11_shown = _raise_open_viewer_windows(window_ids)
+            except Exception:
+                x11_shown = False
+    if not sys.platform.startswith("darwin"):
+        return bool(x11_shown)
+    if cocoa_shown:
+        return True
+    script_shown = _osascript_show_viewer(int(pid), unhide_xquartz=x11_shown)
+    return bool(script_shown or x11_shown)
+
+
+def _decide_viewer_launch(
+    *,
+    viewer_script: Path,
+    artifact_h5: Path,
+    viewer_process: subprocess.Popen[Any] | None = None,
+) -> _ViewerLaunchDecision:
+    """Decide whether ``--viewer`` may start a new pychmp-view.
+
+    One open window for the artifact blocks another launch. The existing
+    window is brought forward when it is hidden. A process left behind after
+    its window was closed does not block a launch when the display can be
+    queried and shows no viewer window. When the display cannot be queried,
+    a matching process still blocks a second launch.
+    """
+    if viewer_process is not None and viewer_process.poll() is None:
+        focused = False
+        try:
+            focused = _focus_existing_viewer_pid(int(viewer_process.pid), artifact_h5=artifact_h5)
+        except Exception:
+            focused = False
+        return _ViewerLaunchDecision("running", int(viewer_process.pid), focused)
+
+    existing_pids = _find_existing_viewer_pids(viewer_script=viewer_script, artifact_h5=artifact_h5)
+    try:
+        queried, open_pids = _viewer_window_owner_pids(existing_pids, artifact_h5)
+    except Exception:
+        queried, open_pids = False, []
+    if open_pids:
+        existing_pid = max(int(pid) for pid in open_pids)
+    elif (not queried) and existing_pids:
+        existing_pid = max(existing_pids)
+    else:
+        return _ViewerLaunchDecision("launch", None, False)
+
+    focused = False
+    try:
+        focused = _focus_existing_viewer_pid(int(existing_pid), artifact_h5=artifact_h5)
+    except Exception:
+        focused = False
+    return _ViewerLaunchDecision("reuse", int(existing_pid), focused)
 
 
 def _is_hdf5_lock_contention_error(exc: BaseException) -> bool:
@@ -431,6 +891,10 @@ def _load_slice_preflight_payload(
     include_maps: bool = False,
     search_id: str | None = None,
 ) -> dict[str, Any] | None:
+    # Slice-common diagnostics may still describe an auxiliary render placeholder.
+    # The selected search owns the scoring recipe, including PSF provenance.
+    if search_id is None and artifact_h5.exists():
+        search_id = read_slice_active_search_id(artifact_h5, slice_key=slice_key)
     try:
         payload = load_slice_observation_reference_payload(
             artifact_h5,
@@ -476,6 +940,13 @@ def _load_slice_preflight_payload(
         return None
     obs_diagnostics = dict(payload.get("diagnostics") or {})
     merged_diagnostics = {**common_diagnostics, **obs_diagnostics}
+    if search_id:
+        profile = load_search_run_profile(artifact_h5, search_id=search_id)
+        merged_diagnostics.update(profile["diagnostics"])
+        for key in ("psf_source", "resolved_psf"):
+            if key in profile["request"]:
+                merged_diagnostics[key] = profile["request"][key]
+        merged_diagnostics.pop("render_only_slice", None)
     wcs_header = payload.get("wcs_header")
     if wcs_header is None:
         wcs_header = fits.Header.fromstring(str(header_text), sep="\n")
@@ -1203,6 +1674,7 @@ class _AdaptiveRendererFactory:
     euv_parallel: bool = False
     euv_exact: bool = False
     euv_projection_threads: int = 0
+    prebuilt_euv_response: Any = None
 
     def __call__(self, a: float, b: float) -> Any:
         sdk = import_module("gxrender.sdk")
@@ -1252,6 +1724,7 @@ class _AdaptiveRendererFactory:
             render_channels=self.render_channels,
             instrument=str(self.euv_instrument or "AIA"),
             response_sav=self.euv_response_sav,
+            prebuilt_response=self.prebuilt_euv_response,
             ebtel_path=self.ebtel_path,
             tbase=float(self.tbase),
             nbase=float(self.nbase),
@@ -2731,6 +3204,37 @@ def _pinned_search_id(args: argparse.Namespace) -> str:
     return _normalized_recompute_search_id(args) or _normalized_expand_grid_search_id(args)
 
 
+def _matching_search_is_finished(
+    artifact_h5: Path, *, slice_key: str, search_id: str,
+    diagnostics: dict[str, Any],
+) -> bool:
+    """Recognize a finished run without loading maps or replaying the optimizer.
+
+    Evaluation identity is checked by the caller. Adaptive bounds and seed are
+    deliberately outside that identity, so require those to match as well.
+    """
+    import h5py
+
+    with h5py.File(artifact_h5, "r") as f:
+        search = f[SLICE_CONTAINER_GROUP][slice_key][SEARCHES_GROUP][search_id]
+        stored = json.loads(search["diagnostics_json"][()])
+        lifecycle = json.loads(search["lifecycle_json"][()]) if "lifecycle_json" in search else {}
+        if (lifecycle.get("status") != "complete" or lifecycle.get("active")
+                or not lifecycle.get("completed_at")):
+            return False
+        for key in ("search_mode", "a_start", "b_start", "da", "db", "a_range", "b_range"):
+            if key not in stored or stored[key] != diagnostics.get(key):
+                return False
+        points = search.get(GRID_POINTS_GROUP)
+        if points is None or not len(points):
+            return False
+        return all(
+            not grid_point_storage_corrupt(point)
+            and classify_grid_point_state(read_grid_point_header(point)) == "complete"
+            for point in points.values()
+        )
+
+
 def _preserve_stored_search_trials_requested(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "preserve_stored_search_trials", False))
 
@@ -3031,10 +3535,14 @@ def _preload_search_cache_from_artifact(
             "Map-store warm preload: slice index ready "
             "(per-point rescore at grid point start; no full-artifact rescore)"
         )
+    if hydrate_completed_points and getattr(cache, "_preserve_stored_search_trials", False):
+        # Matching searches already own their scores. Missing/new points can use
+        # the map-store index lazily, when the adaptive walk actually needs them.
+        return hydrated, 0, 0, 0
     promoted_index = 0
     promoted_same_slice = 0
     promoted_auxiliary = 0
-    if hydrate_completed_points is False and getattr(cache, "_slice_map_index", None) is not None:
+    if getattr(cache, "_slice_map_index", None) is not None:
         promoted_index = cache.count_indexed_warm_points_from_index()
     else:
         promoted_same_slice = cache.promote_current_slice_trial_maps(
@@ -3655,6 +4163,7 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             target_metric=self._target_metric,
             use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
             mask_type=self._warm_curve_rescore_mask_type(),
+            observation_reference=self._observation_reference,
         )
         if not events:
             return 0
@@ -3724,7 +4233,10 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
                 threshold=float(self._diagnostics.get("metrics_mask_threshold", 0.1)),
                 explicit_mask=self._explicit_metric_mask,
                 use_emthreshold=bool(self._diagnostics.get("use_emthreshold", True)),
-                rescore=not bool(self._preserve_stored_search_trials),
+                # These trials belong to this search and were already scored
+                # when committed. Only a different optimizer mask stage needs
+                # another evaluation (e.g. data seeds versus union curves).
+                rescore=(not self._preserve_stored_search_trials and self._needs_curve_metric_rescore()),
                 mask_type=self._warm_bracket_seed_mask_type(),
             )
             if evaluations:
@@ -3825,6 +4337,10 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
             if GRID_POINTS_GROUP not in search_group or str(point_id) not in search_group[GRID_POINTS_GROUP]:
                 return None
             header = read_grid_point_header(search_group[GRID_POINTS_GROUP][str(point_id)])
+        # A warm curve (or an interrupted optimizer) is not proof of convergence.
+        # Only an explicitly completed point can bypass the optimizer.
+        if classify_grid_point_state(header) != "complete":
+            return None
         restored = _ab_point_from_completed_grid_point(
             header,
             trials,
@@ -4544,7 +5060,10 @@ class _PersistentPointCache(MutableMapping[tuple[float, float], ABPointResult]):
         if not self._artifact_h5.exists():
             return 0
         try:
-            payload = load_scan_file(self._artifact_h5, slice_key=self._target_slice_key(), include_maps=False)
+            payload = load_scan_file(
+                self._artifact_h5, slice_key=self._target_slice_key(),
+                search_id=self._diagnostics.get("selected_search_id"), include_maps=False,
+            )
         except KeyError:
             return 0
         if bool(dict(payload.get("diagnostics") or {}).get("render_only_slice", False)) and not payload.get("point_records"):
@@ -5137,23 +5656,34 @@ def main() -> int:
         nonlocal viewer_process
         if not auto_viewer_enabled:
             return
-        if viewer_process is not None and viewer_process.poll() is None:
-            print(f"pychmp-view already running ({phase}) pid={viewer_process.pid}")
+        decision = _decide_viewer_launch(
+            viewer_script=viewer_script,
+            artifact_h5=artifact_h5,
+            viewer_process=viewer_process,
+        )
+        if decision.action == "running":
+            print(f"pychmp-view already running ({phase}) pid={decision.pid}")
             if on_reused is not None:
                 on_reused()
             return
-        existing_viewer_pid = _find_existing_viewer_pid(viewer_script=viewer_script, artifact_h5=artifact_h5)
-        if existing_viewer_pid is not None:
+        if decision.action == "reuse":
             if on_reused is not None:
                 on_reused()
-            if _focus_existing_viewer_pid(int(existing_viewer_pid)):
-                print(f"Reusing existing pychmp-view ({phase}) pid={existing_viewer_pid} (brought to front)")
-                return
-            print(
-                f"Existing pychmp-view detected ({phase}) pid={existing_viewer_pid} but could not be focused; launching a fresh viewer"
-            )
+            brought_forward = " (brought to front)" if decision.focused else ""
+            if decision.pid is not None:
+                print(f"Reusing existing pychmp-view ({phase}) pid={decision.pid}{brought_forward}")
+            else:
+                print(f"Reusing existing pychmp-view ({phase}){brought_forward}")
+            return
         try:
-            proc = subprocess.Popen(viewer_cmd, start_new_session=True)
+            # Detach the viewer's streams too: inherited tee pipes would keep
+            # the shell launcher waiting after a completed-search early exit.
+            viewer_log = Path(f"{artifact_h5}.viewer.log")
+            with viewer_log.open("a") as log_stream:
+                proc = subprocess.Popen(
+                    viewer_cmd, start_new_session=True,
+                    stdin=subprocess.DEVNULL, stdout=log_stream, stderr=subprocess.STDOUT,
+                )
             if proc.poll() is not None:
                 print(f"WARNING: pychmp-view exited immediately after auto-launch ({phase}). Try running manually: {viewer_cmd_text}")
                 return
@@ -5621,28 +6151,29 @@ def main() -> int:
             psf_source = cached_psf_recipe_source
             resolved_psf_meta = dict(cached_psf_recipe_meta)
 
+    prebuilt_euv_response = None
+    response_store_request = None
     euv_response_identity = None
     euv_response_identity_version = None
     euv_response_sha256 = None
     euv_response_identity_summary = None
     if render_selection.domain != "mw":
-        reused_identity = False
-        if artifact_preexisting and not _grid_reset_requested(args):
-            cached_version = str(resume_slice_diagnostics.get("euv_response_identity_version") or "").strip()
-            cached_sha = str(resume_slice_diagnostics.get("euv_response_sha256") or "").strip()
-            cached_summary = resume_slice_diagnostics.get("euv_response_identity_summary")
-            if cached_version and cached_sha and isinstance(cached_summary, dict):
-                euv_response_identity_version = cached_version
-                euv_response_sha256 = cached_sha
-                euv_response_identity_summary = dict(cached_summary)
-                reused_identity = True
-                print("  EUV response identity: reused cached artifact diagnostics")
-        if not reused_identity:
-            identity_started = time.perf_counter()
-            euv_response_identity = resolve_euv_response_identity(
+        from pychmp.calibration_store import canonical_response, load_response, save_response
+
+        response_store_request = {
+            "model_sha256": str(model_sha256),
+            "instrument": str(render_selection.euv_instrument).upper(),
+            "channels": sorted(set([str(render_selection.euv_channel), *map(str, render_channels)])),
+            "source": "dynamic_evenorm_chiantifix" if render_selection.euv_response_sav is None else "sav",
+            "response_sav_sha256": None if render_selection.euv_response_sav is None else _compute_file_sha256(Path(render_selection.euv_response_sav)),
+        }
+        prebuilt_euv_response = load_response(artifact_h5, response_store_request)
+        if prebuilt_euv_response is None:
+            print("  EUV response: resolving calibration once before search startup...", flush=True)
+            response_adapter = GXRenderEUVAdapter(
                 model_path=str(model_h5),
                 channel=str(render_selection.euv_channel),
-                render_channels=render_channels,
+                render_channels=tuple(response_store_request["channels"]),
                 instrument=str(render_selection.euv_instrument),
                 response_sav=render_selection.euv_response_sav,
                 ebtel_path=str(ebtel_path),
@@ -5656,12 +6187,21 @@ def main() -> int:
                 tr_region_mask=euv_tr_mask,
                 pixel_scale_arcsec=float(args.pixel_scale_arcsec),
             )
-            if euv_response_identity is not None:
-                euv_response_identity_version = str(euv_response_identity.version)
-                euv_response_sha256 = str(euv_response_identity.sha256)
-                euv_response_identity_summary = dict(euv_response_identity.summary)
-            identity_elapsed = time.perf_counter() - identity_started
-            print(f"  EUV response identity: computed in {identity_elapsed:.2f}s")
+            prebuilt_euv_response = response_adapter._ensure_euv_response_cache()
+            if prebuilt_euv_response is None:
+                raise RuntimeError("Unable to resolve EUV response for persistence; search not started")
+            prebuilt_euv_response = canonical_response(prebuilt_euv_response)
+            if artifact_h5.exists():
+                save_response(artifact_h5, response_store_request, prebuilt_euv_response)
+                prebuilt_euv_response = load_response(artifact_h5, response_store_request)
+        else:
+            print("  EUV response: loaded arrays from artifact (no response provider/network call)", flush=True)
+        euv_response_identity = prebuilt_euv_response.response_identity
+        if euv_response_identity is None:
+            euv_response_identity = response_adapter.response_identity()
+        euv_response_identity_version = str(euv_response_identity.version)
+        euv_response_sha256 = str(euv_response_identity.sha256)
+        euv_response_identity_summary = dict(euv_response_identity.summary)
     euv_response_origin = "pyEUVTools" if render_selection.euv_response_sav is None else "response_sav"
     euv_response_override_path = None if render_selection.euv_response_sav is None else str(render_selection.euv_response_sav)
     euv_response_resolver = "pychmp.gxrender_adapter.resolve_euv_response_identity"
@@ -5903,6 +6443,17 @@ def main() -> int:
                 "Slice preflight: skipped (new search identity on existing slice; "
                 "prior searches and map_store are preserved)"
             )
+    if matching_search_id and not _grid_reset_requested(args) and not new_search_identity:
+        args.preserve_stored_search_trials = True
+        if (not pinned_search_id and not bool(getattr(args, "retry_failed", False))
+                and _matching_search_is_finished(
+                    artifact_h5, slice_key=target_slice_key,
+                    search_id=target_search_id, diagnostics=root_diag,
+                )):
+            print(f"Already completed: {target_slice_key} | {target_search_id}; "
+                  "saved results reused; no rescoring or rendering", flush=True)
+            _maybe_launch_viewer("search already completed")
+            return 0
     root_diag["selected_search_id"] = target_search_id
     root_diag["search_id"] = target_search_id
     root_diag["search_active"] = True
@@ -6097,6 +6648,9 @@ def main() -> int:
         viewer_heartbeat.set_phase("initialized")
         viewer_heartbeat.notify_refresh()
 
+    if prebuilt_euv_response is not None:
+        save_response(artifact_h5, response_store_request, prebuilt_euv_response)
+
     factory = _AdaptiveRendererFactory(
         model_path=str(model_h5),
         ebtel_path=str(ebtel_path),
@@ -6139,14 +6693,18 @@ def main() -> int:
         euv_parallel=bool(args.euv_parallel),
         euv_exact=bool(args.euv_exact),
         euv_projection_threads=int(args.euv_projection_threads),
+        prebuilt_euv_response=prebuilt_euv_response,
     )
     slice_map_index = None
     if artifact_h5.exists():
         from pychmp.slice_map_index import build_slice_map_index
 
         try:
+            index_started = time.perf_counter()
+            viewer_heartbeat.set_phase(f"indexing saved map metadata: {target_slice_key}")
             slice_map_index = build_slice_map_index(artifact_h5, slice_key=str(target_slice_key))
-            print(f"Slice map index ({target_slice_key}): {slice_map_index.summary()}")
+            print(f"Slice map index ({target_slice_key}): {slice_map_index.summary()} "
+                  f"in {time.perf_counter() - index_started:.1f}s", flush=True)
         except Exception as exc:
             print(f"Slice map index: unavailable ({exc})")
     cache = _PersistentPointCache(
@@ -6195,7 +6753,7 @@ def main() -> int:
             threshold=float(args.metrics_mask_threshold),
             explicit_mask=explicit_metric_mask,
             artifact_preexisting=artifact_preexisting,
-            hydrate_completed_points=not grid_reset,
+            hydrate_completed_points=bool(matching_search_id) and not grid_reset,
             )
         )
         reused_points = hydrated + promoted_same_slice + promoted_auxiliary + promoted_index
@@ -6330,8 +6888,12 @@ def main() -> int:
             live_shift_y_trials.clear()
             live_shift_valid_trials.clear()
             live_mask_stage_trials.clear()
-            committed = cache.commit_map_store_warm_trials_for_point(float(a_value), float(b_value))
             warm_maps = cache.map_store_trial_count_for_point(float(a_value), float(b_value))
+            point_label = f"{point_search_spectral_label(factory)}; a={float(a_value):.3f} b={float(b_value):.3f}"
+            print(f"    Preparing point: {point_label}; {warm_maps} saved Q0 trial(s) indexed", flush=True)
+            viewer_heartbeat.set_phase(f"preparing point: {point_label}")
+            warm_started = time.perf_counter()
+            committed = cache.commit_map_store_warm_trials_for_point(float(a_value), float(b_value))
             if committed > 0:
                 rescore_note = (
                     "maps linked by ref"
@@ -6339,7 +6901,8 @@ def main() -> int:
                     else "all metrics rescored; maps linked by ref"
                 )
                 print(
-                    f"    Warm start: {committed} grid trial(s) from map_store ({rescore_note})",
+                    f"    Warm start: {point_label}; {committed} grid trial(s) from map_store "
+                    f"({rescore_note}; {time.perf_counter() - warm_started:.2f}s)",
                     flush=True,
                 )
             elif warm_maps > 0 and cache.defer_warm_curve_commits():

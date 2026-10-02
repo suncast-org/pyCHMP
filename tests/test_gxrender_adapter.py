@@ -546,7 +546,8 @@ def test_gxrender_euv_adapter_forwards_projection(monkeypatch, parallel, exact, 
     assert options_seen[0]["projection_threads"] == threads
 
 
-def test_gxrender_euv_adapter_reuses_cached_response_payload(monkeypatch) -> None:
+@pytest.mark.parametrize("response_sav", [None, "legacy_override.sav"])
+def test_gxrender_euv_adapter_reuses_cached_response_payload(monkeypatch, response_sav) -> None:
     class FakeSDKWithCachedResponse(FakeSDK):
         options_seen = []
 
@@ -577,7 +578,7 @@ def test_gxrender_euv_adapter_reuses_cached_response_payload(monkeypatch) -> Non
         model_path="model.h5",
         channel="171",
         instrument="AIA",
-        response_sav="legacy_override.sav",
+        response_sav=response_sav,
         ebtel_path="ebtel.sav",
         tbase=1e6,
         nbase=1e8,
