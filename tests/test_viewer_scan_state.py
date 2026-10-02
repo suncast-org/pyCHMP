@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -1880,6 +1881,50 @@ def test_apply_locked_navigation_best_follows_slice_local_best() -> None:
     assert app._selected_trial_token is None
 
 
+def test_best_mode_heatmap_pointer_locks_to_best_grid_point() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("best")
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+    app.a_values = np.asarray([0.0, 0.3], dtype=float)
+    app.b_values = np.asarray([2.4, 2.7], dtype=float)
+    app.display_model = {"records": []}
+    app._applying_navigation_selection = False
+    app._selected_trial_token = "stale"
+    app._refresh_selector_values = lambda: None
+    app.payload = {
+        "a_values": [0.0, 0.3],
+        "b_values": [2.4, 2.7],
+        "points": {
+            (0, 0): {
+                "status": "computed",
+                "a": 0.0,
+                "b": 2.4,
+                "metrics": {"eta2": 9.0},
+                "diagnostics": {"eta2": 9.0},
+            },
+            (1, 1): {
+                "status": "computed",
+                "a": 0.3,
+                "b": 2.7,
+                "metrics": {"eta2": 0.2},
+                "diagnostics": {"eta2": 0.2},
+            },
+        },
+    }
+    app._best_navigation_available = lambda: True
+    app._active_navigation_mode_available = lambda: False
+
+    app._apply_locked_navigation_selection(schedule_slice_reload=False)
+
+    assert app._heatmap_selection_marker_coords() == (
+        pytest.approx(0.3),
+        pytest.approx(2.7),
+    )
+
+
 def test_on_navigation_mode_changed_selects_live_coordinates() -> None:
     app = object.__new__(PychmpViewApp)
     app.navigation_mode_var = _Var("active")
@@ -2801,6 +2846,70 @@ def test_draw_trials_uses_unsaved_live_active_point_status_when_same_slice_selec
     assert "Active point: a=0.600, b=2.700" in app.status_var.get()
 
 
+def test_active_mode_red_pointer_follows_best_trial_not_the_first_q0() -> None:
+    class _VlineAxis(_AxisStub):
+        def __init__(self) -> None:
+            self.vlines: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def axvline(self, *args: object, **kwargs: object) -> None:
+            self.vlines.append((args, kwargs))
+
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("active")
+    app._refresh_signal_active_point = (0.6, 2.7)
+    q0_trials = np.asarray([0.0, 0.0046, 0.01], dtype=float)
+    metric_trials = np.asarray([0.9, 0.15, 0.4], dtype=float)
+    app._live_trial_state = lambda: {
+        "a_index": 0,
+        "b_index": 1,
+        "slice_key": "euv_94",
+        "active_a": 0.6,
+        "active_b": 2.7,
+        "metric_name": "eta2",
+        "q0_trials": q0_trials.tolist(),
+        "metric_trials": metric_trials.tolist(),
+        "active_trial_index": 1,
+        "active_trial_q0": 0.0046,
+    }
+    app._should_use_live_trials = lambda _live_state: False
+    app._should_force_live_trials = lambda _live_state: True
+    app._live_slice_matches_selected = lambda _live_state: True
+    app._live_search_matches_selected = lambda _live_state: True
+    app._live_trial_series_from_state = lambda _live_state: (q0_trials, metric_trials, "eta2", None)
+    app._selection_matches_live_active_point = lambda _a, _b: True
+    app._has_selected_point = lambda: False
+    app.metric_var = _Var("eta2")
+    app.run_target_metric = "eta2"
+    app.trial_index_var = _Var(0)
+    app._selected_trial_token = (0, 1, "eta2", -1)
+    app._refresh_trial_selector_controls = lambda *_args, **_kwargs: None
+    app._apply_trials_axis_controls = lambda **_kwargs: None
+    app._sync_trials_axis_controls_from_axes = lambda: None
+    app._capture_current_slice_view_state = lambda *_args, **_kwargs: None
+    app.trials_xscale_var = _Var("linear scale")
+    app.trials_yscale_var = _Var("linear scale")
+    app.ax_trials = _VlineAxis()
+    app.trials_figure = _FigureStub()
+    app.trials_canvas = type("_Canvas", (), {"draw_idle": lambda self: None})()
+    app._apply_figure_autolayout = lambda _figure: None
+    app.status_var = _Var("")
+    app.payload = {"selected_slice": {"display_label": "EUV 94 Å"}, "selected_slice_key": "euv_94", "points": {}}
+    app.a_values = np.asarray([0.6], dtype=float)
+    app.b_values = np.asarray([2.7], dtype=float)
+    app.a_index_var = _Var(0)
+    app.b_index_var = _Var(0)
+
+    app._draw_trials()
+
+    assert app.trial_index_var.get() == 1
+    red = [call for call in app.ax_trials.vlines if call[1].get("color") == "#d62728"]
+    orange = [call for call in app.ax_trials.vlines if call[1].get("color") == "#f08c00"]
+    assert len(red) == 1
+    assert red[0][0][0] == pytest.approx(0.0046)
+    assert len(orange) == 1
+    assert orange[0][0][0] == pytest.approx(0.0046)
+
+
 def test_sync_trials_axis_controls_displays_current_limits_for_autoscale() -> None:
     app = object.__new__(PychmpViewApp)
 
@@ -3016,39 +3125,12 @@ def test_should_use_live_trials_only_when_selection_matches_active_index() -> No
     assert app._should_use_live_trials({"a_index": 0, "b_index": 2}) is False
 
 
-def test_trial_slider_uses_force_live_mode_for_unsaved_active_point() -> None:
+def test_trial_slider_does_not_move_the_pointer_in_active_mode() -> None:
     app = object.__new__(PychmpViewApp)
     app._updating_trial_slider = False
     app.navigation_mode_var = _Var("active")
-    app._refresh_signal_active_point = (0.9, 3.0)
-    app._has_selected_point = lambda: True
-    app._selected_point = lambda: {
-        "fit_q0_trials": np.asarray([1.0e-5, 1.0e-4]),
-        "fit_metric_trials": np.asarray([1.0, 2.0]),
-        "target_metric": "eta2",
-    }
-    app._trial_series_for_point = lambda _point: (np.asarray([1.0e-5, 1.0e-4]), np.asarray([1.0, 2.0]), "eta2")
-    app._live_trial_state = lambda: {
-        "slice_key": "mw_6p929688ghz",
-        "active_a": 0.9,
-        "active_b": 3.0,
-        "metric_name": "eta2",
-        "q0_trials": [1.0e-6, 1.0e-5, 1.0e-4],
-        "metric_trials": [0.5, 0.6, 0.9],
-    }
-    app._live_trial_series_from_state = lambda _live_state: (
-        np.asarray([1.0e-6, 1.0e-5, 1.0e-4], dtype=float),
-        np.asarray([0.5, 0.6, 0.9], dtype=float),
-        "eta2",
-        None,
-    )
-    app.payload = {"selected_slice_key": "mw_6p929688ghz", "points": {}}
-    app.a_values = np.asarray([0.9], dtype=float)
-    app.b_values = np.asarray([3.0], dtype=float)
     app.trial_index_var = _Var(2)
-    app.run_target_metric = "eta2"
-    app.metric_var = _Var("eta2")
-    app._selected_trial_token = None
+    app._selected_trial_token = (0, 1, "eta2", -1)
     calls = {"refresh": 0}
 
     def _refresh() -> None:
@@ -3058,9 +3140,9 @@ def test_trial_slider_uses_force_live_mode_for_unsaved_active_point() -> None:
 
     app._on_trial_slider_changed("0")
 
-    assert app.trial_index_var.get() == 0
-    assert app._selected_trial_token == (0.9, 3.0, "eta2", -1)
-    assert calls["refresh"] == 1
+    assert app.trial_index_var.get() == 2
+    assert app._selected_trial_token == (0, 1, "eta2", -1)
+    assert calls["refresh"] == 0
 
 
 def test_trial_slider_uses_live_mode_for_saved_active_point() -> None:
@@ -3382,6 +3464,99 @@ def test_selected_trial_index_defaults_to_display_metric_best() -> None:
 
     assert selected == 1
     assert app.trial_index_var.get() == 1
+
+
+def test_active_and_best_modes_lock_metrics_pointer_to_best_trial() -> None:
+    q0_trials = np.asarray([0.0, 0.0046, 0.01], dtype=float)
+    metric_trials = np.asarray([0.9, 0.15, 0.4], dtype=float)
+    for mode in ("active", "best"):
+        app = object.__new__(PychmpViewApp)
+        app.navigation_mode_var = _Var(mode)
+        app.a_index_var = _Var(1)
+        app.b_index_var = _Var(2)
+        app.trial_index_var = _Var(0)
+        app._selected_trial_token = (1, 2, "eta2", 3)
+        app.run_target_metric = "eta2"
+
+        selected = app._selected_trial_index_for_point({}, q0_trials, metric_trials, "eta2")
+
+        assert selected == 1
+        assert app.trial_index_var.get() == 1
+
+
+def test_free_mode_keeps_a_manual_metrics_pointer() -> None:
+    app = object.__new__(PychmpViewApp)
+    app.navigation_mode_var = _Var("free")
+    app.a_index_var = _Var(1)
+    app.b_index_var = _Var(2)
+    app.trial_index_var = _Var(0)
+    app._selected_trial_token = (1, 2, "eta2", 3)
+    app.run_target_metric = "eta2"
+    q0_trials = np.asarray([0.0, 0.0046, 0.01], dtype=float)
+    metric_trials = np.asarray([0.9, 0.15, 0.4], dtype=float)
+
+    selected = app._selected_trial_index_for_point({}, q0_trials, metric_trials, "eta2")
+
+    assert selected == 0
+    assert app.trial_index_var.get() == 0
+
+
+def test_locked_modes_ignore_metrics_pointer_moves() -> None:
+    for mode in ("active", "best"):
+        app = object.__new__(PychmpViewApp)
+        app.navigation_mode_var = _Var(mode)
+        app._updating_trial_slider = False
+        app.trial_index_var = _Var(0)
+        app._selected_trial_token = (1, 2, "eta2", -1)
+        app.ax_trials = object()
+
+        class _Event:
+            inaxes = app.ax_trials
+            xdata = 0.0046
+            ydata = 0.15
+
+        app._on_trial_slider_changed("2")
+        app._jump_to_best_trial()
+        app._on_trials_canvas_click(_Event())
+
+        assert app.trial_index_var.get() == 0
+        assert app._selected_trial_token == (1, 2, "eta2", -1)
+
+
+def test_locked_modes_disable_trial_pointer_controls() -> None:
+    class _Control:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] = {}
+
+        def configure(self, **kwargs: object) -> None:
+            self.kwargs.update(kwargs)
+
+        def set(self, value: object) -> None:
+            self.value = value
+
+    for mode, expected_state in (("free", "normal"), ("active", "disabled"), ("best", "disabled")):
+        app = object.__new__(PychmpViewApp)
+        app.navigation_mode_var = _Var(mode)
+        app._updating_trial_slider = False
+        app.a_index_var = _Var(0)
+        app.b_index_var = _Var(0)
+        app.trial_index_var = _Var(0)
+        app.trial_label_var = _Var("")
+        app.trial_slider = _Control()
+        app.trial_best_button = _Control()
+        q0_trials = np.asarray([0.0, 0.0046], dtype=float)
+        metric_trials = np.asarray([0.9, 0.15], dtype=float)
+
+        app._refresh_trial_selector_controls(
+            None,
+            q0_trials,
+            metric_trials,
+            "eta2",
+            selected_index_override=1,
+        )
+
+        assert app.trial_slider.kwargs["state"] == expected_state
+        assert app.trial_best_button.kwargs["state"] == expected_state
 
 
 def test_slice_change_schedules_deferred_reload() -> None:
@@ -4195,6 +4370,184 @@ def test_heatmap_pending_outlier_does_not_set_color_limits(monkeypatch, log_scal
         assert len(colored.get_paths()) == 2
     else:
         assert app._heatmap_colorbar is None
+
+
+def test_unvisited_store_dots_pref_defaults_off(monkeypatch) -> None:
+    monkeypatch.setattr(viewer_mod, "_read_viewer_state", lambda: {})
+    assert viewer_mod._load_unvisited_store_dots_pref() is False
+    monkeypatch.setattr(viewer_mod, "_read_viewer_state", lambda: {"unvisited_store_dots": True})
+    assert viewer_mod._load_unvisited_store_dots_pref() is True
+    monkeypatch.setattr(viewer_mod, "_read_viewer_state", lambda: {"unvisited_store_dots": "yes"})
+    assert viewer_mod._load_unvisited_store_dots_pref() is False
+
+
+def _heatmap_app_for_store_dots() -> PychmpViewApp:
+    from matplotlib.figure import Figure
+
+    app = object.__new__(PychmpViewApp)
+    records = [
+        {
+            "a": 0.0,
+            "b": 0.0,
+            "a_center": 0.0,
+            "b_center": 0.0,
+            "a_index": 0,
+            "b_index": 0,
+            "a0": -0.5,
+            "a1": 0.5,
+            "b0": -0.5,
+            "b1": 0.5,
+            "metrics": {"eta2": 0.4},
+            "status": "computed",
+        },
+        {
+            "a": 1.0,
+            "b": 0.0,
+            "a_center": 1.0,
+            "b_center": 0.0,
+            "a_index": 1,
+            "b_index": 0,
+            "a0": 0.5,
+            "a1": 1.5,
+            "b0": -0.5,
+            "b1": 0.5,
+            "metrics": {"eta2": 0.9},
+            "status": "pending",
+        },
+    ]
+    app.payload = {"point_records": [], "selected_slice_key": "euv_193"}
+    app.display_model = {"records": records}
+    app.a_values = np.asarray([0.0, 1.0], dtype=float)
+    app.b_values = np.asarray([0.0, 1.0], dtype=float)
+    app.artifact_h5 = Path("/tmp/unused-store-dots.h5")
+    app.slice_key_var = _Var("euv_193")
+    app.metric_var = _Var("eta2")
+    app.heatmap_figure = Figure()
+    app.ax_heatmap = app.heatmap_figure.add_subplot(121)
+    app.ax_heatmap_cbar = app.heatmap_figure.add_subplot(122)
+    app._heatmap_colorbar = None
+    app._reset_heatmap_colorbar = lambda: None
+    app._ensure_heatmap_colorbar_axes = lambda: None
+    app._heatmap_display_metric = lambda: "eta2"
+    app._heatmap_display_model = lambda: app.display_model
+    app._use_heatmap_log_scale = lambda: False
+    app._heatmap_plot_limits = lambda _model: (-0.5, 1.5, -0.5, 1.5)
+    app._heatmap_selection_locked = lambda: True
+    app._navigation_mode = lambda: "free"
+    app._best_tied_records = []
+    app._refresh_signal_active_point = None
+    app._refresh_signal_pending_points = []
+    return app
+
+
+def test_unvisited_store_dots_stay_off_without_reading_the_slice_index(monkeypatch) -> None:
+    from matplotlib.collections import PatchCollection, PathCollection
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(False)
+    queries: list[str] = []
+
+    def _forbidden(*_args, **_kwargs):
+        queries.append("slice_index")
+        raise AssertionError("slice index queried while Stored maps is off")
+
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _forbidden)
+    app._draw_heatmap()
+    assert queries == []
+    colored = [item for item in app.ax_heatmap.collections if isinstance(item, PatchCollection)]
+    assert len(colored[0].get_paths()) == 1
+    assert not any(isinstance(item, PathCollection) for item in app.ax_heatmap.collections)
+
+
+def _stored_dot_offsets(app: PychmpViewApp) -> np.ndarray:
+    from matplotlib.collections import PathCollection
+
+    dots = [item for item in app.ax_heatmap.collections if isinstance(item, PathCollection)]
+    assert len(dots) == 1
+    return np.asarray(dots[0].get_offsets(), dtype=float)
+
+
+def test_stored_map_dots_match_across_wavelengths_from_one_index_read(monkeypatch) -> None:
+    from matplotlib.collections import PatchCollection, PathCollection
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(True)
+    queries: list[int] = []
+
+    def _indexed(_path, slice_key="", after_row=0):
+        del slice_key
+        queries.append(int(after_row))
+        return {(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)}, 8
+
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _indexed)
+    app.slice_key_var = _Var("euv_193")
+    app._draw_heatmap()
+    first = _stored_dot_offsets(app)
+    app.slice_key_var = _Var("euv_131")
+    app._last_payload_reload_at_s = 5.0
+    app._draw_heatmap()
+    second = _stored_dot_offsets(app)
+    assert queries == [0]
+    assert first.shape == (3, 2)
+    assert np.allclose(first, second)
+    assert np.allclose(first, np.asarray([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]]))
+    collections = list(app.ax_heatmap.collections)
+    dots = next(item for item in collections if isinstance(item, PathCollection))
+    colored = next(item for item in collections if isinstance(item, PatchCollection))
+    assert collections.index(dots) < collections.index(colored)
+    assert dots.get_zorder() < colored.get_zorder()
+    assert float(dots.get_sizes()[0]) == pytest.approx(16)
+    face = dots.get_facecolor()
+    assert face[0, 0] == pytest.approx(214 / 255)
+    assert face[0, 1] == pytest.approx(39 / 255)
+    assert face[0, 2] == pytest.approx(40 / 255)
+    assert len(colored.get_paths()) == 1
+
+
+def test_unvisited_store_dots_read_off_the_ui_thread(monkeypatch) -> None:
+    import threading
+
+    app = _heatmap_app_for_store_dots()
+    app.unvisited_store_dots_var = _Var(True)
+    queries: list[int] = []
+    painted: list[int] = []
+    reader_threads: list[threading.Thread] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def _indexed(_path, slice_key="", after_row=0):
+        del slice_key
+        queries.append(int(after_row))
+        reader_threads.append(threading.current_thread())
+        started.set()
+        assert release.wait(2.0)
+        return {(0.0, 1.0)}, 4
+
+    class _Root:
+        def __init__(self) -> None:
+            self.callbacks: list = []
+
+        def after(self, _delay: int, callback) -> None:
+            self.callbacks.append(callback)
+
+    app.root = _Root()
+    monkeypatch.setattr(viewer_mod, "slice_index_ab_snapshot", _indexed)
+    app._draw_heatmap()
+    assert started.wait(2.0)
+    assert queries == [0]
+    assert reader_threads[0] is not threading.current_thread()
+    app._draw_heatmap()
+    assert queries == [0]
+    release.set()
+    deadline = time.time() + 2.0
+    while not app.root.callbacks and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(app.root.callbacks) == 1
+    app._draw_heatmap = lambda: painted.append(1)
+    app.root.callbacks[0]()
+    assert painted == [1]
+    app._cached_unvisited_store_tokens(app.artifact_h5, "euv_131")
+    assert queries == [0]
 
 
 def test_refresh_controls_does_not_restore_previous_slice_search_while_loading() -> None:

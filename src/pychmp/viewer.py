@@ -42,6 +42,7 @@ from .ab_scan_artifacts import (
     default_point_index,
     extend_patch_grid_model_with_pending_point,
     find_record_for_point,
+    _axis_spans,
     grid_indices_for_coordinates,
     grid_patch_rectangle,
     nearest_index,
@@ -55,6 +56,7 @@ from .ab_scan_artifacts import (
     with_observer_metadata,
 )
 from .grid_points import load_grid_point_live_state
+from .slice_map_index import slice_index_ab_snapshot
 from .metrics import (
     METRICS_MASK_STAGE_UNKNOWN,
     format_metrics_mask_label,
@@ -159,6 +161,17 @@ def _load_heatmap_log_scale_pref() -> bool:
 def _save_heatmap_log_scale_pref(enabled: bool) -> None:
     payload = _read_viewer_state()
     payload["heatmap_log_scale"] = bool(enabled)
+    _write_viewer_state(payload)
+
+
+def _load_unvisited_store_dots_pref() -> bool:
+    value = _read_viewer_state().get("unvisited_store_dots")
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _save_unvisited_store_dots_pref(enabled: bool) -> None:
+    payload = _read_viewer_state()
+    payload["unvisited_store_dots"] = bool(enabled)
     _write_viewer_state(payload)
 
 
@@ -1034,6 +1047,7 @@ class PychmpViewApp:
         self.trial_label_var = tk.StringVar(value="trial: n/a")
         self.shared_heatmap_axes_var = tk.BooleanVar(value=_load_shared_grid_axes_pref())
         self.heatmap_log_scale_var = tk.BooleanVar(value=_load_heatmap_log_scale_pref())
+        self.unvisited_store_dots_var = tk.BooleanVar(value=_load_unvisited_store_dots_pref())
         self._shared_heatmap_extents: dict[str, float] | None = None
         self._open_global_best_applied = False
         self.a_index_var = tk.IntVar(value=0)
@@ -1093,6 +1107,8 @@ class PychmpViewApp:
         self._selected_trial_map_cache_key: tuple[Any, ...] | None = None
         self._selected_trial_map_cache_value: dict[str, Any] | None = None
         self._heatmap_selection_artists: list[Any] = []
+        self._unvisited_store_dot_cache: dict[str, Any] = {}
+        self._unvisited_store_dot_load_key: str | None = None
         self.refresh_button: ttk.Button | None = None
         self.metric_menu: ttk.Combobox | None = None
         self.navigation_mode_var = tk.StringVar(value="free")
@@ -1778,6 +1794,10 @@ class PychmpViewApp:
 
     def _metric_selection_locked(self) -> bool:
         return self._navigation_mode() == "active"
+
+    def _metrics_pointer_locked(self) -> bool:
+        """Active and Best keep the red q0 pointer on the best trial. Free is the only movable mode."""
+        return self._navigation_mode() in {"active", "best"}
 
     def _navigation_is_locked(self) -> bool:
         return self._grid_point_selection_locked()
@@ -3683,6 +3703,18 @@ class PychmpViewApp:
             log_scale_check,
             "Apply logarithmic scaling to the heatmap color scale (positive metric values only).",
         )
+        store_dots_check = ttk.Checkbutton(
+            parent,
+            text="Stored maps",
+            variable=self.unvisited_store_dots_var,
+            command=self._on_unvisited_store_dots_changed,
+        )
+        store_dots_check.pack(side=tk.LEFT, padx=(12, 4))
+        self.unvisited_store_dots_check = store_dots_check
+        _ToolTip(
+            store_dots_check,
+            "Red dots for every stored (a, b), the same on every heatmap. Computed cells cover the dots.",
+        )
 
     def _use_heatmap_log_scale(self) -> bool:
         return bool(getattr(self, "heatmap_log_scale_var", None) and self.heatmap_log_scale_var.get())
@@ -3693,6 +3725,107 @@ class PychmpViewApp:
             return
         self._draw_heatmap()
         self.heatmap_canvas.draw_idle()
+
+    def _use_unvisited_store_dots(self) -> bool:
+        return bool(getattr(self, "unvisited_store_dots_var", None) and self.unvisited_store_dots_var.get())
+
+    def _on_unvisited_store_dots_changed(self) -> None:
+        _save_unvisited_store_dots_pref(self._use_unvisited_store_dots())
+        if not self.payload:
+            return
+        self._draw_heatmap()
+        self.heatmap_canvas.draw_idle()
+
+    def _read_unvisited_store_cache_entry(self, artifact: Path, *, path: str, after_row: int, points: set[tuple[float, float]]) -> dict[str, Any]:
+        added, nrows = slice_index_ab_snapshot(Path(artifact), after_row=after_row)
+        if after_row and int(nrows) < after_row:
+            added, nrows = slice_index_ab_snapshot(Path(artifact), after_row=0)
+            points = set()
+        elif not after_row:
+            points = set()
+        else:
+            points = set(points)
+        points.update((float(a_value), float(b_value)) for a_value, b_value in added)
+        return {"path": path, "nrows": int(nrows), "points": points}
+
+    def _cached_unvisited_store_tokens(self, artifact: Path, slice_key: str = "") -> set[tuple[float, float]]:
+        """Cached ``(a, b)`` points for the whole map store.
+
+        The set is not filtered by wavelength. Heatmap redraws reuse it and do
+        not open the index. A missing entry is filled on a background thread
+        when Tk is running.
+        """
+        del slice_key
+        path = str(artifact)
+        cache = getattr(self, "_unvisited_store_dot_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._unvisited_store_dot_cache = cache
+        if cache.get("path") == path and isinstance(cache.get("points"), set):
+            return cache["points"]
+        if getattr(self, "_unvisited_store_dot_load_key", None) == path:
+            pending = cache.get("points")
+            return pending if isinstance(pending, set) else set()
+        root = getattr(self, "root", None)
+        after = getattr(root, "after", None) if root is not None else None
+        if not callable(after):
+            try:
+                filled = self._read_unvisited_store_cache_entry(artifact, path=path, after_row=0, points=set())
+            except Exception:
+                return set()
+            self._unvisited_store_dot_cache = filled
+            filled_points = filled.get("points")
+            return filled_points if isinstance(filled_points, set) else set()
+
+        self._unvisited_store_dot_load_key = path
+
+        def _worker() -> None:
+            filled: dict[str, Any] | None = None
+            try:
+                filled = self._read_unvisited_store_cache_entry(artifact, path=path, after_row=0, points=set())
+            except Exception:
+                filled = None
+
+            def _apply() -> None:
+                if getattr(self, "_unvisited_store_dot_load_key", None) == path:
+                    self._unvisited_store_dot_load_key = None
+                if filled is not None:
+                    self._unvisited_store_dot_cache = filled
+                if not self._use_unvisited_store_dots():
+                    return
+                try:
+                    self._draw_heatmap()
+                    canvas = getattr(self, "heatmap_canvas", None)
+                    if canvas is not None:
+                        canvas.draw_idle()
+                except Exception:
+                    return
+
+            try:
+                after(0, _apply)
+            except Exception:
+                if getattr(self, "_unvisited_store_dot_load_key", None) == path:
+                    self._unvisited_store_dot_load_key = None
+
+        threading.Thread(target=_worker, name="pychmp-store-dots", daemon=True).start()
+        return set()
+
+    def _unvisited_store_dot_centers(self, records: list[dict[str, Any]]) -> tuple[list[float], list[float]]:
+        """Stored ``(a, b)`` points. The same set is drawn on every heatmap."""
+        del records
+        if not self._use_unvisited_store_dots():
+            return [], []
+        artifact = getattr(self, "artifact_h5", None)
+        if artifact is None:
+            return [], []
+        try:
+            stored_points = self._cached_unvisited_store_tokens(Path(artifact))
+        except Exception:
+            return [], []
+        if not stored_points:
+            return [], []
+        ordered = sorted(stored_points)
+        return [float(a_value) for a_value, _b_value in ordered], [float(b_value) for _a_value, b_value in ordered]
 
     def _refresh_shared_heatmap_extents(self) -> None:
         self._shared_heatmap_extents = None
@@ -5475,7 +5608,7 @@ class PychmpViewApp:
             b_token=token[1],
             point_metric=point_metric,
         )
-        if force_best:
+        if force_best or self._metrics_pointer_locked():
             current_index = 0 if display_best_index is None else int(display_best_index)
         elif (
             not token_matches_context
@@ -5484,13 +5617,6 @@ class PychmpViewApp:
         ):
             default_index = self._default_trial_index_for_point(point, q0_trials, metric_trials)
             current_index = 0 if default_index is None else int(default_index)
-        elif (
-            self._navigation_mode() != "free"
-            and display_best_index is not None
-            and 0 <= current_index < metric_trials.size
-            and not np.isfinite(float(metric_trials[current_index]))
-        ):
-            current_index = int(display_best_index)
         if trial_index_var is not None and int(trial_index_var.get()) != int(current_index):
             trial_index_var.set(int(current_index))
         self._selected_trial_token = token
@@ -5550,7 +5676,7 @@ class PychmpViewApp:
                     self.trial_slider.configure(
                         from_=0.0,
                         to=float(max(0, len(q0_trials) - 1)),
-                        state=tk.NORMAL,
+                        state=(tk.DISABLED if self._metrics_pointer_locked() else tk.NORMAL),
                     )
                     self.trial_slider.set(float(selected_index))
                 else:
@@ -5559,7 +5685,8 @@ class PychmpViewApp:
             finally:
                 self._updating_trial_slider = False
         if self.trial_best_button is not None:
-            self.trial_best_button.configure(state=(tk.NORMAL if enabled else tk.DISABLED))
+            pointer_movable = enabled and not self._metrics_pointer_locked()
+            self.trial_best_button.configure(state=(tk.NORMAL if pointer_movable else tk.DISABLED))
 
     def _clear_trial_selector_controls(self) -> None:
         self._selected_trial_token = None
@@ -5576,6 +5703,8 @@ class PychmpViewApp:
             self.trial_best_button.configure(state=tk.DISABLED)
 
     def _jump_to_best_trial(self) -> None:
+        if self._metrics_pointer_locked():
+            return
         live_state = self._live_trial_state()
         use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
         if self._has_selected_point() and not use_live_trials:
@@ -5604,7 +5733,7 @@ class PychmpViewApp:
         self._refresh_all()
 
     def _on_trial_slider_changed(self, value: str) -> None:
-        if self._updating_trial_slider:
+        if self._updating_trial_slider or self._metrics_pointer_locked():
             return
         live_state = self._live_trial_state()
         use_live_trials = self._should_force_live_trials(live_state) or self._should_use_live_trials(live_state)
@@ -6085,9 +6214,13 @@ class PychmpViewApp:
             return None
 
         current_index = int(np.clip(int(self.trial_index_var.get()), 0, max(0, int(q0_trials.size) - 1)))
+        best_index = self._best_trial_index_from_metric(metric_trials)
+        if self._metrics_pointer_locked() and best_index is not None:
+            current_index = int(best_index)
+            if int(self.trial_index_var.get()) != current_index:
+                self.trial_index_var.set(current_index)
         selected_q0 = float(q0_trials[current_index])
         selected_metric = float(metric_trials[current_index])
-        best_index = self._best_trial_index_from_metric(metric_trials)
         best_q0 = float(q0_trials[int(best_index)]) if best_index is not None else selected_q0
 
         active_coords = self._live_active_ab(live_state)
@@ -6278,6 +6411,8 @@ class PychmpViewApp:
         self._refresh_all()
 
     def _on_trials_canvas_click(self, event: Any) -> None:
+        if self._metrics_pointer_locked():
+            return
         if event.inaxes is not self.ax_trials or event.xdata is None:
             return
         live_state = self._live_trial_state()
@@ -6610,6 +6745,17 @@ class PychmpViewApp:
                 computed_records.append(record)
             else:
                 pending_records.append(record)
+        dot_x, dot_y = self._unvisited_store_dot_centers(records)
+        if dot_x:
+            self.ax_heatmap.scatter(
+                dot_x,
+                dot_y,
+                s=16,
+                marker="o",
+                color="#d62728",
+                linewidths=0,
+                zorder=1,
+            )
         patches = [_heatmap_grid_rectangle(record) for record in computed_records]
         values = np.asarray(
             [float(record["metrics"].get(metric_name, np.nan)) for record in computed_records],
@@ -6633,6 +6779,7 @@ class PychmpViewApp:
                 facecolors=facecolors,
                 edgecolor="none",
                 linewidth=0.0,
+                zorder=2,
             )
             metric_mappable = mpl_cm.ScalarMappable(norm=heatmap_norm, cmap=cmap)
             metric_mappable.set_array(np.asarray(color_values, dtype=float))
@@ -6645,6 +6792,7 @@ class PychmpViewApp:
                 edgecolors="#666666",
                 linewidths=1.8,
                 linestyles="dashed",
+                zorder=3,
             )
             self.ax_heatmap.add_collection(pending_collection)
         apply_heatmap_axis_style(self.ax_heatmap, metric_name=metric_name)
@@ -6865,18 +7013,29 @@ class PychmpViewApp:
                 selected_trial_index = None
             else:
                 current_index = int(self.trial_index_var.get())
-                token_matches_context = self._trial_token_matches_context(
-                    self._selected_trial_token,
-                    a_token=live_a_token,
-                    b_token=live_b_token,
-                    point_metric=point_metric,
-                )
-                if not token_matches_context or current_index < 0 or current_index >= q0_trials.size:
-                    selected_trial_index = int(np.clip(q0_trials.size - 1, 0, max(0, q0_trials.size - 1)))
-                    self.trial_index_var.set(selected_trial_index)
+                if self._metrics_pointer_locked():
+                    best_index = self._best_trial_index_from_metric(metric_trials)
+                    selected_trial_index = (
+                        int(best_index)
+                        if best_index is not None
+                        else int(np.clip(current_index, 0, max(0, q0_trials.size - 1)))
+                    )
+                    if int(self.trial_index_var.get()) != int(selected_trial_index):
+                        self.trial_index_var.set(int(selected_trial_index))
                     self._selected_trial_token = current_live_token
                 else:
-                    selected_trial_index = current_index
+                    token_matches_context = self._trial_token_matches_context(
+                        self._selected_trial_token,
+                        a_token=live_a_token,
+                        b_token=live_b_token,
+                        point_metric=point_metric,
+                    )
+                    if not token_matches_context or current_index < 0 or current_index >= q0_trials.size:
+                        selected_trial_index = int(np.clip(q0_trials.size - 1, 0, max(0, q0_trials.size - 1)))
+                        self.trial_index_var.set(selected_trial_index)
+                        self._selected_trial_token = current_live_token
+                    else:
+                        selected_trial_index = current_index
             raw_active_trial_index = live_state.get("active_trial_index")
             if raw_active_trial_index is not None:
                 try:
