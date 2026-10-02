@@ -62,6 +62,12 @@ Console entry points after install:
 | `pychmp-view` | Artifact viewer |
 | `pychmp-rescore` | Rescore `map_store` into a parallel search identity |
 | `pychmp-repair-grid-trial-maps` | Repair invalid trial HDF5 groups |
+| `pychmp-clean-map-store` | Report (default) or delete orphan `map_store` `(a,b)` points |
+
+`pychmp-clean-map-store` is dry-run by default: it reports map-store entries
+whose `(a,b)` no search grid visited. Pass `--delete` to remove orphans.
+Orphan detection always unions visited points from **all** searches;
+`--slice-key` / `--search-id` only filter the per-search report section.
 
 Release history: [CHANGELOG.md](CHANGELOG.md).
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -1979,10 +1980,23 @@ class PychmpViewApp:
             return None
 
     def _process_is_running(self, pid: int) -> bool:
+        """Return True when ``pid`` refers to an existing process.
+
+        ``os.kill(pid, 0)`` raises ``PermissionError`` / ``EPERM`` when the
+        process exists but this user cannot signal it; treat that as alive so
+        operators do not get a false Incomplete while another user's runner
+        still owns the artifact.
+        """
         try:
             os.kill(int(pid), 0)
             return True
-        except OSError:
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.EPERM:
+                return True
             return False
 
     def _artifact_marks_active_search(self) -> bool:
@@ -2935,12 +2949,35 @@ class PychmpViewApp:
                 artifact_live or (adaptive_point_run and refresh_active and matches_slice)
             )
 
+            phase = str(self._refresh_signal_phase or "").strip().lower()
+            phase_aborted = self._refresh_phase_indicates_failure(phase)
+            search_completed = self._selected_search_is_successfully_complete()
+            search_failed = self._selected_search_is_failed_or_interrupted()
+
+            # Align with non-empty PID-dead rules: leftover active/heartbeat
+            # markers after the runner is gone are Incomplete, not Interrupted,
+            # unless phase/status indicates failure. Authoritative complete
+            # still wins over a stale live PID (see Oct 2 badge note).
             if runner_active or heartbeat_running:
-                badge = "RUNNING"
-                color = "#0b7285"
-            elif artifact_live or search_active_flag:
+                if self._search_run_terminal():
+                    if search_failed or phase_aborted:
+                        badge = "INTERRUPTED"
+                        color = "#c92a2a"
+                    else:
+                        badge = "FINISHED"
+                        color = "#2b8a3e"
+                else:
+                    badge = "RUNNING"
+                    color = "#0b7285"
+            elif phase_aborted or search_failed:
                 badge = "INTERRUPTED"
                 color = "#c92a2a"
+            elif search_completed:
+                badge = "FINISHED"
+                color = "#2b8a3e"
+            elif artifact_live or search_active_flag or bool(started_at):
+                badge = "INCOMPLETE"
+                color = "#b26a00"
             else:
                 badge = "EMPTY"
                 color = "#6c757d"
@@ -3000,6 +3037,9 @@ class PychmpViewApp:
             or (adaptive_point_run and scoped_refresh_active and not scoped_phase_complete)
         )
 
+        # Policy: authoritative terminal status (complete/failed) wins over a
+        # still-alive runner PID. A stale or delayed process exit must not keep
+        # the badge at RUNNING after the selected search finished successfully.
         if runner_active or heartbeat_running or cross_slice_runner:
             if self._search_run_terminal():
                 if search_failed or phase_aborted:
@@ -3048,15 +3088,9 @@ class PychmpViewApp:
         if completed_at:
             info_lines.append(f"Search completed: {completed_at}")
         if search_status:
-            if (
-                search_active_flag
-                and search_status == "complete"
-                and runner_active
-                and not self._search_run_terminal()
-            ):
-                info_lines.append("Search status: in_progress (runner active)")
-            else:
-                info_lines.append(f"Search status: {search_status}")
+            # Authoritative ``complete`` is terminal even if a PID is still
+            # alive, so do not rewrite the status line to in_progress.
+            info_lines.append(f"Search status: {search_status}")
         shift_diag = self._diagnostics_with_search_shift(dict(diagnostics))
         info_lines.append(format_search_shift_policy_label(shift_diag))
         info_lines.append(f"Navigation mode: {self._navigation_mode()}")

@@ -310,6 +310,34 @@ def test_badge_reports_running_while_runner_pid_alive(tmp_path: Path) -> None:
     assert "Live runner: yes" in info_detail
 
 
+def test_process_is_running_treats_eperm_as_alive(tmp_path: Path) -> None:
+    """PermissionError / EPERM from os.kill(pid, 0) means the process exists."""
+
+    import errno
+    import os
+
+    app = object.__new__(PychmpViewApp)
+
+    def _raise_eperm(_pid: int, _sig: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    original_kill = os.kill
+    os.kill = _raise_eperm  # type: ignore[assignment]
+    try:
+        assert app._process_is_running(4242) is True
+    finally:
+        os.kill = original_kill  # type: ignore[assignment]
+
+    def _raise_esrch(_pid: int, _sig: int) -> None:
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    os.kill = _raise_esrch  # type: ignore[assignment]
+    try:
+        assert app._process_is_running(4242) is False
+    finally:
+        os.kill = original_kill  # type: ignore[assignment]
+
+
 def test_badge_reports_incomplete_after_runner_pid_gone_despite_fresh_heartbeat(tmp_path: Path) -> None:
     app = _make_app(tmp_path, phase="point 1 saved", refresh_active=True)
     app.payload = {
@@ -885,8 +913,10 @@ def test_poll_external_refresh_signal_uses_lightweight_refresh_for_trial_phase(t
     assert calls["refresh"] == 0
 
 
-def test_scan_state_reports_interrupted_for_empty_search_with_stale_live_state(tmp_path: Path) -> None:
-    app = _make_app(tmp_path, phase="trial 06 active", refresh_active=False)
+def test_scan_state_reports_incomplete_for_empty_search_with_stale_live_state(tmp_path: Path) -> None:
+    """Empty grid + dead PID + leftover active/heartbeat → INCOMPLETE (not INTERRUPTED)."""
+
+    app = _make_app(tmp_path, phase="trial 06 active", refresh_active=True)
     app.payload = {
         "points": {},
         "selected_slice_key": "mw_2p873584ghz",
@@ -895,7 +925,12 @@ def test_scan_state_reports_interrupted_for_empty_search_with_stale_live_state(t
         "selected_search": {
             "status": "empty",
             "active": True,
-            "lifecycle": {"active": True, "in_progress": True, "status": "empty"},
+            "lifecycle": {
+                "active": True,
+                "in_progress": True,
+                "status": "empty",
+                "started_at": "2026-10-02T12:00:00Z",
+            },
             "target_metric": "eta2",
         },
         "diagnostics": {
@@ -910,17 +945,57 @@ def test_scan_state_reports_interrupted_for_empty_search_with_stale_live_state(t
         "metric_name": "eta2",
     }
     app._refresh_signal_slice_key = "mw_2p873584ghz"
-    app._live_runner_detected = lambda: False
+    app._refresh_signal_search_id = "search_a4c3736655362921"
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: False
     app._active_point_scoped_to_selection = lambda: None
+
+    assert app._live_runner_detected() is False
 
     badge, toolbar_detail, info_detail, _color, _foreground = app._scan_state_snapshot()
 
-    assert badge == "INTERRUPTED"
+    assert badge == "INCOMPLETE"
     assert toolbar_detail == "MW: 2.874 GHz | search_a4c3736655362921 | 0/0 computed"
     assert "Computed: 0" in info_detail
 
 
+def test_scan_state_reports_interrupted_for_empty_search_after_failed_phase(tmp_path: Path) -> None:
+    """Empty grid still uses INTERRUPTED when phase/status indicates failure."""
+
+    app = _make_app(tmp_path, phase="adaptive search failed", refresh_active=False)
+    app.payload = {
+        "points": {},
+        "selected_slice_key": "mw_2p873584ghz",
+        "selected_slice": {"label": "MW: 2.874 GHz", "key": "mw_2p873584ghz"},
+        "selected_search_id": "search_failed_empty",
+        "selected_search": {
+            "status": "failed",
+            "active": False,
+            "lifecycle": {
+                "active": False,
+                "status": "failed",
+                "started_at": "2026-10-02T12:00:00Z",
+            },
+            "target_metric": "eta2",
+        },
+        "diagnostics": {
+            "artifact_kind": "pychmp_ab_scan_sparse_points",
+            "search_mode": "adaptive_local_single_observation",
+        },
+    }
+    app._runner_pid_from_log = lambda: 4242
+    app._process_is_running = lambda _pid: False
+    app._active_point_scoped_to_selection = lambda: None
+
+    badge, toolbar_detail, _info_detail, _color, _foreground = app._scan_state_snapshot()
+
+    assert badge == "INTERRUPTED"
+    assert "0/0 computed" in toolbar_detail
+
+
 def test_scan_state_reports_finished_when_saved_search_complete_even_if_refresh_fresh(tmp_path: Path) -> None:
+    """Authoritative complete wins over a still-alive runner PID (and fresh refresh)."""
+
     app = _make_app(tmp_path, phase="trial 03 complete", refresh_active=True)
     app.payload["selected_search"] = {
         "status": "complete",
