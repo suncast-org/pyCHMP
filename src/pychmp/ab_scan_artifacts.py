@@ -4355,6 +4355,9 @@ def _write_map_store_array(
             map_group.attrs["map_layer_id"] = np.bytes_(str(map_layer["layer_id"]))
             map_group.attrs["component"] = np.bytes_(component)
             map_group.attrs["channel_or_frequency"] = np.bytes_(str(map_layer["channel_or_frequency"]))
+        from .slice_map_index import append_map_store_slice_index
+
+        append_map_store_slice_index(h5_file, identity=identity, map_key=map_id)
     return f"/{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}/{map_id}"
 
 
@@ -4905,6 +4908,137 @@ def ensure_slice_common_psf_kernel_in_file(
         )
 
 
+def _store_common_observation_maps(
+    common: h5py.Group,
+    *,
+    observed: np.ndarray,
+    sigma_map: np.ndarray,
+    diagnostics: dict[str, Any],
+    observation_canvas: np.ndarray | None = None,
+    sigma_canvas: np.ndarray | None = None,
+    canvas_wcs_header: fits.Header | None = None,
+    only_missing: bool = False,
+) -> dict[str, Any]:
+    """Write ``observed`` and ``sigma_map`` the same way ``_write_common_group`` does.
+
+    Arrays must already be the area-corrected reference. This function does not regrid.
+    ``only_missing`` adds datasets that were stripped and leaves maps already stored.
+    """
+    if only_missing and "observed" in common:
+        observed_store = np.asarray(common["observed"], dtype=np.float32)
+    else:
+        observed_store = np.asarray(observed, dtype=np.float32)
+    if only_missing and "sigma_map" in common:
+        sigma_store = np.asarray(common["sigma_map"], dtype=np.float32)
+    else:
+        sigma_store = np.asarray(sigma_map, dtype=np.float32)
+    canvas_for_identity = observation_canvas
+    sigma_canvas_for_identity = sigma_canvas
+    if only_missing and "observation_canvas" in common and "sigma_canvas" in common:
+        canvas_for_identity = np.asarray(common["observation_canvas"], dtype=np.float32)
+        sigma_canvas_for_identity = np.asarray(common["sigma_canvas"], dtype=np.float32)
+    diagnostics_out = _sync_preprocessed_content_identity_diagnostics(
+        diagnostics,
+        observed=observed_store,
+        sigma_map=sigma_store,
+        observation_canvas=canvas_for_identity,
+        sigma_canvas=sigma_canvas_for_identity,
+    )
+    if not (only_missing and "observed" in common):
+        common.create_dataset("observed", data=observed_store, compression="gzip", compression_opts=4)
+    if not (only_missing and "sigma_map" in common):
+        common.create_dataset("sigma_map", data=sigma_store, compression="gzip", compression_opts=4)
+    if (
+        canvas_for_identity is not None
+        and sigma_canvas_for_identity is not None
+        and canvas_wcs_header is not None
+    ):
+        if "observation_canvas" not in common:
+            common.create_dataset(
+                "observation_canvas",
+                data=np.asarray(canvas_for_identity, dtype=np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+        if "sigma_canvas" not in common:
+            common.create_dataset(
+                "sigma_canvas",
+                data=np.asarray(sigma_canvas_for_identity, dtype=np.float32),
+                compression="gzip",
+                compression_opts=4,
+            )
+        if "canvas_wcs_header" not in common:
+            _create_text_dataset(
+                common,
+                "canvas_wcs_header",
+                canvas_wcs_header.tostring(sep="\n", endcard=True),
+            )
+    return diagnostics_out
+
+
+def ensure_slice_common_observation_maps(
+    h5_path: Path,
+    *,
+    slice_key: str,
+    observed: np.ndarray | None,
+    sigma_map: np.ndarray | None,
+    observation_canvas: np.ndarray | None = None,
+    sigma_canvas: np.ndarray | None = None,
+    canvas_wcs_header: fits.Header | None = None,
+) -> bool:
+    """Backfill missing ``common/observed`` and ``common/sigma_map`` from a prepared reference.
+
+    ``observed`` and ``sigma_map`` are the maps returned by
+    ``resolve_slice_observation_reference``. Pixel-area scaling stays in that
+    prepare step; this only persists the pair when either dataset is absent.
+    """
+    if observed is None or sigma_map is None:
+        return False
+    slice_name = str(slice_key or "").strip()
+    if not slice_name or not Path(h5_path).exists():
+        return False
+    with _H5PY_FILE(Path(h5_path), "r") as h5_file:
+        slice_group, _descriptors, _selected_key = _resolve_slice_group(
+            h5_file,
+            slice_key=slice_name,
+            allow_missing=True,
+        )
+        if slice_group is None or "common" not in slice_group:
+            return False
+        common = slice_group["common"]
+        if "observed" in common and "sigma_map" in common:
+            return False
+    with _H5PY_FILE(Path(h5_path), "a") as h5_file:
+        slice_group, _descriptors, _selected_key = _resolve_slice_group(
+            h5_file,
+            slice_key=slice_name,
+            allow_missing=True,
+        )
+        if slice_group is None or "common" not in slice_group:
+            return False
+        common = slice_group["common"]
+        if "observed" in common and "sigma_map" in common:
+            return False
+        diagnostics: dict[str, Any] = {}
+        if "diagnostics_json" in common:
+            parsed = json.loads(decode_scalar(common["diagnostics_json"][()]))
+            if isinstance(parsed, dict):
+                diagnostics = parsed
+        diagnostics_out = _store_common_observation_maps(
+            common,
+            observed=np.asarray(observed, dtype=float),
+            sigma_map=np.asarray(sigma_map, dtype=float),
+            diagnostics=diagnostics,
+            observation_canvas=observation_canvas,
+            sigma_canvas=sigma_canvas,
+            canvas_wcs_header=canvas_wcs_header,
+            only_missing=True,
+        )
+        if "diagnostics_json" in common:
+            _replace_text_dataset(common, "diagnostics_json", _json_dumps(diagnostics_out))
+    return True
+
+
 def _write_common_group(
     common: h5py.Group,
     *,
@@ -4927,31 +5061,15 @@ def _write_common_group(
     diagnostics_out = dict(diagnostics)
     diagnostics_out.setdefault("artifact_geometry_sha256", geometry_sha)
     if store_observation_maps:
-        observed_store = np.asarray(observed, dtype=np.float32)
-        sigma_store = np.asarray(sigma_map, dtype=np.float32)
-        diagnostics_out = _sync_preprocessed_content_identity_diagnostics(
-            diagnostics_out,
-            observed=observed_store,
-            sigma_map=sigma_store,
+        diagnostics_out = _store_common_observation_maps(
+            common,
+            observed=observed,
+            sigma_map=sigma_map,
+            diagnostics=diagnostics_out,
             observation_canvas=observation_canvas,
             sigma_canvas=sigma_canvas,
+            canvas_wcs_header=canvas_wcs_header,
         )
-        common.create_dataset("observed", data=observed_store, compression="gzip", compression_opts=4)
-        common.create_dataset("sigma_map", data=sigma_store, compression="gzip", compression_opts=4)
-        if observation_canvas is not None and sigma_canvas is not None and canvas_wcs_header is not None:
-            common.create_dataset(
-                "observation_canvas",
-                data=np.asarray(observation_canvas, dtype=np.float32),
-                compression="gzip",
-                compression_opts=4,
-            )
-            common.create_dataset(
-                "sigma_canvas",
-                data=np.asarray(sigma_canvas, dtype=np.float32),
-                compression="gzip",
-                compression_opts=4,
-            )
-            _create_text_dataset(common, "canvas_wcs_header", canvas_wcs_header.tostring(sep="\n", endcard=True))
     _create_text_dataset(common, "wcs_header", wcs_header.tostring(sep="\n", endcard=True))
     _create_text_dataset(common, "diagnostics_json", _json_dumps(diagnostics_out))
     _create_text_dataset(common, COMMON_ARTIFACT_CONTRACT_VERSION_DATASET, CANONICAL_ARTIFACT_CONTRACT_VERSION)
