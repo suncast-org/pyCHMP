@@ -332,3 +332,242 @@ def test_euv_slice_map_index_requires_explicit_channel_identity(tmp_path: Path) 
     index = build_slice_map_index(artifact_h5, slice_key="euv_171")
     assert index.trial_count() == 1
     assert index.raw_map_ref(0.6, 1.8, 0.003) == "/map_store/maps/explicit"
+
+
+@pytest.mark.parametrize("complete_layer", [True, False])
+def test_index_prefers_layer_metadata_with_legacy_fallback(tmp_path, complete_layer):
+    from pychmp.slice_map_index import _index_map_store_maps
+
+    path = tmp_path / "layers.h5"
+    identity = dict(domain="euv", channel_or_frequency="94", component="stokes_i",
+                    a=0.6, b=1.8, q0=0.001)
+    layer = dict(identity) if complete_layer else {"channel_or_frequency": "94"}
+    with h5py.File(path, "w") as f:
+        group = f.create_group("map_store/maps/raw")
+        group.create_dataset("map_layer_json", data=json.dumps(layer))
+        # A complete layer must not need the full identity dataset.
+        if not complete_layer:
+            group.create_dataset("identity_json", data=json.dumps(identity))
+        group.create_dataset("data", data=np.ones((2, 2)))
+    index = SliceMapIndex(slice_key="euv_94", descriptor={"domain": "euv", "channel_label": "94"})
+    with h5py.File(path) as f:
+        assert _index_map_store_maps(f, index, index.descriptor) == 1
+    assert index.raw_map_ref(0.6, 1.8, 0.001) == "/map_store/maps/raw"
+
+
+def test_map_store_index_progress_hook_fires_a_handful_of_times(tmp_path, capsys):
+    from pychmp.slice_map_index import _index_map_store_maps, _report_map_index_progress
+
+    path = tmp_path / "progress.h5"
+    n_maps = 11
+    matching = {0, 5, 10}
+    with h5py.File(path, "w") as f:
+        maps = f.create_group("map_store/maps")
+        for i in range(n_maps):
+            channel = "94" if i in matching else "171"
+            layer = {
+                "domain": "euv",
+                "channel_or_frequency": channel,
+                "component": "stokes_i",
+                "a": 0.6,
+                "b": 1.8,
+                "q0": 0.001 * (i + 1),
+            }
+            group = maps.create_group(f"m{i:02d}")
+            group.create_dataset("map_layer_json", data=json.dumps(layer))
+    descriptor = {"domain": "euv", "channel_label": "94"}
+    index = SliceMapIndex(slice_key="euv_94", descriptor=descriptor)
+    calls: list[tuple[int, int]] = []
+    with h5py.File(path, "r") as f:
+        added = _index_map_store_maps(
+            f,
+            index,
+            descriptor,
+            progress=lambda visited, total: calls.append((visited, total)),
+            progress_every=3,
+            progress_interval_s=1.0e9,
+        )
+    assert added == len(matching)
+    assert calls == [(3, n_maps), (6, n_maps), (9, n_maps), (11, n_maps)]
+    assert index.raw_map_ref(0.6, 1.8, 0.001) == "/map_store/maps/m00"
+
+    stamps = iter([0.0, 6.0, 6.2, 12.0, *([12.1] * 8)])
+
+    def clock() -> float:
+        return next(stamps)
+
+    timed: list[tuple[int, int]] = []
+    timed_index = SliceMapIndex(slice_key="euv_94", descriptor=descriptor)
+    with h5py.File(path, "r") as f:
+        _index_map_store_maps(
+            f,
+            timed_index,
+            descriptor,
+            progress=lambda visited, total: timed.append((visited, total)),
+            progress_every=10**9,
+            progress_interval_s=5.0,
+            _clock=clock,
+        )
+    assert timed == [(1, n_maps), (3, n_maps), (11, n_maps)]
+
+    _report_map_index_progress(5000, n_maps, None)
+    captured = capsys.readouterr()
+    assert captured.out == "Map store index: visited 5000/11 maps\n"
+
+
+def test_current_slice_index_reads_one_slice_without_walking_maps(tmp_path, monkeypatch):
+    from pychmp.ab_scan_artifacts import _write_map_store_array
+    from pychmp.slice_map_index import MAP_STORE_SLICE_INDEX_GROUP, _index_map_store_maps
+
+    path = tmp_path / "shared-index.h5"
+    with h5py.File(path, "w") as f:
+        maps = f.create_group("map_store/maps")
+        for name, channel, q0 in (("a94", "94", 0.002), ("a171", "171", 0.004), ("other", "335", 0.006)):
+            layer = {
+                "domain": "euv",
+                "channel_or_frequency": channel,
+                "component": "stokes_i",
+                "a": 0.5,
+                "b": 1.5,
+                "q0": q0,
+            }
+            group = maps.create_group(name)
+            group.create_dataset("map_layer_json", data=json.dumps(layer))
+
+    map_walks: list[str] = []
+    original_keys = h5py.Group.keys
+
+    def counting_keys(self):
+        if str(self.name).endswith("/maps"):
+            map_walks.append(str(self.name))
+        return original_keys(self)
+
+    monkeypatch.setattr(h5py.Group, "keys", counting_keys)
+    descriptor_94 = {"domain": "euv", "channel_label": "94"}
+    descriptor_171 = {"domain": "euv", "channel_label": "171"}
+    first = SliceMapIndex(slice_key="euv_94", descriptor=descriptor_94)
+    with h5py.File(path, "r+") as f:
+        assert _index_map_store_maps(f, first, descriptor_94) == 1
+        assert MAP_STORE_SLICE_INDEX_GROUP in f["map_store"]
+        assert len(f["map_store"][MAP_STORE_SLICE_INDEX_GROUP]["slice_id"]) == 3
+    assert map_walks == ["/map_store/maps"]
+    assert first.raw_map_ref(0.5, 1.5, 0.002) == "/map_store/maps/a94"
+    assert first.raw_map_ref(0.5, 1.5, 0.004) is None
+
+    map_walks.clear()
+    second = SliceMapIndex(slice_key="euv_171", descriptor=descriptor_171)
+    with h5py.File(path, "r+") as f:
+        assert _index_map_store_maps(f, second, descriptor_171) == 1
+    assert map_walks == []
+    assert second.raw_map_ref(0.5, 1.5, 0.004) == "/map_store/maps/a171"
+    assert second.raw_map_ref(0.5, 1.5, 0.002) is None
+
+    with h5py.File(path, "r+") as f:
+        _write_map_store_array(
+            f,
+            identity={
+                "domain": "euv",
+                "channel_or_frequency": "193",
+                "component": "stokes_i",
+                "a": 0.4,
+                "b": 1.2,
+                "q0": 0.005,
+            },
+            data=np.ones((2, 2), dtype=np.float32),
+        )
+        assert len(f["map_store"][MAP_STORE_SLICE_INDEX_GROUP]["slice_id"]) == len(f["map_store/maps"])
+    map_walks.clear()
+    third = SliceMapIndex(slice_key="euv_193", descriptor={"domain": "euv", "channel_label": "193"})
+    with h5py.File(path, "r+") as f:
+        assert _index_map_store_maps(f, third, third.descriptor) == 1
+    assert map_walks == []
+    assert third.raw_map_ref(0.4, 1.2, 0.005) is not None
+
+
+def test_slice_index_ab_points_reads_columns_without_opening_maps(tmp_path, monkeypatch) -> None:
+    from pychmp.slice_map_index import _write_slice_index_rows, slice_index_ab_points, slice_index_ab_snapshot
+
+    path = tmp_path / "index-only.h5"
+    rows = [
+        ("euv_193", 0.0, 1.0, 0.002, "sibling-low-q0", "stokes_i"),
+        ("euv_193", 0.0, 1.0, 0.2, "sibling-other-q0", "stokes_i"),
+        ("euv_193", 4.0, 4.0, 1.0e-6, "any-positive-q0", "stokes_i"),
+        ("euv_193", 1.0, 1.0, 0.002, "corona-only", "corona"),
+        ("euv_193", 2.0, 2.0, 0.0, "nonpositive-q0", "stokes_i"),
+        ("euv_193", 3.0, 3.0, -0.1, "negative-q0", "stokes_i"),
+        ("euv_94", 0.0, 1.0, 0.002, "other-wavelength", "stokes_i"),
+    ]
+    with h5py.File(path, "w") as handle:
+        _write_slice_index_rows(handle, rows)
+        maps = handle.create_group("map_store/maps")
+        data = maps.create_group("sibling-low-q0").create_dataset("data", data=np.ones((2, 2), dtype=np.float32))
+        assert data.name.endswith("/data")
+
+    opened_map_arrays: list[str] = []
+    original_getitem = h5py.Dataset.__getitem__
+
+    def tracking_getitem(self, item):
+        if str(self.name).endswith("/data"):
+            opened_map_arrays.append(str(self.name))
+        return original_getitem(self, item)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", tracking_getitem)
+    shared = {(0.0, 1.0), (1.0, 1.0), (2.0, 2.0), (3.0, 3.0), (4.0, 4.0)}
+    assert slice_index_ab_points(path, "euv_193") == shared
+    assert slice_index_ab_points(path, "euv_94") == shared
+    assert slice_index_ab_points(path, "euv_335") == shared
+    assert slice_index_ab_points(tmp_path / "missing.h5", "euv_193") == set()
+    assert opened_map_arrays == []
+    column_reads: list[str] = []
+    index_kinds: list[str] = []
+
+    def tracking_columns(self, item):
+        column_reads.append(str(self.name))
+        index_kinds.append(type(item).__name__)
+        return original_getitem(self, item)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", tracking_columns)
+    _points, nrows = slice_index_ab_snapshot(path, "euv_193", after_row=0)
+    assert (0.0, 1.0) in _points
+    assert "ndarray" not in index_kinds
+    column_reads.clear()
+    unchanged, same_nrows = slice_index_ab_snapshot(path, "euv_193", after_row=nrows)
+    assert unchanged == set()
+    assert same_nrows == nrows
+    assert column_reads == []
+
+
+def test_slice_index_ab_snapshot_keeps_points_when_the_tail_is_torn(tmp_path, monkeypatch) -> None:
+    from pychmp import slice_map_index as index_mod
+    from pychmp.slice_map_index import _write_slice_index_rows, slice_index_ab_snapshot
+
+    path = tmp_path / "torn-tail.h5"
+    rows = [
+        ("euv_131", 0.0, 0.1, 0.002, "row-0", "stokes_i"),
+        ("euv_211", 0.2, 0.2, 0.002, "sibling-other", "stokes_i"),
+        ("euv_131", 0.4, 0.4, 0.003, "row-2", "stokes_i"),
+        ("euv_131", 0.5, 0.5, 0.003, "row-3", "corona"),
+        ("euv_131", 0.6, 0.6, 0.004, "row-4", "stokes_i"),
+        ("euv_131", 0.7, 0.7, 0.004, "row-5", "stokes_i"),
+        ("euv_131", 9.0, 9.0, 0.004, "torn-tail", "stokes_i"),
+    ]
+    with h5py.File(path, "w") as handle:
+        _write_slice_index_rows(handle, rows)
+    monkeypatch.setattr(index_mod, "_INDEX_READ_CHUNK", 3)
+    original_getitem = h5py.Dataset.__getitem__
+
+    def torn_tail(self, item):
+        if (
+            str(self.name).endswith("/a")
+            and isinstance(item, slice)
+            and item.start is not None
+            and int(item.start) >= 6
+        ):
+            raise OSError("address of object past end of allocation")
+        return original_getitem(self, item)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", torn_tail)
+    points, nrows = slice_index_ab_snapshot(path, "euv_131")
+    assert points == {(0.0, 0.1), (0.2, 0.2), (0.4, 0.4), (0.5, 0.5), (0.6, 0.6), (0.7, 0.7)}
+    assert (9.0, 9.0) not in points
+    assert nrows == 6

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,12 +24,21 @@ from .ab_scan_artifacts import (
     _optional_float,
     _read_map_store_ref_array,
     _resolve_slice_group,
+    _sanitize_slice_token,
     _synthetic_registry_entries_for_descriptor,
     decode_scalar,
 )
 from .grid_points import GRID_POINTS_GROUP, _load_grid_point_trials
 
 _STOKES_I_COMPONENTS = frozenset({"stokes_i", "stokes_i_raw", ""})
+_MAP_INDEX_PROGRESS_EVERY = 5000
+_MAP_INDEX_PROGRESS_INTERVAL_S = 5.0
+MAP_STORE_SLICE_INDEX_GROUP = "slice_index"
+_SLICE_INDEX_SCHEMA = "pychmp.map_store_slice_index.v1"
+# One full variable-length read of a half-million-row index takes tens of seconds
+# and holds the HDF5 lock the viewer also needs. Chunks stay on the order of a
+# single dataset read.
+_INDEX_READ_CHUNK = 16384
 
 
 @dataclass(frozen=True)
@@ -224,52 +235,334 @@ def _load_slice_descriptor(h5_file: h5py.File, slice_key: str) -> dict[str, Any]
     return {"key": str(slice_key), "domain": "unknown", "label": str(slice_key)}
 
 
-def _index_map_store_maps(h5_file: h5py.File, index: SliceMapIndex, descriptor: dict[str, Any]) -> int:
+def _report_map_index_progress(
+    visited: int,
+    total: int,
+    progress: Callable[[int, int], None] | None,
+) -> None:
+    """Report walk progress. The default line is flushed so a redirected log updates."""
+    if progress is not None:
+        progress(visited, total)
+        return
+    print(f"Map store index: visited {visited}/{total} maps", flush=True)
+
+
+def _decode_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _h5_writable(h5_file: h5py.File) -> bool:
+    return str(getattr(h5_file, "mode", "r")) not in {"r"}
+
+
+def _slice_id_from_map_identity(identity: dict[str, Any]) -> str:
+    """Canonical slice key for one map, derived from domain and channel only."""
+    domain = str(identity.get("domain") or identity.get("spectral_domain") or "").strip().lower()
+    channel = str(identity.get("channel_or_frequency") or "").strip().lower()
+    if domain == "mw":
+        freq = _optional_float(channel[:-3]) if channel.endswith("ghz") else None
+        if freq is None:
+            freq = _optional_float(identity.get("frequency_ghz"))
+        if freq is None:
+            return ""
+        return f"mw_{float(freq):.6f}ghz".replace(".", "p")
+    if domain in {"euv", "uv"} and channel:
+        return f"{domain}_{_sanitize_slice_token(channel)}"
+    return ""
+
+
+def _component_for_index(identity: dict[str, Any]) -> str:
+    component = str(identity.get("component") or "").strip().lower()
+    if component:
+        return component
+    array_name = str(identity.get("array_name") or "").lower()
+    if "raw_modeled" in array_name:
+        return "stokes_i"
+    return ""
+
+
+def _read_map_group_identity(map_group: h5py.Group) -> dict[str, Any] | None:
+    layer_keys = {"domain", "channel_or_frequency", "component", "a", "b", "q0"}
+    layer: dict[str, Any] = {}
+    if "map_layer_json" in map_group:
+        try:
+            parsed = json.loads(decode_scalar(map_group["map_layer_json"][()]))
+            if isinstance(parsed, dict):
+                layer = {k: v for k, v in parsed.items() if k in layer_keys}
+        except Exception:
+            pass
+    if layer_keys <= layer.keys():
+        return layer
+    if "identity_json" not in map_group:
+        return None
+    try:
+        identity = json.loads(decode_scalar(map_group["identity_json"][()]))
+    except Exception:
+        return None
+    if not isinstance(identity, dict):
+        return None
+    return {**identity, **layer}
+
+
+def _index_row(
+    identity: dict[str, Any] | None,
+    map_key: str,
+    *,
+    descriptor: dict[str, Any] | None,
+    requested_slice_key: str,
+) -> tuple[str, float, float, float, str, str]:
+    """One compact record: slice id, a, b, q0, map key, component."""
+    if not isinstance(identity, dict):
+        return ("", np.nan, np.nan, np.nan, str(map_key), "")
+    a_value = _optional_float(identity.get("a"))
+    b_value = _optional_float(identity.get("b"))
+    q0_value = _optional_float(identity.get("q0"))
+    component = _component_for_index(identity)
+    slice_id = ""
+    if component and a_value is not None and b_value is not None and q0_value is not None:
+        slice_id = _slice_id_from_map_identity(identity)
+        if (
+            descriptor is not None
+            and _identity_matches_slice(identity, descriptor)
+            and slice_id in {"", requested_slice_key}
+        ):
+            slice_id = requested_slice_key
+    return (
+        slice_id,
+        np.nan if a_value is None else float(a_value),
+        np.nan if b_value is None else float(b_value),
+        np.nan if q0_value is None else float(q0_value),
+        str(map_key),
+        component,
+    )
+
+
+def _slice_index_group(h5_file: h5py.File) -> h5py.Group | None:
+    store = h5_file.get(MAP_STORE_GROUP)
+    if store is None or MAP_STORE_SLICE_INDEX_GROUP not in store:
+        return None
+    group = store[MAP_STORE_SLICE_INDEX_GROUP]
+    if not isinstance(group, h5py.Group):
+        return None
+    if _decode_text(group.attrs.get("schema", "")) != _SLICE_INDEX_SCHEMA:
+        return None
+    if "slice_id" not in group or "map_key" not in group:
+        return None
+    return group
+
+
+def _map_store_count(h5_file: h5py.File) -> int | None:
+    store = h5_file.get(MAP_STORE_GROUP)
+    if store is None or MAP_STORE_MAPS_GROUP not in store:
+        return None
+    return int(len(store[MAP_STORE_MAPS_GROUP]))
+
+
+def _slice_index_is_current(h5_file: h5py.File) -> bool:
+    count = _map_store_count(h5_file)
+    group = _slice_index_group(h5_file)
+    if count is None or group is None:
+        return False
+    return int(group["slice_id"].shape[0]) == count
+
+
+def _column_text(dataset: h5py.Dataset) -> list[str]:
+    if int(dataset.shape[0]) == 0:
+        return []
+    values = dataset.asstr()[()] if hasattr(dataset, "asstr") else dataset[()]
+    if np.ndim(values) == 0:
+        return [_decode_text(values)]
+    return [_decode_text(value) for value in values]
+
+
+def _write_slice_index_rows(h5_file: h5py.File, rows: list[tuple[str, float, float, float, str, str]]) -> None:
+    store = h5_file.require_group(MAP_STORE_GROUP)
+    if MAP_STORE_SLICE_INDEX_GROUP in store:
+        del store[MAP_STORE_SLICE_INDEX_GROUP]
+    group = store.create_group(MAP_STORE_SLICE_INDEX_GROUP)
+    group.attrs["schema"] = _SLICE_INDEX_SCHEMA
+    text_dtype = h5py.string_dtype(encoding="utf-8")
+    if not rows:
+        for name in ("slice_id", "map_key", "component"):
+            group.create_dataset(name, shape=(0,), maxshape=(None,), dtype=text_dtype)
+        for name in ("a", "b", "q0"):
+            group.create_dataset(name, shape=(0,), maxshape=(None,), dtype=np.float64)
+        return
+    columns: dict[str, Any] = {
+        "slice_id": np.array([row[0] for row in rows], dtype=object),
+        "a": np.array([row[1] for row in rows], dtype=np.float64),
+        "b": np.array([row[2] for row in rows], dtype=np.float64),
+        "q0": np.array([row[3] for row in rows], dtype=np.float64),
+        "map_key": np.array([row[4] for row in rows], dtype=object),
+        "component": np.array([row[5] for row in rows], dtype=object),
+    }
+    for name, values in columns.items():
+        if name in {"a", "b", "q0"}:
+            group.create_dataset(name, data=values, maxshape=(None,), dtype=np.float64)
+        else:
+            group.create_dataset(name, data=values, maxshape=(None,), dtype=text_dtype)
+
+
+def _append_slice_index_row(
+    h5_file: h5py.File,
+    row: tuple[str, float, float, float, str, str],
+) -> None:
+    group = _slice_index_group(h5_file)
+    if group is None:
+        return
+    n = int(group["slice_id"].shape[0])
+    values = {
+        "slice_id": row[0],
+        "a": row[1],
+        "b": row[2],
+        "q0": row[3],
+        "map_key": row[4],
+        "component": row[5],
+    }
+    for name, value in values.items():
+        dataset = group[name]
+        dataset.resize((n + 1,))
+        dataset[n] = value
+
+
+def append_map_store_slice_index(
+    h5_file: h5py.File,
+    *,
+    identity: dict[str, Any],
+    map_key: str,
+) -> None:
+    """Append one record after a new map is saved, when the index was already current."""
+    count = _map_store_count(h5_file)
+    group = _slice_index_group(h5_file)
+    if count is None or group is None:
+        return
+    if int(group["slice_id"].shape[0]) != count - 1:
+        return
+    _append_slice_index_row(
+        h5_file,
+        _index_row(identity, map_key, descriptor=None, requested_slice_key=""),
+    )
+
+
+def _register_index_row(index: SliceMapIndex, row: tuple[str, float, float, float, str, str]) -> bool:
+    slice_id, a_value, b_value, q0_value, map_key, component = row
+    if str(slice_id) != index.slice_key or not component or not map_key:
+        return False
+    before = index.trial_count()
+    index.register(
+        a=float(a_value),
+        b=float(b_value),
+        q0=float(q0_value),
+        raw_map_ref=f"/{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}/{map_key}",
+        component=str(component),
+    )
+    return index.trial_count() > before
+
+
+def _register_slice_from_saved_index(h5_file: h5py.File, index: SliceMapIndex) -> int:
+    group = _slice_index_group(h5_file)
+    if group is None:
+        return 0
+    slice_ids = _column_text(group["slice_id"])
+    selected = [i for i, slice_id in enumerate(slice_ids) if slice_id == index.slice_key]
+    if not selected:
+        return 0
+    picker = np.asarray(selected, dtype=np.int64)
+    a_values = np.asarray(group["a"][picker], dtype=float)
+    b_values = np.asarray(group["b"][picker], dtype=float)
+    q0_values = np.asarray(group["q0"][picker], dtype=float)
+    map_keys = [_decode_text(value) for value in group["map_key"].asstr()[picker]]
+    components = [_decode_text(value) for value in group["component"].asstr()[picker]]
+    added = 0
+    for offset, row_index in enumerate(selected):
+        if _register_index_row(
+            index,
+            (
+                slice_ids[row_index],
+                float(a_values[offset]),
+                float(b_values[offset]),
+                float(q0_values[offset]),
+                map_keys[offset],
+                components[offset],
+            ),
+        ):
+            added += 1
+    return added
+
+
+def _index_map_store_maps(
+    h5_file: h5py.File,
+    index: SliceMapIndex,
+    descriptor: dict[str, Any],
+    *,
+    progress: Callable[[int, int], None] | None = None,
+    progress_every: int = _MAP_INDEX_PROGRESS_EVERY,
+    progress_interval_s: float = _MAP_INDEX_PROGRESS_INTERVAL_S,
+    _clock: Callable[[], float] | None = None,
+) -> int:
     if MAP_STORE_GROUP not in h5_file or MAP_STORE_MAPS_GROUP not in h5_file[MAP_STORE_GROUP]:
         return 0
+    if _slice_index_is_current(h5_file):
+        return _register_slice_from_saved_index(h5_file, index)
     added = 0
     maps_group = h5_file[MAP_STORE_GROUP][MAP_STORE_MAPS_GROUP]
-    for map_id in maps_group.keys():
-        map_group = maps_group[map_id]
-        if "identity_json" not in map_group:
-            continue
-        try:
-            identity = json.loads(decode_scalar(map_group["identity_json"][()]))
-        except Exception:
-            continue
-        if "map_layer_json" in map_group:
-            try:
-                layer = json.loads(decode_scalar(map_group["map_layer_json"][()]))
-                if isinstance(layer, dict):
-                    layer_keys = {"domain", "channel_or_frequency", "component", "a", "b", "q0"}
-                    identity = {**identity, **{k: v for k, v in layer.items() if k in layer_keys}}
-            except Exception:
-                pass
-        if not isinstance(identity, dict) or not _identity_matches_slice(identity, descriptor):
-            continue
-        a_value = _optional_float(identity.get("a"))
-        b_value = _optional_float(identity.get("b"))
-        q0_value = _optional_float(identity.get("q0"))
-        if a_value is None or b_value is None or q0_value is None:
-            continue
-        component = str(identity.get("component") or "").strip().lower()
-        if not component:
-            array_name = str(identity.get("array_name") or "").lower()
-            if "raw_modeled" in array_name:
-                component = "stokes_i"
-            else:
-                continue
-        ref_path = f"/{MAP_STORE_GROUP}/{MAP_STORE_MAPS_GROUP}/{map_id}"
-        before = index.trial_count()
-        index.register(
-            a=float(a_value),
-            b=float(b_value),
-            q0=float(q0_value),
-            raw_map_ref=ref_path,
-            component=component,
+    # Group length is the stored link count, not a second walk of every map.
+    total = int(len(maps_group))
+    visited = 0
+    now = _clock or time.monotonic
+    last_report_at = now()
+    last_reported = 0
+    rows: list[tuple[str, float, float, float, str, str]] = []
+    if progress is None and total:
+        print(
+            f"Building map metadata index ({index.slice_key}); no maps are being rescored...",
+            flush=True,
         )
-        if index.trial_count() > before:
-            added += 1
+
+    def _maybe_report() -> None:
+        nonlocal last_report_at, last_reported
+        stamp = now()
+        count_due = progress_every > 0 and visited % progress_every == 0
+        time_due = progress_interval_s > 0 and (stamp - last_report_at) >= progress_interval_s
+        if not count_due and not time_due:
+            return
+        _report_map_index_progress(visited, total, progress)
+        last_report_at = stamp
+        last_reported = visited
+
+    for map_id in maps_group.keys():
+        visited += 1
+        try:
+            identity = _read_map_group_identity(maps_group[map_id])
+            row = _index_row(
+                identity,
+                str(map_id),
+                descriptor=descriptor,
+                requested_slice_key=index.slice_key,
+            )
+            rows.append(row)
+            registered = _register_index_row(index, row)
+            if (
+                not registered
+                and isinstance(identity, dict)
+                and _identity_matches_slice(identity, descriptor)
+            ):
+                registered = _register_index_row(
+                    index,
+                    (index.slice_key, row[1], row[2], row[3], row[4], row[5]),
+                )
+            if registered:
+                added += 1
+        finally:
+            _maybe_report()
+    if visited and visited != last_reported:
+        _report_map_index_progress(visited, total, progress)
+    if _h5_writable(h5_file):
+        _write_slice_index_rows(h5_file, rows)
     return added
 
 
@@ -340,17 +633,125 @@ def _index_grid_trials_on_slice(h5_file: h5py.File, index: SliceMapIndex, slice_
     return added
 
 
+def _finite_ab_points(a_values: np.ndarray, b_values: np.ndarray) -> set[tuple[float, float]]:
+    """Every finite ``(a, b)`` in these rows. Does not touch map arrays."""
+    a_arr = np.asarray(a_values, dtype=float).reshape(-1)
+    b_arr = np.asarray(b_values, dtype=float).reshape(-1)
+    if a_arr.size == 0 or b_arr.size != a_arr.size:
+        return set()
+    keep = np.isfinite(a_arr) & np.isfinite(b_arr)
+    if not np.any(keep):
+        return set()
+    pairs = np.unique(np.stack((a_arr[keep], b_arr[keep]), axis=1), axis=0)
+    return {(float(pair[0]), float(pair[1])) for pair in pairs}
+
+
+def _readable_float_prefix(dataset: h5py.Dataset, start: int, stop: int) -> tuple[int, np.ndarray | None]:
+    """Float values for the readable prefix of ``dataset[start:stop]``."""
+    if stop <= start:
+        return start, None
+    try:
+        values = np.asarray(dataset[slice(start, stop)], dtype=float).reshape(-1)
+    except OSError:
+        values = None
+    if values is not None and int(values.size) == stop - start:
+        return stop, values
+    if stop <= start + 1:
+        return start, None
+    mid = start + (stop - start) // 2
+    lower_end, lower_values = _readable_float_prefix(dataset, start, mid)
+    if lower_end < mid:
+        return lower_end, lower_values
+    upper_end, upper_values = _readable_float_prefix(dataset, mid, stop)
+    if upper_end <= mid or upper_values is None:
+        return lower_end, lower_values
+    if lower_values is None:
+        return upper_end, upper_values
+    return upper_end, np.concatenate((lower_values, upper_values))
+
+
+def slice_index_ab_snapshot(
+    artifact_h5: Path,
+    slice_key: str = "",
+    *,
+    after_row: int = 0,
+) -> tuple[set[tuple[float, float]], int]:
+    """Every finite ``(a, b)`` in the slice index, plus the row count.
+
+    ``slice_key`` is ignored. One render stores every channel, so the set is
+    shared by every heatmap. Reads ``a`` and ``b`` only, one stored chunk at a
+    time. ``after_row`` skips rows already cached. Does not walk ``map_store/maps``
+    or open map arrays.
+    """
+    del slice_key
+    start = max(0, int(after_row))
+    points: set[tuple[float, float]] = set()
+    pos = start
+    nrows = start
+    while True:
+        try:
+            h5_file = _H5PY_FILE(Path(artifact_h5), "r")
+        except OSError:
+            return points, pos
+        try:
+            with h5_file:
+                group = _slice_index_group(h5_file)
+                if group is None or "a" not in group or "b" not in group:
+                    return points, 0
+                nrows = int(group["a"].shape[0])
+                if pos >= nrows:
+                    return points, nrows
+                stored_chunk = group["a"].chunks
+                step = max(1, int(_INDEX_READ_CHUNK))
+                if stored_chunk:
+                    step = min(step, max(1, int(stored_chunk[0])))
+                stop = min(pos + step, nrows)
+                trusted, a_values = _readable_float_prefix(group["a"], pos, stop)
+                if trusted <= pos or a_values is None:
+                    return points, pos
+                try:
+                    b_values = np.asarray(group["b"][slice(pos, trusted)], dtype=float).reshape(-1)
+                except OSError:
+                    return points, pos
+                points.update(_finite_ab_points(a_values, b_values))
+                pos = trusted
+                if trusted < stop or pos >= nrows:
+                    return points, nrows if pos >= nrows else pos
+        except OSError:
+            return points, pos
+
+
+def slice_index_ab_points(artifact_h5: Path, slice_key: str = "") -> set[tuple[float, float]]:
+    """Every finite ``(a, b)`` already indexed. ``slice_key`` is ignored."""
+    points, _nrows = slice_index_ab_snapshot(artifact_h5, slice_key, after_row=0)
+    return points
+
+
 def build_slice_map_index(
     artifact_h5: Path,
     *,
     slice_key: str,
+    progress: Callable[[int, int], None] | None = None,
+    progress_every: int = _MAP_INDEX_PROGRESS_EVERY,
+    progress_interval_s: float = _MAP_INDEX_PROGRESS_INTERVAL_S,
 ) -> SliceMapIndex:
     """Scan the artifact once and build (a, b, q0) → map_store ref for one slice."""
     path = Path(artifact_h5)
-    with _H5PY_FILE(path, "r") as h5_file:
+    try:
+        h5_file = _H5PY_FILE(path, "r+")
+    except OSError:
+        h5_file = _H5PY_FILE(path, "r")
+    with h5_file:
         descriptor = _load_slice_descriptor(h5_file, str(slice_key))
         index = SliceMapIndex(slice_key=str(slice_key), descriptor=descriptor)
-        _index_map_store_maps(h5_file, index, descriptor)
+        _index_map_store_maps(
+            h5_file,
+            index,
+            descriptor,
+            progress=progress,
+            progress_every=progress_every,
+            progress_interval_s=progress_interval_s,
+        )
         _index_synthetic_registry(h5_file, index, descriptor)
         _index_grid_trials_on_slice(h5_file, index, str(slice_key))
     return index
