@@ -209,7 +209,8 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
     Resolution order:
     1. Viktor/srhimages σ axes: ``BEAM_SA`` / ``BEAM_SB`` / ``BEAM_PHI`` (``BEAM_P`` must be 1)
     2. gx_simulator SRH correlated σ: ``BEAM_SX`` / ``BEAM_SY`` / ``BEAM_RHO``
-    3. Standard FWHM ellipse: ``BMAJ`` / ``BMIN`` / ``BPA`` (degrees if |value|≤1)
+    3. NORH clean beam via SSW ``norh_beam`` / gx ``BeamFitNoRH`` (PMAT + OBS-FREQ)
+    4. Standard FWHM ellipse: ``BMAJ`` / ``BMIN`` / ``BPA`` (degrees if |value|≤1)
 
     Radio σ headers are converted to FWHM for storage in ``PSFMetadata`` so the
     existing ``elliptical_gaussian_kernel`` path stays unchanged (FWHM→σ internally).
@@ -256,6 +257,11 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
                 allows_frequency_scaling=True,
             )
 
+    # --- NORH clean beam (SSW norh_beam → FitBeam / BeamFitNoRH) ---
+    norh_psf = extract_norh_psf_metadata_from_header(header)
+    if norh_psf is not None:
+        return norh_psf
+
     # --- Standard FWHM beam ---
     bmaj_raw = _header_first(header, ("BMAJ", "BMAJ_DEG", "BMAJDEG", "BEAM_MAJ", "PSF_BMAJ"))
     bmin_raw = _header_first(header, ("BMIN", "BMIN_DEG", "BMINDEG", "BEAM_MIN", "PSF_BMIN"))
@@ -288,6 +294,29 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
         bmin_arcsec=float(bmin_arcsec),
         bpa_deg=float(bpa),
         allows_frequency_scaling=False,
+    )
+
+
+def extract_norh_psf_metadata_from_header(
+    header: fits.Header,
+    *,
+    marx: int = 51,
+) -> PSFMetadata | None:
+    """Build NORH PSF metadata via the IDL ``norh_beam`` / ``BeamFitNoRH`` recipe."""
+    from .norh_beam import beam_fit_norh_from_header, is_norh_header
+
+    if not is_norh_header(header):
+        return None
+    try:
+        params = beam_fit_norh_from_header(header, marx=int(marx))
+    except Exception:
+        return None
+    return _psf_from_sigma_axes(
+        sigma_a=params.sigma_x_arcsec,
+        sigma_b=params.sigma_y_arcsec,
+        pa_of_a_deg=params.theta_deg,
+        source="fits_header:norh_beam",
+        allows_frequency_scaling=True,
     )
 
 

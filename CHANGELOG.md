@@ -14,12 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `MakeSRHbeam` correlated σ (`BEAM_SX` / `BEAM_SY` / `BEAM_RHO`). σ values are
   converted to FWHM for the existing elliptical-kernel path; frequency scaling
   remains enabled for both radio forms.
+- NORH clean-beam PSF path (`pychmp.norh_beam`): in-tree port of SSW
+  `norh_prog2pinf` / `norh_beam` and gx `BeamFitNoRH`/`FitBeam`. Nobeyama FITS
+  headers with `PMAT*` + `OBS-FREQ` resolve to a frequency-scalable Gaussian
+  ellipse without an IDL runtime. Validated against Viktor’s IFZ sample
+  (`ifz140202_022005_corrected`) vs IDL reference beam samples and fit params.
 
 ### Known limitations
 
 - Super-Gaussian SRH `BEAM_P≠1` is rejected (no kernel) until a later slice.
-- Full NORH auto-beam from IFZ-only products is still deferred (needs WCS/freq
-  packaging or gx/SSW efl export); CLI / `BMAJ` paths remain valid.
+- NORH beam uses header `SOLP` (degrees) rather than recomputing `get_rb0p`;
+  on standard products this matches IDL to ≲0.01°.
 
 ## [0.2.0] - 2026-10-02
 
