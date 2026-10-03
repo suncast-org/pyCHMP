@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Microwave SRH beam header support in `pychmp.psf`: Viktor/srhimages σ axes
+  (`BEAM_SA` / `BEAM_SB` / `BEAM_PHI`, `BEAM_P==1` only) and gx_simulator
+  `MakeSRHbeam` correlated σ (`BEAM_SX` / `BEAM_SY` / `BEAM_RHO`). σ values are
+  converted to FWHM for the existing elliptical-kernel path; frequency scaling
+  remains enabled for both radio forms.
+
+### Known limitations
+
+- Super-Gaussian SRH `BEAM_P≠1` is rejected (no kernel) until a later slice.
+- Full NORH auto-beam from IFZ-only products is still deferred (needs WCS/freq
+  packaging or gx/SSW efl export); CLI / `BMAJ` paths remain valid.
+
 ## [0.2.0] - 2026-10-02
 
 Observational EUV/UV unit correction, map-store indexing, warm-restart hardening, and

@@ -19,6 +19,8 @@ _RESPONSE_SAMPLING_FWHM_FACTORS: dict[str, float] = {
     "aia": 2.5,
     "sdoaia": 2.5,
 }
+
+
 @dataclass(frozen=True)
 class PSFMetadata:
     source: str
@@ -60,6 +62,233 @@ def _optional_float(value: Any) -> float | None:
 
 def _normalize_instrument_key(instrument_name: str | None) -> str:
     return "".join(ch for ch in str(instrument_name or "").strip().lower() if ch.isalnum())
+
+
+# FWHM = σ * 2√(2 ln 2). Radio σ headers are stored in the existing FWHM fields.
+_SIGMA_TO_FWHM = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def sigma_arcsec_to_fwhm(sigma_arcsec: float) -> float:
+    """Convert Gaussian σ (arcsec) to FWHM (arcsec)."""
+    return float(sigma_arcsec) * _SIGMA_TO_FWHM
+
+
+def fwhm_arcsec_to_sigma(fwhm_arcsec: float) -> float:
+    """Convert Gaussian FWHM (arcsec) to σ (arcsec)."""
+    return float(fwhm_arcsec) / _SIGMA_TO_FWHM
+
+
+def _normalize_pa_deg(pa_deg: float) -> float:
+    """Wrap position angle to (-90, 90] degrees."""
+    pa = float(pa_deg) % 180.0
+    if pa > 90.0:
+        pa -= 180.0
+    if pa <= -90.0:
+        pa += 180.0
+    return pa
+
+
+def ordered_major_minor_sigma(
+    sigma_a: float,
+    sigma_b: float,
+    *,
+    pa_of_a_deg: float,
+) -> tuple[float, float, float]:
+    """Return (σ_maj, σ_min, PA_maj_deg) with σ_maj ≥ σ_min."""
+    sa = float(sigma_a)
+    sb = float(sigma_b)
+    if sa >= sb:
+        return sa, sb, _normalize_pa_deg(pa_of_a_deg)
+    return sb, sa, _normalize_pa_deg(pa_of_a_deg + 90.0)
+
+
+def correlated_sigma_to_rotated(
+    sx: float,
+    sy: float,
+    rho: float,
+) -> tuple[float, float, float]:
+    """Convert gx ``MakeSRHbeam`` (sx, sy, rho) to rotated (σ_maj, σ_min, PA_deg).
+
+    ``MakeSRHbeam`` uses the standard bivariate Gaussian with σ_x=sx, σ_y=sy and
+    correlation ``rho`` (FITS ``beam_sx`` / ``beam_sy`` / ``beam_rho``). Eigenvalues
+    of the covariance are the ellipse σ axes; PA is CCW from +X to the major axis
+    and matches the angle consumed by ``elliptical_gaussian_kernel`` / ``Gauss2Drot``.
+    """
+    sx = float(sx)
+    sy = float(sy)
+    rho = float(np.clip(rho, -0.999999, 0.999999))
+    if sx <= 0.0 or sy <= 0.0:
+        raise ValueError("beam_sx/beam_sy must be positive")
+
+    var_x = sx * sx
+    var_y = sy * sy
+    cov_xy = rho * sx * sy
+    mid = 0.5 * (var_x + var_y)
+    diff = 0.5 * (var_x - var_y)
+    disc = np.sqrt(diff * diff + cov_xy * cov_xy)
+    lam_maj = mid + disc
+    lam_min = mid - disc
+    smaj = float(np.sqrt(max(lam_maj, 0.0)))
+    smin = float(np.sqrt(max(lam_min, 0.0)))
+
+    if abs(cov_xy) > 1e-15 or abs(lam_maj - var_x) > 1e-15:
+        if abs(cov_xy) >= abs(lam_maj - var_x):
+            vx, vy = cov_xy, lam_maj - var_x
+        else:
+            vx, vy = lam_maj - var_y, cov_xy
+        pa = np.rad2deg(np.arctan2(vy, vx))
+    else:
+        pa = 0.0 if var_x >= var_y else 90.0
+    return smaj, smin, _normalize_pa_deg(pa)
+
+
+def make_srh_correlated_beam(
+    sx: float,
+    sy: float,
+    rho: float,
+    *,
+    nx: int,
+    ny: int,
+    dx_arcsec: float,
+    dy_arcsec: float,
+) -> np.ndarray:
+    """IDL ``MakeSRHbeam`` (unnormalized, peak=1 at center).
+
+    ``sx``/``sy`` are Gaussian σ in arcsec (IDL comments call these 1/e widths;
+    the formula is the standard bivariate normal with those σ parameters).
+    """
+    sx = float(sx)
+    sy = float(sy)
+    rho = float(np.clip(rho, -0.999999, 0.999999))
+    x = (np.arange(nx, dtype=float) - 0.5 * nx + 0.5) * float(dx_arcsec)
+    y = (np.arange(ny, dtype=float) - 0.5 * ny + 0.5) * float(dy_arcsec)
+    xx, yy = np.meshgrid(x, y, indexing="xy")
+    denom = 1.0 - rho * rho
+    beam = np.exp(
+        -0.5
+        / denom
+        * (xx * xx / (sx * sx) + yy * yy / (sy * sy) - 2.0 * rho * xx * yy / (sx * sy))
+    )
+    return beam
+
+
+def _header_first(header: fits.Header, keys: tuple[str, ...]) -> Any | None:
+    for key in keys:
+        if key in header:
+            return header[key]
+        for existing in header.keys():
+            if str(existing).upper() == key.upper():
+                return header[existing]
+    return None
+
+
+def _psf_from_sigma_axes(
+    *,
+    sigma_a: float,
+    sigma_b: float,
+    pa_of_a_deg: float,
+    source: str,
+    allows_frequency_scaling: bool,
+) -> PSFMetadata | None:
+    if sigma_a <= 0.0 or sigma_b <= 0.0:
+        return None
+    smaj, smin, bpa = ordered_major_minor_sigma(sigma_a, sigma_b, pa_of_a_deg=pa_of_a_deg)
+    return PSFMetadata(
+        source=source,
+        kind="gaussian",
+        bmaj_arcsec=sigma_arcsec_to_fwhm(smaj),
+        bmin_arcsec=sigma_arcsec_to_fwhm(smin),
+        bpa_deg=float(bpa),
+        allows_frequency_scaling=bool(allows_frequency_scaling),
+    )
+
+
+def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
+    """Resolve beam metadata from FITS header keywords.
+
+    Resolution order:
+    1. Viktor/srhimages σ axes: ``BEAM_SA`` / ``BEAM_SB`` / ``BEAM_PHI`` (``BEAM_P`` must be 1)
+    2. gx_simulator SRH correlated σ: ``BEAM_SX`` / ``BEAM_SY`` / ``BEAM_RHO``
+    3. Standard FWHM ellipse: ``BMAJ`` / ``BMIN`` / ``BPA`` (degrees if |value|≤1)
+
+    Radio σ headers are converted to FWHM for storage in ``PSFMetadata`` so the
+    existing ``elliptical_gaussian_kernel`` path stays unchanged (FWHM→σ internally).
+    """
+    # --- SRH σ + PA (Viktor / srhimages) ---
+    sa_raw = _header_first(header, ("BEAM_SA", "beam_sa"))
+    sb_raw = _header_first(header, ("BEAM_SB", "beam_sb"))
+    if sa_raw is not None and sb_raw is not None:
+        sa = _optional_float(sa_raw)
+        sb = _optional_float(sb_raw)
+        phi = _optional_float(_header_first(header, ("BEAM_PHI", "beam_phi"))) or 0.0
+        beam_p = _optional_float(_header_first(header, ("BEAM_P", "beam_p")))
+        if beam_p is not None and abs(beam_p - 1.0) > 1e-6:
+            # Super-Gaussian p≠1 not supported in the first slice.
+            return None
+        if sa is not None and sb is not None:
+            # Match Viktor get_psf: gaussian2d(..., theta=-beam_phi)
+            return _psf_from_sigma_axes(
+                sigma_a=sa,
+                sigma_b=sb,
+                pa_of_a_deg=-float(phi),
+                source="fits_header:srh_sigma",
+                allows_frequency_scaling=True,
+            )
+
+    # --- gx MakeSRHbeam correlated σ ---
+    sx_raw = _header_first(header, ("BEAM_SX", "beam_sx"))
+    sy_raw = _header_first(header, ("BEAM_SY", "beam_sy"))
+    if sx_raw is not None and sy_raw is not None:
+        sx = _optional_float(sx_raw)
+        sy = _optional_float(sy_raw)
+        rho = _optional_float(_header_first(header, ("BEAM_RHO", "beam_rho"))) or 0.0
+        if sx is not None and sy is not None:
+            try:
+                smaj, smin, pa = correlated_sigma_to_rotated(sx, sy, rho)
+            except ValueError:
+                return None
+            return PSFMetadata(
+                source="fits_header:srh_correlated",
+                kind="gaussian",
+                bmaj_arcsec=sigma_arcsec_to_fwhm(smaj),
+                bmin_arcsec=sigma_arcsec_to_fwhm(smin),
+                bpa_deg=float(pa),
+                allows_frequency_scaling=True,
+            )
+
+    # --- Standard FWHM beam ---
+    bmaj_raw = _header_first(header, ("BMAJ", "BMAJ_DEG", "BMAJDEG", "BEAM_MAJ", "PSF_BMAJ"))
+    bmin_raw = _header_first(header, ("BMIN", "BMIN_DEG", "BMINDEG", "BEAM_MIN", "PSF_BMIN"))
+    bpa_raw = _header_first(header, ("BPA", "BPA_DEG", "BEAM_PA", "PSF_BPA"))
+
+    if bmaj_raw is None or bmin_raw is None:
+        return None
+
+    try:
+        bmaj = float(bmaj_raw)
+        bmin = float(bmin_raw)
+        bpa = float(bpa_raw) if bpa_raw is not None else 0.0
+    except Exception:
+        return None
+
+    if abs(bmaj) <= 1.0 and abs(bmin) <= 1.0:
+        bmaj_arcsec = bmaj * 3600.0
+        bmin_arcsec = bmin * 3600.0
+    else:
+        bmaj_arcsec = bmaj
+        bmin_arcsec = bmin
+
+    if not (np.isfinite(bmaj_arcsec) and np.isfinite(bmin_arcsec) and bmaj_arcsec > 0 and bmin_arcsec > 0):
+        return None
+
+    return PSFMetadata(
+        source="fits_header",
+        kind="gaussian",
+        bmaj_arcsec=float(bmaj_arcsec),
+        bmin_arcsec=float(bmin_arcsec),
+        bpa_deg=float(bpa),
+        allows_frequency_scaling=False,
+    )
 
 
 def _channel_label_from_wavelength(wavelength_angstrom: float | None) -> str | None:
@@ -173,47 +402,6 @@ def _response_sampling_default_psf(
     )
 
 
-def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
-    def first_header_value(keys: tuple[str, ...]) -> Any | None:
-        for key in keys:
-            if key in header:
-                return header[key]
-        return None
-
-    bmaj_raw = first_header_value(("BMAJ", "BMAJ_DEG", "BMAJDEG", "BEAM_MAJ", "PSF_BMAJ"))
-    bmin_raw = first_header_value(("BMIN", "BMIN_DEG", "BMINDEG", "BEAM_MIN", "PSF_BMIN"))
-    bpa_raw = first_header_value(("BPA", "BPA_DEG", "BEAM_PA", "PSF_BPA"))
-
-    if bmaj_raw is None or bmin_raw is None:
-        return None
-
-    try:
-        bmaj = float(bmaj_raw)
-        bmin = float(bmin_raw)
-        bpa = float(bpa_raw) if bpa_raw is not None else 0.0
-    except Exception:
-        return None
-
-    if abs(bmaj) <= 1.0 and abs(bmin) <= 1.0:
-        bmaj_arcsec = bmaj * 3600.0
-        bmin_arcsec = bmin * 3600.0
-    else:
-        bmaj_arcsec = bmaj
-        bmin_arcsec = bmin
-
-    if not (np.isfinite(bmaj_arcsec) and np.isfinite(bmin_arcsec) and bmaj_arcsec > 0 and bmin_arcsec > 0):
-        return None
-
-    return PSFMetadata(
-        source="fits_header",
-        kind="gaussian",
-        bmaj_arcsec=float(bmaj_arcsec),
-        bmin_arcsec=float(bmin_arcsec),
-        bpa_deg=float(bpa),
-        allows_frequency_scaling=False,
-    )
-
-
 def default_psf_metadata(
     *,
     domain: str | None,
@@ -321,9 +509,6 @@ def effective_psf_parameters(
     }
 
 
-_FWHM_FROM_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
-
-
 def beam_fwhm_from_kernel(
     kernel: np.ndarray,
     *,
@@ -358,8 +543,8 @@ def beam_fwhm_from_kernel(
     eigvals, eigvecs = np.linalg.eigh(cov)
     eigvals = np.maximum(eigvals, 0.0)
     order = np.argsort(eigvals)
-    bmin_arcsec = float(_FWHM_FROM_SIGMA * np.sqrt(eigvals[order[0]]))
-    bmaj_arcsec = float(_FWHM_FROM_SIGMA * np.sqrt(eigvals[order[1]]))
+    bmin_arcsec = float(_SIGMA_TO_FWHM * np.sqrt(eigvals[order[0]]))
+    bmaj_arcsec = float(_SIGMA_TO_FWHM * np.sqrt(eigvals[order[1]]))
     if bmaj_arcsec <= 0.0 or bmin_arcsec <= 0.0:
         return None
     major_vec = eigvecs[:, order[1]]
