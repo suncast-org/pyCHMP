@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ellipse without an IDL runtime. Validated against Viktor’s IFZ sample
   (`ifz140202_022005_corrected`) vs IDL reference beam samples and fit params.
 - Example `examples/python/compare_norh_ifz_beam_python_vs_idl.py`: side-by-side
-  Python vs `sswidl` ``norh_beam`` plot + numeric metrics on the IFZ fixture.
+  Python vs `sswidl` ``norh_beam`` plot + numeric metrics for any NORH IFZ/FITS
+  (`--ifz` / `PYCHMP_NORH_IFZ`); P-angle from live IDL `get_rb0p` or header `SOLP`.
 
 ### Known limitations
 

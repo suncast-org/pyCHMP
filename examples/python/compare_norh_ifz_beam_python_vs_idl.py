@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Compare NORH clean beams: pyCHMP Python path vs SSW IDL ``norh_beam``.
 
-Uses Viktor's IFZ fixture by default:
-  ``../SRH-NORH-4CHMP/ifz140202_022005_corrected``
-  (override with ``--ifz`` / ``PYCHMP_NORH_IFZ``).
+Pass any Nobeyama IFZ/FITS product with a standard NORH header:
 
-Writes:
-  * a 3-panel comparison PNG (Python / IDL / difference)
-  * a small JSON metrics summary next to the PNG
+  python compare_norh_ifz_beam_python_vs_idl.py --ifz /path/to/ifzYYMMDD_HHMMSS
+
+Or set ``PYCHMP_NORH_IFZ``. P-angle for the Python beam is taken from:
+
+* ``--solp idl`` (default): live ``get_rb0p(/pangle)`` returned by the IDL run
+* ``--solp header``: ``SOLP`` from the FITS header (degrees → radians)
+
+Requires local ``sswidl`` and gx_simulator ``FitBeam`` / ``Gauss2Drot`` on
+``IDL_PATH`` (override package root with ``GX_SIMULATOR``).
+
+Writes a comparison PNG and JSON metrics summary under ``--out-dir``.
 """
 
 from __future__ import annotations
@@ -37,40 +43,27 @@ from pychmp.norh_beam import (  # noqa: E402
 from pychmp.psf import sigma_arcsec_to_fwhm  # noqa: E402
 
 
-DEFAULT_IFZ = Path("/Users/gelu/code/SUNCAST-ORG/SRH-NORH-4CHMP/ifz140202_022005_corrected")
-# IDL get_rb0p(/pangle) for this IFZ timestamp (radians); recorded from sswidl.
-IFZ_SOLP_IDL_RAD = -0.21937722
-
-
 def _resolve_ifz(path: Path | None) -> Path:
     env = os.environ.get("PYCHMP_NORH_IFZ")
     candidates: list[Path] = []
     if path is not None:
-        candidates.append(path.expanduser())
+        candidates.append(Path(path).expanduser())
     if env:
         candidates.append(Path(env).expanduser())
-    candidates.extend(
-        [
-            _REPO_ROOT.parent / "SRH-NORH-4CHMP" / "ifz140202_022005_corrected",
-            DEFAULT_IFZ,
-        ]
-    )
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
     raise FileNotFoundError(
-        "NORH IFZ fixture not found. Pass --ifz or set PYCHMP_NORH_IFZ. "
-        f"Tried: {[str(c) for c in candidates]}"
+        "NORH IFZ/FITS not found. Pass --ifz /path/to/file or set PYCHMP_NORH_IFZ."
     )
 
 
 def _find_sswidl() -> Path:
     for candidate in (
-        Path(os.environ.get("SSWIDL", "")),
-        Path("/Users/gelu/scripts/sswidl"),
+        Path(os.environ["SSWIDL"]) if os.environ.get("SSWIDL") else None,
         Path.home() / "scripts" / "sswidl",
     ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if candidate is not None and candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
     which = subprocess.run(["bash", "-lc", "command -v sswidl"], capture_output=True, text=True)
     text = which.stdout.strip()
@@ -79,10 +72,29 @@ def _find_sswidl() -> Path:
     raise FileNotFoundError("sswidl not found on PATH; set SSWIDL=/path/to/sswidl")
 
 
+def _gx_beams_dir() -> Path:
+    env_root = os.environ.get("GX_SIMULATOR") or os.environ.get("SSW_GX_SIMULATOR")
+    if env_root:
+        root = Path(env_root).expanduser()
+    elif os.environ.get("SSW"):
+        root = Path(os.environ["SSW"]).expanduser() / "packages" / "gx_simulator"
+    else:
+        raise FileNotFoundError(
+            "Set GX_SIMULATOR=/path/to/gx_simulator (or SSW) so FitBeam.pro can be found"
+        )
+    beams = root / "beams"
+    if not (beams / "FitBeam.pro").is_file():
+        raise FileNotFoundError(
+            f"gx_simulator FitBeam.pro not found under {beams}. "
+            "Set GX_SIMULATOR=/path/to/gx_simulator"
+        )
+    return beams
+
+
 def run_idl_norh_beam(ifz: Path, marx: int, out_fits: Path) -> dict[str, float]:
     """Run IDL ``norh_beam`` + ``FitBeam`` and write the beam to ``out_fits``."""
     sswidl = _find_sswidl()
-    gx_beams = Path("/Users/gelu/ssw/packages/gx_simulator/beams")
+    gx_beams = _gx_beams_dir()
     pro = out_fits.with_suffix(".pro")
     log = out_fits.with_suffix(".idl.log")
     metrics_txt = out_fits.with_suffix(".idl_metrics.txt")
@@ -240,7 +252,6 @@ def make_comparison_plot(
     axes[0, 2].set_ylabel("Y [arcsec]")
     fig.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
 
-    # 1-D cuts through the peak (center pixel).
     cx = cy = half
     x_arc = (np.arange(marx) - half) * spp
     axes[1, 0].plot(x_arc, python_beam[:, cy], label="Python", lw=2)
@@ -294,19 +305,27 @@ def make_comparison_plot(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ifz", type=Path, default=None, help="Path to NORH IFZ FITS")
+    parser.add_argument(
+        "--ifz",
+        type=Path,
+        default=None,
+        help="Path to a NORH IFZ/FITS file (or set PYCHMP_NORH_IFZ)",
+    )
     parser.add_argument("--marx", type=int, default=51, help="Beam array size (odd)")
     parser.add_argument(
         "--out-dir",
         type=Path,
         default=None,
-        help="Output directory for PNG/JSON (default: tempfile + agent media copy)",
+        help="Output directory for PNG/JSON (default: tempfile)",
     )
     parser.add_argument(
         "--solp",
         choices=("idl", "header"),
         default="idl",
-        help="Solar P-angle source for the Python beam (default: idl get_rb0p value)",
+        help=(
+            "P-angle for the Python beam: live IDL get_rb0p (default) "
+            "or FITS header SOLP"
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -323,13 +342,30 @@ def main(argv: list[str] | None = None) -> int:
 
     header = fits.getheader(ifz)
     index = norh_index_from_header(header)
-    solp = IFZ_SOLP_IDL_RAD if args.solp == "idl" else float(index["solp_rad"])
 
     print(f"IFZ: {ifz}")
-    print(f"marx={marx}  solp_source={args.solp}  solp_rad={solp:.8f}")
+    print(f"marx={marx}  solp_source={args.solp}")
     print(f"out_dir: {out_dir}")
 
-    # --- Python path ---
+    # --- IDL path first (also supplies live get_rb0p when --solp idl) ---
+    idl_fits = out_dir / f"norh_beam_idl_marx{marx}.fits"
+    print(f"Running sswidl norh_beam → {idl_fits}")
+    idl_metrics = run_idl_norh_beam(ifz, marx=marx, out_fits=idl_fits)
+    idl_beam = np.asarray(fits.getdata(idl_fits), dtype=float)
+    # Astropy returns FITS arrays as (NAXIS2, NAXIS1); IDL wrote beam[i,j] with
+    # i=NAXIS1 (x). Transpose back to IDL (x, y) layout to match make_norh_beam.
+    if idl_beam.ndim == 2:
+        idl_beam = idl_beam.T
+
+    if args.solp == "idl":
+        if "solp_rad" not in idl_metrics:
+            raise RuntimeError("IDL metrics missing solp_rad")
+        solp = float(idl_metrics["solp_rad"])
+    else:
+        solp = float(index["solp_rad"])
+    print(f"solp_rad={solp:.8f} (source={args.solp})")
+
+    # --- Python path (same P-angle choice as above) ---
     python_beam = make_norh_beam(
         sec_per_pix=float(index["sec_per_pix"]),
         sec_per_pix_dty=float(index["sec_per_pix_dty"]),
@@ -339,6 +375,10 @@ def main(argv: list[str] | None = None) -> int:
         marx=marx,
         ns2ew=float(index["ns2ew"]),
     )
+    if python_beam.shape != idl_beam.shape:
+        raise RuntimeError(
+            f"shape mismatch: python {python_beam.shape} vs idl {idl_beam.shape}"
+        )
     py_sx, py_sy, py_theta = fit_norh_beam_ellipse(
         python_beam, sec_per_pix=float(index["sec_per_pix"])
     )
@@ -347,20 +387,6 @@ def main(argv: list[str] | None = None) -> int:
         f"Python FitBeam: sx={py_sx:.7f} sy={py_sy:.7f} "
         f"theta_rad={py_theta:.7f} (header-path sx={py_params.sigma_x_arcsec:.7f})"
     )
-
-    # --- IDL path ---
-    idl_fits = out_dir / f"norh_beam_idl_marx{marx}.fits"
-    print(f"Running sswidl norh_beam → {idl_fits}")
-    idl_metrics = run_idl_norh_beam(ifz, marx=marx, out_fits=idl_fits)
-    idl_beam = np.asarray(fits.getdata(idl_fits), dtype=float)
-    # Astropy returns FITS arrays as (NAXIS2, NAXIS1); IDL wrote beam[i,j] with
-    # i=NAXIS1 (x). Transpose back to IDL (x, y) layout to match make_norh_beam.
-    if idl_beam.ndim == 2:
-        idl_beam = idl_beam.T
-    if idl_beam.shape != python_beam.shape:
-        raise RuntimeError(
-            f"shape mismatch: python {python_beam.shape} vs idl {idl_beam.shape}"
-        )
     print(
         f"IDL FitBeam: sx={idl_metrics['sx']:.7f} sy={idl_metrics['sy']:.7f} "
         f"theta_rad={idl_metrics['theta_rad']:.7f}"
@@ -385,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
             float(idl_metrics["theta_deg"]),
         ),
         out_png=out_png,
-        title_prefix=f"NORH IFZ beam parity (marx={marx}) — {ifz.name}",
+        title_prefix=f"NORH beam parity (marx={marx}) — {ifz.name}",
     )
     print(f"Wrote plot: {out_png}")
 
@@ -395,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         "solp_source": args.solp,
         "solp_rad_python": solp,
         "solp_rad_idl": idl_metrics.get("solp_rad"),
+        "solp_rad_header": float(index["solp_rad"]),
         "python_fit": {
             "sx": py_sx,
             "sy": py_sy,
@@ -415,18 +442,6 @@ def main(argv: list[str] | None = None) -> int:
     out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Wrote metrics: {out_json}")
 
-    # Copy plot + json into the project agent store media/.
-    media = Path(
-        "/Users/gelu/Library/Application Support/Cursor/AgentStores/"
-        "cursor_agent_stores/bc-5040a427-9f94-4a4b-a3c6-e0bda110472a/files/media"
-    )
-    media.mkdir(parents=True, exist_ok=True)
-    for src in (out_png, out_json):
-        dest = media / src.name
-        dest.write_bytes(src.read_bytes())
-        print(f"Copied to agent media: {dest}")
-
-    # Soft pass/fail gate for interactive use (float64 dump; allow tiny fit noise).
     if metrics["max_abs_diff"] > 1e-6 or metrics["corr"] < 1.0 - 1e-10:
         print(
             "WARNING: larger-than-expected residual "
