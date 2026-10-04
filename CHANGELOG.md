@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Example `examples/python/compare_norh_ifz_beam_python_vs_idl.py`: side-by-side
   Python vs `sswidl` ``norh_beam`` plot + numeric metrics for any NORH IFZ/FITS
   (`--ifz` / `PYCHMP_NORH_IFZ`); P-angle from live IDL `get_rb0p` or header `SOLP`.
+- SSRT restoring-beam path (`pychmp.ssrt_beam`): in-tree port of gx
+  `GetSSRTangles` / `MakeSSRTbeam` / `BeamFitSSRT`. Example
+  `examples/python/compare_ssrt_beam_python_vs_idl.py` compares Python vs IDL
+  for any observation time / classic SSRT map ``.sav``.
 
 ### Known limitations
 

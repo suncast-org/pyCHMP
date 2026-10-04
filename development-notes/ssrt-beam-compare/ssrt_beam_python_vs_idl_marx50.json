@@ -1,0 +1,35 @@
+{
+  "time": "2-Oct-2012 03:16:23.917",
+  "angles_mode": "idl",
+  "angles_python_used": {
+    "dEW": 19.157769,
+    "dNS": 25.826949,
+    "pEW": -27.850994,
+    "pNS": -85.062927
+  },
+  "angles_idl": {
+    "dEW": 19.157769,
+    "dNS": 25.826949,
+    "pEW": -27.850994,
+    "pNS": -85.062927
+  },
+  "python_fit": {
+    "sx": 7.319308397382244,
+    "sy": 14.501139606100175,
+    "theta_rad": -0.7737655945781556
+  },
+  "idl_fit": {
+    "sx": 14.500631,
+    "sy": 7.3190091,
+    "theta_rad": 0.79709549
+  },
+  "array_metrics": {
+    "max_abs_diff": 1.4563178774018581e-08,
+    "rms_diff": 7.438666161329656e-09,
+    "corr": 1.0,
+    "max_rel_to_peak": 1.4580509711786866e-08,
+    "python_sum": 631.6510356032213,
+    "idl_sum": 631.6510511646052
+  },
+  "plot": "/Users/gelu/code/SUNCAST-ORG/pyCHMP/ab_scan_artifacts/ssrt_beam_compare/ssrt_beam_python_vs_idl_marx50.png"
+}
