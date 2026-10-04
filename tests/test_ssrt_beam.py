@@ -40,6 +40,7 @@ requires_idl_beam = pytest.mark.skipif(
 
 @requires_idl_beam
 def test_make_ssrt_beam_matches_idl_fixture() -> None:
+    assert _IDL_BEAM is not None
     d_ew, d_ns, p_ew, p_ns = _IDL_ANGLES
     _x, _y, beam = make_ssrt_beam(
         d_ew, d_ns, p_ew, p_ns, nx=50, ny=50, dx_arcsec=1.0, dy_arcsec=1.0
