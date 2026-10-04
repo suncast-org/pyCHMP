@@ -1,0 +1,33 @@
+{
+  "ifz": "/Users/gelu/code/SUNCAST-ORG/SRH-NORH-4CHMP/ifz140202_022005_corrected",
+  "marx": 21,
+  "solp_source": "idl",
+  "solp_rad_python": -0.21937722,
+  "solp_rad_idl": -0.21937722,
+  "python_fit": {
+    "sx": 3.418467268179039,
+    "sy": 5.64090321483411,
+    "theta_rad": -4.440892098500626e-16,
+    "theta_deg": -2.5444437451708134e-14
+  },
+  "idl_fit": {
+    "sx": 3.4154307,
+    "sy": 5.6472339,
+    "theta_rad": 0.041586996,
+    "theta_deg": 2.3827594
+  },
+  "array_metrics": {
+    "max_abs_diff": 3.423476435671091e-08,
+    "rms_diff": 4.819997153602159e-09,
+    "mean_abs_diff": 1.6488955085600415e-09,
+    "max_rel_to_peak": 3.423476435671091e-08,
+    "rms_rel_to_peak": 4.819997153602159e-09,
+    "corr": 0.9999999999999994,
+    "python_sum": 20.098823830225285,
+    "idl_sum": 20.098824359852497,
+    "python_max": 1.0,
+    "idl_max": 1.0
+  },
+  "plot": "/Users/gelu/code/SUNCAST-ORG/pyCHMP/ab_scan_artifacts/norh_ifz_beam_compare/norh_ifz_beam_python_vs_idl_marx21.png",
+  "idl_beam_fits": "/Users/gelu/code/SUNCAST-ORG/pyCHMP/ab_scan_artifacts/norh_ifz_beam_compare/norh_beam_idl_marx21.fits"
+}
