@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GetSSRTangles` / `MakeSSRTbeam` / `BeamFitSSRT`. Example
   `examples/python/compare_ssrt_beam_python_vs_idl.py` compares Python vs IDL
   for any observation time / classic SSRT map ``.sav``.
+- SSRT FITS header routing in `pychmp.psf`: headers identified as SSRT
+  (`TELESCOP`/`INSTRUME`/`ORIGIN` containing SSRT or Badary AOR) resolve the
+  restoring beam from `DATE-OBS` via `BeamFitSSRT`, before the generic
+  `BMAJ`/`BMIN` path used by EOVSA. Image data are not required.
 
 ### Known limitations
 

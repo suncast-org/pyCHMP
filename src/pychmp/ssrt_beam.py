@@ -19,6 +19,7 @@ from typing import Any
 
 import numpy as np
 from astropy.coordinates import EarthLocation, get_sun
+from astropy.io import fits
 from astropy.time import Time
 from astropy import units as u
 from scipy.optimize import curve_fit
@@ -281,3 +282,120 @@ def beam_fit_ssrt(
         dy_arcsec=dy,
     )
     return params, beam
+
+
+def _header_text_blob(header: fits.Header) -> str:
+    parts: list[str] = []
+    for key in (
+        "TELESCOP",
+        "INSTRUME",
+        "INSTRUMENT",
+        "ORIGIN",
+        "OBSERVAT",
+        "OBSERVER",
+        "OBJECT",
+        "TELESCOPE",
+        "SITE",
+        "CONTENT",
+    ):
+        value = header.get(key)
+        if value is not None and str(value).strip():
+            parts.append(str(value))
+    return " ".join(parts).lower()
+
+
+def is_ssrt_header(header: fits.Header) -> bool:
+    """True when the FITS header looks like a Siberian Solar Radio Telescope image."""
+    blob = _header_text_blob(header)
+    if "ssrt" in blob:
+        return True
+    # Classic SSRT map IDs / site tags (e.g. ``SSRT AOR BADARY``).
+    if "badary" in blob and ("aor" in blob or "siberian" in blob):
+        return True
+    return False
+
+
+def ssrt_time_from_header(header: fits.Header) -> Any | None:
+    """Observation time for ``GetSSRTangles`` from common FITS time cards.
+
+    Prefers a full ``DATE-OBS`` / ``DATE_OBS`` / ``T_OBS`` timestamp. When the
+    date card is date-only, combines it with ``TIME-OBS`` / ``TIME_OBS`` when
+    present (SSW-style split headers).
+    """
+    for key in ("DATE-OBS", "DATE_OBS", "T_OBS", "OBS_DATE"):
+        raw = header.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        # Already a full datetime string.
+        if "T" in text or ":" in text or "-" in text[2:]:
+            # Date-only YYYY-MM-DD needs TIME-OBS.
+            if len(text) <= 10 and ":" not in text:
+                time_obs = header.get("TIME-OBS", header.get("TIME_OBS"))
+                if time_obs is not None and str(time_obs).strip():
+                    return f"{text} {str(time_obs).strip()}"
+                continue
+            return text
+    date_only = header.get("DATE")
+    time_obs = header.get("TIME-OBS", header.get("TIME_OBS"))
+    if date_only is not None and time_obs is not None:
+        date_text = str(date_only).strip()
+        time_text = str(time_obs).strip()
+        if date_text and time_text:
+            return f"{date_text} {time_text}"
+    return None
+
+
+def _header_pixel_scale_arcsec(header: fits.Header) -> tuple[float, float]:
+    """Return ``(dx, dy)`` in arcsec for the BeamFit grid (defaults match IDL)."""
+
+    def _cdelt(key: str) -> float | None:
+        if key not in header:
+            return None
+        try:
+            value = float(header[key])
+        except Exception:
+            return None
+        if not np.isfinite(value) or value == 0.0:
+            return None
+        return float(abs(value))
+
+    dx = _cdelt("CDELT1")
+    dy = _cdelt("CDELT2")
+    if dx is None:
+        dx = 1.0
+    if dy is None:
+        dy = float(dx)
+    return float(dx), float(dy)
+
+
+def beam_fit_ssrt_from_header(
+    header: fits.Header,
+    *,
+    marx: int = 50,
+    time: Any | None = None,
+    angles: SsrtAngles | None = None,
+) -> SsrtBeamParams:
+    """``BeamFitSSRT`` from an SSRT FITS header (image data not required).
+
+    Beam geometry is determined by observation time via ``GetSSRTangles``;
+    ``CDELT1``/``CDELT2`` only set the fitting-grid sampling (IDL default 1″).
+    """
+    obs_time = time if time is not None else ssrt_time_from_header(header)
+    if angles is None and obs_time is None:
+        raise ValueError("SSRT header requires DATE-OBS (or equivalent) for GetSSRTangles")
+    dx, dy = _header_pixel_scale_arcsec(header)
+    # Prefer IDL BeamFitSSRT sampling (1″) when the map pixel is coarse; a 4–5″
+    # CDELT under-samples the EW/NS lobes for a stable Gaussian fit.
+    fit_dx = float(dx) if float(dx) <= 2.0 else 1.0
+    fit_dy = float(dy) if float(dy) <= 2.0 else float(fit_dx)
+    params, _beam = beam_fit_ssrt(
+        obs_time if obs_time is not None else "2000-01-01T00:00:00",
+        marx=int(marx),
+        dx_arcsec=fit_dx,
+        dy_arcsec=fit_dy,
+        angles=angles,
+    )
+    return params

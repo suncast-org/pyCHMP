@@ -210,7 +210,8 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
     1. Viktor/srhimages σ axes: ``BEAM_SA`` / ``BEAM_SB`` / ``BEAM_PHI`` (``BEAM_P`` must be 1)
     2. gx_simulator SRH correlated σ: ``BEAM_SX`` / ``BEAM_SY`` / ``BEAM_RHO``
     3. NORH clean beam via SSW ``norh_beam`` / gx ``BeamFitNoRH`` (PMAT + OBS-FREQ)
-    4. Standard FWHM ellipse: ``BMAJ`` / ``BMIN`` / ``BPA`` (degrees if |value|≤1)
+    4. SSRT restoring beam via gx ``GetSSRTangles`` / ``BeamFitSSRT`` (TELESCOP/INSTRUME + DATE-OBS)
+    5. Standard FWHM ellipse: ``BMAJ`` / ``BMIN`` / ``BPA`` (degrees if |value|≤1)
 
     Radio σ headers are converted to FWHM for storage in ``PSFMetadata`` so the
     existing ``elliptical_gaussian_kernel`` path stays unchanged (FWHM→σ internally).
@@ -261,6 +262,11 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
     norh_psf = extract_norh_psf_metadata_from_header(header)
     if norh_psf is not None:
         return norh_psf
+
+    # --- SSRT restoring beam (GetSSRTangles / BeamFitSSRT from DATE-OBS) ---
+    ssrt_psf = extract_ssrt_psf_metadata_from_header(header)
+    if ssrt_psf is not None:
+        return ssrt_psf
 
     # --- Standard FWHM beam ---
     bmaj_raw = _header_first(header, ("BMAJ", "BMAJ_DEG", "BMAJDEG", "BEAM_MAJ", "PSF_BMAJ"))
@@ -316,6 +322,29 @@ def extract_norh_psf_metadata_from_header(
         sigma_b=params.sigma_y_arcsec,
         pa_of_a_deg=params.theta_deg,
         source="fits_header:norh_beam",
+        allows_frequency_scaling=True,
+    )
+
+
+def extract_ssrt_psf_metadata_from_header(
+    header: fits.Header,
+    *,
+    marx: int = 50,
+) -> PSFMetadata | None:
+    """Build SSRT PSF metadata via ``GetSSRTangles`` / ``BeamFitSSRT`` from DATE-OBS."""
+    from .ssrt_beam import beam_fit_ssrt_from_header, is_ssrt_header
+
+    if not is_ssrt_header(header):
+        return None
+    try:
+        params = beam_fit_ssrt_from_header(header, marx=int(marx))
+    except Exception:
+        return None
+    return _psf_from_sigma_axes(
+        sigma_a=params.sigma_x_arcsec,
+        sigma_b=params.sigma_y_arcsec,
+        pa_of_a_deg=params.theta_deg,
+        source="fits_header:ssrt_beam",
         allows_frequency_scaling=True,
     )
 
