@@ -111,6 +111,11 @@ def _parse_time(time: Any) -> Time:
         "%Y-%m-%d %H:%M:%S.%f",
         "%Y-%m-%dT%H:%M:%S.%f",
         "%Y-%m-%dT%H:%M:%S",
+        # Classic SSRT FITS: DATE-OBS=DD/MM/YY + TIME-OBS (Badary / European).
+        "%d/%m/%y %H:%M:%S.%f",
+        "%d/%m/%y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S.%f",
+        "%d/%m/%Y %H:%M:%S",
     ):
         try:
             return Time(datetime.strptime(text, fmt).replace(tzinfo=timezone.utc))
@@ -329,10 +334,12 @@ def ssrt_time_from_header(header: fits.Header) -> Any | None:
         text = str(raw).strip()
         if not text:
             continue
-        # Already a full datetime string.
-        if "T" in text or ":" in text or "-" in text[2:]:
-            # Date-only YYYY-MM-DD needs TIME-OBS.
-            if len(text) <= 10 and ":" not in text:
+        # Full timestamp, or date-only (ISO / slash) needing TIME-OBS.
+        has_clock = "T" in text or ":" in text
+        looks_like_date = has_clock or "-" in text[2:] or "/" in text
+        if looks_like_date:
+            # Date-only YYYY-MM-DD or DD/MM/YY needs TIME-OBS.
+            if not has_clock and len(text) <= 10:
                 time_obs = header.get("TIME-OBS", header.get("TIME_OBS"))
                 if time_obs is not None and str(time_obs).strip():
                     return f"{text} {str(time_obs).strip()}"

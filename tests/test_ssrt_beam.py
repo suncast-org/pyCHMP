@@ -100,6 +100,11 @@ def test_ssrt_time_from_header_reads_date_obs_and_split_cards() -> None:
     split["DATE-OBS"] = "2012-07-12"
     split["TIME-OBS"] = "02:49:22.341"
     assert ssrt_time_from_header(split) == "2012-07-12 02:49:22.341"
+    # Classic Badary SSRT maps: DD/MM/YY + TIME-OBS (e.g. I20110801_0313.fit).
+    slash = fits.Header()
+    slash["DATE-OBS"] = "01/08/11"
+    slash["TIME-OBS"] = "03:13:32.673"
+    assert ssrt_time_from_header(slash) == "01/08/11 03:13:32.673"
 
 
 def test_extract_psf_metadata_from_ssrt_header_uses_time_beam() -> None:
