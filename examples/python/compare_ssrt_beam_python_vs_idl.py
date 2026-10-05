@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Compare SSRT restoring beams: pyCHMP Python path vs SSW IDL ``MakeSSRTbeam``.
 
-Supply an observation time and/or a classic SSRT map ``.sav`` (``map`` variable).
-Optionally compare against a precomputed IDL beam FITS (e.g. map-object index 2
-exported with ``writefits``):
+Supply an observation time, a classic SSRT map FITS (``DATE-OBS`` / ``TIME-OBS``),
+and/or a classic SSRT map ``.sav`` (``map`` variable). Optionally compare against
+a precomputed IDL beam FITS (e.g. map-object index 2 exported with ``writefits``):
+
+  python compare_ssrt_beam_python_vs_idl.py \\
+    --fits /path/to/I20110801_0313.fit
 
   python compare_ssrt_beam_python_vs_idl.py \\
     --time '2-Oct-2012 03:16:23.917' \\
