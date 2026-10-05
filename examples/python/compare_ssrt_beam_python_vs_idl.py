@@ -40,9 +40,11 @@ if str(_REPO_ROOT / "src") not in sys.path:
 
 from pychmp.psf import sigma_arcsec_to_fwhm  # noqa: E402
 from pychmp.ssrt_beam import (  # noqa: E402
+    _parse_time,
     fit_ssrt_beam_ellipse,
     get_ssrt_angles,
     make_ssrt_beam,
+    ssrt_time_from_header,
 )
 
 
@@ -91,6 +93,21 @@ def time_from_map_sav(path: Path) -> str:
         raise KeyError(f"{path} has no 'map' variable")
     m = payload["map"]
     return _decode_bytes(m["time"])
+
+
+def time_from_ssrt_fits(path: Path) -> str:
+    """Observation time from classic SSRT FITS (DATE-OBS + TIME-OBS), IDL anytim form."""
+    with fits.open(path) as hdul:
+        raw = ssrt_time_from_header(hdul[0].header)
+    if raw is None:
+        raise KeyError(f"{path} has no DATE-OBS/TIME-OBS (or equivalent)")
+    t = _parse_time(raw).utc.datetime
+    # Match prior compare artifacts: "1-Aug-2011 03:13:32.673"
+    return (
+        f"{t.day}-{t.strftime('%b')}-{t.year} "
+        f"{t.hour:02d}:{t.minute:02d}:{t.second:02d}."
+        f"{int(t.microsecond / 1000):03d}"
+    )
 
 
 def run_idl_ssrt_beam(time: str, marx: int, dx: float, out_fits: Path) -> dict[str, float]:
@@ -260,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--time", default=None, help="Observation time (anytim-like string)")
     p.add_argument("--map-sav", type=Path, default=None, help="Classic SSRT map .sav with 'map'")
+    p.add_argument(
+        "--fits",
+        type=Path,
+        default=None,
+        help="Classic SSRT map FITS; derive time from DATE-OBS (+ TIME-OBS)",
+    )
     p.add_argument("--idl-beam-fits", type=Path, default=None, help="Optional IDL beam FITS to compare")
     p.add_argument("--marx", type=int, default=50)
     p.add_argument("--dx", type=float, default=1.0, help="Beam pixel size arcsec (BeamFitSSRT uses 1)")
@@ -273,10 +296,12 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     time = args.time
+    if time is None and args.fits is not None:
+        time = time_from_ssrt_fits(Path(args.fits).expanduser())
     if time is None and args.map_sav is not None:
         time = time_from_map_sav(Path(args.map_sav).expanduser())
     if not time:
-        raise SystemExit("Provide --time or --map-sav")
+        raise SystemExit("Provide --time, --fits, or --map-sav")
 
     out_dir = args.out_dir or Path(tempfile.mkdtemp(prefix="ssrt_beam_compare_"))
     out_dir = out_dir.expanduser().resolve()
