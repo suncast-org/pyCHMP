@@ -270,15 +270,17 @@ def test_srh_negative_sx_falls_through_to_bmaj() -> None:
 
 
 def test_eovsa_bmaj_extract_does_not_import_sunpy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """EOVSA/BMAJ resolve must not pull sunpy (lazy SSRT-only import)."""
+    """EOVSA/BMAJ resolve must not pull sunpy (lazy SSRT-only import).
+
+    Do not evict ``pychmp.psf`` from ``sys.modules``: reloading it mid-suite
+    leaves stale ``from pychmp.psf import …`` bindings in other tests and
+    breaks monkeypatch-based cache assertions.
+    """
     import builtins
     import sys
 
     for key in list(sys.modules):
-        if key == "sunpy" or key.startswith("sunpy.") or key in {
-            "pychmp.ssrt_beam",
-            "pychmp.psf",
-        }:
+        if key == "sunpy" or key.startswith("sunpy."):
             monkeypatch.delitem(sys.modules, key, raising=False)
 
     real_import = builtins.__import__
@@ -291,14 +293,12 @@ def test_eovsa_bmaj_extract_does_not_import_sunpy(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(builtins, "__import__", _guard)
 
-    from pychmp.psf import extract_psf_metadata_from_header as extract_fresh
-
     header = fits.Header()
     header["TELESCOP"] = "EOVSA"
     header["BMAJ"] = 30.0 / 3600.0
     header["BMIN"] = 20.0 / 3600.0
     header["BPA"] = 15.0
-    metadata = extract_fresh(header)
+    metadata = extract_psf_metadata_from_header(header)
     assert metadata is not None
     assert metadata.source == "fits_header"
     assert not any(k == "sunpy" or k.startswith("sunpy.") for k in sys.modules)

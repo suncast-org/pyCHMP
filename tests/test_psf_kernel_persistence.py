@@ -315,15 +315,16 @@ def test_resolve_slice_psf_kernel_reuses_build_cache_when_stored_kernel_missing(
     clear_psf_kernel_build_cache()
     diagnostics = _eovsa_diagnostics()
     calls = {"count": 0}
-    original = build_psf_kernel
+    # Patch the globals of the resolve function under test (not sys.modules),
+    # so the assertion still holds if another test reloaded pychmp.psf.
+    resolve_globals = resolve_slice_psf_kernel.__globals__
+    original = resolve_globals["build_psf_kernel"]
 
     def _counting_build(**kwargs: object) -> tuple[np.ndarray | None, dict[str, object] | None]:
         calls["count"] += 1
         return original(**kwargs)
 
-    import pychmp.psf as psf_module
-
-    psf_module.build_psf_kernel = _counting_build
+    resolve_globals["build_psf_kernel"] = _counting_build
     try:
         kwargs = {
             "stored_kernel": None,
@@ -335,7 +336,7 @@ def test_resolve_slice_psf_kernel_reuses_build_cache_when_stored_kernel_missing(
         first = resolve_slice_psf_kernel(**kwargs)
         second = resolve_slice_psf_kernel(**kwargs)
     finally:
-        psf_module.build_psf_kernel = original
+        resolve_globals["build_psf_kernel"] = original
         clear_psf_kernel_build_cache()
 
     assert first is not None
