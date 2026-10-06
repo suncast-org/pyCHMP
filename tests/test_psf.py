@@ -189,7 +189,8 @@ def test_extract_viktor_srh_sigma_header_from_pdf_example() -> None:
     assert metadata.bpa_deg == pytest.approx(expected_pa)
 
 
-def test_extract_viktor_srh_rejects_super_gaussian_p() -> None:
+def test_extract_viktor_srh_rejects_super_gaussian_p_without_fallback() -> None:
+    """Unsupported BEAM_P≠1 yields None only when no later route exists."""
     header = fits.Header()
     header["beam_sa"] = 3.0
     header["beam_sb"] = 5.0
@@ -197,6 +198,110 @@ def test_extract_viktor_srh_rejects_super_gaussian_p() -> None:
     header["beam_p"] = 2.0
 
     assert extract_psf_metadata_from_header(header) is None
+
+
+def test_srh_super_gaussian_p_falls_through_to_bmaj() -> None:
+    header = fits.Header()
+    header["BEAM_SA"] = 3.0
+    header["BEAM_SB"] = 5.0
+    header["BEAM_PHI"] = 10.0
+    header["BEAM_P"] = 2.0
+    header["BMAJ"] = 30.0 / 3600.0
+    header["BMIN"] = 20.0 / 3600.0
+    header["BPA"] = 15.0
+
+    metadata = extract_psf_metadata_from_header(header)
+    assert metadata is not None
+    assert metadata.source == "fits_header"
+    assert metadata.bmaj_arcsec == pytest.approx(30.0)
+    assert metadata.bmin_arcsec == pytest.approx(20.0)
+
+
+def test_srh_super_gaussian_p_falls_through_to_correlated_sx() -> None:
+    header = fits.Header()
+    header["BEAM_SA"] = 3.0
+    header["BEAM_SB"] = 5.0
+    header["BEAM_PHI"] = 10.0
+    header["BEAM_P"] = 2.0
+    header["BEAM_SX"] = 5.0
+    header["BEAM_SY"] = 12.0
+    header["BEAM_RHO"] = 0.35
+
+    metadata = extract_psf_metadata_from_header(header)
+    smaj, smin, pa = psf_module.correlated_sigma_to_rotated(5.0, 12.0, 0.35)
+    assert metadata is not None
+    assert metadata.source == "fits_header:srh_correlated"
+    assert metadata.bmaj_arcsec == pytest.approx(psf_module.sigma_arcsec_to_fwhm(smaj))
+    assert metadata.bmin_arcsec == pytest.approx(psf_module.sigma_arcsec_to_fwhm(smin))
+    assert metadata.bpa_deg == pytest.approx(pa)
+
+
+def test_srh_zero_sa_falls_through_to_bmaj() -> None:
+    header = fits.Header()
+    header["BEAM_SA"] = 0.0
+    header["BEAM_SB"] = 5.0
+    header["BEAM_PHI"] = 10.0
+    header["BEAM_P"] = 1.0
+    header["BMAJ"] = 25.0 / 3600.0
+    header["BMIN"] = 18.0 / 3600.0
+    header["BPA"] = -5.0
+
+    metadata = extract_psf_metadata_from_header(header)
+    assert metadata is not None
+    assert metadata.source == "fits_header"
+    assert metadata.bmaj_arcsec == pytest.approx(25.0)
+    assert metadata.bmin_arcsec == pytest.approx(18.0)
+
+
+def test_srh_negative_sx_falls_through_to_bmaj() -> None:
+    header = fits.Header()
+    header["BEAM_SX"] = -1.0
+    header["BEAM_SY"] = 12.0
+    header["BEAM_RHO"] = 0.0
+    header["BMAJ"] = 22.0 / 3600.0
+    header["BMIN"] = 16.0 / 3600.0
+    header["BPA"] = 0.0
+
+    metadata = extract_psf_metadata_from_header(header)
+    assert metadata is not None
+    assert metadata.source == "fits_header"
+    assert metadata.bmaj_arcsec == pytest.approx(22.0)
+    assert metadata.bmin_arcsec == pytest.approx(16.0)
+
+
+def test_eovsa_bmaj_extract_does_not_import_sunpy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EOVSA/BMAJ resolve must not pull sunpy (lazy SSRT-only import)."""
+    import builtins
+    import sys
+
+    for key in list(sys.modules):
+        if key == "sunpy" or key.startswith("sunpy.") or key in {
+            "pychmp.ssrt_beam",
+            "pychmp.psf",
+        }:
+            monkeypatch.delitem(sys.modules, key, raising=False)
+
+    real_import = builtins.__import__
+
+    def _guard(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
+        root = name.split(".", 1)[0]
+        if root == "sunpy":
+            raise AssertionError(f"unexpected sunpy import during EOVSA resolve: {name}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _guard)
+
+    from pychmp.psf import extract_psf_metadata_from_header as extract_fresh
+
+    header = fits.Header()
+    header["TELESCOP"] = "EOVSA"
+    header["BMAJ"] = 30.0 / 3600.0
+    header["BMIN"] = 20.0 / 3600.0
+    header["BPA"] = 15.0
+    metadata = extract_fresh(header)
+    assert metadata is not None
+    assert metadata.source == "fits_header"
+    assert not any(k == "sunpy" or k.startswith("sunpy.") for k in sys.modules)
 
 
 def test_extract_gx_srh_correlated_header() -> None:

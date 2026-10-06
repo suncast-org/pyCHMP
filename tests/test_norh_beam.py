@@ -36,7 +36,13 @@ def _ifz_path() -> Path | None:
 
 
 IFZ_PATH = _ifz_path()
-requires_ifz = pytest.mark.skipif(IFZ_PATH is None, reason="NORH IFZ fixture not found")
+# Optional local fixture: set PYCHMP_NORH_IFZ or place
+# SRH-NORH-4CHMP/ifz140202_022005_corrected beside the repo. Skips cleanly in CI.
+_SKIP_IFZ = (
+    "NORH IFZ fixture not found "
+    "(set PYCHMP_NORH_IFZ or sibling SRH-NORH-4CHMP/ifz140202_022005_corrected)"
+)
+requires_ifz = pytest.mark.skipif(IFZ_PATH is None, reason=_SKIP_IFZ)
 
 
 def test_norh_prog2pinf_snap2d34_uses_scaled_dirty_pixel() -> None:
@@ -59,6 +65,7 @@ def test_is_norh_header_requires_pmat_and_freq() -> None:
     assert is_norh_header(header) is True
 
 
+@pytest.mark.external_fixture
 @requires_ifz
 def test_norh_beam_pixels_match_idl_reference() -> None:
     """Spot-check marx=21 beam samples against IDL ``norh_beam`` on the IFZ file."""
@@ -83,6 +90,7 @@ def test_norh_beam_pixels_match_idl_reference() -> None:
     assert beam[0, 0] == pytest.approx(1.19841e-16, rel=1e-3)
 
 
+@pytest.mark.external_fixture
 @requires_ifz
 def test_beam_fit_norh_matches_idl_beamfitnorh() -> None:
     """IDL ``BeamFitNoRH`` on IFZ @ marx=51: sx=5.6473555, sy=3.4153717, theta=-1.5292061."""
@@ -104,6 +112,7 @@ def test_beam_fit_norh_matches_idl_beamfitnorh() -> None:
     assert pa_maj == pytest.approx(-87.617057, abs=0.05)
 
 
+@pytest.mark.external_fixture
 @requires_ifz
 def test_extract_psf_metadata_from_ifz_header() -> None:
     assert IFZ_PATH is not None

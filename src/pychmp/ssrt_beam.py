@@ -23,7 +23,6 @@ from astropy.io import fits
 from astropy.time import Time
 from astropy import units as u
 from scipy.optimize import curve_fit
-from sunpy.coordinates import sun as sunpy_sun
 
 # Badary observatory (matches GetSSRTangles.pro)
 _BADARY_LON_DEG = 102.0 + 13.0 / 60.0
@@ -126,6 +125,9 @@ def _parse_time(time: Any) -> Time:
 
 def get_ssrt_angles(time: Any) -> SsrtAngles:
     """IDL ``GetSSRTangles`` using Astropy/SunPy ephemeris (Badary site)."""
+    # Lazy: keep module import free of sunpy so EOVSA/BMAJ header resolve stays light.
+    from sunpy.coordinates import sun as sunpy_sun
+
     t = _parse_time(time)
     # Declination / P-angle: SunPy tracks SSW get_sun closely for SSRT use.
     decl_deg = float(get_sun(t).dec.deg)

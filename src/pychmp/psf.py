@@ -224,18 +224,19 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
         sb = _optional_float(sb_raw)
         phi = _optional_float(_header_first(header, ("BEAM_PHI", "beam_phi"))) or 0.0
         beam_p = _optional_float(_header_first(header, ("BEAM_P", "beam_p")))
-        if beam_p is not None and abs(beam_p - 1.0) > 1e-6:
-            # Super-Gaussian p≠1 not supported in the first slice.
-            return None
-        if sa is not None and sb is not None:
+        # Super-Gaussian p≠1 is unsupported; fall through to SX/SY, NORH/SSRT, or BMAJ.
+        # Invalid SA/SB (≤0) also fall through rather than aborting the resolver.
+        if (beam_p is None or abs(beam_p - 1.0) <= 1e-6) and sa is not None and sb is not None:
             # Match Viktor get_psf: gaussian2d(..., theta=-beam_phi)
-            return _psf_from_sigma_axes(
+            meta = _psf_from_sigma_axes(
                 sigma_a=sa,
                 sigma_b=sb,
                 pa_of_a_deg=-float(phi),
                 source="fits_header:srh_sigma",
                 allows_frequency_scaling=True,
             )
+            if meta is not None:
+                return meta
 
     # --- gx MakeSRHbeam correlated σ ---
     sx_raw = _header_first(header, ("BEAM_SX", "beam_sx"))
@@ -248,15 +249,16 @@ def extract_psf_metadata_from_header(header: fits.Header) -> PSFMetadata | None:
             try:
                 smaj, smin, pa = correlated_sigma_to_rotated(sx, sy, rho)
             except ValueError:
-                return None
-            return PSFMetadata(
-                source="fits_header:srh_correlated",
-                kind="gaussian",
-                bmaj_arcsec=sigma_arcsec_to_fwhm(smaj),
-                bmin_arcsec=sigma_arcsec_to_fwhm(smin),
-                bpa_deg=float(pa),
-                allows_frequency_scaling=True,
-            )
+                pass  # fall through to NORH / SSRT / BMAJ
+            else:
+                return PSFMetadata(
+                    source="fits_header:srh_correlated",
+                    kind="gaussian",
+                    bmaj_arcsec=sigma_arcsec_to_fwhm(smaj),
+                    bmin_arcsec=sigma_arcsec_to_fwhm(smin),
+                    bpa_deg=float(pa),
+                    allows_frequency_scaling=True,
+                )
 
     # --- NORH clean beam (SSW norh_beam → FitBeam / BeamFitNoRH) ---
     norh_psf = extract_norh_psf_metadata_from_header(header)
@@ -340,12 +342,13 @@ def extract_ssrt_psf_metadata_from_header(
         params = beam_fit_ssrt_from_header(header, marx=int(marx))
     except Exception:
         return None
+    # Monochromatic ~5.7 GHz restoring beam — do not inverse-frequency scale.
     return _psf_from_sigma_axes(
         sigma_a=params.sigma_x_arcsec,
         sigma_b=params.sigma_y_arcsec,
         pa_of_a_deg=params.theta_deg,
         source="fits_header:ssrt_beam",
-        allows_frequency_scaling=True,
+        allows_frequency_scaling=False,
     )
 
 

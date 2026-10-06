@@ -61,6 +61,9 @@ testpaths = ["tests"]
 addopts = "-q"
 pythonpath = [".", "src"]
 cache_dir = "/tmp/pychmp_pytest_cache"
+markers = [
+  "external_fixture: optional local IDL/IFZ FITS fixtures; skipped in CI when absent (PYCHMP_NORH_IFZ / PYCHMP_SSRT_IDL_BEAM)",
+]
 
 [tool.bumpver]
 current_version = "0.2.0"

@@ -32,11 +32,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   restoring beam from observation time via `BeamFitSSRT`, before the generic
   `BMAJ`/`BMIN` path used by EOVSA. Image data are not required. Time cards
   accept ISO/IDL forms and classic Badary ``DATE-OBS=DD/MM/YY`` plus
-  ``TIME-OBS``.
+  ``TIME-OBS``. The SSRT beam is monochromatic (~5.7 GHz) and does not
+  enable inverse-frequency scaling. `sunpy` is imported only inside
+  `GetSSRTangles`, so EOVSA/`BMAJ` resolve does not load it.
+
+### Changed
+
+- SRH header resolve soft-fails on unsupported `BEAM_P≠1`, non-positive
+  `BEAM_SA`/`BEAM_SB`, or invalid `BEAM_SX`/`BEAM_SY`/`BEAM_RHO`, falling
+  through to later routes (correlated σ, NORH, SSRT, or `BMAJ`) instead of
+  aborting the resolver.
+- NORH/SSRT IDL parity tests that need local fixtures are marked
+  `external_fixture` and skip cleanly when `PYCHMP_NORH_IFZ` /
+  `PYCHMP_SSRT_IDL_BEAM` (or sibling `SRH-NORH-4CHMP/`) are absent.
 
 ### Known limitations
 
-- Super-Gaussian SRH `BEAM_P≠1` is rejected (no kernel) until a later slice.
+- Super-Gaussian SRH `BEAM_P≠1` is not converted to a kernel; the resolver
+  falls through to SX/SY or `BMAJ` when present.
 - NORH beam uses header `SOLP` (degrees) rather than recomputing `get_rb0p`;
   on standard products this matches IDL to ≲0.01°.
 

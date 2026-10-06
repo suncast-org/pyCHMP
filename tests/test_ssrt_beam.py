@@ -41,11 +41,16 @@ _IDL_BEAM = _idl_beam_path()
 _IDL_ANGLES = (19.157769, 25.826949, -27.850994, -85.062927)
 _IDL_FIT = (14.500631, 7.3190091, 0.79709549)
 
-requires_idl_beam = pytest.mark.skipif(
-    _IDL_BEAM is None, reason="SSRT IDL beam FITS fixture not found"
+# Optional local fixture: set PYCHMP_SSRT_IDL_BEAM or place
+# SRH-NORH-4CHMP/ssrt2oct2012_idl_beam.fits beside the repo. Skips cleanly in CI.
+_SKIP_IDL_BEAM = (
+    "SSRT IDL beam FITS fixture not found "
+    "(set PYCHMP_SSRT_IDL_BEAM or sibling SRH-NORH-4CHMP/ssrt2oct2012_idl_beam.fits)"
 )
+requires_idl_beam = pytest.mark.skipif(_IDL_BEAM is None, reason=_SKIP_IDL_BEAM)
 
 
+@pytest.mark.external_fixture
 @requires_idl_beam
 def test_make_ssrt_beam_matches_idl_fixture() -> None:
     assert _IDL_BEAM is not None
@@ -59,6 +64,7 @@ def test_make_ssrt_beam_matches_idl_fixture() -> None:
     assert float(np.corrcoef(beam.ravel(), idl.ravel())[0, 1]) > 1.0 - 1e-12
 
 
+@pytest.mark.external_fixture
 @requires_idl_beam
 def test_fit_ssrt_beam_matches_idl_beamfitssrt() -> None:
     d_ew, d_ns, p_ew, p_ns = _IDL_ANGLES
@@ -124,7 +130,8 @@ def test_extract_psf_metadata_from_ssrt_header_uses_time_beam() -> None:
     assert metadata is not None
     assert metadata.source == "fits_header:ssrt_beam"
     assert metadata.kind == "gaussian"
-    assert metadata.allows_frequency_scaling is True
+    # Single-frequency ~5.7 GHz beam — not inverse-frequency scalable.
+    assert metadata.allows_frequency_scaling is False
     assert metadata.bmaj_arcsec is not None and metadata.bmin_arcsec is not None
     assert metadata.bmaj_arcsec > metadata.bmin_arcsec > 0.0
 
@@ -142,11 +149,12 @@ def test_extract_psf_metadata_from_ssrt_header_uses_time_beam() -> None:
         dx_arcsec=4.9110398,
         dy_arcsec=4.9110398,
         active_frequency_ghz=5.7,
-        ref_frequency_ghz=5.7,
+        ref_frequency_ghz=2.85,
         scale_inverse_frequency=True,
     )
     assert kernel is not None and kernel_meta is not None
     assert float(kernel.sum()) == pytest.approx(1.0)
+    assert bool(kernel_meta["scaled"]) is False
 
 
 def test_ssrt_header_without_time_does_not_claim_psf() -> None:
