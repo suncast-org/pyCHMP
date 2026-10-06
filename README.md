@@ -77,6 +77,25 @@ Release history: [CHANGELOG.md](CHANGELOG.md).
 pychmp --help
 ```
 
+### Microwave PSF from FITS headers
+
+`pychmp.psf` resolves restoring beams for microwave maps in this order:
+
+1. **SRH** σ headers — Viktor/srhimages `BEAM_SA` / `BEAM_SB` / `BEAM_PHI`
+   (`BEAM_P==1` only) or gx `MakeSRHbeam` `BEAM_SX` / `BEAM_SY` / `BEAM_RHO`
+   (σ → FWHM for the elliptical kernel path).
+2. **NORH** — `PMAT*` + `OBS-FREQ` via in-tree `norh_beam` / `BeamFitNoRH`.
+3. **SSRT** — instrument tags + observation time via `GetSSRTangles` /
+   `BeamFitSSRT` (including classic Badary `DATE-OBS=DD/MM/YY` + `TIME-OBS`).
+4. **EOVSA / generic** — `BMAJ` / `BMIN` / `BPA` FWHM ellipse (unchanged
+   fallback when no instrument-specific path matches).
+
+Optional IDL parity scripts (fixture-agnostic; need local `sswidl`):
+`examples/python/compare_norh_ifz_beam_python_vs_idl.py` (`--ifz`) and
+`examples/python/compare_ssrt_beam_python_vs_idl.py` (`--fits` / `--time` /
+`--map-sav`). See [CHANGELOG.md](CHANGELOG.md) Unreleased for known limits
+(`BEAM_P≠1` not yet supported).
+
 User-facing runnable workflows live under `examples/`, and tracked shell
 launchers for the heavier manual validation and observational fitting runs live
 under `scripts/`.

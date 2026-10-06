@@ -72,6 +72,20 @@ examples that may be added later by pull requests.
   - Requires explicit model and EBTEL paths plus gxrender in the active environment.
   - Runs one or more fixed PSF-plus-noise recovery checks and exits nonzero if a profile fails.
 
+- `python/compare_norh_ifz_beam_python_vs_idl.py`
+  - Side-by-side NORH clean-beam parity: pyCHMP `norh_beam` / `BeamFitNoRH` vs
+    SSW IDL ``norh_beam``.
+  - Fixture-agnostic: pass any Nobeyama IFZ/FITS with ``--ifz`` (or
+    ``PYCHMP_NORH_IFZ``). Optional ``--solp idl|header``.
+  - Requires local ``sswidl`` / gx_simulator; writes PNG + JSON metrics.
+
+- `python/compare_ssrt_beam_python_vs_idl.py`
+  - Side-by-side SSRT restoring-beam parity: pyCHMP `MakeSSRTbeam` /
+    `GetSSRTangles` vs IDL.
+  - Fixture-agnostic: ``--fits`` (classic SSRT map; time from ``DATE-OBS`` /
+    ``TIME-OBS``, including ``DD/MM/YY``), ``--time``, and/or ``--map-sav``.
+  - Requires local ``sswidl`` / gx_simulator; writes PNG + JSON metrics.
+
 - `python/adaptive_ab_search_single_observation.py`
   - Generic real-data adaptive local `(a, b)` search for a single observational map.
   - Supports both MW external FITS observations and EUV/UV model-refmap selections.
@@ -184,6 +198,16 @@ python examples/validate_q0_recovery.py \
 python examples/python/validate_q0_recovery_earth_eovsa_psf.py \
   --model-path /path/to/test.chr.sav \
   --ebtel-path /path/to/ebtel.sav
+```
+
+```bash
+python examples/python/compare_norh_ifz_beam_python_vs_idl.py \
+  --ifz /path/to/ifzYYMMDD_HHMMSS
+```
+
+```bash
+python examples/python/compare_ssrt_beam_python_vs_idl.py \
+  --fits /path/to/I20110801_0313.fit
 ```
 
 ```bash
